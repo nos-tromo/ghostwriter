@@ -1,0 +1,368 @@
+"""Stand-ins for Ghostwriter's neighbours, built from the shared contract alone.
+
+:class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
+REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``. Every name,
+id and value here is invented.
+"""
+
+import json
+from dataclasses import dataclass
+from typing import Any
+from urllib.parse import quote
+
+import anyio
+import httpx
+from starlette.datastructures import Headers, UploadFile
+from starlette.formparsers import MultiPartParser
+
+from ghostwriter.workbench import META_SERVER_INFO
+from tests.conftest import KEY
+
+XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": "0.3.0"}}
+#: The id workbench gives the output of :func:`call_result`.
+OUTPUT_ID = "0" * 32
+#: The id the door gives every upload, unless a test sets another.
+UPLOAD_ID = "1" * 32
+NOT_FOUND = {"detail": "not found"}
+
+#: The eight workspace tools of the contract: name, description and input properties.
+CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
+    "list_files": ("List the files in the chat's folder.", {"path": {"type": "string"}}),
+    "read_document": ("Read a document as text.", {"path": {"type": "string"}}),
+    "search_files": ("Search the chat's files for a text.", {"query": {"type": "string"}}),
+    "run_python": ("Run Python on the chat's files.", {"code": {"type": "string"}}),
+    "inspect_template": ("List a template's fields.", {"path": {"type": "string"}}),
+    "fill_template": ("Fill a template's fields.", {"path": {"type": "string"}, "values": {"type": "object"}}),
+    "write_table": ("Write a table as csv or xlsx.", {"name": {"type": "string"}, "rows": {"type": "array"}}),
+    "write_document": ("Write a document.", {"name": {"type": "string"}, "text": {"type": "string"}}),
+}
+
+_ROUTES = frozenset({("POST", "/mcp"), ("POST", "/files/upload"), ("GET", "/files/view"), ("DELETE", "/files/chat")})
+
+
+@dataclass(frozen=True)
+class RpcError:
+    """A JSON-RPC error the door answers with.
+
+    Attributes:
+        code: The error code.
+        message: Its text.
+        status: The HTTP status it comes with.
+    """
+
+    code: int
+    message: str
+    status: int = 400
+
+
+@dataclass(frozen=True)
+class Upload:
+    """A file part the door parsed out of an upload, as workbench's FastAPI parser reads it.
+
+    Attributes:
+        filename: The part's file name.
+        content_type: The part's media type.
+        data: Its bytes.
+    """
+
+    filename: str
+    content_type: str
+    data: bytes
+
+
+def discover_result() -> dict[str, Any]:
+    """Return workbench's ``server/discover`` result.
+
+    Returns:
+        The result, serving 2026-07-28 for an hour.
+    """
+    return {
+        "supportedVersions": ["2026-07-28", "2025-11-25", "2025-06-18"],
+        "capabilities": {"tools": {"listChanged": False}},
+        "ttlMs": 3600000,
+        "cacheScope": "private",
+        "resultType": "complete",
+        "_meta": SERVER_META,
+    }
+
+
+def tools_result() -> dict[str, Any]:
+    """Return workbench's ``tools/list`` result for the ghostwriter caller.
+
+    Returns:
+        The result, the eight contract tools, cached for 300 s.
+    """
+    tools = [
+        {
+            "name": name,
+            "description": description,
+            "inputSchema": {"type": "object", "properties": properties, "required": sorted(properties)},
+        }
+        for name, (description, properties) in CONTRACT_TOOLS.items()
+    ]
+    return {"tools": tools, "ttlMs": 300000, "cacheScope": "private", "resultType": "complete", "_meta": SERVER_META}
+
+
+def output(folder: str, **changes: Any) -> dict[str, Any]:
+    """Return one entry of ``structuredContent.outputs``: an xlsx with its preview.
+
+    Args:
+        folder: The chat's folder.
+        **changes: Fields to set instead.
+
+    Returns:
+        The entry.
+    """
+    preview = {"columns": ["month", "sum"], "rows": [["2026-01", "1200"]], "row_count": 12, "truncated": True}
+    entry = {
+        "id": OUTPUT_ID,
+        "path": f"{folder}/out/sums.xlsx",
+        "name": "sums.xlsx",
+        "mime": XLSX,
+        "size": 48213,
+        "preview": preview,
+    }
+    return {**entry, **changes}
+
+
+def call_result(folder: str, outputs: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Return a successful ``tools/call`` result: the text without previews, the outputs with them.
+
+    Args:
+        folder: The chat's folder.
+        outputs: The outputs; one xlsx with its preview when omitted.
+
+    Returns:
+        The result.
+    """
+    listed = [output(folder)] if outputs is None else outputs
+    structured = {"stdout": "12 months summed", "stderr": "", "truncated": False, "outputs": listed}
+    told = {**structured, "outputs": [{k: v for k, v in item.items() if k != "preview"} for item in listed]}
+    return {
+        "resultType": "complete",
+        "isError": False,
+        "content": [{"type": "text", "text": json.dumps(told)}],
+        "structuredContent": structured,
+        "_meta": SERVER_META,
+    }
+
+
+def refusal(token: str) -> dict[str, Any]:
+    """Return a refused ``tools/call`` result.
+
+    Args:
+        token: The reason.
+
+    Returns:
+        The result, its text the one every refusal carries.
+    """
+    return {
+        "resultType": "complete",
+        "isError": True,
+        "content": [{"type": "text", "text": "busy, retry later"}],
+        "structuredContent": {"reason": token},
+        "_meta": SERVER_META,
+    }
+
+
+async def _parse_upload(request: httpx.Request) -> Upload | None:
+    """Read the ``file`` part of an upload with Starlette's parser, which workbench's route uses.
+
+    Args:
+        request: The upload.
+
+    Returns:
+        The part, or ``None`` when the body holds no ``file`` part.
+    """
+
+    async def body() -> Any:
+        yield request.content
+
+    try:
+        form = await MultiPartParser(Headers({"content-type": request.headers["content-type"]}), body()).parse()
+    except Exception:
+        return None
+    try:
+        part = form.get("file")
+        if not isinstance(part, UploadFile):
+            return None
+        return Upload(part.filename or "", part.content_type or "", await part.read())
+    finally:
+        await form.close()
+
+
+class FakeDoor:
+    """workbench's doors as Ghostwriter's key reaches them, for ``httpx.MockTransport``.
+
+    It refuses a wrong key (401), any other route (404) and a missing or ``default``
+    session (400, or ``-32600`` on ``/mcp``). It answers ``/mcp`` by method and the REST
+    routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
+    an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
+    folder and returns one of those. ``None`` for ``/files/upload`` and ``/files/view``
+    is the default: an upload is parsed, stored in :attr:`files` and answered with
+    its path, size and :attr:`upload_id`; a view serves a stored file of the chat.
+
+    Attributes:
+        key: The key the door accepts.
+        requests: Every request, with its body: the JSON-RPC message, the parsed upload, or ``None``.
+        answers: The scripted answers, by MCP method or REST path.
+        delays: Seconds to wait before answering, by MCP method or REST path.
+        files: The stored files, by path: their bytes and media type.
+        upload_id: The id every upload gets.
+        last_call_answer: The last result ``tools/call`` was answered with.
+    """
+
+    def __init__(self, key: str = KEY) -> None:
+        """Answer as a healthy workbench does, without delay.
+
+        Args:
+            key: The key the door accepts.
+        """
+        self.key = key
+        self.requests: list[tuple[httpx.Request, Any]] = []
+        self.answers: dict[str, object] = {
+            "server/discover": discover_result(),
+            "tools/list": tools_result(),
+            "tools/call": call_result,
+            "/files/upload": None,
+            "/files/view": None,
+            "/files/chat": {"deleted": 3},
+        }
+        self.delays: dict[str, float] = {}
+        self.files: dict[str, tuple[bytes, str]] = {}
+        self.upload_id = UPLOAD_ID
+        self.last_call_answer: dict[str, Any] | None = None
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer it.
+
+        Args:
+            request: The request the client sent, its body read.
+
+        Returns:
+            The answer.
+
+        Raises:
+            Exception: The scripted exception, when one is set.
+        """
+        path = request.url.path
+        body: Any = None
+        if path == "/mcp":
+            body = json.loads(request.content)
+        elif path == "/files/upload":
+            body = await _parse_upload(request)
+        self.requests.append((request, body))
+        route = body["method"] if path == "/mcp" else path
+        if route in self.delays:
+            await anyio.sleep(self.delays[route])
+        if request.headers.get("authorization") != f"Bearer {self.key}":
+            return httpx.Response(401, json={"detail": "unauthorized"})
+        if (request.method, path) not in _ROUTES:
+            return httpx.Response(404, json=NOT_FOUND)
+        session = request.headers.get("x-session-id", "")
+        if session in ("", "default"):
+            if path == "/mcp":
+                return _rpc_error(body, RpcError(-32600, "invalid session"))
+            return httpx.Response(400, json={"detail": "invalid session"})
+        folder = f"/workspace/{session}"
+        answer = self.answers.get(route)
+        if callable(answer):
+            answer = answer(folder)
+        if isinstance(answer, Exception):
+            raise answer
+        if isinstance(answer, httpx.Response):
+            return answer
+        if path == "/mcp":
+            if isinstance(answer, RpcError):
+                return _rpc_error(body, answer)
+            if route == "tools/call" and isinstance(answer, dict):
+                self.last_call_answer = answer
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": answer})
+        if answer is None and path == "/files/upload":
+            return self._store(request, body, folder)
+        if answer is None and path == "/files/view":
+            return self._serve(request, folder)
+        return httpx.Response(200, json=answer)
+
+    def _store(self, request: httpx.Request, upload: Upload | None, folder: str) -> httpx.Response:
+        """Store an upload into the chat's folder, as workbench does for Ghostwriter.
+
+        Args:
+            request: The upload.
+            upload: Its parsed file part.
+            folder: The chat's folder.
+
+        Returns:
+            The path, size and id; 404 for another folder, 400 without a file part.
+        """
+        if upload is None:
+            return httpx.Response(400, json={"detail": "invalid upload"})
+        if request.url.params.get("directory") != folder:
+            return httpx.Response(404, json=NOT_FOUND)
+        path = f"{folder}/{upload.filename}"
+        self.files[path] = (upload.data, upload.content_type)
+        return httpx.Response(200, json={"path": path, "size": len(upload.data), "id": self.upload_id})
+
+    def _serve(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Serve a stored file of the chat.
+
+        Args:
+            request: The view.
+            folder: The chat's folder.
+
+        Returns:
+            The file; 404 for a path outside the chat or a missing file alike.
+        """
+        path = request.url.params.get("path", "")
+        stored = self.files.get(path) if path.startswith(f"{folder}/") else None
+        if stored is None:
+            return httpx.Response(404, json=NOT_FOUND)
+        data, mime = stored
+        name = quote(path.rsplit("/", 1)[-1], safe="")
+        disposition = f"inline; filename*=UTF-8''{name}"
+        return httpx.Response(200, content=data, headers={"Content-Type": mime, "Content-Disposition": disposition})
+
+    def methods(self) -> list[str]:
+        """Return the MCP method of every ``/mcp`` request so far, in order.
+
+        Returns:
+            The methods.
+        """
+        return [body["method"] for request, body in self.requests if request.url.path == "/mcp"]
+
+    def last(self, path: str) -> httpx.Request:
+        """Return the last request to a path.
+
+        Args:
+            path: The route, such as ``/files/upload``.
+
+        Returns:
+            The request.
+
+        Raises:
+            LookupError: When no request went there.
+        """
+        for request, _ in reversed(self.requests):
+            if request.url.path == path:
+                return request
+        raise LookupError(path)
+
+    @property
+    def uploads(self) -> list[Upload]:
+        """Every upload's parsed file part, in order."""
+        return [body for _, body in self.requests if isinstance(body, Upload)]
+
+
+def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
+    """Answer a JSON-RPC request with an error.
+
+    Args:
+        body: The request.
+        error: The error.
+
+    Returns:
+        The answer.
+    """
+    payload = {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": error.code, "message": error.message}}
+    return httpx.Response(error.status, json=payload)
