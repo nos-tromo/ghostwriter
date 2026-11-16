@@ -430,6 +430,19 @@ def text_chunk(t: str) -> Chunk:
     return _delta({"content": t})
 
 
+def reasoning_chunk(t: str, *, field: str = "reasoning_content") -> Chunk:
+    """Return a chunk carrying a piece of reasoning apart from the content, as a router with a parser sends it.
+
+    Args:
+        t: The piece.
+        field: The delta's field: ``reasoning_content`` (vLLM, LiteLLM) or ``reasoning``.
+
+    Returns:
+        The chunk.
+    """
+    return _delta({field: t})
+
+
 def call_chunk(index: int, id: str | None, name: str | None, args: str) -> Chunk:
     """Return a chunk carrying one tool-call fragment.
 

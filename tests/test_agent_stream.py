@@ -7,20 +7,30 @@ import dataclasses
 import json
 import re
 import threading
-from collections.abc import Generator
+from collections.abc import Generator, Sequence
 from pathlib import Path
 from typing import Any
 
 import httpx2
 import openai
 import pytest
+from typing_extensions import override
 
 from ghostwriter.agent import limits
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.config import Settings
 from ghostwriter.inference import ModelClient, cache_scope_for, inference_headers
 from tests.conftest import make_settings
-from tests.fakes import SERVED_MODEL, Chunk, FakeOpenAI, Round, call_chunk, text_chunk, usage_chunk
+from tests.fakes import (
+    SERVED_MODEL,
+    Chunk,
+    FakeOpenAI,
+    Round,
+    call_chunk,
+    reasoning_chunk,
+    text_chunk,
+    usage_chunk,
+)
 
 MSGS: list[dict[str, Any]] = [
     {"role": "system", "content": "You are Ghostwriter."},
@@ -33,6 +43,7 @@ TOOLS: list[dict[str, Any]] = [
 H = inference_headers("user-a", "req-0001")
 ROUTER = "http://router.test/v1"
 THINKING_OFF = {"chat_template_kwargs": {"enable_thinking": False}}
+THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
 #: The JSON body of a round offering TOOLS, before any provider's own field.
 BODY = {
     "model": "chat-model",
@@ -63,8 +74,10 @@ def _model(settings: Settings, *rounds: Round) -> tuple[ModelClient, FakeOpenAI]
     return ModelClient(settings, client=fake.as_client()), fake
 
 
-def _round(model: ModelClient, *, tools: list[dict[str, Any]] | None = None) -> list[TextDelta | RoundDone]:
-    return list(stream_round(model, MSGS, tools=tools or [], headers=H, cancel=threading.Event()))
+def _round(
+    model: ModelClient, *, tools: list[dict[str, Any]] | None = None, reasoning: bool = False
+) -> list[TextDelta | RoundDone]:
+    return list(stream_round(model, MSGS, tools=tools or [], headers=H, cancel=threading.Event(), reasoning=reasoning))
 
 
 def _text(events: list[TextDelta | RoundDone]) -> str:
@@ -96,7 +109,7 @@ def test_text_streams_as_it_arrives_and_reasoning_never_does(settings: Settings)
 
 
 def test_reasoning_split_across_chunks_or_sent_apart_never_goes_out(settings: Settings) -> None:
-    """A think block split across chunks is read out of the content; a separate reasoning field is ignored."""
+    """A think block split across chunks is read out of the content; a separate reasoning field is never shown."""
     apart = text_chunk("")
     apart["choices"][0]["delta"] = {"reasoning_content": "Plan: erst lesen"}
     model, _ = _model(
@@ -114,6 +127,74 @@ def test_a_tail_that_never_became_a_tag_goes_out_at_the_end(settings: Settings) 
     events = _round(model)
     assert events[:-1] == [TextDelta("Kleiner als:"), TextDelta(" <")]
     assert isinstance(events[-1], RoundDone) and events[-1].text == "Kleiner als: <"
+
+
+def test_with_reasoning_the_text_before_the_close_tag_is_dropped(settings: Settings) -> None:
+    """A reasoning round may open inside the template's think block: held until the close tag, then dropped."""
+    model, fake = _model(
+        settings,
+        [text_chunk("Der Nutzer fragt nach B."), text_chunk("\n</th"), text_chunk("ink>\n\nSumme: "), text_chunk("42")],
+    )
+    rounds = stream_round(model, MSGS, tools=[], headers=H, cancel=threading.Event(), reasoning=True)
+    assert next(rounds) == TextDelta("Summe:") and fake.streams[0].sent == 3
+    events = [TextDelta("Summe:"), *rounds]
+    assert events[:-1] == [TextDelta("Summe:"), TextDelta(" 42")]
+    assert events[-1] == RoundDone("Summe: 42", [], None, SERVED_MODEL, None, None, False)
+    assert fake.calls[0]["max_tokens"] == 12_000
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning"])
+def test_with_reasoning_a_separate_reasoning_field_releases_the_content(settings: Settings, field: str) -> None:
+    """A router that keeps reasoning apart sends clean content: it streams as it arrives, the reasoning never does."""
+    model, fake = _model(
+        settings,
+        [
+            reasoning_chunk("Erst lesen, ", field=field),
+            reasoning_chunk("dann rechnen.", field=field),
+            text_chunk("Summe: "),
+            text_chunk("42"),
+        ],
+    )
+    rounds = stream_round(model, MSGS, tools=[], headers=H, cancel=threading.Event(), reasoning=True)
+    assert next(rounds) == TextDelta("Summe:") and fake.streams[0].sent == 3
+    events = [TextDelta("Summe:"), *rounds]
+    assert events[:-1] == [TextDelta("Summe:"), TextDelta(" 42")]
+    assert events[-1] == RoundDone("Summe: 42", [], None, SERVED_MODEL, None, None, False)
+
+
+def test_with_reasoning_content_held_before_a_reasoning_field_is_the_answer(settings: Settings) -> None:
+    """Content held while no close tag came is released once a reasoning field shows the router keeps them apart."""
+    model, _ = _model(settings, [text_chunk("Summe: "), reasoning_chunk("nachrechnen"), text_chunk("42")])
+    events = _round(model, reasoning=True)
+    assert events[:-1] == [TextDelta("Summe:"), TextDelta(" 42")]
+
+
+def test_with_reasoning_a_reply_without_a_close_tag_is_released_at_the_end(settings: Settings) -> None:
+    """A reasoning round that never closed a think block and sent no reasoning field was the answer."""
+    model, fake = _model(settings, [text_chunk("Summe: "), text_chunk("42"), usage_chunk(812, 40, SERVED_MODEL)])
+    rounds = stream_round(model, MSGS, tools=[], headers=H, cancel=threading.Event(), reasoning=True)
+    assert next(rounds) == TextDelta("Summe: 42") and fake.streams[0].sent == 3
+    assert list(rounds) == [RoundDone("Summe: 42", [], None, SERVED_MODEL, 812, 40, False)]
+
+
+class _SetAfter(threading.Event):
+    """A stop that arrives mid-round: it reads as set from its ``checks + 1``-th check on."""
+
+    def __init__(self, checks: int) -> None:
+        super().__init__()
+        self._left = checks
+
+    @override
+    def is_set(self) -> bool:
+        self._left -= 1
+        return self._left < 0 or super().is_set()
+
+
+def test_a_stopped_reasoning_round_shows_nothing_it_held(settings: Settings) -> None:
+    """Held content may be reasoning: a stop before the close tag drops it."""
+    model, fake = _model(settings, [text_chunk("Der Nutzer fragt"), text_chunk(" nach B."), text_chunk("\n")])
+    events = list(stream_round(model, MSGS, tools=[], headers=H, cancel=_SetAfter(2), reasoning=True))
+    assert events == [RoundDone("", [], None, SERVED_MODEL, None, None, True)] and fake.streams[0].sent == 3
 
 
 def test_tool_calls_are_joined_from_their_fragments(settings: Settings) -> None:
@@ -215,12 +296,14 @@ def test_every_round_carries_the_cache_scope_and_request_id(settings: Settings) 
     assert cache_scope_for("user-a") == cache_scope_for("user-a") and "user-a" not in cache_scope_for("user-a")
 
 
-def _over_the_wire(settings: Settings) -> tuple[list[TextDelta | RoundDone], httpx2.Request]:
+def _over_the_wire(
+    settings: Settings, *, reasoning: bool = False, reply: Sequence[Chunk] = (text_chunk("Hal"), text_chunk("lo"))
+) -> tuple[list[TextDelta | RoundDone], httpx2.Request]:
     """Run one round offering TOOLS through the real SDK over a mock transport."""
     seen: list[httpx2.Request] = []
     finish = text_chunk("")
     finish["choices"][0] |= {"delta": {}, "finish_reason": "stop"}
-    chunks = [text_chunk("Hal"), text_chunk("lo"), finish, usage_chunk(812, 40, SERVED_MODEL)]
+    chunks = [*reply, finish, usage_chunk(812, 40, SERVED_MODEL)]
     sse = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
 
     def answer(request: httpx2.Request) -> httpx2.Response:
@@ -233,7 +316,7 @@ def _over_the_wire(settings: Settings) -> tuple[list[TextDelta | RoundDone], htt
         max_retries=0,
         http_client=httpx2.Client(transport=httpx2.MockTransport(answer)),
     )
-    events = _round(ModelClient(settings, client=client), tools=TOOLS)
+    events = _round(ModelClient(settings, client=client), tools=TOOLS, reasoning=reasoning)
     [request] = seen
     return events, request
 
@@ -251,13 +334,33 @@ def test_the_sdk_sends_the_round_to_the_router_as_built(settings: Settings) -> N
     assert json.loads(request.content) == {**BODY, **THINKING_OFF}
 
 
-@pytest.mark.parametrize(("provider", "extra"), [("vllm", THINKING_OFF), ("ollama", {}), ("openai", {})])
-def test_on_vllm_the_chat_templates_thinking_is_switched_off(
-    settings: Settings, provider: str, extra: dict[str, Any]
+@pytest.mark.parametrize(
+    ("provider", "reasoning", "extra", "max_tokens"),
+    [
+        ("vllm", False, THINKING_OFF, 4000),
+        ("vllm", True, THINKING_ON, 12000),
+        ("ollama", False, {}, 4000),
+        ("ollama", True, {}, 12000),
+        ("openai", True, {}, 12000),
+    ],
+)
+def test_on_vllm_the_reasoning_switch_reaches_the_chat_template(
+    settings: Settings, provider: str, reasoning: bool, extra: dict[str, Any], max_tokens: int
 ) -> None:
-    """On vllm the body switches the template's thinking off, as docint does; other providers get no unknown field."""
-    _, request = _over_the_wire(dataclasses.replace(settings, inference_provider=provider))
-    assert json.loads(request.content) == {**BODY, **extra}
+    """On vllm the body sets the template's thinking to the switch, as docint does; other providers get nothing.
+
+    A reasoning round may answer longer, whatever the provider.
+    """
+    _, request = _over_the_wire(dataclasses.replace(settings, inference_provider=provider), reasoning=reasoning)
+    assert json.loads(request.content) == {**BODY, "max_tokens": max_tokens, **extra}
+
+
+def test_the_sdk_hands_over_a_separate_reasoning_field_and_it_is_dropped(settings: Settings) -> None:
+    """Through the real SDK: a ``reasoning_content`` delta is read as the sign of clean content, and never shown."""
+    reply = (reasoning_chunk("Erst lesen."), text_chunk("Hal"), text_chunk("lo"))
+    events, request = _over_the_wire(settings, reasoning=True, reply=reply)
+    assert events == [TextDelta("Hal"), TextDelta("lo"), RoundDone("Hallo", [], "stop", SERVED_MODEL, 812, 40, False)]
+    assert json.loads(request.content)["chat_template_kwargs"] == {"enable_thinking": True}
 
 
 def test_the_client_goes_to_the_router_once_per_round(settings: Settings) -> None:
@@ -271,6 +374,8 @@ def test_the_prompt_and_the_answer_fit_the_context() -> None:
     """The caps are the plan's; a full prompt plus a full answer fit the 40k context."""
     assert (limits.CONTEXT_TOKENS, limits.PROMPT_TOKENS, limits.MAX_ANSWER_TOKENS) == (40_000, 34_000, 4_000)
     assert limits.PROMPT_TOKENS + limits.MAX_ANSWER_TOKENS <= limits.CONTEXT_TOKENS
+    assert (limits.REASONING_PROMPT_TOKENS, limits.REASONING_ANSWER_TOKENS) == (26_000, 12_000)
+    assert limits.REASONING_PROMPT_TOKENS + limits.REASONING_ANSWER_TOKENS <= limits.CONTEXT_TOKENS
     assert (limits.CHARS_PER_TOKEN, limits.MODEL_TIMEOUT_S) == (3, 120.0)
     assert (limits.MAX_TOOL_ROUNDS, limits.MAX_CALLS_PER_ROUND) == (8, 4)
     assert (limits.MESSAGE_WALL_S, limits.TOOL_CUTOFF_S, limits.BUSY_RETRY_S) == (300.0, 10.0, 2.0)

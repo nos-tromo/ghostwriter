@@ -9,9 +9,13 @@ CONTEXT_TOKENS: Final = 40_000
 MAX_ANSWER_TOKENS: Final = 4_000
 #: The most a round's prompt may hold, its tool schemas included.
 PROMPT_TOKENS: Final = 34_000
+#: A reasoning round's ``max_tokens``: the thinking counts against it.
+REASONING_ANSWER_TOKENS: Final = 12_000
+#: The most a reasoning round's prompt may hold, its tool schemas included.
+REASONING_PROMPT_TOKENS: Final = CONTEXT_TOKENS - REASONING_ANSWER_TOKENS - 2_000
 #: Characters per token, the estimate.
 CHARS_PER_TOKEN: Final = 3
-#: Seconds one round may take.
+#: Seconds each wait on the router may take (connecting, and each read of the stream); not a bound on the round.
 MODEL_TIMEOUT_S: Final = 120.0
 
 # Tools.

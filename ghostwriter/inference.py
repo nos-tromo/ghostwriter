@@ -3,20 +3,21 @@
 Inference goes only to ``OPENAI_API_BASE``, the federation's LiteLLM router. Every call
 carries ``X-Cache-Scope``, a pseudonym of the user keyed in this process, so the router keeps
 each user's cached prompt prefixes apart from other users', and ``X-Request-ID``. A round is
-one attempt: the SDK retries nothing, so :data:`~ghostwriter.agent.limits.MODEL_TIMEOUT_S`
-bounds it.
+one attempt: the SDK retries nothing. :data:`~ghostwriter.agent.limits.MODEL_TIMEOUT_S`
+bounds each wait on the router (connecting, and each read of the stream), not the round: a
+long answer streams for longer.
 
-On vllm, the federation's provider, every round switches the chat template's thinking off
-(``chat_template_kwargs.enable_thinking``), as docint does: a template that opens a think
-block in the prompt would otherwise begin the reply inside it, and the reasoning would be
-shown. Other providers get no such field, as OpenAI proper refuses unknown ones.
+On vllm, the federation's provider, every round sets the chat template's thinking
+(``chat_template_kwargs.enable_thinking``) to the message's reasoning switch, in both states,
+as docint does: a template that opens a think block in the prompt would otherwise begin the
+reply inside it unasked. Other providers get no such field, as OpenAI proper refuses unknown ones.
 """
 
 import hashlib
 import hmac
 import secrets
 from collections.abc import Mapping
-from typing import Any, Final, TypedDict, cast
+from typing import Any, TypedDict, cast
 
 import openai
 from openai.types.chat import (
@@ -30,8 +31,6 @@ from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import REQUEST_ID_HEADER
 
 CACHE_SCOPE_HEADER = "X-Cache-Scope"
-#: The body field that switches a vllm chat template's thinking off.
-THINKING_OFF: Final = {"chat_template_kwargs": {"enable_thinking": False}}
 
 # Keys the cache scopes; it never leaves this process, so a scope cannot be
 # mapped back to a user anywhere else. A restart gives every user a new scope.
@@ -94,8 +93,10 @@ class ModelClient:
         """
         self.model = settings.text_model
         self.provider = settings.inference_provider
-        self.client = client or openai.OpenAI(
-            base_url=settings.openai_api_base, api_key=settings.openai_api_key, max_retries=0
+        self.client = (
+            client
+            if client is not None
+            else openai.OpenAI(base_url=settings.openai_api_base, api_key=settings.openai_api_key, max_retries=0)
         )
 
     def stream(
@@ -106,6 +107,7 @@ class ModelClient:
         headers: Mapping[str, str],
         max_tokens: int,
         timeout_s: float,
+        reasoning: bool = False,
     ) -> openai.Stream[Any]:
         """Start one streamed round.
 
@@ -115,7 +117,9 @@ class ModelClient:
                 nor ``tool_choice``: an OpenAI-compatible endpoint may refuse an empty list.
             headers: The extra headers, :func:`inference_headers`.
             max_tokens: The longest answer.
-            timeout_s: Seconds the round may take.
+            timeout_s: Seconds each wait on the router may take.
+            reasoning: Whether the model may think first; on vllm it sets the template's
+                ``enable_thinking``, elsewhere nothing is sent for it.
 
         Returns:
             The stream of chunks; the last one carries the usage.
@@ -128,7 +132,7 @@ class ModelClient:
             options["tools"] = cast("list[ChatCompletionToolUnionParam]", tools)
             options["tool_choice"] = "auto"
         if self.provider == "vllm":
-            options["extra_body"] = THINKING_OFF
+            options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": reasoning}}
         usage: ChatCompletionStreamOptionsParam = {"include_usage": True}
         return self.client.chat.completions.create(
             model=self.model,

@@ -3,8 +3,14 @@
 Text goes out as it arrives, with no hold, also when the round then turns to tool calls: a
 preface such as "I'll read the file." is shown and kept. Reasoning never goes out: think
 blocks in the content are read out by :class:`~ghostwriter.agent.reasoning.ReasoningStripper`,
-and a reasoning field the endpoint sends apart from the content (``reasoning_content``) is
-not read at all. Neither is logged.
+and a reasoning field the endpoint sends apart from the content (``reasoning_content``, or
+``reasoning``) is dropped. Neither is kept, logged or returned.
+
+A reasoning round (the message's switch) may open inside a think block the chat template
+began in the prompt, so its content is held until a close tag (what came before it is
+reasoning), a separate reasoning field (the endpoint keeps reasoning apart, so the content is
+the answer), or the end of the reply (the held content was the answer), as docint's
+``stream_round`` does. It may answer in up to ``REASONING_ANSWER_TOKENS``.
 
 :class:`ToolCall` and :class:`ToolCallAccumulator`, with the helpers they use, are copied
 unchanged from docint (``docint/agents/turn/stream.py``); here they read the SDK's chunks
@@ -23,7 +29,7 @@ from typing import Any
 
 from loguru import logger
 
-from ghostwriter.agent.limits import MAX_ANSWER_TOKENS, MODEL_TIMEOUT_S
+from ghostwriter.agent.limits import MAX_ANSWER_TOKENS, MODEL_TIMEOUT_S, REASONING_ANSWER_TOKENS
 from ghostwriter.agent.reasoning import ReasoningStripper
 from ghostwriter.inference import ModelClient
 
@@ -279,8 +285,9 @@ def stream_round(
     tools: list[dict[str, Any]],
     headers: Mapping[str, str],
     cancel: threading.Event,
+    reasoning: bool = False,
 ) -> Iterator[TextDelta | RoundDone]:
-    """Stream one model round, bounded by ``MAX_ANSWER_TOKENS`` and ``MODEL_TIMEOUT_S``.
+    """Stream one model round, bounded in tokens, each wait on the router by ``MODEL_TIMEOUT_S``.
 
     Args:
         model (ModelClient): The chat model.
@@ -289,6 +296,8 @@ def stream_round(
             neither ``tools`` nor ``tool_choice``.
         headers (Mapping[str, str]): The extra headers, ``inference_headers``.
         cancel (threading.Event): Set to stop the round.
+        reasoning (bool): Whether the model may think first: the round asks for it and answers
+            in up to ``REASONING_ANSWER_TOKENS``, else ``MAX_ANSWER_TOKENS``.
 
     Yields:
         TextDelta | RoundDone: The visible text as it arrives, then exactly one :class:`RoundDone`.
@@ -297,10 +306,15 @@ def stream_round(
         openai.OpenAIError: Whatever the model call raises.
     """
     stream = model.stream(
-        messages, tools=tools, headers=headers, max_tokens=MAX_ANSWER_TOKENS, timeout_s=MODEL_TIMEOUT_S
+        messages,
+        tools=tools,
+        headers=headers,
+        max_tokens=REASONING_ANSWER_TOKENS if reasoning else MAX_ANSWER_TOKENS,
+        timeout_s=MODEL_TIMEOUT_S,
+        reasoning=reasoning,
     )
     accumulator = ToolCallAccumulator()
-    reader = ReasoningStripper()
+    reader = ReasoningStripper(reasoning_open=reasoning)
     shown: list[str] = []
     finish_reason: str | None = None
     model_id: str | None = None
@@ -319,7 +333,11 @@ def stream_round(
             if usage is not None:
                 input_tokens = _count(_field(usage, "prompt_tokens"))
                 output_tokens = _count(_field(usage, "completion_tokens"))
-            text = reader.feed(_text(_field(_field(_choice(chunk), "delta"), "content")))
+            delta = _field(_choice(chunk), "delta")
+            text = ""
+            if _text(_field(delta, "reasoning_content")) or _text(_field(delta, "reasoning")):
+                text = reader.cancel_open_reasoning()
+            text += reader.feed(_text(_field(delta, "content")))
             if text:
                 shown.append(text)
                 yield TextDelta(text)

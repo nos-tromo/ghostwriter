@@ -124,6 +124,7 @@ dependencies = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "httpx2" },
     { name = "pre-commit" },
     { name = "pyrefly" },
     { name = "pytest" },
@@ -147,6 +148,7 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "httpx2", specifier = ">=2.16.2" },
     { name = "pre-commit", specifier = ">=4.7.0" },
     { name = "pyrefly", specifier = "==1.1.1" },
     { name = "pytest", specifier = ">=9.2.0" },
