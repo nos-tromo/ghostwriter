@@ -18,7 +18,12 @@ class Base(DeclarativeBase):
 
 
 class Chat(Base):
-    """A chat, its owner and its deadline."""
+    """A chat, its owner and its deadline.
+
+    ``first_file_at`` is the chat's first attachment, tool step or result: from
+    then on its workbench folder may hold files, some named by no row. It is
+    set once and never cleared.
+    """
 
     __tablename__ = "chats"
 
@@ -28,6 +33,7 @@ class Chat(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime())
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), index=True)
+    first_file_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
 
 
 class Message(Base):

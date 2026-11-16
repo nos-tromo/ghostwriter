@@ -97,9 +97,10 @@ def make_engine(path: str) -> Engine:
         path: The database file.
 
     Returns:
-        The engine; each of its connections has the pragmas set.
+        The engine; each of its connections has the pragmas set. Its errors
+        never carry bound values, which hold message and tool content.
     """
-    engine = create_engine(f"sqlite:///{path}")
+    engine = create_engine(f"sqlite:///{path}", hide_parameters=True)
     event.listen(engine, "connect", _set_pragmas)
     return engine
 

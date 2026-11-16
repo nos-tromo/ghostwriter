@@ -4,12 +4,12 @@ from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import cast
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, func, select, update
+from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ghostwriter.db import init_db, make_engine
@@ -217,6 +217,83 @@ def test_tool_contents_expire_with_the_files(store: ChatStore, engine: Engine, c
     ):
         assert _value(engine, column, row_id) == T0 + 3 * DAY
     assert _value(engine, ToolStep.content_expires_at, emptied.id) == T0 - 3 * DAY
+
+
+def test_a_step_without_any_file_row_still_caps_later_steps(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A chat's first workbench call may write files no row names; content after it expires with them."""
+    chat = store.create_chat("user-a")
+    _step(store, store.start_assistant_message(chat.id))
+    clock.now = T0 + 5 * DAY
+    later = _step(store, store.start_assistant_message(chat.id))
+    assert _value(engine, ToolStep.content_expires_at, later.id) == T0 + 7 * DAY
+
+
+@pytest.mark.parametrize("named_by", ["attachment", "result"])
+def test_dropped_rows_never_move_the_cap_later(store: ChatStore, engine: Engine, clock: Clock, named_by: str) -> None:
+    """The chat's first file is remembered when the row that named it is gone (a regenerate, a lost row)."""
+    chat = store.create_chat("user-a")
+    if named_by == "attachment":
+        _attach(store, chat.id)
+        with Session(engine) as s, s.begin():
+            s.execute(delete(Attachment).where(Attachment.chat_id == chat.id))
+    else:
+        dropped = store.start_assistant_message(chat.id)
+        _result(store, dropped)
+        store.drop_message(dropped)
+    assert store.chat_counts(chat.id) == {"messages": 0, "steps": 0, "results": 0, "attachments": 0}
+    clock.now = T0 + 5 * DAY
+    answer = store.start_assistant_message(chat.id)
+    step = _step(store, answer)
+    result = _result(store, answer)
+    assert _value(engine, ToolStep.content_expires_at, step.id) == T0 + 7 * DAY
+    assert _value(engine, Result.preview_expires_at, result.id) == T0 + 7 * DAY
+    ChatStore(engine, file_days=7, notice_days=30, now=clock).apply_periods(90)
+    assert _value(engine, ToolStep.content_expires_at, step.id) == T0 + 7 * DAY
+    assert _value(engine, Result.preview_expires_at, result.id) == T0 + 7 * DAY
+
+
+def test_a_result_lives_as_long_as_its_file_and_its_preview_with_the_earliest(store: ChatStore, clock: Clock) -> None:
+    """A result written on day 6 over a file of day 0: its preview goes on day 7, the result on day 13."""
+    chat = store.create_chat("user-a")
+    _attach(store, chat.id)
+    clock.now = T0 + 6 * DAY
+    _result(store, store.start_assistant_message(chat.id))
+
+    def card() -> ResultOut:
+        return store.chat_detail("user-a", chat.id).messages[0].results[0]
+
+    clock.now = T0 + 7 * DAY - timedelta(seconds=1)
+    assert (card().preview, card().expired) == (TablePreviewOut(**PREVIEW), False)
+    clock.now = T0 + 7 * DAY
+    assert (card().preview, card().expired) == (None, False)
+    clock.now = T0 + 13 * DAY - timedelta(seconds=1)
+    assert card().expired is False
+    clock.now = T0 + 13 * DAY
+    assert (card().preview, card().expired) == (None, True)
+
+
+def test_a_user_message_keeps_the_id_it_was_given(store: ChatStore) -> None:
+    """The id recorded before the insert is the stored message's; without one, a uuid4 is minted."""
+    chat = store.create_chat("user-a")
+    given = str(uuid4())
+    assert store.add_user_message("user-a", chat.id, "Summe der Spalte B", [], id=given).id == given
+    minted = store.add_user_message("user-a", chat.id, "Und pro Quartal?", []).id
+    assert UUID(minted).version == 4 and minted != given
+    assert [m.id for m in store.chat_detail("user-a", chat.id).messages] == [given, minted]
+
+
+def test_an_attachment_keeps_the_id_it_was_given(store: ChatStore) -> None:
+    """The id recorded before the hand-over is the stored attachment's; without one, a uuid4 is minted."""
+    chat = store.create_chat("user-a")
+    given = str(uuid4())
+    path, name = "/workspace/s/sales.xlsx", "sales.xlsx"
+    assert (
+        store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, id=given).id
+        == given
+    )
+    minted = store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX).id
+    assert UUID(minted).version == 4 and minted != given
+    assert {a.id for a in store.chat_detail("user-a", chat.id).pending_attachments} == {given, minted}
 
 
 def test_a_longer_file_period_brings_back_nothing_expired(store: ChatStore, engine: Engine, clock: Clock) -> None:

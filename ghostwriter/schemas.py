@@ -98,8 +98,9 @@ class ResultOut(BaseModel):
         name: The file name.
         mime: Its MIME type.
         size: Its size in bytes.
-        preview: The table's head; ``None`` without one or once expired.
-        expired: Whether it has expired with the chat's files.
+        preview: The table's head; ``None`` without one, or once it has expired
+            with the chat's earliest file.
+        expired: Whether workbench's period for its own file has passed.
     """
 
     id: str

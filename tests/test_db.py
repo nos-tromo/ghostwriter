@@ -4,8 +4,8 @@ from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from sqlalchemy import Column, Connection, Engine, Integer, MetaData, Table, inspect, select
-from sqlalchemy.exc import StatementError
+from sqlalchemy import Column, Connection, Engine, Integer, MetaData, Table, Text, inspect, select
+from sqlalchemy.exc import IntegrityError, StatementError
 
 from ghostwriter import db
 from ghostwriter.db import UtcDateTime, init_db, make_engine, utcnow
@@ -90,6 +90,18 @@ def test_every_connection_has_the_pragmas(tmp_path: Path) -> None:
                 for name in ("foreign_keys", "journal_mode", "secure_delete", "busy_timeout")
             }
             assert values == {"foreign_keys": 1, "journal_mode": "wal", "secure_delete": 1, "busy_timeout": 5000}
+
+
+def test_a_failed_statement_names_no_bound_value(tmp_path: Path) -> None:
+    """An error's text, which the server log prints, never carries what was bound."""
+    table = Table("t", MetaData(), Column("id", Integer, primary_key=True), Column("text", Text))
+    engine = make_engine(str(tmp_path / "a.sqlite3"))
+    table.metadata.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(table.insert().values(id=1, text="first"))
+    with engine.begin() as conn, pytest.raises(IntegrityError) as refused:
+        conn.execute(table.insert().values(id=1, text="SENTINEL-Umsatz pro Monat"))
+    assert "SENTINEL" not in str(refused.value)
 
 
 def test_times_come_back_aware_in_utc(tmp_path: Path) -> None:

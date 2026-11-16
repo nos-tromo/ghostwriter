@@ -3,8 +3,9 @@
 Every method runs one short transaction and returns schema objects, never ORM
 rows. A lookup a user can reach names the owner. A chat is due under the chat
 period (:mod:`ghostwriter.retention_rule`). A tool step's content and a result's
-preview expire with the chat's earliest file: nothing derived from a file
-outlives it (spec §5.6).
+preview expire with the chat's earliest file, which the chat remembers when the
+rows that named it are gone: nothing derived from a file outlives it (spec
+§5.6). An attachment or a result itself lives as long as its own file.
 """
 
 import json
@@ -117,30 +118,6 @@ def _step_out(step: ToolStep, now: datetime) -> StepOut:
     )
 
 
-def _result_out(result: Result, now: datetime) -> ResultOut:
-    """Serve a result row, without its preview once that has expired.
-
-    Args:
-        result: The row.
-        now: The time of the read.
-
-    Returns:
-        The result.
-    """
-    expired = result.preview_expires_at <= now
-    preview = None if expired or result.preview is None else TablePreviewOut.model_validate_json(result.preview)
-    return ResultOut(
-        id=result.id,
-        kind=cast(ResultKind, result.kind),
-        file_id=result.workbench_file_id,
-        name=result.name,
-        mime=result.mime,
-        size=result.size,
-        preview=preview,
-        expired=expired,
-    )
-
-
 class ChatStore:
     """The chats, their messages, tool steps, attachments and results.
 
@@ -190,6 +167,32 @@ class ChatStore:
             expired=attachment.created_at + self._file_period <= now,
         )
 
+    def _result_out(self, result: Result, now: datetime) -> ResultOut:
+        """Serve a result row.
+
+        Args:
+            result: The row.
+            now: The time of the read.
+
+        Returns:
+            The result, expired once workbench's period for its file has
+            passed; its preview goes earlier, at ``preview_expires_at``.
+        """
+        expired = result.created_at + self._file_period <= now
+        preview: TablePreviewOut | None = None
+        if not expired and result.preview_expires_at > now and result.preview is not None:
+            preview = TablePreviewOut.model_validate_json(result.preview)
+        return ResultOut(
+            id=result.id,
+            kind=cast(ResultKind, result.kind),
+            file_id=result.workbench_file_id,
+            name=result.name,
+            mime=result.mime,
+            size=result.size,
+            preview=preview,
+            expired=expired,
+        )
+
     @staticmethod
     def _owned(s: Session, owner: str, chat_id: str) -> Chat:
         """Return an owner's chat.
@@ -227,7 +230,7 @@ class ChatStore:
 
     @staticmethod
     def _earliest_files(s: Session, chat_id: str | None = None) -> dict[str, datetime]:
-        """Return when each chat's earliest attachment or result was made.
+        """Return when each chat's earliest file was made: its first file, attachment or result.
 
         Args:
             s: The session.
@@ -236,12 +239,16 @@ class ChatStore:
         Returns:
             The earliest time per chat id, for chats that hold a file.
         """
-        attachments = select(Attachment.chat_id.label("chat_id"), Attachment.created_at.label("created_at"))
+        first = select(Chat.id.label("chat_id"), Chat.first_file_at.label("created_at")).where(
+            Chat.first_file_at.is_not(None)
+        )
+        attachments = select(Attachment.chat_id, Attachment.created_at)
         results = select(Message.chat_id, Result.created_at).join(Message, Result.message_id == Message.id)
         if chat_id is not None:
+            first = first.where(Chat.id == chat_id)
             attachments = attachments.where(Attachment.chat_id == chat_id)
             results = results.where(Message.chat_id == chat_id)
-        files = union_all(attachments, results).subquery()
+        files = union_all(first, attachments, results).subquery()
         rows = s.execute(select(files.c.chat_id, func.min(files.c.created_at)).group_by(files.c.chat_id)).all()
         return {chat: earliest for chat, earliest in rows}
 
@@ -260,6 +267,17 @@ class ChatStore:
         """
         start = made if earliest_file is None else min(made, earliest_file)
         return start + self._file_period
+
+    @staticmethod
+    def _mark_first_file(s: Session, chat_id: str, now: datetime) -> None:
+        """Remember when a chat's folder may first have held a file, unless it is known already.
+
+        Args:
+            s: The session.
+            chat_id: The chat.
+            now: The time of the attachment, step or result.
+        """
+        s.execute(update(Chat).where(Chat.id == chat_id, Chat.first_file_at.is_(None)).values(first_file_at=now))
 
     @staticmethod
     def _next_position(s: Session, chat_id: str) -> int:
@@ -431,7 +449,7 @@ class ChatStore:
                         created_at=message.created_at,
                         attachments=[self._attachment_out(a, now) for a in attachments if a.message_id == message.id],
                         steps=[_step_out(step, now) for step in steps if step.message_id == message.id],
-                        results=[_result_out(result, now) for result in results if result.message_id == message.id],
+                        results=[self._result_out(r, now) for r in results if r.message_id == message.id],
                     )
                     for message in messages
                 ],
@@ -489,7 +507,9 @@ class ChatStore:
         with self._transaction() as s:
             s.execute(delete(Chat).where(Chat.id == chat_id))
 
-    def add_user_message(self, owner: str, chat_id: str, content: str, attachment_ids: Sequence[str]) -> MessageOut:
+    def add_user_message(
+        self, owner: str, chat_id: str, content: str, attachment_ids: Sequence[str], *, id: str | None = None
+    ) -> MessageOut:
         """Store a user's message and bind the attachments it sends.
 
         An untitled chat takes the message's first line as its title, and the
@@ -500,6 +520,7 @@ class ChatStore:
             chat_id: The chat.
             content: The message.
             attachment_ids: Pending attachments of this chat; a repeated id counts once.
+            id: The message's id, when it was recorded before the insert; minted otherwise.
 
         Returns:
             The message with its attachments.
@@ -514,7 +535,7 @@ class ChatStore:
         with self._transaction() as s:
             chat = self._owned(s, owner, chat_id)
             message = Message(
-                id=str(uuid4()),
+                id=str(uuid4()) if id is None else id,
                 chat_id=chat_id,
                 position=self._next_position(s, chat_id),
                 role="user",
@@ -614,6 +635,7 @@ class ChatStore:
         now = self._now()
         with self._transaction() as s:
             chat_id = s.execute(select(Message.chat_id).where(Message.id == message_id)).scalar_one()
+            self._mark_first_file(s, chat_id, now)
             step = ToolStep(
                 id=id,
                 message_id=message_id,
@@ -662,6 +684,7 @@ class ChatStore:
         now = self._now()
         with self._transaction() as s:
             chat_id = s.execute(select(Message.chat_id).where(Message.id == message_id)).scalar_one()
+            self._mark_first_file(s, chat_id, now)
             row = Result(
                 id=str(uuid4()),
                 message_id=message_id,
@@ -676,10 +699,10 @@ class ChatStore:
                 preview_expires_at=self._content_deadline(now, self._earliest_files(s, chat_id).get(chat_id)),
             )
             s.add(row)
-            return _result_out(row, now)
+            return self._result_out(row, now)
 
     def add_attachment(
-        self, chat_id: str, *, file_id: str, path: str, name: str, size: int, mime: str
+        self, chat_id: str, *, file_id: str, path: str, name: str, size: int, mime: str, id: str | None = None
     ) -> AttachmentOut:
         """Store a file handed to workbench, by reference, pending until a message sends it.
 
@@ -690,14 +713,16 @@ class ChatStore:
             name: The file name.
             size: Its size in bytes.
             mime: Its MIME type.
+            id: The attachment's id, when it was recorded before the hand-over; minted otherwise.
 
         Returns:
             The attachment.
         """
         now = self._now()
         with self._transaction() as s:
+            self._mark_first_file(s, chat_id, now)
             attachment = Attachment(
-                id=str(uuid4()),
+                id=str(uuid4()) if id is None else id,
                 chat_id=chat_id,
                 message_id=None,
                 workbench_file_id=file_id,
