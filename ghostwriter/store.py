@@ -19,6 +19,8 @@ from uuid import uuid4
 from sqlalchemy import Engine, delete, func, select, union_all, update
 from sqlalchemy.orm import Session
 
+from ghostwriter.agent.context import PastCall, PastTurn, user_content
+from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, Message, Result, RetentionPeriod, ToolStep
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, next_period_state
@@ -104,14 +106,15 @@ def _step_out(step: ToolStep, now: datetime) -> StepOut:
         now: The time of the read.
 
     Returns:
-        The step.
+        The step; its detail read from its arguments while they are kept.
     """
     expired = step.content_expires_at <= now
+    arguments = None if expired or step.arguments is None else parse_arguments(step.arguments)
     return StepOut(
         id=step.id,
         tool=step.tool,
         status=cast(StepStatus, step.status),
-        detail=None,
+        detail=None if arguments is None else step_detail(step.tool, arguments),
         arguments=None if expired else step.arguments,
         result=None if expired else step.result,
         expired=expired,
@@ -777,6 +780,125 @@ class ChatStore:
                     .where(Message.chat_id.in_(owned), Result.workbench_file_id == file_id)
                 ).first()
             return None if found is None else FileRef(path=found[0], created_at=found[1])
+
+    def _prompt_text(self, message: Message, attachments: Sequence[Attachment], now: datetime) -> str:
+        """Return a user's message as the model reads it.
+
+        Args:
+            message: The message.
+            attachments: The files it sent.
+            now: The time of the read.
+
+        Returns:
+            The text, then each attachment with its path and size, or as expired.
+        """
+        paths = {attachment.id: attachment.path for attachment in attachments}
+        return user_content(
+            message.content,
+            [self._attachment_out(attachment, now) for attachment in attachments],
+            path_of=lambda attachment: paths[attachment.id],
+        )
+
+    def user_turn(self, chat_id: str, message_id: str) -> tuple[str, int]:
+        """Return a user's message as the model reads it, and its place in the chat.
+
+        Args:
+            chat_id: The chat.
+            message_id: The user's message.
+
+        Returns:
+            The text with its attachments named (:func:`~ghostwriter.agent.context.user_content`),
+            and the message's position.
+
+        Raises:
+            sqlalchemy.exc.NoResultFound: If the chat has no such user's message.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            message = s.scalars(
+                select(Message).where(Message.id == message_id, Message.chat_id == chat_id, Message.role == "user")
+            ).one()
+            attachments = s.scalars(
+                select(Attachment)
+                .where(Attachment.message_id == message_id)
+                .order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            return self._prompt_text(message, attachments, now), message.position
+
+    def past_turns(self, chat_id: str, *, before_position: int) -> tuple[list[PastTurn], bool]:
+        """Return the turns before a message, for a follow-up: questions, live tool contents, answers.
+
+        A question is followed by its answer, if it has one. A step whose content has
+        expired is not replayed, and a round left without a step goes with it.
+
+        Args:
+            chat_id: The chat.
+            before_position: The position of the message being answered.
+
+        Returns:
+            The turns, oldest first, and whether any of their files or tool contents have expired.
+        """
+        now = self._now()
+        earlier = (Message.chat_id == chat_id, Message.position < before_position)
+        with self._transaction() as s:
+            messages = s.scalars(select(Message).where(*earlier).order_by(Message.position)).all()
+            attachments = s.scalars(
+                select(Attachment)
+                .join(Message, Attachment.message_id == Message.id)
+                .where(*earlier)
+                .order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            steps = s.scalars(
+                select(ToolStep)
+                .join(Message, ToolStep.message_id == Message.id)
+                .where(*earlier)
+                .order_by(ToolStep.round, ToolStep.position)
+            ).all()
+            results = s.execute(
+                select(Result.message_id, Result.created_at)
+                .join(Message, Result.message_id == Message.id)
+                .where(*earlier)
+            ).all()
+            gone_results = {message_id for message_id, made in results if made + self._file_period <= now}
+            turns: list[PastTurn] = []
+            question: tuple[str, bool] | None = None
+            for message in messages:
+                if message.role == "user":
+                    if question is not None:
+                        turns.append(PastTurn(question[0], (), "", question[1]))
+                    sent = [a for a in attachments if a.message_id == message.id]
+                    lost = any(a.created_at + self._file_period <= now for a in sent)
+                    question = (self._prompt_text(message, sent, now), lost)
+                    continue
+                if question is None:
+                    continue
+                rounds, lost = self._live_rounds([step for step in steps if step.message_id == message.id], now)
+                lost = lost or question[1] or message.id in gone_results
+                turns.append(PastTurn(question[0], rounds, message.content, lost))
+                question = None
+            if question is not None:
+                turns.append(PastTurn(question[0], (), "", question[1]))
+            return turns, any(turn.expired for turn in turns)
+
+    @staticmethod
+    def _live_rounds(steps: Sequence[ToolStep], now: datetime) -> tuple[tuple[tuple[PastCall, ...], ...], bool]:
+        """Group an answer's steps into rounds, leaving out those whose content has expired.
+
+        Args:
+            steps: The answer's steps, by round and position.
+            now: The time of the read.
+
+        Returns:
+            The live calls of each round that kept one, and whether any step had expired.
+        """
+        rounds: dict[int, list[PastCall]] = {}
+        lost = False
+        for step in steps:
+            if step.content_expires_at <= now or step.arguments is None or step.result is None:
+                lost = True
+                continue
+            rounds.setdefault(step.round, []).append(PastCall(step.call_id, step.tool, step.arguments, step.result))
+        return tuple(tuple(calls) for calls in rounds.values()), lost
 
     def last_answer(self, owner: str, chat_id: str) -> str | None:
         """Return the answer that ends an owner's chat.

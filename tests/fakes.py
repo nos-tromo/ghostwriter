@@ -3,12 +3,14 @@
 :class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
 REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``.
 :class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
-builders :func:`text_chunk`, :func:`call_chunk` and :func:`usage_chunk`. Every
-name, id and value here is invented.
+builders :func:`text_chunk`, :func:`reasoning_chunk`, :func:`call_chunk` and
+:func:`usage_chunk`. :class:`FakeWorkbench` and :class:`RecordingAudit` are workbench
+and a turn's audit as the agent loop reaches them. Every name, id and value here is
+invented.
 """
 
 import json
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, cast
@@ -22,7 +24,17 @@ from openai.types.chat import ChatCompletionChunk
 from starlette.datastructures import Headers, UploadFile
 from starlette.formparsers import MultiPartParser
 
-from ghostwriter.workbench import META_SERVER_INFO
+from ghostwriter.agent.stream import RoundDone
+from ghostwriter.utils.audit_event import AuditWriteError
+from ghostwriter.workbench import (
+    META_SERVER_INFO,
+    CallFor,
+    Discovery,
+    McpTool,
+    ToolFailure,
+    ToolResult,
+    WorkbenchClient,
+)
 from tests.conftest import KEY
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -614,3 +626,169 @@ class FakeOpenAI:
         if isinstance(self.transcript, Exception):
             raise self.transcript
         return Transcription(text=self.transcript)
+
+
+# --- workbench and the audit, as the agent loop reaches them ------------------
+
+#: What :class:`FakeWorkbench` answers a call with: an outcome, or a callable that returns one
+#: (it may move a clock, set a stop, or raise to stand for a fault).
+Answer = ToolResult | ToolFailure | Callable[[], ToolResult | ToolFailure]
+#: What a call answers when the script has no answer left.
+PLAIN_RESULT = ToolResult('{"text": "Umsatz 42"}', ())
+
+
+def contract_tools() -> tuple[McpTool, ...]:
+    """Return the eight contract tools as discovery hands them out.
+
+    Returns:
+        The tools, in workbench's order.
+    """
+    return tuple(McpTool(t["name"], t["description"], t["inputSchema"]) for t in tools_result()["tools"])
+
+
+@dataclass(frozen=True)
+class SentCall:
+    """A call the loop sent to workbench.
+
+    Attributes:
+        name: The tool.
+        arguments: Its arguments.
+        call: The chat it was made for.
+        timeout_s: Its deadline.
+    """
+
+    name: str
+    arguments: dict[str, Any]
+    call: CallFor
+    timeout_s: float
+
+
+class RecordingAudit:
+    """A turn's audit that records each write as a line, or fails it.
+
+    Attributes:
+        log: ``disclose:<tool>:<round>:<attempt>`` and ``model:<round>:<outcome>``, in order.
+        rounds: Each ``model_called``'s round, as the loop reported it.
+        failing: The writes that fail, ``disclose`` or ``model``.
+        on_model: Called with the round after each ``model_called`` was written.
+    """
+
+    def __init__(self) -> None:
+        """Record nothing yet, and fail nothing."""
+        self.log: list[str] = []
+        self.rounds: list[RoundDone | None] = []
+        self.failing: set[str] = set()
+        self.on_model: Callable[[int], None] | None = None
+
+    def disclosed(self, *, tool: str, round: int, call_id: str, attempt: int) -> None:
+        """Record a disclosure to workbench.
+
+        Args:
+            tool: The tool.
+            round: The model round that asked for it.
+            call_id: The model's id for the call.
+            attempt: 1, or 2 for the retry after a busy answer.
+
+        Raises:
+            AuditWriteError: While ``disclose`` is failing.
+        """
+        if "disclose" in self.failing:
+            raise AuditWriteError("synthetic audit failure")
+        self.log.append(f"disclose:{tool}:{round}:{attempt}")
+
+    def model_called(self, *, round: int, done: RoundDone | None, outcome: str) -> None:
+        """Record a model round.
+
+        Args:
+            round: The round.
+            done: How it ended; ``None`` when it failed.
+            outcome: ``ok`` or ``error``.
+
+        Raises:
+            AuditWriteError: While ``model`` is failing.
+        """
+        if "model" in self.failing:
+            raise AuditWriteError("synthetic audit failure")
+        self.log.append(f"model:{round}:{outcome}")
+        self.rounds.append(done)
+        if self.on_model is not None:
+            self.on_model(round)
+
+
+class FakeWorkbench:
+    """``WorkbenchClient`` as the agent loop calls it: ``discover`` and ``call_tool``.
+
+    Discovery answers :attr:`discovery`. Each call answers the next of :attr:`answers`, or
+    :data:`PLAIN_RESULT` once they are used up, and is recorded with the audit line written
+    last before it went out.
+
+    Attributes:
+        discovery: What every discovery answers; ``None`` is a workbench that is not usable.
+        answers: The scripted answers, in order.
+        calls: Every call, in order.
+        discoveries: The chat of every discovery, in order.
+        sent_after: For every call, the audit's last line when it was sent.
+        audit: The audit whose log :attr:`sent_after` reads.
+    """
+
+    def __init__(
+        self,
+        answers: Sequence[Answer] = (),
+        *,
+        tools: Sequence[McpTool] | None = None,
+        audit: RecordingAudit | None = None,
+    ) -> None:
+        """Script workbench.
+
+        Args:
+            answers: The calls' answers, in order.
+            tools: The tools discovery finds; the eight contract tools when omitted, none
+                at all (``()``) for a workbench that is not usable.
+            audit: The audit whose log :attr:`sent_after` reads.
+        """
+        found = contract_tools() if tools is None else tuple(tools)
+        self.discovery: Discovery | None = Discovery(tools=found, server_version="0.3.0") if found else None
+        self.answers: list[Answer] = list(answers)
+        self.calls: list[SentCall] = []
+        self.discoveries: list[CallFor] = []
+        self.sent_after: list[str | None] = []
+        self.audit = audit
+
+    def as_client(self) -> WorkbenchClient:
+        """Return this fake typed as the client, for ``AgentLoop(workbench=...)``.
+
+        Returns:
+            The fake.
+        """
+        return cast(WorkbenchClient, self)
+
+    def discover(self, *, call: CallFor) -> Discovery | None:
+        """Answer a discovery.
+
+        Args:
+            call: The asking turn's chat.
+
+        Returns:
+            :attr:`discovery`.
+        """
+        self.discoveries.append(call)
+        return self.discovery
+
+    def call_tool(
+        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float
+    ) -> ToolResult | ToolFailure:
+        """Record a call and answer it from the script.
+
+        Args:
+            name: The tool.
+            arguments: Its arguments.
+            call: The chat.
+            timeout_s: Its deadline.
+
+        Returns:
+            The next scripted answer.
+        """
+        self.calls.append(SentCall(name, dict(arguments), call, timeout_s))
+        self.sent_after.append(self.audit.log[-1] if self.audit is not None and self.audit.log else None)
+        answer = self.answers.pop(0) if self.answers else PLAIN_RESULT
+        return answer() if callable(answer) else answer
