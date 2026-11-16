@@ -4,7 +4,9 @@ uvicorn runs it as ``uvicorn --factory ghostwriter.main:create_app`` with one
 worker. The routes live under ``/api``; ``/metrics`` serves aggregate HTTP
 metrics, never request content, for obs-plane's Prometheus. The lifespan holds
 the process's one audit chain (:mod:`ghostwriter.audit`) and its chat store,
-``app.state.store`` (:mod:`ghostwriter.store`).
+``app.state.store`` (:mod:`ghostwriter.store`). ``app.state.workbench`` is the
+workbench client, ``None`` while workbench is off, and ``app.state.turns`` the
+process's one turn registry (:mod:`ghostwriter.turns`).
 """
 
 from collections.abc import AsyncIterator
@@ -12,6 +14,7 @@ from contextlib import asynccontextmanager
 from typing import Final, TextIO
 from urllib.parse import quote
 
+import httpx
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response
@@ -21,13 +24,15 @@ from sqlalchemy import Engine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ghostwriter import __version__
-from ghostwriter.api import meta
+from ghostwriter.api import chats, meta
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.log_cfg import setup_logger
 from ghostwriter.store import ChatStore
+from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditWriteError
+from ghostwriter.workbench import WorkbenchClient
 
 setup_logger()
 
@@ -35,12 +40,19 @@ setup_logger()
 FAILED: Final = {"detail": "Request failed."}
 
 
-def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    *,
+    audit_stream: TextIO | None = None,
+    workbench_transport: httpx.AsyncBaseTransport | None = None,
+) -> FastAPI:
     """Build the application.
 
     Args:
         settings: The settings to serve with; read from the environment when omitted.
         audit_stream: Where the audit chain goes; where ``AUDIT_OUTPUT`` selects when omitted.
+        workbench_transport: The transport to workbench (tests pass an ``httpx.MockTransport``);
+            ``None`` uses httpx's own.
 
     Returns:
         The app, with ``settings`` on ``app.state.settings``.
@@ -86,6 +98,10 @@ def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None 
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.workbench = (
+        WorkbenchClient(settings, transport=workbench_transport) if settings.workbench_enabled else None
+    )
+    app.state.turns = TurnRegistry()
 
     @app.exception_handler(AuditWriteError)
     async def refuse_unrecorded(request: Request, exc: AuditWriteError) -> JSONResponse:
@@ -142,5 +158,6 @@ def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None 
         return {"status": "ok"}
 
     app.include_router(meta.router)
+    app.include_router(chats.router)
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     return app

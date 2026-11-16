@@ -353,11 +353,12 @@ class ChatStore:
                 )
         return state
 
-    def create_chat(self, owner: str) -> ChatOut:
+    def create_chat(self, owner: str, *, id: str | None = None) -> ChatOut:
         """Start an untitled chat, due under the chat period in force.
 
         Args:
             owner: Its owner.
+            id: The chat's id, when the caller minted it first; a fresh uuid otherwise.
 
         Returns:
             The chat.
@@ -366,7 +367,7 @@ class ChatStore:
         with self._transaction() as s:
             state = self._period(s)
             chat = Chat(
-                id=str(uuid4()),
+                id=str(uuid4()) if id is None else id,
                 owner=owner,
                 title=None,
                 created_at=now,
