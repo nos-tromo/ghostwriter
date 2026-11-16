@@ -4,7 +4,7 @@ Every name, id and value here is invented.
 """
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -13,6 +13,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from typing_extensions import override
 
 from ghostwriter.main import create_app
 from ghostwriter.turns import TurnRegistry
@@ -249,6 +250,40 @@ def test_no_answer_starts_while_the_chat_is_being_deleted(client: TestClient, do
     door.on_delete = lambda: seen.append(turns.begin(cid))
     assert client.delete(f"/api/chats/{cid}", headers=as_user()).status_code == 204
     assert seen == [None] and not turns.running(cid)
+
+
+class _LateClaim(TurnRegistry):
+    """A turn registry that runs ``first`` once, just before the next claim, as if that delete won the race."""
+
+    def __init__(self, first: Callable[[], None]) -> None:
+        super().__init__()
+        self._first: Callable[[], None] | None = first
+
+    @override
+    def begin(self, chat_id: str) -> threading.Event | None:
+        first, self._first = self._first, None
+        if first is not None:
+            first()
+        return super().begin(chat_id)
+
+
+def test_a_delete_that_claims_the_turn_after_another_finds_the_chat_gone(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """The second of two deletes, past its lookup before the first ended, records and sends nothing and answers 404."""
+    cid = _new(client)
+    state = _state(client)
+    first: list[int] = []
+    state.turns = _LateClaim(lambda: first.append(client.delete(f"/api/chats/{cid}", headers=as_user()).status_code))
+    before = len(events(audit_stream))
+    second = client.delete(f"/api/chats/{cid}", headers=as_user())
+    assert first == [204]
+    assert second.status_code == NOT_FOUND[0] and second.json() == NOT_FOUND[1]
+    assert [op for op in _operations(audit_stream, before) if op[1] == "chat.delete"] == [
+        ("delete", "chat.delete", "ok")
+    ]
+    assert [request.url.path for request, _ in door.requests] == ["/files/chat"]
+    assert not state.turns.running(cid)
 
 
 def test_events_name_chats_by_id_only(client: TestClient, audit_stream: CapturedAuditStream) -> None:

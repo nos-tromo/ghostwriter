@@ -7,7 +7,8 @@ each is written before the action takes effect, so an action whose event cannot
 be written does not happen.
 
 A delete (spec §6.2) is refused while an answer runs, and holds the chat's turn
-while it runs itself. It records ``chat.delete``, then asks workbench to delete
+while it runs itself; holding it, it looks the chat up again, so of two deletes
+only the first acts. It records ``chat.delete``, then asks workbench to delete
 the chat's folder, and deletes the chat's rows only after that worked. If
 workbench fails, the rows stay and the user may try again.
 """
@@ -192,8 +193,9 @@ def delete_chat(
             ``delete`` / ``chat.workbench`` records how many files workbench deleted, or why not.
 
     Raises:
-        HTTPException: 404 for another owner's chat or an unknown one; 409 while an answer runs
-            in it; 502 when workbench could not delete its files, the chat then kept.
+        HTTPException: 404 for another owner's chat or an unknown one, also once another delete
+            removed it; 409 while an answer runs in it; 502 when workbench could not delete its
+            files, the chat then kept.
     """
     store = _store(request)
     owned_chat(store, user.name, chat_id)
@@ -201,6 +203,7 @@ def delete_chat(
     if turns.begin(chat_id) is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ANSWER_RUNNING)
     try:
+        owned_chat(store, user.name, chat_id)
         op.record(target=_chat(chat_id), criteria=store.chat_counts(chat_id))
         workbench: WorkbenchClient | None = request.app.state.workbench
         if workbench is None:
