@@ -131,6 +131,10 @@ def _read(raw: str) -> tuple[dict[str, Any] | None, bool]:
         return None, False
     if not isinstance(value, dict) or _nested_too_deeply(value):
         return None, False
+    try:
+        compact(value).encode("utf-8")
+    except UnicodeEncodeError:
+        return None, False
     return value, direct
 
 
@@ -142,7 +146,8 @@ def parse_arguments(raw: str) -> dict[str, Any] | None:
 
     Returns:
         ``{}`` for none, the object, or the object a JSON string holds (decoded once); ``None``
-        for anything else, an object nested deeper than :data:`MAX_ARGUMENT_DEPTH` included.
+        for anything else, an object nested deeper than :data:`MAX_ARGUMENT_DEPTH` or one that
+        holds an unpaired surrogate (it cannot be encoded to be sent, stored or shown) included.
     """
     return _read(raw)[0]
 

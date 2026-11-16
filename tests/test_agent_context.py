@@ -19,6 +19,7 @@ from ghostwriter.agent.limits import (
     HISTORY_RESULT_CHARS,
     INLINE_IMAGE_BYTES,
     PROMPT_TOKENS,
+    REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
 from ghostwriter.agent.prompt import system_prompt
@@ -159,6 +160,7 @@ def test_mcp_tools_become_function_tools() -> None:
         ("null", None),
         ("[" * 5000 + "]" * 5000, None),
         ('{"a": ' * 40 + "1" + "}" * 40, None),
+        ('{"path": "a\\ud800.pdf"}', None),
     ],
 )
 def test_arguments_are_read_as_models_write_them(raw: str, expected: dict[str, Any] | None) -> None:
@@ -172,6 +174,7 @@ def test_arguments_are_read_as_models_write_them(raw: str, expected: dict[str, A
         ('{"path": "/w/a.pdf"}', '{"path": "/w/a.pdf"}'),
         ('"{\\"path\\": \\"/w/a.pdf\\"}"', '{"path":"/w/a.pdf"}'),
         ('{"a": ' * 40 + "1" + "}" * 40, "{}"),
+        ('"{\\"path\\": \\"a\\\\ud800.pdf\\"}"', "{}"),
         ("", "{}"),
         ("[1]", "{}"),
         ("not json", "{}"),
@@ -253,6 +256,28 @@ def test_the_current_turns_oldest_results_are_cleared_first() -> None:
     assert [m["content"] for m in tools] == [CLEARED, "1" * 12_000, "2" * 12_000]
     assert estimate_tokens(messages) + estimate_tokens(TOOLS) <= 9_000
     assert _past_users(messages) == ["Vorher"] and current[2]["content"] == "0" * 12_000
+
+
+def test_the_current_turns_arguments_are_cut_oldest_first_once_its_results_are_cleared() -> None:
+    """Long documents written in a reasoning message: the oldest round's arguments are cut, still JSON objects."""
+    current: list[dict[str, Any]] = [_user("Schreib den Bericht und überarbeite ihn zweimal")]
+    for n in range(3):
+        arguments = json.dumps({"name": f"bericht-{n}.docx", "markdown": f"# Fassung {n}\n" + "Absatz. " * 3_750})
+        call = {"id": f"call_{n}", "type": "function", "function": {"name": "write_document", "arguments": arguments}}
+        result = json.dumps({"path": f"{FOLDER}/out/bericht-{n}.docx", "size": 31_000, "outputs": []})
+        current += [
+            {"role": "assistant", "content": "", "tool_calls": [call]},
+            {"role": "tool", "tool_call_id": f"call_{n}", "content": result},
+        ]
+    before = json.loads(json.dumps(current))
+    messages = fit(SYSTEM, TOOLS, [], current, budget=REASONING_PROMPT_TOKENS)
+    assert estimate_tokens(messages) + estimate_tokens(TOOLS) <= REASONING_PROMPT_TOKENS
+    sent = [m["tool_calls"][0]["function"]["arguments"] for m in messages if m.get("tool_calls")]
+    assert all(isinstance(json.loads(arguments), dict) for arguments in sent)
+    assert len(sent[0]) <= HISTORY_ARGUMENT_CHARS and json.loads(sent[0])["markdown"].endswith("…[cut]")
+    assert json.loads(sent[0])["name"] == "bericht-0.docx"
+    assert sent[1:] == [m["tool_calls"][0]["function"]["arguments"] for m in current[3::2]]
+    assert current == before
 
 
 def test_earlier_turns_are_kept_newest_first_without_a_gap() -> None:

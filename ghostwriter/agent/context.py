@@ -2,7 +2,8 @@
 
 The budget is counted as characters of the messages' compact JSON over ``CHARS_PER_TOKEN``,
 the tool schemas included. The current turn is always sent; while it alone is over budget,
-its oldest tool results are cleared, one at a time. Earlier turns are then added newest
+its oldest tool results are cleared, one at a time, and then, still over, its oldest calls'
+arguments are cut as a replayed call's are. Earlier turns are then added newest
 first, whole, while they fit: each as its question, per round an assistant message with its
 calls and one tool message per call, then its answer. A replayed call's arguments stay a
 JSON object, which chat templates parse, and are cut to ``HISTORY_ARGUMENT_CHARS``; its
@@ -118,6 +119,22 @@ def _cut_arguments(raw: str, limit: int) -> str:
     return shortened if len(shortened) <= limit else "{}"
 
 
+def _with_cut_arguments(call: Mapping[str, Any]) -> dict[str, Any]:
+    """Return a copy of one of the current turn's ``tool_calls``, its arguments cut as a replayed call's are.
+
+    Args:
+        call: The entry; never changed.
+
+    Returns:
+        The entry, its arguments a JSON object of at most ``HISTORY_ARGUMENT_CHARS``.
+    """
+    function = call["function"]
+    return {
+        **call,
+        "function": {**function, "arguments": _cut_arguments(function["arguments"], HISTORY_ARGUMENT_CHARS)},
+    }
+
+
 def _replayed(turn: PastTurn) -> list[dict[str, Any]]:
     """Return an earlier turn as the messages that replay it.
 
@@ -191,7 +208,7 @@ def fit(
         The system message, the earlier turns that fit, and the current turn, in order.
     """
     fixed = estimate_tokens(tools) if tools else 0
-    kept = [{"role": "system", "content": system}, *(dict(m) for m in current)]
+    kept: list[dict[str, Any]] = [{"role": "system", "content": system}, *(dict(m) for m in current)]
     size = _Size(kept)
     for message in kept[1:]:
         if size.tokens() + fixed <= budget:
@@ -199,6 +216,14 @@ def fit(
         if message["role"] == "tool" and message.get("content") != CLEARED:
             size.chars += len(compact({**message, "content": CLEARED})) - len(compact(message))
             message["content"] = CLEARED
+    for index, message in enumerate(kept):
+        if size.tokens() + fixed <= budget:
+            break
+        if message["role"] != "assistant" or not message.get("tool_calls"):
+            continue
+        shortened = {**message, "tool_calls": [_with_cut_arguments(call) for call in message["tool_calls"]]}
+        size.chars += len(compact(shortened)) - len(compact(message))
+        kept[index] = shortened
     if size.tokens() + fixed > budget:
         logger.warning("The current turn alone is over the prompt budget: about {} tokens", size.tokens() + fixed)
     replayed: list[dict[str, Any]] = []

@@ -518,6 +518,35 @@ def test_a_follow_up_reads_the_earlier_turn_with_its_tool_results(loop_env: Loop
     assert (sent[4]["content"], sent[5]["content"]) == ("Summe: 42", "Und im Vorjahr?")
 
 
+def test_a_reasoning_message_writing_long_documents_stays_within_its_budget(loop_env: LoopEnv) -> None:
+    """Three rounds each writing a document of 30 000 characters: every round's prompt fits 26 000."""
+    rounds: list[Round] = []
+    for n in range(3):
+        markdown = f"# Fassung {n}\n" + "Absatz. " * 3_750
+        rounds.append(_calls(json.dumps({"name": f"bericht-{n}.docx", "markdown": markdown}), name="write_document"))
+    loop_env.run(*rounds, [text_chunk("Der Bericht steht.")], reasoning=True)
+    assert len(loop_env.fake.calls) == 4 and len(loop_env.workbench.calls) == 3
+    for call in loop_env.fake.calls:
+        assert estimate_tokens(call["messages"]) + estimate_tokens(call["tools"]) <= REASONING_PROMPT_TOKENS
+    written = [m["tool_calls"][0]["function"]["arguments"] for m in loop_env.sent(4) if m.get("tool_calls")]
+    assert [json.loads(arguments)["name"] for arguments in written] == [f"bericht-{n}.docx" for n in range(3)]
+    assert len(written[0]) <= 2_000 and len(written[2]) > 30_000
+
+
+def test_arguments_that_cannot_be_encoded_are_refused(loop_env: LoopEnv) -> None:
+    """An unpaired surrogate in the arguments is refused unsent and unstored; the chat still opens and goes on."""
+    events = loop_env.run(_calls('{"path": "a\\ud800.pdf"}'), [text_chunk("Das ging nicht.")])
+    assert loop_env.workbench.calls == [] and _steps(events) == []
+    assistant, refused = loop_env.sent(2)[-2:]
+    assert assistant["tool_calls"][0]["function"]["arguments"] == "{}"
+    assert json.loads(refused["content"])["error"] == "bad_arguments"
+    loop_env.store.chat_detail("user-a", CHAT).model_dump_json()
+    loop_env.run([text_chunk("Gern.")], content="Dann lies sales.xlsx")
+    assert len(loop_env.fake.calls) == 3
+    for call in loop_env.fake.calls:
+        json.dumps(call["messages"], ensure_ascii=False).encode("utf-8")
+
+
 def test_a_reasoning_message_reasons_in_every_round_within_its_budget(loop_env: LoopEnv) -> None:
     """Every round of a reasoning message asks for thinking and a longer answer, and its prompt fits 26_000."""
     for n in range(30):
