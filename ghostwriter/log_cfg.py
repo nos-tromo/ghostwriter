@@ -1,10 +1,12 @@
 """Logging configuration for the Ghostwriter backend.
 
-Installs a single Loguru stderr sink on every call to :func:`setup_logger`
-and strips query strings from uvicorn's access log. Operational logs go to
-stderr only: stdout carries the data-protection audit events, which the
-log collector routes to their own store. The container logging driver
-owns log retention and rotation (see ``docker/compose.yaml``).
+Installs a single Loguru stderr sink on every call to :func:`setup_logger`,
+strips query strings from uvicorn's access log and keeps httpx and httpcore,
+which log each request URL (a view URL carries a file name), at WARNING.
+Operational logs go to stderr only: stdout carries the data-protection
+audit events, which the log collector routes to their own store. The
+container logging driver owns log retention and rotation (see
+``docker/compose.yaml``).
 """
 
 from __future__ import annotations
@@ -17,6 +19,8 @@ from loguru import logger
 from typing_extensions import override
 
 UVICORN_ACCESS_LOGGER = "uvicorn.access"
+#: The HTTP client's loggers; below WARNING they name request URLs.
+HTTP_CLIENT_LOGGERS = ("httpx", "httpcore")
 
 
 class StripQueryStringFilter(logging.Filter):
@@ -96,8 +100,9 @@ def setup_logger(
     Removes any existing Loguru handlers, then attaches a single stderr
     sink. ``LOG_LEVEL`` selects the minimum level (default ``INFO``). Also
     attaches :class:`StripQueryStringFilter` to uvicorn's access logger,
-    once no matter how often this runs, and moves every stdlib handler that
-    writes to stdout, such as uvicorn's access log, to stderr.
+    once no matter how often this runs, pins :data:`HTTP_CLIENT_LOGGERS` to
+    WARNING, and moves every stdlib handler that writes to stdout, such as
+    uvicorn's access log, to stderr.
     ``ghostwriter.main`` calls this at import time, which uvicorn reaches
     after applying its own logging config, so both are in place before the
     first request.
@@ -123,4 +128,6 @@ def setup_logger(
     access_logger = logging.getLogger(UVICORN_ACCESS_LOGGER)
     if not any(isinstance(f, StripQueryStringFilter) for f in access_logger.filters):
         access_logger.addFilter(StripQueryStringFilter())
+    for name in HTTP_CLIENT_LOGGERS:
+        logging.getLogger(name).setLevel(logging.WARNING)
     _move_stdout_handlers_to_stderr()

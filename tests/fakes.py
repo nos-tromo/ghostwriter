@@ -6,6 +6,7 @@ id and value here is invented.
 """
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import quote
@@ -39,6 +40,7 @@ CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
 }
 
 _ROUTES = frozenset({("POST", "/mcp"), ("POST", "/files/upload"), ("GET", "/files/view"), ("DELETE", "/files/chat")})
+_DISCOVERY = frozenset({"server/discover", "tools/list"})
 
 
 @dataclass(frozen=True)
@@ -91,7 +93,7 @@ def tools_result() -> dict[str, Any]:
     """Return workbench's ``tools/list`` result for the ghostwriter caller.
 
     Returns:
-        The result, the eight contract tools, cached for 300 s.
+        The result, the eight contract tools by name, as workbench lists them, cached for 300 s.
     """
     tools = [
         {
@@ -99,7 +101,7 @@ def tools_result() -> dict[str, Any]:
             "description": description,
             "inputSchema": {"type": "object", "properties": properties, "required": sorted(properties)},
         }
-        for name, (description, properties) in CONTRACT_TOOLS.items()
+        for name, (description, properties) in sorted(CONTRACT_TOOLS.items())
     ]
     return {"tools": tools, "ttlMs": 300000, "cacheScope": "private", "resultType": "complete", "_meta": SERVER_META}
 
@@ -196,7 +198,8 @@ class FakeDoor:
     """workbench's doors as Ghostwriter's key reaches them, for ``httpx.MockTransport``.
 
     It refuses a wrong key (401), any other route (404) and a missing or ``default``
-    session (400, or ``-32600`` on ``/mcp``). It answers ``/mcp`` by method and the REST
+    session (400, or ``-32600`` on ``tools/call``); as workbench's, its discovery reads
+    no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
     folder and returns one of those. ``None`` for ``/files/upload`` and ``/files/view``
@@ -211,6 +214,7 @@ class FakeDoor:
         files: The stored files, by path: their bytes and media type.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
+        on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
     """
 
     def __init__(self, key: str = KEY) -> None:
@@ -233,6 +237,7 @@ class FakeDoor:
         self.files: dict[str, tuple[bytes, str]] = {}
         self.upload_id = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
+        self.on_delete: Callable[[], None] | None = None
 
     async def __call__(self, request: httpx.Request) -> httpx.Response:
         """Record the request and answer it.
@@ -261,11 +266,13 @@ class FakeDoor:
         if (request.method, path) not in _ROUTES:
             return httpx.Response(404, json=NOT_FOUND)
         session = request.headers.get("x-session-id", "")
-        if session in ("", "default"):
+        if session in ("", "default") and route not in _DISCOVERY:
             if path == "/mcp":
                 return _rpc_error(body, RpcError(-32600, "invalid session"))
             return httpx.Response(400, json={"detail": "invalid session"})
         folder = f"/workspace/{session}"
+        if route == "/files/chat" and self.on_delete is not None:
+            self.on_delete()
         answer = self.answers.get(route)
         if callable(answer):
             answer = answer(folder)

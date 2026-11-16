@@ -128,23 +128,23 @@ def log_lines() -> Iterator[list[str]]:
 
 
 def test_discovery_offers_the_tools_workbench_lists() -> None:
-    """Discovery asks server/discover, then tools/list, and offers every listed tool with its schema."""
+    """Discovery asks server/discover, then tools/list, and offers every listed tool, in workbench's order."""
     door = FakeDoor()
     found = WorkbenchClient(CFG, transport=httpx.MockTransport(door)).discover(call=CALL)
     assert found is not None
     assert _tool_names(found) == [
+        "fill_template",
+        "inspect_template",
         "list_files",
         "read_document",
-        "search_files",
         "run_python",
-        "inspect_template",
-        "fill_template",
-        "write_table",
+        "search_files",
         "write_document",
+        "write_table",
     ]
     assert door.methods() == ["server/discover", "tools/list"]
     assert found.server_version == "0.3.0"
-    read = found.tools[1]
+    read = next(tool for tool in found.tools if tool.name == "read_document")
     assert read.description == CONTRACT_TOOLS["read_document"][0]
     assert read.input_schema["type"] == "object" and "path" in read.input_schema["properties"]
 
@@ -179,7 +179,7 @@ def test_a_tool_without_an_object_schema_is_dropped() -> None:
     door.answers["tools/list"] = {**listed, "tools": tools}
     found = _client(door).discover(call=CALL)
     assert found is not None
-    assert _tool_names(found) == list(CONTRACT_TOOLS)[2:]
+    assert _tool_names(found) == sorted(CONTRACT_TOOLS)[2:]
 
 
 def test_each_result_is_cached_for_its_ttl() -> None:
@@ -292,6 +292,19 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
         assert request.headers["x-audit-purpose"] == encode_purpose(None, "ghostwriter chat")
 
 
+async def test_the_door_reads_no_session_on_discovery() -> None:
+    """As workbench's MCP door, the fake answers discovery without a session and refuses only the call."""
+    auth = {"Authorization": f"Bearer {KEY}"}
+    async with httpx.AsyncClient(transport=httpx.MockTransport(FakeDoor()), base_url="http://workbench.test") as http:
+        for method in ("server/discover", "tools/list", "tools/call"):
+            message: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": method, "params": {}}
+            answer = (await http.post("/mcp", json=message, headers=auth)).json()
+            if method == "tools/call":
+                assert answer["error"]["code"] == -32600
+            else:
+                assert "result" in answer
+
+
 # --- results -----------------------------------------------------------------
 
 
@@ -379,6 +392,7 @@ def test_a_preview_is_clamped_or_dropped() -> None:
     assert second is not None and len(second.rows) == PREVIEW_ROWS == 5 and second.truncated
     assert second.row_count == 7
     assert third is not None and third.rows[0][0] == "x" * PREVIEW_CELL_CHARS and PREVIEW_CELL_CHARS == 100
+    assert third.truncated
     assert fourth is None and len(result.outputs) == 4
 
 
@@ -506,6 +520,34 @@ async def test_an_upload_past_50_mib_is_cut_off() -> None:
     assert door.requests == []
 
 
+async def test_the_callers_stream_is_closed_on_a_cut_off() -> None:
+    """On the cut-off the caller's iterator is closed at once, so its own cleanup runs."""
+    mib = b"\x00" * (1024 * 1024)
+    closed: list[bool] = []
+
+    async def chunks() -> AsyncIterator[bytes]:
+        try:
+            while True:
+                yield mib
+        finally:
+            closed.append(True)
+
+    with pytest.raises(UploadTooLarge):
+        await _client(FakeDoor()).upload(call=CALL, filename="sales.xlsx", mime=XLSX, chunks=chunks())
+    assert closed == [True]
+
+
+@pytest.mark.parametrize(
+    "name", ["../sales.xlsx", "in/sales.xlsx", "in\\sales.xlsx", ".", "..", "", "sales\n.xlsx", "sales\x00.xlsx"]
+)
+async def test_an_upload_name_that_is_not_flat_is_refused_unsent(name: str) -> None:
+    """A name with a separator or a control character, or one that is no name, is refused before anything is sent."""
+    door = FakeDoor()
+    with pytest.raises(ValueError):
+        await _upload(_client(door), name)
+    assert door.requests == []
+
+
 @pytest.mark.parametrize(("status", "error"), [(413, UploadTooLarge), (507, StorageFull)])
 async def test_workbenchs_413_and_507_are_told_apart(status: int, error: type[Exception]) -> None:
     """Workbench's own size limit and a full quota each have their exception."""
@@ -573,9 +615,11 @@ async def test_a_path_outside_the_chat_is_never_asked_for() -> None:
 async def test_deleting_a_chat_returns_workbenchs_count() -> None:
     """DELETE /files/chat answers how many files the chat held; a failure is unavailable."""
     door = FakeDoor()
+    arrived: list[int] = []
+    door.on_delete = lambda: arrived.append(len(door.requests))
     client = _client(door)
     assert await client.delete_chat(call=CALL) == 3
-    assert door.last("/files/chat").method == "DELETE"
+    assert door.last("/files/chat").method == "DELETE" and arrived == [1]
     door.answers["/files/chat"] = httpx.Response(503, json={"detail": "busy, retry later"})
     with pytest.raises(WorkbenchUnavailable):
         await client.delete_chat(call=CALL)

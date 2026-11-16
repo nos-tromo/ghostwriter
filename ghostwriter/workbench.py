@@ -13,8 +13,8 @@ together) is single-flight and cached per result for its ``ttlMs``, for every ch
 succeeds when workbench serves this revision and lists at least one tool whose
 ``inputSchema`` is an object; other tools are dropped. A failure offers no tool and is
 tried again at most once per :data:`DISCOVERY_RETRY_S`. A call without an answer, refused
-arguments, ``-32022`` or ``-32602`` drops the cache. workbench refuses this caller without
-a chat on every route, so discovery carries the asking turn's headers too.
+arguments, ``-32022`` or ``-32602`` drops the cache. workbench's discovery reads no
+principal; it carries the asking turn's headers only because every request does.
 
 The model reads a result's ``content[0].text``, which workbench writes without the table
 previews; the cards come from ``structuredContent.outputs``, kept only inside the chat's
@@ -149,7 +149,7 @@ class TablePreview:
         columns: The header, at most :data:`PREVIEW_COLUMNS`.
         rows: At most :data:`PREVIEW_ROWS` rows, cells cut to :data:`PREVIEW_CELL_CHARS`.
         row_count: The data rows, when workbench knows them.
-        truncated: Whether rows or columns were left out.
+        truncated: Whether rows, columns or the end of a cell were left out.
     """
 
     columns: tuple[str, ...]
@@ -505,7 +505,10 @@ def _preview(value: object) -> TablePreview | None:
         return None
     if not (row_count is None or _count(row_count) is not None) or not isinstance(truncated, bool):
         return None
-    cut = len(rows) > PREVIEW_ROWS or any(len(row) > PREVIEW_COLUMNS for row in [columns, *rows])
+    cut = len(rows) > PREVIEW_ROWS or any(
+        len(row) > PREVIEW_COLUMNS or any(len(cell) > PREVIEW_CELL_CHARS for cell in row[:PREVIEW_COLUMNS])
+        for row in [columns, *rows[:PREVIEW_ROWS]]
+    )
     return TablePreview(_cells(columns), tuple(_cells(row) for row in rows[:PREVIEW_ROWS]), row_count, truncated or cut)
 
 
@@ -804,7 +807,8 @@ class WorkbenchClient:
         plus half a second; a caller that would is offered no tool on this turn.
 
         Args:
-            call: The asking turn's chat; its headers go with the requests.
+            call: The asking turn's chat. Its headers go with the requests, as with every request
+                to workbench; workbench's discovery reads no principal from them.
 
         Returns:
             The tools and the version, or ``None`` when workbench is not usable on this turn.
@@ -979,17 +983,27 @@ class WorkbenchClient:
             call: The chat.
             filename: The file's name, one that passed ``name_problem``.
             mime: Its media type, without parameters.
-            chunks: Its bytes, as they arrive.
+            chunks: Its bytes, as they arrive; closed when the upload returns or raises.
 
         Returns:
             The stored file.
 
         Raises:
-            ValueError: If ``mime`` is not a bare media type; nothing is sent.
+            ValueError: If ``filename`` is not one flat name or ``mime`` not a bare media type; nothing is sent.
             UploadTooLarge: Past :data:`MAX_ATTACHMENT_BYTES`, or on workbench's ``413``.
             StorageFull: On workbench's ``507``.
             WorkbenchUnavailable: On any other failure, an answer without a valid id included.
         """
+        try:
+            return await self._upload(call, filename, mime, chunks)
+        finally:
+            aclose = getattr(chunks, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _upload(self, call: CallFor, filename: str, mime: str, chunks: AsyncIterator[bytes]) -> UploadedFile:
+        if _flat_name(filename) is None:
+            raise ValueError("filename must be one flat name")
         if not _MEDIA_TYPE.fullmatch(mime):
             raise ValueError("mime must be a bare media type")
         with _rest_errors("upload"):
