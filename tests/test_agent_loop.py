@@ -547,6 +547,40 @@ def test_arguments_that_cannot_be_encoded_are_refused(loop_env: LoopEnv) -> None
         json.dumps(call["messages"], ensure_ascii=False).encode("utf-8")
 
 
+def test_lone_surrogates_from_the_stream_are_replaced(loop_env: LoopEnv) -> None:
+    """A stray surrogate in a text delta, a call's id or its name becomes U+FFFD; the next round still goes out."""
+    loop_env.workbench.answers = [RESULT]
+    first = [
+        text_chunk("Ich lese\ud800."),
+        call_chunk(0, "call_\udc00", "read_document", READ_SALES),
+        call_chunk(1, "call_1", "read\ud800", "{}"),
+    ]
+    events = loop_env.run(first, [text_chunk("Summe: 42, Größe ✓ 😀")])
+    tokens = [e.text for e in events if isinstance(e, TokenEvent)]
+    assert tokens == ["Ich lese\ufffd.", "\n\n", "Summe: 42, Größe ✓ 😀"]
+    assert loop_env.stored() == "".join(tokens)
+    assert len(loop_env.fake.calls) == 2 and [c.name for c in loop_env.workbench.calls] == ["read_document"]
+    sent = loop_env.sent(2)
+    assert [c["id"] for c in sent[2]["tool_calls"]] == ["call_\ufffd", "call_1"]
+    assert sent[2]["tool_calls"][1]["function"]["name"] == "read\ufffd"
+    json.dumps(sent, ensure_ascii=False).encode("utf-8")
+    loop_env.store.chat_detail("user-a", CHAT).model_dump_json()
+
+
+def test_a_fault_while_building_the_context_is_an_internal_error(
+    loop_env: LoopEnv, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A round whose messages cannot be built never reaches the router and is no model error."""
+
+    def broken(*args: object, **kwargs: object) -> list[dict[str, Any]]:
+        raise ValueError("synthetic fault")
+
+    monkeypatch.setattr("ghostwriter.agent.loop.fit", broken)
+    events = loop_env.run([text_chunk("nie")])
+    assert events == [ErrorEvent("internal", "The answer could not be finished.")]
+    assert loop_env.fake.calls == [] and loop_env.audit.log == []
+
+
 def test_a_reasoning_message_reasons_in_every_round_within_its_budget(loop_env: LoopEnv) -> None:
     """Every round of a reasoning message asks for thinking and a longer answer, and its prompt fits 26_000."""
     for n in range(30):

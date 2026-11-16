@@ -16,6 +16,10 @@ the answer), or the end of the reply (the held content was the answer), as docin
 unchanged from docint (``docint/agents/turn/stream.py``); here they read the SDK's chunks
 directly.
 
+A malformed stream may carry an unpaired surrogate (an escaped U+D800), which no store,
+frame or later request can encode; :func:`_scalar` replaces it with U+FFFD in the text, the
+calls' ids and names, the served model's name and the finish reason. Valid text is unchanged.
+
 A round stops once ``cancel`` is set: the next chunk is not read on, the stream is closed,
 and the round asks for no call, as none of its calls may be whole. A round dropped by its
 consumer closes its stream too. The model's errors propagate: a refused request on the first
@@ -254,6 +258,22 @@ class ToolCallAccumulator:
         return calls
 
 
+def _scalar(text: str) -> str:
+    """Replace each unpaired surrogate with U+FFFD; a pair that stands apart is joined, valid text is unchanged.
+
+    Args:
+        text (str): Text read from the stream.
+
+    Returns:
+        str: Text that encodes as UTF-8.
+    """
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    return text
+
+
 def _finish_reason(raw_chunk: Any) -> str | None:
     """Read the finish reason a raw chunk carries.
 
@@ -327,8 +347,8 @@ def stream_round(
                 stopped = True
                 break
             accumulator.feed(chunk)
-            finish_reason = _finish_reason(chunk) or finish_reason
-            model_id = _text(_field(chunk, "model")) or model_id
+            finish_reason = _scalar(_finish_reason(chunk) or "") or finish_reason
+            model_id = _scalar(_text(_field(chunk, "model"))) or model_id
             usage = _field(chunk, "usage")
             if usage is not None:
                 input_tokens = _count(_field(usage, "prompt_tokens"))
@@ -337,7 +357,7 @@ def stream_round(
             text = ""
             if _text(_field(delta, "reasoning_content")) or _text(_field(delta, "reasoning")):
                 text = reader.cancel_open_reasoning()
-            text += reader.feed(_text(_field(delta, "content")))
+            text += reader.feed(_scalar(_text(_field(delta, "content"))))
             if text:
                 shown.append(text)
                 yield TextDelta(text)
@@ -349,7 +369,7 @@ def stream_round(
         if tail:
             shown.append(tail)
             yield TextDelta(tail)
-        calls = accumulator.calls()
+        calls = [ToolCall(_scalar(c.id), _scalar(c.name), c.arguments) for c in accumulator.calls()]
         if accumulator.dropped:
             logger.warning("A model round sent tool calls without a name; dropped: {}", accumulator.dropped)
     yield RoundDone(

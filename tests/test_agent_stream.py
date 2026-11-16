@@ -363,6 +363,30 @@ def test_the_sdk_hands_over_a_separate_reasoning_field_and_it_is_dropped(setting
     assert json.loads(request.content)["chat_template_kwargs"] == {"enable_thinking": True}
 
 
+def test_stray_surrogates_become_replacement_characters_and_valid_text_is_unchanged(settings: Settings) -> None:
+    """A lone surrogate in the content, a call's id or name, or the served model's name is U+FFFD."""
+    reply = [
+        text_chunk("Größe ✓ 😀 \ud83d"),
+        call_chunk(0, "call_\udfff", "read\ud800", "{}"),
+        usage_chunk(812, 40, "served\udc00"),
+    ]
+    model, _ = _model(settings, reply)
+    events = _round(model, tools=TOOLS)
+    assert _text(events) == "Größe ✓ 😀 \ufffd"
+    done = events[-1]
+    assert isinstance(done, RoundDone)
+    assert done.calls == [ToolCall("call_\ufffd", "read\ufffd", "{}")] and done.model_id == "served\ufffd"
+
+
+def test_an_escaped_surrogate_from_the_router_is_replaced(settings: Settings) -> None:
+    """Through the real SDK: the router's escaped U+D800 arrives as a lone surrogate and goes out as U+FFFD."""
+    reply = (text_chunk("Hal\ud800lo"), call_chunk(0, "call_\ud800", "read_document", "{}"))
+    events, _ = _over_the_wire(settings, reply=reply)
+    assert _text(events) == "Hal\ufffdlo"
+    done = events[-1]
+    assert isinstance(done, RoundDone) and done.calls == [ToolCall("call_\ufffd", "read_document", "{}")]
+
+
 def test_the_client_goes_to_the_router_once_per_round(settings: Settings) -> None:
     """Built from the settings, the client calls OPENAI_API_BASE with its key and never retries a round."""
     client = ModelClient(settings).client

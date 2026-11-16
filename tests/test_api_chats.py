@@ -231,14 +231,15 @@ def test_a_chat_with_a_running_answer_is_not_deleted(
     """While an answer runs the delete is refused unrecorded; another owner still gets not found."""
     cid = _new(client)
     turns = _state(client).turns
-    assert turns.begin(cid) is not None
+    claim = turns.begin(cid)
+    assert claim is not None
     before = len(events(audit_stream))
     response = client.delete(f"/api/chats/{cid}", headers=as_user())
     assert (response.status_code, response.json()) == (409, {"detail": "Stop the answer before deleting the chat."})
     r = client.delete(f"/api/chats/{cid}", headers=as_user("user-b"))
     assert (r.status_code, r.json()) == NOT_FOUND
     assert _operations(audit_stream, before) == [] and door.requests == [] and _ids(client) == [cid]
-    turns.end(cid)
+    turns.end(cid, claim)
     assert client.delete(f"/api/chats/{cid}", headers=as_user()).status_code == 204
 
 
@@ -250,6 +251,21 @@ def test_no_answer_starts_while_the_chat_is_being_deleted(client: TestClient, do
     door.on_delete = lambda: seen.append(turns.begin(cid))
     assert client.delete(f"/api/chats/{cid}", headers=as_user()).status_code == 204
     assert seen == [None] and not turns.running(cid)
+
+
+def test_a_stale_end_does_not_release_a_deletes_claim(client: TestClient, door: FakeDoor) -> None:
+    """An end with an event other than the delete's own leaves the chat held until the delete ends."""
+    cid = _new(client)
+    turns = _state(client).turns
+    held: list[bool] = []
+
+    def stale_end() -> None:
+        turns.end(cid, threading.Event())
+        held.append(turns.running(cid))
+
+    door.on_delete = stale_end
+    assert client.delete(f"/api/chats/{cid}", headers=as_user()).status_code == 204
+    assert held == [True] and not turns.running(cid)
 
 
 class _LateClaim(TurnRegistry):
@@ -328,18 +344,22 @@ def test_an_action_whose_event_cannot_be_written_does_not_happen(
 
 
 def test_one_turn_runs_per_chat_until_it_ends() -> None:
-    """A second begin is refused while a turn runs; stop signals it; end frees the chat."""
+    """A second begin is refused while a turn runs; stop signals it; only its own end frees the chat."""
     turns = TurnRegistry()
     cancel = turns.begin("chat-1")
     assert isinstance(cancel, threading.Event) and not cancel.is_set()
     assert turns.begin("chat-1") is None and turns.running("chat-1") and not turns.running("chat-2")
     assert turns.begin("chat-2") is not None
     assert turns.stop("chat-1") is True and cancel.is_set() and turns.running("chat-1")
-    turns.end("chat-1")
+    turns.end("chat-1", threading.Event())
+    assert turns.running("chat-1")
+    turns.end("chat-1", cancel)
     assert not turns.running("chat-1") and turns.stop("chat-1") is False
     again = turns.begin("chat-1")
     assert again is not None and not again.is_set()
-    turns.end("chat-unknown")
+    turns.end("chat-1", cancel)
+    assert turns.running("chat-1")
+    turns.end("chat-unknown", again)
 
 
 def test_of_many_threads_one_begins_the_turn() -> None:

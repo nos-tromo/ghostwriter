@@ -330,10 +330,11 @@ class AgentLoop:
             )
             done: RoundDone | None = None
             said: list[str] = []
+            messages = fit(system, tools, past, current, budget=budget)
             try:
                 for event in stream_round(
                     self._model,
-                    fit(system, tools, past, current, budget=budget),
+                    messages,
                     tools=tools,
                     headers=headers,
                     cancel=turn.cancel,

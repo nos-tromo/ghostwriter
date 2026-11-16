@@ -200,7 +200,8 @@ def delete_chat(
     store = _store(request)
     owned_chat(store, user.name, chat_id)
     turns: TurnRegistry = request.app.state.turns
-    if turns.begin(chat_id) is None:
+    claim = turns.begin(chat_id)
+    if claim is None:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ANSWER_RUNNING)
     try:
         owned_chat(store, user.name, chat_id)
@@ -218,4 +219,4 @@ def delete_chat(
             op.child("delete", "chat.workbench", criteria={"files_deleted": deleted})
         store.delete_chat_rows(chat_id)
     finally:
-        turns.end(chat_id)
+        turns.end(chat_id, claim)
