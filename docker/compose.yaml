@@ -47,12 +47,15 @@ services:
   # image, fixes only wrong-owner entries before it starts.
   ##########################################################
   volume-permissions:
+    <<: *hardened
     image: ghostwriter-backend:${GHOSTWRITER_VERSION:-latest}
     logging: *default-logging
     user: "0:0"
+    # CHOWN fixes owners; DAC_OVERRIDE lets find walk 0700 directories (not DAC_READ_SEARCH, which opens open_by_handle_at).
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
     read_only: true
-    security_opt:
-      - no-new-privileges:true
     network_mode: none
     entrypoint:
       - /bin/sh

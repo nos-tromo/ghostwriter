@@ -78,7 +78,7 @@ def test_the_service_slice_stops_at_the_next_service() -> None:
 
 
 def test_every_service_is_hardened() -> None:
-    """Both services run hardened and read-only; the ownership fix has no network."""
+    """Both services run hardened and read-only; the ownership fix has no network and two capabilities."""
     compose = (ROOT / "docker" / "compose.yaml").read_text(encoding="utf-8")
     hardened = "x-hardened: &hardened\n  security_opt:\n    - no-new-privileges:true\n  cap_drop:\n    - ALL\n"
     assert hardened in compose
@@ -87,8 +87,12 @@ def test_every_service_is_hardened() -> None:
         assert "    <<: *hardened\n" in service and "    read_only: true\n" in service
         assert "      - /tmp:size=16m\n" in service
     fixer = _service(compose, "volume-permissions")
-    assert "    network_mode: none\n" in fixer and "    read_only: true\n" in fixer
-    assert "      - no-new-privileges:true\n" in fixer
+    assert "    <<: *hardened\n" in fixer and "security_opt" not in fixer and "cap_drop" not in fixer
+    assert re.findall(r"^    cap_add:\n((?:      - \w+\n)+)", fixer, re.MULTILINE) == [
+        "      - CHOWN\n      - DAC_OVERRIDE\n"
+    ]
+    assert "      - DAC_READ_SEARCH\n" not in fixer
+    assert '    user: "0:0"\n' in fixer and "    network_mode: none\n" in fixer and "    read_only: true\n" in fixer
     assert "find /var/lib/ghostwriter -xdev ! -user 10001 -exec chown -h 10001:10001 {} +" in fixer
     backend = _service(compose, "backend")
     assert "      volume-permissions:\n        condition: service_completed_successfully" in backend
