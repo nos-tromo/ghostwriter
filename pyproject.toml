@@ -1,0 +1,79 @@
+[project]
+name = "ghostwriter"
+version = "0.1.0"
+description = "Ghostwriter: the federation's chat assistant. Talk to it, or attach a document and download the result in the chat."
+authors = [
+  { name = "nos-tromo" }
+]
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = "Apache-2.0"
+dependencies = [
+    "anyio>=4.14.2",
+    "fastapi>=0.162.2",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "openai>=3.46.0",
+    "prometheus-fastapi-instrumentator>=8.1.0",
+    "pydantic>=2.14.3",
+    "python-multipart>=0.0.33",
+    "sqlalchemy>=2.0",
+    "uvicorn>=0.54.0",
+]
+
+[project.urls]
+Repository = "https://github.com/nos-tromo/ghostwriter.git"
+
+[dependency-groups]
+dev = [
+    "pre-commit>=4.7.0",
+    "pyrefly==1.1.1",
+    "pytest>=9.2.0",
+    "pytest-asyncio>=1.4.0",
+    "ruff==0.15.14",
+]
+
+[build-system]
+requires = ["setuptools>=84.2.1", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ghostwriter*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+# Mirrors nos-tromo/.github/configs/python-strict/ruff.toml. target-version
+# is the only key that may differ (ghostwriter floors at py311). Drift fails CI.
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = [
+    "E", "F", "W",
+    "I",
+    "B",
+    "D",
+    "ANN",
+    "UP",
+    "RUF",
+]
+ignore = ["ANN401"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.pyrefly]
+# Mirrors nos-tromo/.github/configs/python-strict/pyrefly.toml. Drift fails CI.
+preset = "strict"
+ignore-missing-imports = ["*"]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+ghostwriter = { workspace = true }

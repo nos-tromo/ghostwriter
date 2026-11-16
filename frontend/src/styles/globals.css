@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+@import '@infra/ui/theme.css';
+@source '../../node_modules/@infra/ui/dist';
+
+:root {
+  /* ghostwriter's single design-system knob; primary derives from this.
+     Light default is darkened for WCAG AA as text on white (~4.5:1). */
+  --app-accent: hsl(217 91% 45%);
+}
+
+:root[data-theme='dark'] {
+  --app-accent: hsl(217 91% 60%);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme]) {
+    --app-accent: hsl(217 91% 60%);
+  }
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans);
+}
