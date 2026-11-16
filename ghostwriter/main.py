@@ -3,7 +3,8 @@
 uvicorn runs it as ``uvicorn --factory ghostwriter.main:create_app`` with one
 worker. The routes live under ``/api``; ``/metrics`` serves aggregate HTTP
 metrics, never request content, for obs-plane's Prometheus. The lifespan holds
-the process's one audit chain (:mod:`ghostwriter.audit`).
+the process's one audit chain (:mod:`ghostwriter.audit`) and its chat store,
+``app.state.store`` (:mod:`ghostwriter.store`).
 """
 
 from collections.abc import AsyncIterator
@@ -16,13 +17,16 @@ from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import JSONResponse, Response
 from loguru import logger
 from prometheus_fastapi_instrumentator import Instrumentator
+from sqlalchemy import Engine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ghostwriter import __version__
 from ghostwriter.api import meta
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.config import Settings, load_settings
+from ghostwriter.db import init_db, make_engine
 from ghostwriter.log_cfg import setup_logger
+from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
 
 setup_logger()
@@ -49,7 +53,10 @@ def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None 
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        """Run the process's audit chain for as long as the app serves; if it cannot open, startup fails.
+        """Run the audit chain and the chat store for as long as the app serves; if either cannot open, startup fails.
+
+        The store's schema is brought to this release's version and the
+        configured periods are put in force before the first request.
 
         Args:
             app: The application being served.
@@ -58,10 +65,18 @@ def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None 
             None: Control to the server while it serves.
         """
         emitter = open_emitter(__version__, audit_stream)
+        engine: Engine | None = None
         try:
             start_chain(app, emitter)
+            engine = make_engine(settings.db_path)
+            init_db(engine)
+            store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
+            app.state.store = store
+            store.apply_periods(settings.chat_days)
             yield
         finally:
+            if engine is not None:
+                engine.dispose()
             emitter.close()
 
     app = FastAPI(

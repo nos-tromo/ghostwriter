@@ -1,0 +1,148 @@
+"""What the API serves of a chat. ``expired`` is computed against the time of the read."""
+
+from datetime import datetime
+from typing import Literal
+
+from pydantic import BaseModel
+
+Role = Literal["user", "assistant"]
+StepStatus = Literal["running", "ok", "error"]
+ResultKind = Literal["image", "table", "file"]
+
+
+class ChatOut(BaseModel):
+    """A chat in the list.
+
+    Attributes:
+        id: The chat's id.
+        title: The first line of its first message, or the owner's name for it.
+        created_at: When it started.
+        updated_at: Its latest message or rename.
+        expires_at: When retention deletes it; ``None`` while retention is off.
+    """
+
+    id: str
+    title: str | None
+    created_at: datetime
+    updated_at: datetime
+    expires_at: datetime | None
+
+
+class AttachmentOut(BaseModel):
+    """A file the user attached.
+
+    Attributes:
+        id: The attachment's id.
+        file_id: workbench's id of the file.
+        name: The file name.
+        size: Its size in bytes.
+        mime: Its MIME type.
+        created_at: When it was handed to workbench.
+        expired: Whether workbench's period for it has passed.
+    """
+
+    id: str
+    file_id: str
+    name: str
+    size: int
+    mime: str
+    created_at: datetime
+    expired: bool
+
+
+class StepOut(BaseModel):
+    """A tool step of an answer.
+
+    Attributes:
+        id: The step's id, the same in its ``running`` and its final frame.
+        tool: The tool's name.
+        status: ``running`` while it runs, then ``ok`` or ``error``.
+        detail: What it worked on, for the trail; ``None`` once expired.
+        arguments: The arguments as the model wrote them; ``None`` once expired.
+        result: What the tool answered; ``None`` once expired.
+        expired: Whether its content has expired with the chat's files.
+    """
+
+    id: str
+    tool: str
+    status: StepStatus
+    detail: str | None
+    arguments: str | None
+    result: str | None
+    expired: bool
+
+
+class TablePreviewOut(BaseModel):
+    """The head of a table a tool wrote.
+
+    Attributes:
+        columns: The header.
+        rows: At most 5 rows, cells cut short.
+        row_count: The data rows below the header, when known.
+        truncated: Whether rows or columns were left out.
+    """
+
+    columns: list[str]
+    rows: list[list[str]]
+    row_count: int | None
+    truncated: bool
+
+
+class ResultOut(BaseModel):
+    """A file a tool wrote, as a card below the answer.
+
+    Attributes:
+        id: The result's id.
+        kind: ``image``, ``table`` or ``file``.
+        file_id: workbench's id of the file.
+        name: The file name.
+        mime: Its MIME type.
+        size: Its size in bytes.
+        preview: The table's head; ``None`` without one or once expired.
+        expired: Whether it has expired with the chat's files.
+    """
+
+    id: str
+    kind: ResultKind
+    file_id: str
+    name: str
+    mime: str
+    size: int
+    preview: TablePreviewOut | None
+    expired: bool
+
+
+class MessageOut(BaseModel):
+    """A message with what belongs to it.
+
+    Attributes:
+        id: The message's id.
+        role: ``user`` or ``assistant``.
+        content: Its text.
+        created_at: When it was written.
+        attachments: The files a user's message bound.
+        steps: An answer's tool steps, in order.
+        results: An answer's result cards, in order.
+    """
+
+    id: str
+    role: Role
+    content: str
+    created_at: datetime
+    attachments: list[AttachmentOut]
+    steps: list[StepOut]
+    results: list[ResultOut]
+
+
+class ChatDetail(BaseModel):
+    """A chat as its owner opens it.
+
+    Attributes:
+        chat: The chat.
+        messages: Its messages, in order.
+        pending_attachments: Files attached and not yet sent with a message.
+    """
+
+    chat: ChatOut
+    messages: list[MessageOut]
+    pending_attachments: list[AttachmentOut]
