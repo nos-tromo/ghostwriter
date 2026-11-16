@@ -1,18 +1,24 @@
 """Stand-ins for Ghostwriter's neighbours, built from the shared contract alone.
 
 :class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
-REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``. Every name,
-id and value here is invented.
+REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``.
+:class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
+builders :func:`text_chunk`, :func:`call_chunk` and :func:`usage_chunk`. Every
+name, id and value here is invented.
 """
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 from urllib.parse import quote
 
 import anyio
 import httpx
+import openai
+from openai.types.audio import Transcription
+from openai.types.chat import ChatCompletionChunk
 from starlette.datastructures import Headers, UploadFile
 from starlette.formparsers import MultiPartParser
 
@@ -373,3 +379,225 @@ def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
     """
     payload = {"jsonrpc": "2.0", "id": body.get("id"), "error": {"code": error.code, "message": error.message}}
     return httpx.Response(error.status, json=payload)
+
+
+# --- the router, as the OpenAI SDK reaches it ---------------------------------
+
+#: The model every chunk names, unless a usage chunk names another.
+SERVED_MODEL = "served-model"
+#: One chunk as the router streams it: the JSON of a ``ChatCompletionChunk``.
+Chunk = dict[str, Any]
+#: A scripted round: its chunks, any of them an exception raised once it is reached, or an
+#: exception the request itself raises.
+Round = Sequence[Chunk | Exception] | Exception
+
+
+def _chunk(choices: list[dict[str, Any]], **fields: Any) -> Chunk:
+    """Return a chunk with the fields every chunk carries.
+
+    Args:
+        choices: Its choices.
+        **fields: Further fields, or defaults replaced.
+
+    Returns:
+        The chunk.
+    """
+    head = {"id": "chatcmpl-0001", "object": "chat.completion.chunk", "created": 1_790_000_000, "model": SERVED_MODEL}
+    return {**head, "choices": choices, **fields}
+
+
+def _delta(delta: dict[str, Any]) -> Chunk:
+    """Return a chunk whose one choice carries ``delta``.
+
+    Args:
+        delta: The choice's delta.
+
+    Returns:
+        The chunk.
+    """
+    return _chunk([{"index": 0, "delta": delta, "finish_reason": None}])
+
+
+def text_chunk(t: str) -> Chunk:
+    """Return a chunk carrying a piece of the reply's content.
+
+    Args:
+        t: The piece.
+
+    Returns:
+        The chunk.
+    """
+    return _delta({"content": t})
+
+
+def call_chunk(index: int, id: str | None, name: str | None, args: str) -> Chunk:
+    """Return a chunk carrying one tool-call fragment.
+
+    Args:
+        index: The call's index in the round.
+        id: Its id, which only a call's first fragment carries; ``None`` for a continuation.
+        name: Its name, likewise.
+        args: A piece of its JSON arguments.
+
+    Returns:
+        The chunk.
+    """
+    function: dict[str, Any] = {"arguments": args}
+    if name is not None:
+        function["name"] = name
+    entry: dict[str, Any] = {"index": index, "function": function}
+    if id is not None:
+        entry |= {"id": id, "type": "function"}
+    return _delta({"tool_calls": [entry]})
+
+
+def usage_chunk(prompt: int, completion: int, model: str) -> Chunk:
+    """Return the last chunk, which ``stream_options.include_usage`` asks for: no choice, the token counts.
+
+    Args:
+        prompt: The prompt's tokens.
+        completion: The reply's tokens.
+        model: The model that served.
+
+    Returns:
+        The chunk.
+    """
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion, "total_tokens": prompt + completion}
+    return _chunk([], model=model, usage=usage)
+
+
+class FakeStream:
+    """A streamed reply as the SDK's ``openai.Stream`` hands it out: read once, closable.
+
+    Each chunk goes out parsed into the SDK's ``ChatCompletionChunk``; an exception in a
+    chunk's place is raised there, as a reply cut off mid-stream is. Reading on after
+    :meth:`close` fails, as it does on the SDK's closed response.
+
+    Attributes:
+        sent: How many chunks went out.
+        closed: Whether :meth:`close` was called.
+    """
+
+    def __init__(self, chunks: Sequence[Chunk | Exception]) -> None:
+        """Hold the reply.
+
+        Args:
+            chunks: Its chunks, in order.
+        """
+        self.sent = 0
+        self.closed = False
+        self._chunks = self._read(list(chunks))
+
+    def _read(self, chunks: list[Chunk | Exception]) -> Iterator[ChatCompletionChunk]:
+        """Hand out the chunks.
+
+        Args:
+            chunks: The chunks.
+
+        Yields:
+            Each chunk, parsed.
+
+        Raises:
+            Exception: The one scripted in a chunk's place.
+            RuntimeError: When read after :meth:`close`.
+        """
+        for chunk in chunks:
+            if self.closed:
+                raise RuntimeError("read after close")
+            if isinstance(chunk, Exception):
+                raise chunk
+            self.sent += 1
+            yield ChatCompletionChunk.model_validate(chunk)
+
+    def __iter__(self) -> Iterator[ChatCompletionChunk]:
+        """Read the reply.
+
+        Returns:
+            The chunks not read yet.
+        """
+        return self._chunks
+
+    def close(self) -> None:
+        """Close the reply, as the SDK releases its connection."""
+        self.closed = True
+
+
+class FakeOpenAI:
+    """``openai.OpenAI`` as Ghostwriter calls it: ``chat.completions.create`` and ``audio.transcriptions.create``.
+
+    Each chat call answers the next scripted round: a :class:`FakeStream` of its chunks, or
+    the round's exception raised, as the SDK raises a request the router refused. A call the
+    script has no round for fails the test. Every call's keyword arguments are recorded.
+
+    Attributes:
+        script: The rounds not answered yet, in order.
+        calls: Every chat call's keyword arguments, in order.
+        streams: The stream each answered chat call returned.
+        transcript: What every transcription answers: its text, or an exception to raise.
+        transcriptions: Every transcription call's keyword arguments, in order.
+        chat: Holds ``completions.create``.
+        audio: Holds ``transcriptions.create``.
+    """
+
+    def __init__(self, rounds: Sequence[Round] = (), *, transcript: str | Exception = "Summe der Spalte B") -> None:
+        """Script the router.
+
+        Args:
+            rounds: The rounds to answer, in order.
+            transcript: What every transcription answers.
+        """
+        self.script: list[Round] = list(rounds)
+        self.calls: list[dict[str, Any]] = []
+        self.streams: list[FakeStream] = []
+        self.transcript = transcript
+        self.transcriptions: list[dict[str, Any]] = []
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._complete))
+        self.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=self._transcribe))
+
+    def as_client(self) -> openai.OpenAI:
+        """Return this fake typed as the SDK's client, for ``ModelClient(settings, client=...)``.
+
+        Returns:
+            The fake.
+        """
+        return cast(openai.OpenAI, self)
+
+    def _complete(self, **kwargs: Any) -> FakeStream:
+        """Answer a chat call with the next scripted round.
+
+        Args:
+            **kwargs: The call's keyword arguments.
+
+        Returns:
+            The round's stream.
+
+        Raises:
+            Exception: The round's exception.
+            AssertionError: When the script has no round left.
+        """
+        self.calls.append(kwargs)
+        if not self.script:
+            raise AssertionError("a model round the test did not script")
+        answer = self.script.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        stream = FakeStream(answer)
+        self.streams.append(stream)
+        return stream
+
+    def _transcribe(self, **kwargs: Any) -> Transcription:
+        """Answer a transcription call.
+
+        Args:
+            **kwargs: The call's keyword arguments.
+
+        Returns:
+            The transcript.
+
+        Raises:
+            Exception: The scripted exception.
+        """
+        self.transcriptions.append(kwargs)
+        if isinstance(self.transcript, Exception):
+            raise self.transcript
+        return Transcription(text=self.transcript)

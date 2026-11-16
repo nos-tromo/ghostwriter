@@ -1,0 +1,129 @@
+"""The model client: chat rounds through the router's OpenAI-compatible API, and nothing else.
+
+Inference goes only to ``OPENAI_API_BASE``, the federation's LiteLLM router. Every call
+carries ``X-Cache-Scope``, a pseudonym of the user keyed in this process, so the router keeps
+each user's cached prompt prefixes apart from other users', and ``X-Request-ID``. A round is
+one attempt: the SDK retries nothing, so :data:`~ghostwriter.agent.limits.MODEL_TIMEOUT_S`
+bounds it.
+"""
+
+import hashlib
+import hmac
+import secrets
+from collections.abc import Mapping
+from typing import Any, TypedDict, cast
+
+import openai
+from openai.types.chat import (
+    ChatCompletionMessageParam,
+    ChatCompletionStreamOptionsParam,
+    ChatCompletionToolChoiceOptionParam,
+    ChatCompletionToolUnionParam,
+)
+
+from ghostwriter.config import Settings
+from ghostwriter.utils.audit_runtime import REQUEST_ID_HEADER
+
+CACHE_SCOPE_HEADER = "X-Cache-Scope"
+
+# Keys the cache scopes; it never leaves this process, so a scope cannot be
+# mapped back to a user anywhere else. A restart gives every user a new scope.
+_CACHE_SCOPE_KEY = secrets.token_bytes(32)
+
+
+def cache_scope_for(name: str) -> str:
+    """Return the cache scope of a user: a pseudonym stable within this process.
+
+    The inference router gives calls with the same scope one prompt-prefix
+    cache and calls with different scopes separate ones, so one user cannot
+    time whether another user's text is cached.
+
+    Args:
+        name: The authenticated user's name.
+
+    Returns:
+        64 lowercase hex characters.
+    """
+    return hmac.new(_CACHE_SCOPE_KEY, b"cache-scope/v1\0" + name.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def inference_headers(owner: str, request_id: str) -> dict[str, str]:
+    """Return the headers of every model call made for a request.
+
+    Args:
+        owner: The user the call is made for.
+        request_id: The request's correlation id.
+
+    Returns:
+        The user's cache scope and the request id; never the user's name.
+    """
+    return {CACHE_SCOPE_HEADER: cache_scope_for(owner), REQUEST_ID_HEADER: request_id}
+
+
+class _Offer(TypedDict, total=False):
+    """A request's tool keys, left out while no tool is offered."""
+
+    tools: list[ChatCompletionToolUnionParam]
+    tool_choice: ChatCompletionToolChoiceOptionParam
+
+
+class ModelClient:
+    """The chat model behind the router.
+
+    Attributes:
+        client: The SDK's client.
+        model: The chat model every round asks for, ``TEXT_MODEL``.
+    """
+
+    def __init__(self, settings: Settings, *, client: openai.OpenAI | None = None) -> None:
+        """Build the client.
+
+        Args:
+            settings: The router's base URL and key, and the chat model.
+            client: The SDK's client (tests pass a fake); built from ``settings`` when omitted,
+                making one attempt per call.
+        """
+        self.model = settings.text_model
+        self.client = client or openai.OpenAI(
+            base_url=settings.openai_api_base, api_key=settings.openai_api_key, max_retries=0
+        )
+
+    def stream(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        tools: list[dict[str, Any]],
+        headers: Mapping[str, str],
+        max_tokens: int,
+        timeout_s: float,
+    ) -> openai.Stream[Any]:
+        """Start one streamed round.
+
+        Args:
+            messages: The conversation, as the endpoint receives it.
+            tools: The tool schemas offered. With none, the request carries neither ``tools``
+                nor ``tool_choice``: an OpenAI-compatible endpoint may refuse an empty list.
+            headers: The extra headers, :func:`inference_headers`.
+            max_tokens: The longest answer.
+            timeout_s: Seconds the round may take.
+
+        Returns:
+            The stream of chunks; the last one carries the usage.
+
+        Raises:
+            openai.OpenAIError: When the router refuses the request or cannot be reached.
+        """
+        offered: _Offer = (
+            {"tools": cast("list[ChatCompletionToolUnionParam]", tools), "tool_choice": "auto"} if tools else {}
+        )
+        usage: ChatCompletionStreamOptionsParam = {"include_usage": True}
+        return self.client.chat.completions.create(
+            model=self.model,
+            messages=cast("list[ChatCompletionMessageParam]", messages),
+            stream=True,
+            stream_options=usage,
+            max_tokens=max_tokens,
+            timeout=timeout_s,
+            extra_headers=dict(headers),
+            **offered,
+        )
