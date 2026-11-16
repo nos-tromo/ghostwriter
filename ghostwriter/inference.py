@@ -5,13 +5,18 @@ carries ``X-Cache-Scope``, a pseudonym of the user keyed in this process, so the
 each user's cached prompt prefixes apart from other users', and ``X-Request-ID``. A round is
 one attempt: the SDK retries nothing, so :data:`~ghostwriter.agent.limits.MODEL_TIMEOUT_S`
 bounds it.
+
+On vllm, the federation's provider, every round switches the chat template's thinking off
+(``chat_template_kwargs.enable_thinking``), as docint does: a template that opens a think
+block in the prompt would otherwise begin the reply inside it, and the reasoning would be
+shown. Other providers get no such field, as OpenAI proper refuses unknown ones.
 """
 
 import hashlib
 import hmac
 import secrets
 from collections.abc import Mapping
-from typing import Any, TypedDict, cast
+from typing import Any, Final, TypedDict, cast
 
 import openai
 from openai.types.chat import (
@@ -25,6 +30,8 @@ from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import REQUEST_ID_HEADER
 
 CACHE_SCOPE_HEADER = "X-Cache-Scope"
+#: The body field that switches a vllm chat template's thinking off.
+THINKING_OFF: Final = {"chat_template_kwargs": {"enable_thinking": False}}
 
 # Keys the cache scopes; it never leaves this process, so a scope cannot be
 # mapped back to a user anywhere else. A restart gives every user a new scope.
@@ -60,11 +67,12 @@ def inference_headers(owner: str, request_id: str) -> dict[str, str]:
     return {CACHE_SCOPE_HEADER: cache_scope_for(owner), REQUEST_ID_HEADER: request_id}
 
 
-class _Offer(TypedDict, total=False):
-    """A request's tool keys, left out while no tool is offered."""
+class _Options(TypedDict, total=False):
+    """A request's keys sent only where they apply: the tools while any are offered, the thinking switch on vllm."""
 
     tools: list[ChatCompletionToolUnionParam]
     tool_choice: ChatCompletionToolChoiceOptionParam
+    extra_body: dict[str, Any]
 
 
 class ModelClient:
@@ -73,6 +81,7 @@ class ModelClient:
     Attributes:
         client: The SDK's client.
         model: The chat model every round asks for, ``TEXT_MODEL``.
+        provider: The provider behind the endpoint, ``INFERENCE_PROVIDER``.
     """
 
     def __init__(self, settings: Settings, *, client: openai.OpenAI | None = None) -> None:
@@ -84,6 +93,7 @@ class ModelClient:
                 making one attempt per call.
         """
         self.model = settings.text_model
+        self.provider = settings.inference_provider
         self.client = client or openai.OpenAI(
             base_url=settings.openai_api_base, api_key=settings.openai_api_key, max_retries=0
         )
@@ -113,9 +123,12 @@ class ModelClient:
         Raises:
             openai.OpenAIError: When the router refuses the request or cannot be reached.
         """
-        offered: _Offer = (
-            {"tools": cast("list[ChatCompletionToolUnionParam]", tools), "tool_choice": "auto"} if tools else {}
-        )
+        options: _Options = {}
+        if tools:
+            options["tools"] = cast("list[ChatCompletionToolUnionParam]", tools)
+            options["tool_choice"] = "auto"
+        if self.provider == "vllm":
+            options["extra_body"] = THINKING_OFF
         usage: ChatCompletionStreamOptionsParam = {"include_usage": True}
         return self.client.chat.completions.create(
             model=self.model,
@@ -125,5 +138,5 @@ class ModelClient:
             max_tokens=max_tokens,
             timeout=timeout_s,
             extra_headers=dict(headers),
-            **offered,
+            **options,
         )

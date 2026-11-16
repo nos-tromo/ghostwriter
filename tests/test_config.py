@@ -133,6 +133,23 @@ def test_an_unknown_required_action_stops_startup() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("raw", "provider"),
+    [
+        (None, "vllm"),
+        ("", "vllm"),
+        ("   ", "vllm"),
+        (" Ollama ", "ollama"),
+        ("OpenAI", "openai"),
+        ("lmstudio", "lmstudio"),
+    ],
+)
+def test_the_inference_provider_defaults_to_vllm(raw: str | None, provider: str) -> None:
+    """Unset or blank is the federation's vllm; any other value is kept, stripped and lower-cased."""
+    env = ENV if raw is None else {**ENV, "INFERENCE_PROVIDER": raw}
+    assert load_settings(env).inference_provider == provider
+
+
 def test_an_unknown_ui_language_falls_back_to_english() -> None:
     """An unknown UI language falls back to English; German is kept."""
     assert load_settings({**ENV, "RESPONSE_LANGUAGE": "fr"}).ui_language == "en"

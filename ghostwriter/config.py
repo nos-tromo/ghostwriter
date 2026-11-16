@@ -44,6 +44,8 @@ class Settings:
             identity; always ``None`` while the edge secret is set.
         openai_api_base: The router's OpenAI-compatible base URL, without a trailing ``/``.
         openai_api_key: The router's key.
+        inference_provider: The provider behind the endpoint, lower-case: ``vllm`` (the
+            federation's router), ``ollama``, ``openai`` or another.
         text_model: The chat model.
         whisper_model: The speech-to-text model.
         workbench_api_base: workbench's base URL, without a trailing ``/``.
@@ -63,6 +65,7 @@ class Settings:
     default_identity: str | None
     openai_api_base: str
     openai_api_key: str = field(repr=False)
+    inference_provider: str
     text_model: str
     whisper_model: str
     workbench_api_base: str
@@ -290,6 +293,7 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         default_identity=default_identity,
         openai_api_base=_base(environ, "OPENAI_API_BASE", "http://vllm-router:4000/v1"),
         openai_api_key=_get(environ, "OPENAI_API_KEY") or "dummy",
+        inference_provider=(_get(environ, "INFERENCE_PROVIDER") or "vllm").lower(),
         text_model=_get(environ, "TEXT_MODEL") or "Qwen/Qwen3.8-27B-FP8",
         whisper_model=_get(environ, "WHISPER_MODEL") or "openai/whisper-large-v3",
         workbench_api_base=_base(environ, "WORKBENCH_API_BASE", "http://workbench-api:8000"),

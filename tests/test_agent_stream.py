@@ -3,6 +3,7 @@
 Every name, id and value here is invented.
 """
 
+import dataclasses
 import json
 import re
 import threading
@@ -31,6 +32,17 @@ TOOLS: list[dict[str, Any]] = [
 ]
 H = inference_headers("user-a", "req-0001")
 ROUTER = "http://router.test/v1"
+THINKING_OFF = {"chat_template_kwargs": {"enable_thinking": False}}
+#: The JSON body of a round offering TOOLS, before any provider's own field.
+BODY = {
+    "model": "chat-model",
+    "messages": MSGS,
+    "tools": TOOLS,
+    "tool_choice": "auto",
+    "stream": True,
+    "stream_options": {"include_usage": True},
+    "max_tokens": 4000,
+}
 
 
 @pytest.fixture
@@ -145,6 +157,7 @@ def test_a_round_with_tools_asks_for_usage_and_bounds_the_answer(settings: Setti
             "max_tokens": 4000,
             "timeout": 120.0,
             "extra_headers": H,
+            "extra_body": THINKING_OFF,
         }
     ]
 
@@ -202,8 +215,8 @@ def test_every_round_carries_the_cache_scope_and_request_id(settings: Settings) 
     assert cache_scope_for("user-a") == cache_scope_for("user-a") and "user-a" not in cache_scope_for("user-a")
 
 
-def test_the_sdk_sends_the_round_to_the_router_as_built(settings: Settings) -> None:
-    """Through the real SDK: one POST to chat/completions with the headers, body and timeout, its SSE read back."""
+def _over_the_wire(settings: Settings) -> tuple[list[TextDelta | RoundDone], httpx2.Request]:
+    """Run one round offering TOOLS through the real SDK over a mock transport."""
     seen: list[httpx2.Request] = []
     finish = text_chunk("")
     finish["choices"][0] |= {"delta": {}, "finish_reason": "stop"}
@@ -221,23 +234,30 @@ def test_the_sdk_sends_the_round_to_the_router_as_built(settings: Settings) -> N
         http_client=httpx2.Client(transport=httpx2.MockTransport(answer)),
     )
     events = _round(ModelClient(settings, client=client), tools=TOOLS)
-    assert events == [TextDelta("Hal"), TextDelta("lo"), RoundDone("Hallo", [], "stop", SERVED_MODEL, 812, 40, False)]
     [request] = seen
+    return events, request
+
+
+def test_the_sdk_sends_the_round_to_the_router_as_built(settings: Settings) -> None:
+    """Through the real SDK: one POST to chat/completions with the headers, body and timeout, its SSE read back."""
+    events, request = _over_the_wire(settings)
+    assert events == [TextDelta("Hal"), TextDelta("lo"), RoundDone("Hallo", [], "stop", SERVED_MODEL, 812, 40, False)]
     assert (request.method, str(request.url)) == ("POST", f"{ROUTER}/chat/completions")
     assert (
         request.headers["x-cache-scope"] == cache_scope_for("user-a") and request.headers["x-request-id"] == "req-0001"
     )
     assert request.headers["authorization"] == "Bearer router-key"
     assert request.extensions["timeout"]["read"] == 120.0
-    assert json.loads(request.content) == {
-        "model": "chat-model",
-        "messages": MSGS,
-        "tools": TOOLS,
-        "tool_choice": "auto",
-        "stream": True,
-        "stream_options": {"include_usage": True},
-        "max_tokens": 4000,
-    }
+    assert json.loads(request.content) == {**BODY, **THINKING_OFF}
+
+
+@pytest.mark.parametrize(("provider", "extra"), [("vllm", THINKING_OFF), ("ollama", {}), ("openai", {})])
+def test_on_vllm_the_chat_templates_thinking_is_switched_off(
+    settings: Settings, provider: str, extra: dict[str, Any]
+) -> None:
+    """On vllm the body switches the template's thinking off, as docint does; other providers get no unknown field."""
+    _, request = _over_the_wire(dataclasses.replace(settings, inference_provider=provider))
+    assert json.loads(request.content) == {**BODY, **extra}
 
 
 def test_the_client_goes_to_the_router_once_per_round(settings: Settings) -> None:
