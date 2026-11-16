@@ -6,7 +6,10 @@ metrics, never request content, for obs-plane's Prometheus. The lifespan holds
 the process's one audit chain (:mod:`ghostwriter.audit`) and its chat store,
 ``app.state.store`` (:mod:`ghostwriter.store`). ``app.state.workbench`` is the
 workbench client, ``None`` while workbench is off, and ``app.state.turns`` the
-process's one turn registry (:mod:`ghostwriter.turns`).
+process's one turn registry (:mod:`ghostwriter.turns`). The lifespan also holds
+``app.state.agent``, the agent loop (:mod:`ghostwriter.agent.loop`), and
+``app.state.turn_threads``, the limiter whose ``TURN_THREADS`` threads the turns
+run on, apart from the pool that serves every other request.
 """
 
 from collections.abc import AsyncIterator
@@ -14,6 +17,7 @@ from contextlib import asynccontextmanager
 from typing import Final, TextIO
 from urllib.parse import quote
 
+import anyio
 import httpx
 from fastapi import FastAPI, Request
 from fastapi.exception_handlers import http_exception_handler
@@ -24,10 +28,13 @@ from sqlalchemy import Engine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ghostwriter import __version__
-from ghostwriter.api import chats, meta
+from ghostwriter.agent.limits import TURN_THREADS
+from ghostwriter.agent.loop import AgentLoop
+from ghostwriter.api import chats, messages, meta
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine
+from ghostwriter.inference import ModelClient
 from ghostwriter.log_cfg import setup_logger
 from ghostwriter.store import ChatStore
 from ghostwriter.turns import TurnRegistry
@@ -45,6 +52,7 @@ def create_app(
     *,
     audit_stream: TextIO | None = None,
     workbench_transport: httpx.AsyncBaseTransport | None = None,
+    model: ModelClient | None = None,
 ) -> FastAPI:
     """Build the application.
 
@@ -53,6 +61,8 @@ def create_app(
         audit_stream: Where the audit chain goes; where ``AUDIT_OUTPUT`` selects when omitted.
         workbench_transport: The transport to workbench (tests pass an ``httpx.MockTransport``);
             ``None`` uses httpx's own.
+        model: The chat model (tests pass one over a fake router); the router of the
+            settings when omitted.
 
     Returns:
         The app, with ``settings`` on ``app.state.settings``.
@@ -62,6 +72,7 @@ def create_app(
     """
     if settings is None:
         settings = load_settings()
+    chat_model = model if model is not None else ModelClient(settings)
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -85,6 +96,8 @@ def create_app(
             store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
             app.state.store = store
             store.apply_periods(settings.chat_days)
+            app.state.agent = AgentLoop(model=chat_model, workbench=app.state.workbench, store=store, settings=settings)
+            app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
             yield
         finally:
             if engine is not None:
@@ -159,5 +172,6 @@ def create_app(
 
     app.include_router(meta.router)
     app.include_router(chats.router)
+    app.include_router(messages.router)
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     return app

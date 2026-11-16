@@ -14,8 +14,10 @@ every round recorded after it ends.
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
 ends on a round without calls, on a stop (after the call in flight; no round starts once the
-stop is set) and on a model error. No round is assumed to end in any given time: the wall is
-read from the clock before each round, each call and each retry.
+stop is set) and on a model error. A round that fails once the stop is set, as a stalled
+router's read timing out, ends the turn as stopped, not with the model error. No round is
+assumed to end in any given time: the wall is read from the clock before each round, each
+call and each retry.
 
 The log holds round numbers, counts and exception types; never a message, an argument or a result.
 """
@@ -350,9 +352,13 @@ class AgentLoop:
                     else:
                         done = event
             except Exception as exc:
-                logger.warning("Model round {} failed: {}", round_no, type(exc).__name__)
+                stopped = turn.cancel.is_set()
+                logger.warning(
+                    "Model round {} failed{}: {}", round_no, " after a stop" if stopped else "", type(exc).__name__
+                )
                 audit.model_called(round=round_no, done=None, outcome="error")
-                yield ErrorEvent("model", MODEL_ERROR)
+                if not stopped:
+                    yield ErrorEvent("model", MODEL_ERROR)
                 return
             if done is None:
                 raise RuntimeError("a model round ended without its last event")

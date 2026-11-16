@@ -64,13 +64,15 @@ class CapturedAuditStream(io.StringIO):
 
     Attributes:
         failing: While set, every write fails as a broken output would.
+        writes_left: When set, the writes that still succeed; every later one fails.
     """
 
     failing: bool = False
+    writes_left: int | None = None
 
     @override
     def write(self, s: str, /) -> int:
-        """Keep the text, or fail while :attr:`failing` is set.
+        """Keep the text, or fail while :attr:`failing` is set or no write is left.
 
         Args:
             s: The text to write.
@@ -79,8 +81,12 @@ class CapturedAuditStream(io.StringIO):
             int: The number of characters written.
 
         Raises:
-            OSError: While :attr:`failing` is set.
+            OSError: While :attr:`failing` is set, or once :attr:`writes_left` is used up.
         """
+        if self.writes_left is not None:
+            if self.writes_left <= 0:
+                raise OSError("synthetic audit stream failure")
+            self.writes_left -= 1
         if self.failing:
             raise OSError("synthetic audit stream failure")
         return super().write(s)

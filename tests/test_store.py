@@ -433,15 +433,31 @@ def test_the_last_answer_can_be_replaced(store: ChatStore) -> None:
     _result(store, answer)
     store.finish_assistant_message(answer, "Summe: 42")
     assert store.last_answer("user-a", chat.id) == answer
+    assert store.question_of(chat.id, answer) == question.id
     assert [(m.id, m.role, m.content) for m in store.chat_detail("user-a", chat.id).messages] == [
         (question.id, "user", "Summe der Spalte B"),
         (answer, "assistant", "Summe: 42"),
     ]
+    later = store.add_user_message("user-a", chat.id, "Und im Vorjahr?", [])
+    later_answer = store.start_assistant_message(chat.id)
+    assert store.question_of(chat.id, later_answer) == later.id and store.question_of(chat.id, answer) == question.id
+    assert store.question_of(chat.id, str(uuid4())) is None
+    store.drop_message(later_answer)
+    store.drop_message(later.id)
     store.drop_message(answer)
     assert store.chat_counts(chat.id) == {"messages": 1, "steps": 0, "results": 0, "attachments": 0}
     assert store.last_answer("user-a", chat.id) is None
     again = store.start_assistant_message(chat.id)
     assert store.last_answer("user-a", chat.id) == again
+
+
+def test_a_chats_pending_attachments_are_its_unsent_ones(store: ChatStore) -> None:
+    """Pending are the chat's own attachments that no message has sent yet."""
+    chat, other = store.create_chat("user-a"), store.create_chat("user-a")
+    sent, waiting, theirs = _attach(store, chat.id), _attach(store, chat.id), _attach(store, other.id)
+    store.add_user_message("user-a", chat.id, "Summe der Spalte B", [sent.id])
+    assert store.pending_ids(chat.id) == {waiting.id}
+    assert store.pending_ids(other.id) == {theirs.id}
 
 
 def test_chats_list_by_their_latest_activity(store: ChatStore, clock: Clock) -> None:

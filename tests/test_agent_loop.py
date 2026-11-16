@@ -27,7 +27,7 @@ from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.workbench import CallFor, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
 from tests.conftest import KEY, make_settings
-from tests.fakes import FakeOpenAI, FakeWorkbench, RecordingAudit, Round, call_chunk, text_chunk, usage_chunk
+from tests.fakes import Chunk, FakeOpenAI, FakeWorkbench, RecordingAudit, Round, call_chunk, text_chunk, usage_chunk
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 CHAT = "c0ffee00-0000-4000-8000-000000000001"
@@ -482,6 +482,18 @@ def test_a_stop_ends_the_turn_after_the_call_in_flight(loop_env: LoopEnv) -> Non
     assert len(loop_env.workbench.calls) == 1 and len(loop_env.fake.calls) == 1
     assert [s.step.status for s in _steps(events)] == ["running", "ok"]
     assert [s.status for s in loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps] == ["ok"]
+
+
+def test_a_round_that_breaks_after_a_stop_ends_the_turn_as_stopped(loop_env: LoopEnv) -> None:
+    """A stalled round that fails once the stop is set is no model error; it is recorded as a failed round."""
+
+    def stalled() -> Chunk:
+        loop_env.cancel.set()
+        raise _router_error()
+
+    events = loop_env.run([text_chunk("Ich lese."), stalled])
+    assert events == [TokenEvent("Ich lese.")]
+    assert loop_env.audit.log == ["model:1:error"] and loop_env.stored() == "Ich lese."
 
 
 def test_no_round_starts_once_the_turn_is_stopped(loop_env: LoopEnv) -> None:

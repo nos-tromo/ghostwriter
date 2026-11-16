@@ -755,6 +755,20 @@ class ChatStore:
                 .where(Attachment.chat_id == chat_id, Attachment.message_id.is_(None))
             ).scalar_one()
 
+    def pending_ids(self, chat_id: str) -> set[str]:
+        """Return the ids of a chat's attachments not yet sent with a message.
+
+        Args:
+            chat_id: The chat.
+
+        Returns:
+            The ids.
+        """
+        with self._transaction() as s:
+            return set(
+                s.scalars(select(Attachment.id).where(Attachment.chat_id == chat_id, Attachment.message_id.is_(None)))
+            )
+
     def find_file(self, owner: str, chat_id: str, file_id: str) -> FileRef | None:
         """Find a file through its own chat only: an attachment or a result of the owner's chat.
 
@@ -922,6 +936,31 @@ class ChatStore:
                 .limit(1)
             ).first()
             return last[0] if last is not None and last[1] == "assistant" else None
+
+    def question_of(self, chat_id: str, answer_id: str) -> str | None:
+        """Return the user's message an answer replies to: the last one before it.
+
+        Args:
+            chat_id: The chat.
+            answer_id: The answer.
+
+        Returns:
+            The message's id, or ``None`` when the chat has no such answer or no message before it.
+        """
+        with self._transaction() as s:
+            position = s.execute(
+                select(Message.position).where(
+                    Message.id == answer_id, Message.chat_id == chat_id, Message.role == "assistant"
+                )
+            ).scalar_one_or_none()
+            if position is None:
+                return None
+            return s.execute(
+                select(Message.id)
+                .where(Message.chat_id == chat_id, Message.role == "user", Message.position < position)
+                .order_by(Message.position.desc())
+                .limit(1)
+            ).scalar_one_or_none()
 
     def drop_message(self, message_id: str) -> None:
         """Delete a message with its steps and results.

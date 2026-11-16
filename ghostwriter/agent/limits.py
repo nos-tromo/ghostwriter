@@ -45,3 +45,7 @@ MAX_RESULTS_PER_MESSAGE: Final = 20
 INLINE_IMAGE_BYTES: Final = 10 * 1024 * 1024
 #: The images shown inline.
 IMAGE_MIMES: Final = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+# Turns.
+#: Worker threads the process's turns run on, apart from the shared pool; a turn beyond them waits.
+TURN_THREADS: Final = 16

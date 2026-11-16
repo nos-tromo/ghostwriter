@@ -399,9 +399,12 @@ def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
 SERVED_MODEL = "served-model"
 #: One chunk as the router streams it: the JSON of a ``ChatCompletionChunk``.
 Chunk = dict[str, Any]
-#: A scripted round: its chunks, any of them an exception raised once it is reached, or an
-#: exception the request itself raises.
-Round = Sequence[Chunk | Exception] | Exception
+#: A chunk that comes late: called when the reply reaches it, it returns the chunk or raises,
+#: as a router that stalls and then answers or times out.
+Gate = Callable[[], Chunk]
+#: A scripted round: its chunks, any of them an exception raised once it is reached or a
+#: :data:`Gate`, or an exception the request itself raises.
+Round = Sequence[Chunk | Exception | Gate] | Exception
 
 
 def _chunk(choices: list[dict[str, Any]], **fields: Any) -> Chunk:
@@ -495,15 +498,15 @@ class FakeStream:
     """A streamed reply as the SDK's ``openai.Stream`` hands it out: read once, closable.
 
     Each chunk goes out parsed into the SDK's ``ChatCompletionChunk``; an exception in a
-    chunk's place is raised there, as a reply cut off mid-stream is. Reading on after
-    :meth:`close` fails, as it does on the SDK's closed response.
+    chunk's place is raised there, as a reply cut off mid-stream is, and a :data:`Gate` is
+    called there. Reading on after :meth:`close` fails, as it does on the SDK's closed response.
 
     Attributes:
         sent: How many chunks went out.
         closed: Whether :meth:`close` was called.
     """
 
-    def __init__(self, chunks: Sequence[Chunk | Exception]) -> None:
+    def __init__(self, chunks: Sequence[Chunk | Exception | Gate]) -> None:
         """Hold the reply.
 
         Args:
@@ -513,7 +516,7 @@ class FakeStream:
         self.closed = False
         self._chunks = self._read(list(chunks))
 
-    def _read(self, chunks: list[Chunk | Exception]) -> Iterator[ChatCompletionChunk]:
+    def _read(self, chunks: list[Chunk | Exception | Gate]) -> Iterator[ChatCompletionChunk]:
         """Hand out the chunks.
 
         Args:
@@ -523,7 +526,7 @@ class FakeStream:
             Each chunk, parsed.
 
         Raises:
-            Exception: The one scripted in a chunk's place.
+            Exception: The one scripted in a chunk's place, or the one a gate raises.
             RuntimeError: When read after :meth:`close`.
         """
         for chunk in chunks:
@@ -531,6 +534,8 @@ class FakeStream:
                 raise RuntimeError("read after close")
             if isinstance(chunk, Exception):
                 raise chunk
+            if callable(chunk):
+                chunk = chunk()
             self.sent += 1
             yield ChatCompletionChunk.model_validate(chunk)
 
