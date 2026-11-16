@@ -2,11 +2,15 @@
 
 import re
 from pathlib import Path
+from typing import Annotated, Any
 
 import pytest
+from _pytest.logging import LogCaptureFixture
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from ghostwriter.audit import (
+    Operation,
     RequestContext,
     audited,
     forward_headers,
@@ -14,12 +18,117 @@ from ghostwriter.audit import (
     required_endpoint_actions,
     system_operation,
 )
-from ghostwriter.utils.audit_event import Actor, Purpose
+from ghostwriter.utils.audit_event import Actor, AuditWriteError, Purpose
 from ghostwriter.utils.audit_runtime import encode_purpose
 from tests.conftest import KEY, SECRET, CapturedAuditStream, as_user, events, make_settings, probe_app
 
 ACTOR = Actor("user-a", "edge")
 HEX_ID = re.compile(r"[0-9a-f]{32}")
+FAILED = (500, {"detail": "Request failed."})
+
+
+def failing_app(tmp_path: Path, stream: CapturedAuditStream) -> FastAPI:
+    """Build the probe app with routes that fail after ``collect`` / ``test.op`` began.
+
+    Args:
+        tmp_path: The test's temporary directory.
+        stream: Where the app's audit chain goes.
+
+    Returns:
+        The app.
+    """
+    app = probe_app(make_settings(tmp_path), stream)
+    collect = audited("collect", "test.op")
+
+    @app.post("/fail/raise")
+    def raise_after_begin(op: Annotated[Operation, Depends(collect)]) -> None:
+        """Fail before recording."""
+        raise RuntimeError("synthetic failure")
+
+    @app.post("/fail/recorded")
+    def raise_after_record(op: Annotated[Operation, Depends(collect)]) -> None:
+        """Record, then fail."""
+        op.record()
+        raise RuntimeError("synthetic failure")
+
+    @app.post("/fail/http/{code}")
+    def raise_http(code: int, op: Annotated[Operation, Depends(collect)]) -> None:
+        """Fail with an HTTP status."""
+        raise HTTPException(status_code=code, detail="synthetic")
+
+    @app.post("/fail/audit")
+    def raise_audit(op: Annotated[Operation, Depends(collect)]) -> None:
+        """Fail as a write elsewhere in the request would."""
+        raise AuditWriteError("synthetic")
+
+    @app.post("/fail/settle")
+    def break_the_stream(op: Annotated[Operation, Depends(collect)]) -> None:
+        """Fail while the audit stream is broken too."""
+        stream.failing = True
+        raise RuntimeError("synthetic failure")
+
+    return app
+
+
+def _new_events(client: TestClient, stream: CapturedAuditStream, path: str) -> tuple[Any, list[tuple[str, str, str]]]:
+    """Send one request and return its answer and the events it added.
+
+    Args:
+        client: The client, inside the app's lifespan.
+        stream: The app's audit stream.
+        path: The route to post to.
+
+    Returns:
+        The response and the added events as ``(action, operation, outcome)``.
+    """
+    before = len(events(stream))
+    response = client.post(path, headers=as_user())
+    stream.failing = False
+    return response, [(e["action"], e["operation"], e["outcome"]) for e in events(stream)[before:]]
+
+
+@pytest.mark.parametrize("path", ["/fail/raise", "/fail/audit"])
+def test_a_request_that_fails_after_begin_is_recorded_as_error(
+    tmp_path: Path, audit_stream: CapturedAuditStream, path: str
+) -> None:
+    """An operation begun and never recorded is settled as ``error``; the chain stays valid."""
+    with TestClient(failing_app(tmp_path, audit_stream), raise_server_exceptions=False) as client:
+        response, added = _new_events(client, audit_stream, path)
+    assert (response.status_code, response.json()) == FAILED
+    assert added == [("collect", "test.op", "error")]
+
+
+def test_a_recorded_operation_is_not_recorded_again(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
+    """A request that fails after its outcome was written gets no second event."""
+    with TestClient(failing_app(tmp_path, audit_stream), raise_server_exceptions=False) as client:
+        response, added = _new_events(client, audit_stream, "/fail/recorded")
+    assert (response.status_code, response.json()) == FAILED
+    assert added == [("collect", "test.op", "ok")]
+
+
+@pytest.mark.parametrize(
+    ("code", "settled"), [(404, []), (409, []), (502, [("collect", "test.op", "error")])], ids=["404", "409", "502"]
+)
+def test_only_a_server_error_settles(
+    tmp_path: Path, audit_stream: CapturedAuditStream, code: int, settled: list[tuple[str, str, str]]
+) -> None:
+    """A 4xx returns no data and records nothing; a 5xx settles the operation as ``error``."""
+    with TestClient(failing_app(tmp_path, audit_stream)) as client:
+        response, added = _new_events(client, audit_stream, f"/fail/http/{code}")
+    assert (response.status_code, response.json()) == (code, {"detail": "synthetic"})
+    assert added == settled
+
+
+def test_settling_never_raises_and_logs_the_type_only(
+    tmp_path: Path, audit_stream: CapturedAuditStream, loguru_caplog: LogCaptureFixture
+) -> None:
+    """A write that fails while settling is logged by its exception type; the answer is still the JSON 500."""
+    with TestClient(failing_app(tmp_path, audit_stream), raise_server_exceptions=False) as client:
+        response, added = _new_events(client, audit_stream, "/fail/settle")
+    assert (response.status_code, response.json()) == FAILED
+    assert added == []
+    assert "AuditWriteError" in loguru_caplog.text
+    assert "synthetic" not in loguru_caplog.text
 
 
 def test_a_required_purpose_is_refused_with_428_and_recorded(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
@@ -118,15 +227,17 @@ def test_the_chain_opens_with_the_operating_mode(client: TestClient, audit_strea
 
 
 def test_a_failed_audit_write_refuses_the_request(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
-    """Audited work is refused when its event cannot be written, or when no chain is open."""
+    """Audited work is refused when its event cannot be written, when no chain is open, or after it closed."""
     app = probe_app(make_settings(tmp_path), audit_stream)
     with TestClient(app) as client:
         audit_stream.failing = True
         refused = client.post("/test", headers=as_user())
         audit_stream.failing = False
-    assert (refused.status_code, refused.json()) == (500, {"detail": "Request failed."})
+    assert (refused.status_code, refused.json()) == FAILED
+    closed = TestClient(app, raise_server_exceptions=False).post("/test", headers=as_user())
+    assert (closed.status_code, closed.json()) == FAILED
     unopened = TestClient(probe_app(make_settings(tmp_path), audit_stream)).post("/test", headers=as_user())
-    assert (unopened.status_code, unopened.json()) == (500, {"detail": "Request failed."})
+    assert (unopened.status_code, unopened.json()) == FAILED
 
 
 def test_only_endpoint_actions_are_audited_or_reported(tmp_path: Path) -> None:

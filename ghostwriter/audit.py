@@ -11,8 +11,12 @@ main stdout under a container-wide lock (what ``docker/compose.yaml`` sets).
 
 Events name what they touch by reference: ids, counts, MIME types and sizes,
 never a title, message, file name, code or transcript. Fail closed: an event
-that cannot be written raises, and ``ghostwriter.main`` answers the request
-with the generic 500 instead of its data.
+that cannot be written raises :class:`AuditWriteError`, and ``ghostwriter.main``
+answers the request with the JSON 500 ``Request failed.`` instead of its data.
+After shutdown the closed chain raises a plain ``RuntimeError``, which the
+catch-all answers the same way. A request that ends in a server error settles
+every operation it began and did not record as ``error``
+(:func:`settle_failed_operations`).
 """
 
 import os
@@ -45,6 +49,8 @@ CHAT_REASON: Final = "ghostwriter chat"
 OUTPUT_ENV: Final = "AUDIT_OUTPUT"
 #: The app-state attribute holding the process's emitter.
 EMITTER_STATE_KEY: Final = "audit_emitter"
+#: The request-state attribute listing the operations a request began.
+OPERATIONS_STATE_KEY: Final = "audit_operations"
 #: The system itself, for startup and the retention sweep.
 SYSTEM_ACTOR: Final = Actor(user=None, via="system")
 #: The actions Ghostwriter's routes record. :func:`audited` accepts no other,
@@ -413,7 +419,8 @@ def begin(
         container: The enclosing object, when known.
 
     Returns:
-        The open operation.
+        The open operation, registered on the request so a server error
+        settles it (:func:`settle_failed_operations`).
 
     Raises:
         HTTPException: 400 for a malformed purpose header; 428 when a required
@@ -427,6 +434,8 @@ def begin(
         request_id=clean_request_id(request.headers.get(REQUEST_ID_HEADER)) or uuid4().hex,
     )
     op = Operation(emitter, context, action, operation, container=container)
+    operations: list[Operation] = getattr(request.state, OPERATIONS_STATE_KEY, [])
+    setattr(request.state, OPERATIONS_STATE_KEY, [*operations, op])
     settings: Settings = request.app.state.settings
     if context.purpose is None and settings.require_purpose.intersection((action, *also)):
         # A refusal has no target, so the container it was about goes in its criteria.
@@ -438,9 +447,9 @@ def begin(
 def audited(action: str, operation: str, *, also: Sequence[str] = ()) -> Callable[..., Operation]:
     """Build the FastAPI dependency that opens a route's audited operation.
 
-    It resolves, in this order, who acts (401, nothing recorded), the stated
-    purpose (400, nothing recorded), the emitter and the purpose rule (428,
-    recorded as ``denied``).
+    It resolves, in this order, who acts (401, nothing recorded), the emitter
+    (500, nothing recorded), the stated purpose (400, nothing recorded) and the
+    purpose rule (428, recorded as ``denied``).
 
     Args:
         action: The operation's primary action.
@@ -471,3 +480,35 @@ def audited(action: str, operation: str, *, also: Sequence[str] = ()) -> Callabl
         return begin(request, principal, action, operation, also=also)
 
     return dependency
+
+
+def settle_quietly(
+    op: Operation, *, target: Target | None = None, criteria: Mapping[str, object] | None = None
+) -> None:
+    """Record an interrupted operation as failed, unless it has an outcome already.
+
+    For work that is failing anyway: a write that fails here is logged by its
+    exception type only, and the failure the caller is handling goes on.
+
+    Args:
+        op: The interrupted operation.
+        target: What it touched before failing, if known.
+        criteria: What is known about how far it got.
+    """
+    if op.settled:
+        return
+    try:
+        op.fail(target=target, criteria=criteria)
+    except Exception as exc:
+        logger.error("Could not record the failure of audited operation '{}': {}", op.operation, type(exc).__name__)
+
+
+def settle_failed_operations(request: Request) -> None:
+    """Record every operation a request began and did not record, as it ends in a server error.
+
+    Args:
+        request: The failing request.
+    """
+    operations: list[Operation] = getattr(request.state, OPERATIONS_STATE_KEY, [])
+    for op in operations:
+        settle_quietly(op)

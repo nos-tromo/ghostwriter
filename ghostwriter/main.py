@@ -8,22 +8,27 @@ the process's one audit chain (:mod:`ghostwriter.audit`).
 
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import TextIO
+from typing import Final, TextIO
 from urllib.parse import quote
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.exception_handlers import http_exception_handler
+from fastapi.responses import JSONResponse, Response
 from loguru import logger
 from prometheus_fastapi_instrumentator import Instrumentator
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ghostwriter import __version__
 from ghostwriter.api import meta
-from ghostwriter.audit import open_emitter, start_chain
+from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.log_cfg import setup_logger
 from ghostwriter.utils.audit_event import AuditWriteError
 
 setup_logger()
+
+#: The body of every 500 the backend answers itself.
+FAILED: Final = {"detail": "Request failed."}
 
 
 def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None = None) -> FastAPI:
@@ -79,7 +84,38 @@ def create_app(settings: Settings | None = None, *, audit_stream: TextIO | None 
             The generic 500.
         """
         logger.error("An audit event could not be written; refusing {} '{}'.", request.method, quote(request.url.path))
-        return JSONResponse(status_code=500, content={"detail": "Request failed."})
+        settle_failed_operations(request)
+        return JSONResponse(status_code=500, content=FAILED)
+
+    @app.exception_handler(StarletteHTTPException)
+    async def settle_server_errors(request: Request, exc: StarletteHTTPException) -> Response:
+        """Settle the request's open operations on a 5xx; a 4xx returns no data and records nothing.
+
+        Args:
+            request: The request.
+            exc: The HTTP error.
+
+        Returns:
+            FastAPI's usual answer for it.
+        """
+        if exc.status_code >= 500:
+            settle_failed_operations(request)
+        return await http_exception_handler(request, exc)
+
+    @app.exception_handler(Exception)
+    async def refuse_unexpected(request: Request, exc: Exception) -> JSONResponse:
+        """Answer an unexpected error with the generic 500, after settling the request's open operations.
+
+        Args:
+            request: The request.
+            exc: The error, logged by its type only.
+
+        Returns:
+            The generic 500.
+        """
+        logger.error("Unhandled {} on {} '{}'.", type(exc).__name__, request.method, quote(request.url.path))
+        settle_failed_operations(request)
+        return JSONResponse(status_code=500, content=FAILED)
 
     @app.get("/api/health", summary="Liveness probe", tags=["Metadata"])
     def health() -> dict[str, str]:
