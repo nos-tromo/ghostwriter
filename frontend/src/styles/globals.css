@@ -8,6 +8,10 @@
   /* ghostwriter's single design-system knob; primary derives from this.
      Light default is darkened for WCAG AA as text on white (~4.5:1). */
   --app-accent: hsl(217 91% 45%);
+  /* The user's own messages (@infra/ui's bubble): white text on the accent.
+     Kept at the light accent in dark mode too, since white on the dark accent
+     (60%) is only ~3.6:1; this shade is ~6:1 (WCAG AA) in both themes. */
+  --app-bubble: hsl(217 91% 45%);
 
   /* Code highlighting: rehype-highlight emits hljs-* classes only (no inline
      styles), coloured here. After highlight.js's GitHub themes, darkened

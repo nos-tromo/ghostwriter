@@ -7,15 +7,16 @@ import { MarkdownProse } from './MarkdownProse'
 import { ResultCard } from './ResultCard'
 import { Trail } from './Trail'
 
+/** A file the message bound, as a chip that reads on the blue of the user's bubble. */
 function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
   const t = useT()
   const lang = useLang()
   return (
-    <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-border bg-background px-2 py-0.5 text-xs">
+    <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-primary-foreground/30 bg-primary-foreground/15 px-2 py-0.5 text-xs">
       <span title={attachment.name} className="min-w-0 truncate">
         {attachment.name}
       </span>
-      <span className="shrink-0 text-muted-foreground">{formatSize(attachment.size, lang)}</span>
+      <span className="shrink-0 text-primary-foreground/80">{formatSize(attachment.size, lang)}</span>
       {attachment.expired && <Badge>{t('result.expired')}</Badge>}
     </span>
   )
@@ -25,7 +26,7 @@ function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
 function UserMessage({ message }: { message: Pick<MessageOut, 'content' | 'attachments'> }) {
   return (
     <div data-role="user" className="flex justify-end">
-      <div className="max-w-[85%] space-y-2 rounded-lg bg-primary/10 px-3 py-2 text-sm">
+      <div className="max-w-[85%] space-y-2 rounded-2xl rounded-br-md bg-(--app-bubble) px-4 py-2 text-sm text-primary-foreground">
         {message.content && <p className="whitespace-pre-wrap break-words">{message.content}</p>}
         {message.attachments.length > 0 && (
           <ul className="flex flex-wrap gap-1">
