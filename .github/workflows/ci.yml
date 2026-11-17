@@ -15,7 +15,7 @@ concurrency:
 
 jobs:
   ci:
-    # Pinned to an immutable commit SHA (v3.12): strict-config + make/common.mk +
+    # Pinned to an immutable commit SHA: strict-config + make/common.mk +
     # frontend eslint.config.js drift-checks; nos-tromo style tuning:
     # line-length=120, ANN401 ignored, local pyrefly hook. Canonical configs at
     # nos-tromo/.github/configs/{python-strict,make-common,frontend-eslint}/.
@@ -29,5 +29,3 @@ jobs:
       frontend-lint: true
       node-version: '22'
       pnpm-version: '9.12.0'
-      test-env: |
-        OPENAI_API_BASE=http://test-host:11434/v1

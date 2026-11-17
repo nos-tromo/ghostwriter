@@ -37,17 +37,26 @@ export class FakeRecorder {
 
 /**
  * Give the page a microphone and a MediaRecorder that takes `supported`.
- * `denied` refuses the microphone as a browser does when the user says no.
+ * `denied` refuses the microphone as a browser does when the user says no;
+ * `failure` names the error the next request for it throws instead
+ * (`NotFoundError`, `NotReadableError`), once.
  */
 export function installMedia({
   supported = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4'],
   denied = false,
-}: { supported?: string[]; denied?: boolean } = {}) {
+  failure,
+}: { supported?: string[]; denied?: boolean; failure?: string } = {}) {
   FakeRecorder.instances = []
   FakeRecorder.supported = supported
   const track = { stop: vi.fn() }
+  let failing = failure
   const getUserMedia = vi.fn(async (_constraints: MediaStreamConstraints) => {
     if (denied) throw new DOMException('Permission denied', 'NotAllowedError')
+    if (failing) {
+      const name = failing
+      failing = undefined
+      throw new DOMException('No microphone', name)
+    }
     return { getTracks: () => [track] } as unknown as MediaStream
   })
   vi.stubGlobal('MediaRecorder', FakeRecorder)

@@ -66,6 +66,7 @@ DOWNLOAD_RECIPIENT: Final = "download"
 
 NOT_AVAILABLE: Final = "File processing is not available."
 TOO_MANY_PENDING: Final = "Send the attached files before adding more."
+TOO_MANY_PENDING_CODE: Final = "too_many_pending"
 UNSUPPORTED: Final = "This file type is not supported."
 UNREADABLE: Final = "The upload could not be read."
 NOT_HANDED: Final = "The file could not be handed to workbench."
@@ -200,8 +201,9 @@ async def attach_file(
             the hand-over; ``disclose`` / ``chat.attachment`` children record the hand-over.
 
     Returns:
-        The pending attachment, or the refusal: 409 also when parallel uploads filled the chat
-        meanwhile, counted again as the attachment is stored.
+        The pending attachment, or the refusal: 409 ``too_many_pending`` at
+        :data:`~ghostwriter.upload.MAX_PENDING` waiting files not yet expired, also
+        when parallel uploads filled the chat meanwhile, counted again as the attachment is stored.
 
     Raises:
         HTTPException: 404 for another owner's chat or an unknown one, also one deleted meanwhile;
@@ -213,7 +215,7 @@ async def attach_file(
     if workbench is None:
         return _refused(status.HTTP_503_SERVICE_UNAVAILABLE, NOT_AVAILABLE)
     if await run_in_threadpool(store.pending_count, chat_id) >= MAX_PENDING:
-        return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING)
+        return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING, TOO_MANY_PENDING_CODE)
     try:
         part = await read_file_part(request, max_bytes=MAX_ATTACHMENT_BYTES)
     except TooLarge:
@@ -249,7 +251,7 @@ async def attach_file(
             max_pending=MAX_PENDING,
         )
     except TooManyPending:
-        return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING)
+        return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING, TOO_MANY_PENDING_CODE)
     except ChatNotFound:
         await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None

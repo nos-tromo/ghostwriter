@@ -3,7 +3,9 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 /** The recording formats asked for, in order: Chrome's, Firefox's, Safari's. */
 export const RECORDER_TYPES = ['audio/webm;codecs=opus', 'audio/ogg;codecs=opus', 'audio/mp4']
 
-export type RecorderState = 'idle' | 'recording' | 'unsupported' | 'denied'
+/** `unavailable`: no microphone could be opened this time (none there, or
+ *  in use elsewhere); another try may work, unlike `unsupported`. */
+export type RecorderState = 'idle' | 'recording' | 'unsupported' | 'denied' | 'unavailable'
 
 export interface Recorder {
   state: RecorderState
@@ -19,9 +21,13 @@ function recorderType(): string | null {
   return RECORDER_TYPES.find((type) => MediaRecorder.isTypeSupported(type)) ?? null
 }
 
-/** Whether the browser refused the microphone (the user, or a policy), not merely failed to open one. */
-function isRefusal(error: unknown): boolean {
-  return error instanceof DOMException && (error.name === 'NotAllowedError' || error.name === 'SecurityError')
+/** What a failed request for the microphone means: refused (the user, or a
+ *  policy), none that could be opened, or none this browser can give. */
+function failureOf(error: unknown): RecorderState {
+  if (!(error instanceof DOMException)) return 'unsupported'
+  if (error.name === 'NotAllowedError' || error.name === 'SecurityError') return 'denied'
+  if (error.name === 'NotFoundError' || error.name === 'NotReadableError') return 'unavailable'
+  return 'unsupported'
 }
 
 /**
@@ -73,7 +79,7 @@ export function useRecorder({
       media = await navigator.mediaDevices.getUserMedia({ audio: true })
     } catch (error) {
       busyRef.current = false
-      if (aliveRef.current) setState(isRefusal(error) ? 'denied' : 'unsupported')
+      if (aliveRef.current) setState(failureOf(error))
       return
     }
     const release = () => media.getTracks().forEach((track) => track.stop())

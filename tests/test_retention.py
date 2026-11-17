@@ -492,6 +492,50 @@ async def test_tool_contents_and_previews_are_emptied_after_the_file_period(
     assert "Umsatz 42" not in audit_stream.getvalue() and "sums.xlsx" not in audit_stream.getvalue()
 
 
+def _spin_guard(monkeypatch: pytest.MonkeyPatch, store: ChatStore, name: str) -> None:
+    """Fail a sweep that reads what is due more than ten times, instead of letting it spin."""
+    read = getattr(store, name)
+    reads = 0
+
+    def guarded(now: datetime, limit: int) -> Any:
+        nonlocal reads
+        reads += 1
+        if reads > 10:
+            raise AssertionError("the sweep spins")
+        return read(now, limit)
+
+    monkeypatch.setattr(store, name, guarded)
+
+
+async def test_a_chat_batch_with_nothing_new_ends_the_sweep(
+    settled: Env, monkeypatch: pytest.MonkeyPatch, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """Rows that did not go bring the same chats back: the sweep stops with one warning, recorded once."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    monkeypatch.setattr(env.store, "delete_chat_rows", lambda chat_id: None)
+    _spin_guard(monkeypatch, env.store, "due_chats")
+    assert (await env.sweeper.sweep()).chats == 1
+    assert env.has_rows(cid) and len(_deletes(env.door)) == 1
+    assert loguru_caplog.text.count("no chat it had not handled") == 1
+
+
+async def test_a_content_batch_with_nothing_new_ends_the_sweep(
+    settled: Env,
+    audit_stream: CapturedAuditStream,
+    monkeypatch: pytest.MonkeyPatch,
+    loguru_caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Contents that were not emptied come back: the sweep stops with one warning, each recorded once."""
+    env = settled
+    step, result = _contents(env, NOW - 8 * DAY)
+    monkeypatch.setattr(env.store, "empty_contents", lambda steps, results: None)
+    _spin_guard(monkeypatch, env.store, "due_contents")
+    assert await env.sweeper.sweep() == SweepReport(steps=1, previews=1)
+    assert [e["target"]["ids"] for e in _of(audit_stream, "retention.tool_content")] == [[step], [result]]
+    assert loguru_caplog.text.count("no tool content it had not handled") == 1
+
+
 async def test_the_checkpoint_runs_outside_a_transaction_and_empties_the_log(settled: Env) -> None:
     """After a sweep the write-ahead log is empty, and neither file holds what was deleted or emptied."""
     env = settled

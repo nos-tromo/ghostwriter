@@ -33,6 +33,7 @@ export const de: Strings = {
   'chat.thinking': 'denkt nach…',
   'chat.regenerate': 'Neu erzeugen',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
+  'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',
@@ -53,6 +54,7 @@ export const de: Strings = {
     'Ihre Dateien füllen den von workbench erlaubten Platz; löschen Sie einen Chat oder warten Sie, bis Dateien ablaufen.',
   'composer.error_purpose':
     '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
+  'composer.error_too_many_pending': 'Senden Sie zuerst die angehängten Dateien.',
   'composer.send': 'Senden',
   'composer.stop': 'Stopp',
 
@@ -61,6 +63,7 @@ export const de: Strings = {
   'mic.stop': 'Diktat beenden',
   'mic.denied': 'Der Zugriff auf das Mikrofon wurde verweigert.',
   'mic.unsupported': 'Dieser Browser kann kein Audio aufnehmen.',
+  'mic.unavailable': 'Es konnte kein Mikrofon verwendet werden.',
   'mic.limit': 'noch {s} s',
 
   // the trail of tool steps

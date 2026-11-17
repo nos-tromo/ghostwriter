@@ -149,6 +149,9 @@ class Sweeper:
     async def _sweep_chats(self, now: datetime, report: SweepReport) -> int:
         """Delete the due chats batch by batch, each while holding its chats' turns.
 
+        A batch that brings no chat this sweep has not handled yet ends it with a warning, so
+        rows that did not go cannot keep it turning.
+
         Args:
             now: The time of the sweep.
             report: What the sweep did, counted on.
@@ -157,11 +160,15 @@ class Sweeper:
             How many due chats were left because their turn was held.
         """
         busy: set[str] = set()
+        handled: set[str] = set()
         while True:
             window = SWEEP_BATCH + len(busy)
             due = await anyio.to_thread.run_sync(self._store.due_chats, now, window)
             batch = [(chat_id, owner) for chat_id, owner in due if chat_id not in busy][:SWEEP_BATCH]
             if not batch:
+                return len(busy)
+            if all(chat_id in handled for chat_id, _ in batch):
+                logger.warning("The retention sweep found no chat it had not handled; it stops here.")
                 return len(busy)
             claims: dict[str, threading.Event] = {}
             try:
@@ -175,6 +182,7 @@ class Sweeper:
                     continue
                 still = {chat_id for chat_id, _ in await anyio.to_thread.run_sync(self._store.due_chats, now, window)}
                 held = [(chat_id, owner) for chat_id, owner in batch if chat_id in claims and chat_id in still]
+                handled.update(claims)
                 if held:
                     await self._delete_chats(held, now, report)
             finally:
@@ -233,15 +241,23 @@ class Sweeper:
     async def _sweep_contents(self, now: datetime, report: SweepReport) -> None:
         """Record, then empty, the expired tool contents and previews, batch by batch.
 
+        A batch that brings no step or result this sweep has not handled yet ends it with a
+        warning, so contents that were not emptied cannot keep it turning.
+
         Args:
             now: The time of the sweep.
             report: What the sweep did, counted on.
         """
         criteria = {"file_days": self._settings.file_days}
+        handled: set[str] = set()
         while True:
             steps, results = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
             if not steps and not results:
                 return
+            if handled.issuperset(steps) and handled.issuperset(results):
+                logger.warning("The retention sweep found no tool content it had not handled; it stops here.")
+                return
+            handled.update(steps, results)
             for kind, ids in (("tool_step", steps), ("result", results)):
                 if ids:
                     op = system_operation(self._emitter, "delete", CONTENT_DELETE)

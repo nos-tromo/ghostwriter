@@ -243,7 +243,9 @@ describe('useChatStream', () => {
 
   it('says why a message could not be sent, and that an answer is still being written', async () => {
     const busy = () =>
-      new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.' }), { status: 409 })
+      new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.', code: 'busy' }), {
+        status: 409,
+      })
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'POST /ghostwriter/api/chats/c1/messages': busy })
     const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
@@ -260,6 +262,30 @@ describe('useChatStream', () => {
     await user.click(await screen.findByRole('button', { name: 'Regenerate' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('An answer is still being written in this chat.')
     second.unmount()
+
+    // A regenerate with no answer left to replace says so, by its code; a 409
+    // without a code is not taken for either.
+    const refused = (body: object) => () => new Response(JSON.stringify(body), { status: 409 })
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([QUESTION, ANSWER]),
+      'POST /ghostwriter/api/chats/c1/regenerate': refused({ detail: 'There is no answer to regenerate.', code: 'no_answer' }),
+    })
+    const third = renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    await user.click(await screen.findByRole('button', { name: 'Neu erzeugen' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Es gibt keine Antwort, die neu erzeugt werden kann.')
+    third.unmount()
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([QUESTION, ANSWER]),
+      'POST /ghostwriter/api/chats/c1/regenerate': refused({ detail: 'Conflict.' }),
+    })
+    const fourth = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await user.click(await screen.findByRole('button', { name: 'Regenerate' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (409)')
+    fourth.unmount()
 
     // Any other refusal stays the generic line with its status.
     serve({

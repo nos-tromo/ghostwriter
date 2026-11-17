@@ -23,7 +23,7 @@ from uuid import uuid4
 
 from anyio import CapacityLimiter
 from fastapi import APIRouter, Body, Depends, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 from pydantic import BaseModel, Field, StringConstraints, field_validator, model_validator
 from starlette.types import Receive, Scope, Send
@@ -59,8 +59,10 @@ MAX_MESSAGE_CHARS: Final = 20_000
 #: The most distinct attachments one message may send.
 MAX_MESSAGE_ATTACHMENTS: Final = 10
 ANSWER_RUNNING: Final = "An answer is still being written in this chat."
+BUSY_CODE: Final = "busy"
 UNKNOWN_ATTACHMENT: Final = "Unknown attachment."
 NO_ANSWER: Final = "There is no answer to regenerate."
+NO_ANSWER_CODE: Final = "no_answer"
 #: What the user is told when a record of the turn could not be written.
 AUDIT_ERROR: Final = "The answer stopped: it could not be recorded."
 STREAM_HEADERS: Final = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -372,7 +374,20 @@ def _turns(request: Request) -> TurnRegistry:
     return turns
 
 
-def _claim(request: Request, owner: str, chat_id: str) -> threading.Event:
+def _conflict(detail: str, code: str) -> JSONResponse:
+    """Refuse a turn with 409 and the reason's code.
+
+    Args:
+        detail: What the user is told.
+        code: The reason, for the SPA.
+
+    Returns:
+        The refusal.
+    """
+    return JSONResponse(status_code=status.HTTP_409_CONFLICT, content={"detail": detail, "code": code})
+
+
+def _claim(request: Request, owner: str, chat_id: str) -> threading.Event | None:
     """Claim the owner's chat for a turn.
 
     Args:
@@ -381,16 +396,13 @@ def _claim(request: Request, owner: str, chat_id: str) -> threading.Event:
         chat_id: The chat.
 
     Returns:
-        The claim, the turn's stop.
+        The claim, the turn's stop; ``None`` while a turn runs in the chat.
 
     Raises:
-        HTTPException: 404 for another owner's chat or an unknown one; 409 while a turn runs in it.
+        HTTPException: 404 for another owner's chat or an unknown one.
     """
     owned_chat(_store(request), owner, chat_id)
-    claim = _turns(request).begin(chat_id)
-    if claim is None:
-        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=ANSWER_RUNNING)
-    return claim
+    return _turns(request).begin(chat_id)
 
 
 def _answer(
@@ -446,14 +458,19 @@ def _answer(
     return TurnResponse(stream, request, request.app.state.turn_threads)
 
 
-@router.post("/{chat_id}/messages", response_class=StreamingResponse, summary="Send a message; the answer streams")
+@router.post(
+    "/{chat_id}/messages",
+    response_class=StreamingResponse,
+    response_model=None,
+    summary="Send a message; the answer streams",
+)
 def send_message(
     chat_id: str,
     body: MessageIn,
     request: Request,
     user: User,
     op: Annotated[Operation, Depends(audited("collect", "chat.message", also=("ai_call", "disclose")))],
-) -> TurnResponse:
+) -> TurnResponse | JSONResponse:
     """Store the user's message and stream its answer as Server-Sent Events.
 
     Args:
@@ -465,14 +482,16 @@ def send_message(
             and its length before it is stored; the turn's rounds and calls are its children.
 
     Returns:
-        The stream.
+        The stream; or 409 ``busy`` while a turn runs in the chat.
 
     Raises:
-        HTTPException: 404 for another owner's chat or an unknown one; 409 while a turn runs in
-            it; 400 when an attachment is not pending in this chat.
+        HTTPException: 404 for another owner's chat or an unknown one; 400 when an attachment
+            is not pending in this chat.
     """
     store = _store(request)
     claim = _claim(request, user.name, chat_id)
+    if claim is None:
+        return _conflict(ANSWER_RUNNING, BUSY_CODE)
     try:
         owned_chat(store, user.name, chat_id)
         if not set(body.attachment_ids) <= store.pending_ids(chat_id):
@@ -504,14 +523,19 @@ def send_message(
         raise
 
 
-@router.post("/{chat_id}/regenerate", response_class=StreamingResponse, summary="Answer the last question again")
+@router.post(
+    "/{chat_id}/regenerate",
+    response_class=StreamingResponse,
+    response_model=None,
+    summary="Answer the last question again",
+)
 def regenerate(
     chat_id: str,
     request: Request,
     user: User,
     op: Annotated[Operation, Depends(audited("modify", "chat.regenerate", also=("ai_call", "disclose")))],
     body: Annotated[RegenerateIn | None, Body()] = None,
-) -> TurnResponse:
+) -> TurnResponse | JSONResponse:
     """Replace the chat's last answer with a new one, streamed as Server-Sent Events.
 
     Args:
@@ -523,20 +547,23 @@ def regenerate(
         body: The reasoning switch; off without a body.
 
     Returns:
-        The stream.
+        The stream; or 409 ``busy`` while a turn runs in the chat, ``no_answer`` when it ends in
+        no answer.
 
     Raises:
-        HTTPException: 404 for another owner's chat or an unknown one; 409 while a turn runs in
-            it, or when it ends in no answer.
+        HTTPException: 404 for another owner's chat or an unknown one.
     """
     store = _store(request)
     claim = _claim(request, user.name, chat_id)
+    if claim is None:
+        return _conflict(ANSWER_RUNNING, BUSY_CODE)
     try:
         owned_chat(store, user.name, chat_id)
         replaced = store.last_answer(user.name, chat_id)
         question_id = None if replaced is None else store.question_of(chat_id, replaced)
         if replaced is None or question_id is None:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=NO_ANSWER)
+            _turns(request).end(chat_id, claim)
+            return _conflict(NO_ANSWER, NO_ANSWER_CODE)
         op.container = chat_id
         op.record(target=Target(kind="message", ids=(replaced,)))
         store.drop_message(replaced)

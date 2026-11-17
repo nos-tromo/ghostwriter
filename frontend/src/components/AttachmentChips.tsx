@@ -9,6 +9,7 @@ const ERROR_KEYS: Record<PendingError, keyof Strings> = {
   size: 'composer.error_size',
   upload: 'composer.error_upload',
   storage_full: 'composer.error_storage_full',
+  too_many_pending: 'composer.error_too_many_pending',
   purpose: 'composer.error_purpose',
 }
 

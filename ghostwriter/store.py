@@ -819,7 +819,8 @@ class ChatStore:
             mime: Its MIME type.
             id: The attachment's id, when it was recorded before the hand-over; minted otherwise.
             max_pending: The most attachments the chat may hold waiting, counted under the write
-                lock, so parallel uploads cannot pass it; ``None`` counts nothing.
+                lock, so parallel uploads cannot pass it, and expired ones not counted; ``None``
+                counts nothing.
 
         Returns:
             The attachment.
@@ -833,7 +834,7 @@ class ChatStore:
             self._mark_first_file(s, chat_id, now)
             if s.get(Chat, chat_id) is None:
                 raise ChatNotFound("chat not found")
-            if max_pending is not None and self._pending(s, chat_id) >= max_pending:
+            if max_pending is not None and self._pending(s, chat_id, now) >= max_pending:
                 raise TooManyPending("too many pending attachments")
             attachment = Attachment(
                 id=str(uuid4()) if id is None else id,
@@ -849,13 +850,13 @@ class ChatStore:
             s.add(attachment)
             return self._attachment_out(attachment, now)
 
-    @staticmethod
-    def _pending(s: Session, chat_id: str) -> int:
-        """Count a chat's attachments not yet sent with a message, in an open session.
+    def _pending(self, s: Session, chat_id: str, now: datetime) -> int:
+        """Count a chat's attachments not yet sent with a message whose file has not expired, in an open session.
 
         Args:
             s: The session.
             chat_id: The chat.
+            now: The time of the count.
 
         Returns:
             The count.
@@ -863,11 +864,15 @@ class ChatStore:
         return s.execute(
             select(func.count())
             .select_from(Attachment)
-            .where(Attachment.chat_id == chat_id, Attachment.message_id.is_(None))
+            .where(
+                Attachment.chat_id == chat_id,
+                Attachment.message_id.is_(None),
+                Attachment.created_at > now - self._file_period,
+            )
         ).scalar_one()
 
     def pending_count(self, chat_id: str) -> int:
-        """Count a chat's attachments not yet sent with a message.
+        """Count a chat's attachments not yet sent with a message whose file has not expired.
 
         Args:
             chat_id: The chat.
@@ -875,8 +880,9 @@ class ChatStore:
         Returns:
             The count.
         """
+        now = self._now()
         with self._transaction() as s:
-            return self._pending(s, chat_id)
+            return self._pending(s, chat_id, now)
 
     def pending_ids(self, chat_id: str) -> set[str]:
         """Return the ids of a chat's attachments not yet sent with a message.

@@ -3,6 +3,7 @@ import { QueryClientProvider } from '@tanstack/react-query'
 import { queryClient, refetchRefusedOnPurpose } from './api/queryClient'
 import { ChatPane } from './components/ChatPane'
 import { useConfig } from './hooks/useConfig'
+import { useStrayDropGuard } from './hooks/useStrayDropGuard'
 import { LanguageProvider } from './i18n/LanguageContext'
 import { Shell } from './layout/Shell'
 
@@ -16,6 +17,7 @@ function OpenChat({ chatId }: { chatId: string | null }) {
 
 export default function App() {
   useEffect(() => refetchRefusedOnPurpose(queryClient), [])
+  useStrayDropGuard()
   const [selected, setSelected] = useState<string | null>(null)
   return (
     <QueryClientProvider client={queryClient}>

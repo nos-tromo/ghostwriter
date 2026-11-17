@@ -1,4 +1,4 @@
-import { useCallback, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type KeyboardEvent } from 'react'
 import {
   AttachButton,
   BrainActiveIcon,
@@ -65,8 +65,9 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  *
  * Enter sends and Shift+Enter starts a new line. Send waits while a file
  * uploads, and needs text or an attached file. A transcript goes in at the
- * cursor and is never sent by itself. A message the server refuses comes
- * back into the composer with its files, as it was.
+ * cursor and is never sent by itself; one still running when the composer
+ * goes is aborted. A message the server refuses comes back into the composer
+ * with its files, as it was.
  *
  * The chat's stream, its attachments and the reasoning switch are the
  * `ChatPane`'s, so the conversation above shows the same answer this sends.
@@ -91,6 +92,9 @@ export function Composer({
   const caretRef = useRef<number | null>(null)
   const [transcribing, setTranscribing] = useState(false)
   const [dictationFailure, setDictationFailure] = useState<unknown>(null)
+  const transcriptionRef = useRef<AbortController | null>(null)
+
+  useEffect(() => () => transcriptionRef.current?.abort(), [])
 
   // Put the cursor after a transcript once it is in the textarea.
   useLayoutEffect(() => {
@@ -112,13 +116,16 @@ export function Composer({
 
   const onRecorded = useCallback(
     async (blob: Blob, mime: string) => {
+      const controller = new AbortController()
+      transcriptionRef.current = controller
       setTranscribing(true)
       setDictationFailure(null)
       try {
-        insert(await transcribe(blob, mime))
+        insert(await transcribe(blob, mime, controller.signal))
       } catch (error) {
-        setDictationFailure(error)
+        if (!controller.signal.aborted) setDictationFailure(error)
       } finally {
+        if (transcriptionRef.current === controller) transcriptionRef.current = null
         setTranscribing(false)
       }
     },
@@ -157,12 +164,14 @@ export function Composer({
 
   // A paste of files attaches them. Text is pasted as ever; what comes with
   // it is a picture of that text (an office program's copy) unless it is of
-  // a type that can be attached.
+  // a type that can be attached. Text that is just a pasted file's name (a
+  // file manager's copy) is that file, not text to paste.
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     if (!config.attachments) return
     const files = Array.from(event.clipboardData.files)
     if (files.length === 0) return
-    if (event.clipboardData.getData('text/plain')) {
+    const pasted = event.clipboardData.getData('text/plain')
+    if (pasted && !files.some((f) => f.name === pasted)) {
       const attachable = files.filter((f) => isAttachable(f.name, config))
       if (attachable.length > 0) attachments.add(attachable)
       return
@@ -182,7 +191,7 @@ export function Composer({
     >
       <div className="mx-auto w-full max-w-3xl space-y-2">
         <AttachmentChips pending={attachments.pending} onDismiss={attachments.dismiss} />
-        {attachments.pending.length > 0 && (
+        {attachments.pending.some((f) => f.status !== 'error') && (
           <p className="text-xs text-muted-foreground">
             {t('composer.files_stay', { days: config.file_retention_days })}
           </p>
@@ -244,9 +253,9 @@ export function Composer({
             </div>
           </div>
         </div>
-        {recorder.state === 'denied' && (
+        {(recorder.state === 'denied' || recorder.state === 'unavailable') && (
           <p role="alert" className="text-xs text-danger">
-            {t('mic.denied')}
+            {t(recorder.state === 'denied' ? 'mic.denied' : 'mic.unavailable')}
           </p>
         )}
         {dictationFailure !== null && <RequestError error={dictationFailure} />}

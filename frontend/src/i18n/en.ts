@@ -31,6 +31,7 @@ export const en = {
   'chat.thinking': 'thinking…',
   'chat.regenerate': 'Regenerate',
   'chat.answer_busy': 'An answer is still being written in this chat.',
+  'chat.no_answer': 'There is no answer to regenerate.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',
@@ -50,6 +51,7 @@ export const en = {
   'composer.error_storage_full':
     'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
   'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
+  'composer.error_too_many_pending': 'Send the attached files before adding more.',
   'composer.send': 'Send',
   'composer.stop': 'Stop',
 
@@ -58,6 +60,7 @@ export const en = {
   'mic.stop': 'Stop dictating',
   'mic.denied': 'Microphone access was denied.',
   'mic.unsupported': 'This browser cannot record audio.',
+  'mic.unavailable': 'No microphone could be used.',
   'mic.limit': '{s} s left',
 
   // the trail of tool steps

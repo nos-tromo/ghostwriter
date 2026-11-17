@@ -27,8 +27,33 @@ export function useChats() {
   return useQuery({ queryKey: chatsKey, queryFn: listChats, select: byActivity })
 }
 
+let order = 0
+/** The next mark on the page's own order of events: when a chat's read
+ *  began, when a file was attached. */
+export const nextMark = (): number => ++order
+
+/** When the read that brought a chat's detail began, by the detail; the
+ *  chat's query keeps the object its read returned (no structural sharing). */
+const readMarks = new WeakMap<ChatDetail, number>()
+
+/** The mark of the read that brought `detail` (see {@link nextMark});
+ *  `undefined` for none, or for a detail put in the cache here. */
+export function readMarkOf(detail: ChatDetail | undefined): number | undefined {
+  return detail === undefined ? undefined : readMarks.get(detail)
+}
+
 export function useChat(id: string | null) {
-  return useQuery({ queryKey: chatKey(id), queryFn: () => getChat(id!), enabled: id !== null })
+  return useQuery({
+    queryKey: chatKey(id),
+    queryFn: async () => {
+      const mark = nextMark()
+      const detail = await getChat(id!)
+      readMarks.set(detail, mark)
+      return detail
+    },
+    structuralSharing: false,
+    enabled: id !== null,
+  })
 }
 
 export function useCreateChat() {

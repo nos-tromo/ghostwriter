@@ -51,7 +51,7 @@ from tests.fakes import (
 )
 
 ANSWER: Round = [text_chunk("Summe: 42"), usage_chunk(950, 5, "served-model")]
-RUNNING = (409, {"detail": "An answer is still being written in this chat."})
+RUNNING = (409, {"detail": "An answer is still being written in this chat.", "code": "busy"})
 NOT_FOUND = (404, {"detail": "Chat not found."})
 THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
 THINKING_OFF = {"chat_template_kwargs": {"enable_thinking": False}}
@@ -417,7 +417,7 @@ def test_regenerate_needs_an_answer(client: TestClient, audit_stream: CapturedAu
     cid = _new(client)
     before = len(events(audit_stream))
     r = client.post(f"/api/chats/{cid}/regenerate", json={}, headers=as_user())
-    assert (r.status_code, r.json()) == (409, {"detail": "There is no answer to regenerate."})
+    assert (r.status_code, r.json()) == (409, {"detail": "There is no answer to regenerate.", "code": "no_answer"})
     assert events(audit_stream)[before:] == [] and not _state(client).turns.running(cid)
 
 

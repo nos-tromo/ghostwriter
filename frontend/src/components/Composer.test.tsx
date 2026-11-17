@@ -145,19 +145,38 @@ describe('Composer', () => {
     expect(rich.defaultPrevented).toBe(false)
     expect(within(composer()).queryByText('image.png')).not.toBeInTheDocument()
     expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(1)
+
+    // A file copied in a file manager comes with its name as text: the file
+    // is attached, and its name is not pasted.
+    const copied = createEvent.paste(textbox(), {
+      clipboardData: {
+        files: [file('Bericht.pdf')],
+        types: ['text/plain', 'Files'],
+        getData: (type: string) => (type === 'text/plain' ? 'Bericht.pdf' : ''),
+      },
+    })
+    fireEvent(textbox(), copied)
+    expect(copied.defaultPrevented).toBe(true)
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(2))
+    expect(uploaded(callsTo(calls, 'POST', ATTACHMENTS)[1])).toBe('Bericht.pdf')
   })
 
   it('refuses unsupported types and files over 50 MB before uploading', async () => {
     const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'Bericht.PDF'), 201) })
     await screen.findByText('Ask anything, or attach a document.')
 
-    drop(textbox(), [file('tool.exe'), file('big.pdf', 51 * 1024 * 1024), file('Bericht.PDF')])
+    const stay = 'Attached files stay in this chat until it is deleted, for 7 days at most.'
+    drop(textbox(), [file('tool.exe'), file('big.pdf', 51 * 1024 * 1024)])
     expect(await screen.findByText('tool.exe: this file type is not supported.')).toBeInTheDocument()
     expect(screen.getByText('big.pdf is larger than 50 MB.')).toBeInTheDocument()
     expect(chip('tool.exe')).toHaveAttribute('data-status', 'error')
     expect(chip('big.pdf')).toHaveAttribute('data-status', 'error')
+    // Nothing stays in the chat when every file was refused.
+    expect(screen.queryByText(stay)).not.toBeInTheDocument()
     // The extension is matched in any case.
+    drop(textbox(), [file('Bericht.PDF')])
     await waitFor(() => expect(chip('Bericht.PDF')).toHaveAttribute('data-status', 'done'))
+    expect(screen.getByText(stay)).toBeInTheDocument()
     expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['Bericht.PDF'])
 
     // A refused file can be taken out of view.
@@ -171,12 +190,13 @@ describe('Composer', () => {
         const name = uploaded(call)
         if (name === 'big.xlsx') return json({ detail: 'The file is larger than 50 MB.', code: 'too_large' }, 413)
         if (name === 'full.csv') return json({ detail: 'Storage is full.', code: 'storage_full' }, 507)
+        if (name === 'more.csv') return json({ detail: 'Too many.', code: 'too_many_pending' }, 409)
         // A 413 without the code is not the file's size.
         return json({ detail: 'Request Entity Too Large' }, 413)
       },
     })
     await screen.findByText('Ask anything, or attach a document.')
-    drop(textbox(), [file('big.xlsx'), file('full.csv'), file('odd.csv')])
+    drop(textbox(), [file('big.xlsx'), file('full.csv'), file('more.csv'), file('odd.csv')])
 
     expect(await screen.findByText('big.xlsx is larger than 50 MB.')).toBeInTheDocument()
     expect(
@@ -184,6 +204,7 @@ describe('Composer', () => {
         'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
       ),
     ).toBeInTheDocument()
+    expect(await screen.findByText('Send the attached files before adding more.')).toBeInTheDocument()
     expect(await screen.findByText('odd.csv could not be attached.')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
@@ -286,9 +307,15 @@ describe('Composer', () => {
   })
 
   it('gives the message and its files back when the server refuses it', async () => {
+    // The chat, read again after the refusal, lists the file as still waiting.
+    let waiting: AttachmentOut[] = []
     const { calls } = openChat({
-      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
-      [`POST ${MESSAGES}`]: () => json({ detail: 'An answer is still being written in this chat.' }, 409),
+      'GET /ghostwriter/api/chats/c1': () => json({ ...detail([]), pending_attachments: waiting }),
+      [`POST ${ATTACHMENTS}`]: () => {
+        waiting = [attachment('a1', 'sales.xlsx')]
+        return json(attachment('a1', 'sales.xlsx'), 201)
+      },
+      [`POST ${MESSAGES}`]: () => json({ detail: 'An answer is still being written in this chat.', code: 'busy' }, 409),
     })
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
@@ -320,6 +347,43 @@ describe('Composer', () => {
       { content: '', attachment_ids: ['a1'], reasoning: false },
     ])
     expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument()
+  })
+
+  it('drops attached files that another tab sent, once the chat is read again', async () => {
+    let listed: AttachmentOut[] = []
+    let holdRead: Promise<void> | null = null
+    const { client } = openChat({
+      'GET /ghostwriter/api/chats/c1': async () => {
+        const pending = listed
+        if (holdRead) await holdRead
+        return json({ ...detail([]), pending_attachments: pending })
+      },
+      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    const reread = () => client.invalidateQueries({ queryKey: ['chat', 'c1'] })
+
+    // A read that began before the file was attached cannot list it: the chip stays.
+    let release!: () => void
+    holdRead = new Promise<void>((done) => (release = done))
+    const early = reread()
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+    release()
+    await early
+    holdRead = null
+    expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done')
+
+    // A read that lists it as waiting keeps it, once.
+    listed = [attachment('a1', 'sales.xlsx')]
+    await act(reread)
+    expect(within(composer()).getAllByText('sales.xlsx')).toHaveLength(1)
+
+    // Another tab sent it: the next read no longer lists it, and its chip goes.
+    listed = []
+    await act(reread)
+    await waitFor(() => expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
   })
 
   it('hides the microphone with speech off and the paperclip without workbench', async () => {
@@ -391,6 +455,35 @@ describe('Composer', () => {
     expect(screen.queryByText(/s left$/)).not.toBeInTheDocument()
   })
 
+  it('says when no microphone could be used, and keeps the microphone for another try', async () => {
+    const media = installMedia({ failure: 'NotFoundError' })
+    openChat()
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Dictate' }))
+    expect(await screen.findByText('No microphone could be used.')).toBeInTheDocument()
+    const mic = screen.getByRole('button', { name: 'Dictate' })
+    expect(mic).toBeEnabled()
+    await user.click(mic)
+    expect(await screen.findByRole('button', { name: 'Stop dictating' })).toBeInTheDocument()
+    expect(media.getUserMedia).toHaveBeenCalledTimes(2)
+    expect(screen.queryByText('No microphone could be used.')).not.toBeInTheDocument()
+  })
+
+  it('aborts a transcription still running when the composer goes', async () => {
+    installMedia()
+    const { calls, unmount } = openChat({ [`POST ${TRANSCRIBE}`]: () => new Promise<Response>(() => {}) })
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Dictate' }))
+    await user.click(await screen.findByRole('button', { name: 'Stop dictating' }))
+    await waitFor(() => expect(callsTo(calls, 'POST', TRANSCRIBE)).toHaveLength(1))
+    const [sent] = callsTo(calls, 'POST', TRANSCRIBE)
+    expect(sent.signal?.aborted).toBe(false)
+    unmount()
+    expect(sent.signal?.aborted).toBe(true)
+  })
+
   it('says when the microphone was refused, and when the browser cannot record', async () => {
     installMedia({ denied: true })
     const { unmount } = openChat()
@@ -452,7 +545,7 @@ describe('the reasoning switch', () => {
     let regenerated = false
     const { calls } = openChat({
       'GET /ghostwriter/api/chats/c1': detail([QUESTION, ANSWER]),
-      [`POST ${MESSAGES}`]: () => json({ detail: 'An answer is still being written in this chat.' }, 409),
+      [`POST ${MESSAGES}`]: () => json({ detail: 'An answer is still being written in this chat.', code: 'busy' }, 409),
       'POST /ghostwriter/api/chats/c1/regenerate': () => {
         regenerated = true
         return sse.response()

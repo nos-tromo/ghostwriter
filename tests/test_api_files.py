@@ -25,6 +25,7 @@ from tests.fakes import UPLOAD_ID, XLSX, FakeDoor
 MIB = 1024 * 1024
 TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
 BOUNDARY = "gwtest"
+TOO_MANY_PENDING = {"detail": "Send the attached files before adding more.", "code": "too_many_pending"}
 NOT_FOUND = (404, {"detail": "File not found."})
 GONE = (410, {"detail": "The file has expired."})
 FID = UPLOAD_ID
@@ -308,8 +309,21 @@ def test_more_than_ten_pending_attachments_wait(client: TestClient, door: FakeDo
         door.upload_id = f"{n:032x}"
         assert _attach(client, cid, f"sales-{n}.xlsx").status_code == 201
     r = _attach(client, cid, "sales-10.xlsx")
-    assert (r.status_code, r.json()) == (409, {"detail": "Send the attached files before adding more."})
+    assert (r.status_code, r.json()) == (409, TOO_MANY_PENDING)
     assert len(door.uploads) == 10
+
+
+def test_expired_pending_attachments_leave_room(client: TestClient, door: FakeDoor, clock: Clock) -> None:
+    """Ten waiting files whose 7 days are over do not block an eleventh."""
+    cid = _new(client)
+    store = _state(client).store
+    for n in range(10):
+        store.add_attachment(cid, file_id=f"{n:032x}", path=f"/w/{n}", name=f"{n}.xlsx", size=1, mime=XLSX)
+    r = _attach(client, cid)
+    assert (r.status_code, r.json()) == (409, TOO_MANY_PENDING)
+    clock.now += timedelta(days=7)
+    assert _attach(client, cid).status_code == 201
+    assert len(door.uploads) == 1
 
 
 def test_two_parallel_uploads_at_nine_pending_leave_ten(

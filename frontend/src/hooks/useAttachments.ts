@@ -3,11 +3,11 @@ import { getPurpose, requestPurpose } from '@infra/ui'
 import { uploadAttachment } from '../api/chats'
 import { ApiError, PURPOSE_SCOPE, isPurposeRefusal } from '../api/client'
 import type { AppConfig, AttachmentOut } from '../api/types'
-import { useChat } from './useChats'
+import { nextMark, readMarkOf, useChat } from './useChats'
 
 /** Why a file is not attached: its type, its size, the upload, workbench's
- *  space, or a purpose the user did not state. */
-export type PendingError = 'type' | 'size' | 'upload' | 'storage_full' | 'purpose'
+ *  space, the files already waiting, or a purpose the user did not state. */
+export type PendingError = 'type' | 'size' | 'upload' | 'storage_full' | 'too_many_pending' | 'purpose'
 
 /** A file in the composer, from the drop or the pick until a message sends it. */
 export interface PendingFile {
@@ -17,6 +17,8 @@ export interface PendingFile {
   status: 'uploading' | 'done' | 'error'
   attachment?: AttachmentOut
   error?: PendingError
+  /** When the upload was done, on the page's order of events (`nextMark`). */
+  doneMark?: number
 }
 
 export interface Attachments {
@@ -52,6 +54,7 @@ function refusalOf(error: unknown): PendingError {
   if (error instanceof ApiError) {
     if (error.code === 'too_large') return 'size'
     if (error.code === 'storage_full') return 'storage_full'
+    if (error.code === 'too_many_pending') return 'too_many_pending'
   }
   return isPurposeRefusal(error) ? 'purpose' : 'upload'
 }
@@ -73,7 +76,9 @@ function waiting(attachment: AttachmentOut): PendingFile {
  * code (`too_large`, `storage_full`).
  *
  * Files attached earlier and not sent yet, as the chat lists them, are shown
- * and sent too, so leaving a chat and coming back loses none.
+ * and sent too, so leaving a chat and coming back loses none. An attached
+ * file the chat, read again since, no longer lists has been sent, from
+ * another tab: its chip goes.
  *
  * @param chatId - The chat, or null for none (nothing is uploaded).
  * @param config - The deployment's switches and limits.
@@ -121,7 +126,13 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
         try {
           const attachment = await uploadAttachment(chatId, next.file, controllerRef.current?.signal)
           // Named and sized as stored: the server reduces a name to a safe basename.
-          const stored = { status: 'done' as const, attachment, name: attachment.name, size: attachment.size }
+          const stored = {
+            status: 'done' as const,
+            attachment,
+            name: attachment.name,
+            size: attachment.size,
+            doneMark: nextMark(),
+          }
           if (aliveRef.current) settle(new Set([next.key]), stored)
         } catch (error) {
           if (aliveRef.current) settle(new Set([next.key]), { status: 'error', error: refusalOf(error) })
@@ -153,12 +164,23 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
   )
 
   const pending = useMemo(() => {
-    const known = new Set(local.flatMap((f) => (f.attachment ? [f.attachment.id] : [])))
+    const listed = new Set((chat?.pending_attachments ?? []).map((a) => a.id))
+    const readMark = readMarkOf(chat)
+    // Only a read begun after the upload was done can tell it is no longer waiting.
+    const sent = (f: PendingFile) =>
+      f.status === 'done' &&
+      f.attachment !== undefined &&
+      f.doneMark !== undefined &&
+      readMark !== undefined &&
+      readMark > f.doneMark &&
+      !listed.has(f.attachment.id)
+    const current = local.filter((f) => !sent(f))
+    const known = new Set(current.flatMap((f) => (f.attachment ? [f.attachment.id] : [])))
     const earlier = (chat?.pending_attachments ?? []).filter(
       (a) => !a.expired && !known.has(a.id) && !taken.has(a.id),
     )
-    return [...earlier.map(waiting), ...local]
-  }, [chat?.pending_attachments, local, taken])
+    return [...earlier.map(waiting), ...current]
+  }, [chat, local, taken])
 
   const clear = useCallback(() => {
     const done = pending.filter((f) => f.status === 'done')

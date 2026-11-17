@@ -75,6 +75,20 @@ describe('useRecorder', () => {
     expect(refused.recorders).toHaveLength(0)
   })
 
+  it('says when no microphone could be used, and lets the user try again', async () => {
+    for (const failure of ['NotFoundError', 'NotReadableError']) {
+      const media = installMedia({ failure })
+      const { result, unmount } = recorder()
+      await act(() => result.current.start())
+      expect(result.current.state).toBe('unavailable')
+      // Not "cannot record": once a microphone is there, the next try records.
+      await act(() => result.current.start())
+      expect(media.getUserMedia).toHaveBeenCalledTimes(2)
+      expect(result.current.state).toBe('recording')
+      unmount()
+    }
+  })
+
   it('counts the seconds and stops itself at the limit', async () => {
     vi.useFakeTimers()
     installMedia()

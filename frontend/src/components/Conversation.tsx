@@ -16,15 +16,26 @@ const ERROR_KEYS: Record<ErrorFrame['code'], keyof Strings> = {
   internal: 'error.internal',
 }
 
-/** Why the last answer ended early, or never started: a 409 is the chat's
- *  answer still being written, which a chat left and reopened can meet. */
+/** The refusals a send or a regenerate names by their code. */
+const REFUSAL_KEYS: Partial<Record<string, keyof Strings>> = {
+  busy: 'chat.answer_busy',
+  no_answer: 'chat.no_answer',
+}
+
+/** Why the last answer ended early, or never started: a refusal says what it
+ *  is by its code (`busy`, an answer still being written, which a chat left
+ *  and reopened can meet; `no_answer`), anything else is the generic line. */
 function FailureLine({ failure }: { failure: StreamFailure }) {
   const t = useT()
-  const busy = failure.kind === 'request' && failure.error instanceof ApiError && failure.error.status === 409
-  if (failure.kind === 'request' && !busy) return <RequestError error={failure.error} className="text-sm text-danger" />
+  let key: keyof Strings | undefined
+  if (failure.kind === 'answer') key = ERROR_KEYS[failure.code]
+  else if (failure.error instanceof ApiError && failure.error.code !== null) key = REFUSAL_KEYS[failure.error.code]
+  if (key === undefined) {
+    return <RequestError error={failure.kind === 'request' ? failure.error : null} className="text-sm text-danger" />
+  }
   return (
     <p role="alert" className="text-sm text-danger">
-      {t(failure.kind === 'answer' ? ERROR_KEYS[failure.code] : 'chat.answer_busy')}
+      {t(key)}
     </p>
   )
 }

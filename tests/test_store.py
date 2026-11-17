@@ -310,6 +310,21 @@ def test_the_pending_cap_is_counted_inside_the_write(store: ChatStore) -> None:
     assert store.pending_count(chat.id) == 2
 
 
+def test_expired_pending_attachments_do_not_count_against_the_cap(store: ChatStore, clock: Clock) -> None:
+    """Ten pending files whose 7 days are over no longer wait: an eleventh is taken."""
+    chat = store.create_chat("user-a")
+    for _ in range(10):
+        _attach(store, chat.id)
+    path, name = "/workspace/s/sales.xlsx", "sales.xlsx"
+    clock.now = T0 + 7 * DAY - timedelta(seconds=1)
+    with pytest.raises(TooManyPending):
+        store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=10)
+    clock.now = T0 + 7 * DAY
+    assert store.pending_count(chat.id) == 0
+    store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=10)
+    assert store.pending_count(chat.id) == 1
+
+
 def test_a_longer_file_period_brings_back_nothing_expired(store: ChatStore, engine: Engine, clock: Clock) -> None:
     """Content already read as expired stays expired; content still live gets the longer period."""
     chat = store.create_chat("user-a")

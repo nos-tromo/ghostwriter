@@ -39,10 +39,10 @@ export async function fileBlob(chatId: string, fileId: string, signal?: AbortSig
 
 /** The text of a recording. The server names the file by its type, never by
  *  the name sent here. */
-export async function transcribe(blob: Blob, mime: string): Promise<string> {
+export async function transcribe(blob: Blob, mime: string, signal?: AbortSignal): Promise<string> {
   const body = new FormData()
   body.append('file', new Blob([blob], { type: mime }), 'recording')
-  const out = await apiResult<TranscriptOut>(await apiFetch('/transcribe', { method: 'POST', body }))
+  const out = await apiResult<TranscriptOut>(await apiFetch('/transcribe', { method: 'POST', body, signal }))
   return out.text
 }
 

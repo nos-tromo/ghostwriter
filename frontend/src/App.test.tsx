@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, within } from '@testing-library/react'
+import { createEvent, fireEvent, render, screen, within } from '@testing-library/react'
 import { clearAllPurposes } from '@infra/ui'
 import App from './App'
 import indexHtml from '../index.html?raw'
@@ -53,6 +53,14 @@ describe('App', () => {
     const [header] = await screen.findAllByRole('banner')
     expect(screen.getAllByRole('banner')).toHaveLength(1)
     expect(within(header).getByText('Ghostwriter')).toBeInTheDocument()
+  })
+
+  it('keeps a file dropped beside the conversation from opening in the tab', async () => {
+    render(<App />)
+    await screen.findAllByRole('banner')
+    const drop = createEvent.drop(document.body, { dataTransfer: { files: [], types: ['Files'] } })
+    fireEvent(document.body, drop)
+    expect(drop.defaultPrevented).toBe(true)
   })
 
   it('presents the chat assistant first in the page title', async () => {
