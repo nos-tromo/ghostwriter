@@ -49,6 +49,8 @@ NAME_BYTES: Final = 255
 
 #: A file part's type when it names none.
 UNTYPED: Final = "application/octet-stream"
+#: The Unicode categories dropped from a name: control and format characters.
+_DROPPED: Final = frozenset({"Cc", "Cf"})
 _REPLACED: Final = re.compile(r'["*:<>?|]')
 _SEPARATORS: Final = re.compile(r"[/\\]")
 _BROWSER_ESCAPES: Final = {"%22": '"', "%0A": "\n", "%0D": "\r"}
@@ -71,26 +73,30 @@ class FilePart:
         filename: Its file name as the user had it; ``""`` when it names none.
         content_type: Its ``Content-Type`` as sent, or :data:`UNTYPED`.
         chunks: Its bytes, as they arrive; ends with the part, raises :class:`TooLarge` or
-            :class:`BadUpload`, and closes the request's stream when it ends or is closed.
+            :class:`BadUpload`, and closes the request's stream when it ends, or is closed after
+            it started. :meth:`aclose` closes the stream also when it never started.
     """
 
     filename: str
     content_type: str
     chunks: AsyncIterator[bytes]
+    _body: "_Body" = field(repr=False)
 
     async def aclose(self) -> None:
-        """Close :attr:`chunks` unread, and with it the request's stream."""
+        """Close :attr:`chunks` and the request's stream, whether the part was read or not."""
         aclose = getattr(self.chunks, "aclose", None)
         if aclose is not None:
             await aclose()
+        await self._body.aclose()
 
 
 def safe_filename(raw: str) -> str | None:
     """Reduce a file name as a user's system sent it to one safe name.
 
-    It keeps the text after the last ``/`` or backslash, drops control characters, replaces
-    ``"*:<>?|`` with ``_``, NFCs it and strips spaces and dots at both ends; the stem is cut so
-    the whole stays within :data:`NAME_CHARS` characters, keeping the extension.
+    It keeps the text after the last ``/`` or backslash, drops control and format characters
+    (bidi overrides, zero-width characters), replaces ``"*:<>?|`` with ``_``, NFCs it and strips
+    spaces and dots at both ends; the stem is cut so the whole stays within :data:`NAME_CHARS`
+    characters, keeping the extension.
 
     Args:
         raw: The name sent.
@@ -99,7 +105,7 @@ def safe_filename(raw: str) -> str | None:
         The name, or ``None`` when no stem is left.
     """
     name = _SEPARATORS.split(raw)[-1]
-    name = "".join(char for char in name if unicodedata.category(char) != "Cc")
+    name = "".join(char for char in name if unicodedata.category(char) not in _DROPPED)
     name = unicodedata.normalize("NFC", _REPLACED.sub("_", name)).rstrip(" .")
     stem, dot, extension = name.rpartition(".")
     if not dot:
@@ -321,4 +327,4 @@ async def read_file_part(request: Request, *, field: str = "file", max_bytes: in
         await body.aclose()
         raise
     filename, content_type = parts.found
-    return FilePart(filename, content_type, _part_bytes(parts, body, max_bytes))
+    return FilePart(filename, content_type, _part_bytes(parts, body, max_bytes), body)

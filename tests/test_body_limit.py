@@ -121,10 +121,10 @@ class Drive:
         return starts[0] if starts else None
 
     @property
-    def detail(self) -> str | None:
-        """The ``detail`` of a JSON answer, if one was sent."""
+    def answer(self) -> dict[str, str] | None:
+        """The JSON answer of a 413, if one was sent."""
         bodies = [m["body"] for m in self.sent if m["type"] == "http.response.body"]
-        return json.loads(bodies[0])["detail"] if self.status == 413 and bodies else None
+        return json.loads(bodies[0]) if self.status == 413 and bodies else None
 
 
 def drive(path: str, *, declared: int | None, chunks: list[bytes], method: str = "POST") -> Drive:
@@ -162,23 +162,23 @@ def drive(path: str, *, declared: int | None, chunks: list[bytes], method: str =
 
 
 @pytest.mark.parametrize(
-    ("path", "cap", "detail"),
+    ("path", "cap", "answer"),
     [
-        ("/api/chats/c-1/messages", MIB, "Request too large."),
-        ("/api/chats", MIB, "Request too large."),
-        ("/api/chats/c-1/attachments", 51 * MIB, "The file is larger than 50 MB."),
-        ("/api/transcribe", 11 * MIB, "Request too large."),
+        ("/api/chats/c-1/messages", MIB, {"detail": "Request too large."}),
+        ("/api/chats", MIB, {"detail": "Request too large."}),
+        ("/api/chats/c-1/attachments", 51 * MIB, {"detail": "The file is larger than 50 MB.", "code": "too_large"}),
+        ("/api/transcribe", 11 * MIB, {"detail": "Request too large."}),
     ],
 )
-def test_each_route_class_has_the_cap_nginx_gives_it(path: str, cap: int, detail: str) -> None:
+def test_each_route_class_has_the_cap_nginx_gives_it(path: str, cap: int, answer: dict[str, str]) -> None:
     """At its cap a body passes; one byte more is refused unread; a streamed body stops at the chunk past it."""
     r = drive(path, declared=cap, chunks=[b"x" * cap])
     assert (r.status, r.app_calls, r.error) == (200, 1, None)
     r = drive(path, declared=cap + 1, chunks=[b"x" * (cap + 1)])
-    assert (r.status, r.detail, r.app_calls, r.receives) == (413, detail, 0, 0)
+    assert (r.status, r.answer, r.app_calls, r.receives) == (413, answer, 0, 0)
     half = cap // 2
     r = drive(path, declared=None, chunks=[b"x" * half, b"x" * half, b"x", b"x" * half])
-    assert r.error is not None and (r.error.status_code, r.error.detail) == (413, detail)
+    assert r.error is not None and (r.error.status_code, r.error.detail) == (413, answer["detail"])
     assert (r.receives, r.status) == (3, None)
 
 

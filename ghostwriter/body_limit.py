@@ -5,7 +5,8 @@ reads a JSON body whole before it resolves who asks, so the cap must hold here t
 ``BodyLimit`` is the pattern: a declared ``Content-Length`` over the route's cap is answered 413
 before any body is read, and a body without one, or one that lies, is counted as it arrives and
 stopped at the first chunk past the cap with :class:`BodyTooLarge`, which the app answers as any
-``HTTPException``. Nothing here is logged.
+``HTTPException``; the multipart routes read through :func:`~ghostwriter.upload.read_file_part`,
+which turns it into the route's own 413. Nothing here is logged.
 
 The caps, as ``frontend/nginx/default.conf`` sets them: 1 MiB for every route; one attachment and
 its multipart framing for ``/api/chats/{id}/attachments``; a recording and its framing for
@@ -33,8 +34,9 @@ ATTACHMENT_MAX_BYTES: Final = MAX_ATTACHMENT_BYTES + MULTIPART_SLACK
 TRANSCRIBE_MAX_BYTES: Final = 11 * _MIB
 
 REQUEST_TOO_LARGE: Final = "Request too large."
-#: The attachment route's answer, the one it gives a file past 50 MB itself.
+#: The attachment route's answer, the one it gives a file past 50 MB itself, with its code.
 FILE_TOO_LARGE: Final = "The file is larger than 50 MB."
+TOO_LARGE_CODE: Final = "too_large"
 
 ATTACHMENTS_PATH: Final = re.compile(r"/api/chats/[^/]+/attachments")
 TRANSCRIBE_PATH: Final = "/api/transcribe"
@@ -52,20 +54,20 @@ class BodyTooLarge(HTTPException):
         super().__init__(status_code=status.HTTP_413_CONTENT_TOO_LARGE, detail=detail)
 
 
-def body_cap(path: str) -> tuple[int, str]:
+def body_cap(path: str) -> tuple[int, dict[str, str]]:
     """Return a route's cap and its answer, matched on the path as nginx's locations are.
 
     Args:
         path: The request's path.
 
     Returns:
-        The cap in bytes and the 413's ``detail``.
+        The cap in bytes and the 413's JSON body: its ``detail``, and on the attachment route its ``code``.
     """
     if ATTACHMENTS_PATH.fullmatch(path):
-        return ATTACHMENT_MAX_BYTES, FILE_TOO_LARGE
+        return ATTACHMENT_MAX_BYTES, {"detail": FILE_TOO_LARGE, "code": TOO_LARGE_CODE}
     if path == TRANSCRIBE_PATH:
-        return TRANSCRIBE_MAX_BYTES, REQUEST_TOO_LARGE
-    return REQUEST_MAX_BYTES, REQUEST_TOO_LARGE
+        return TRANSCRIBE_MAX_BYTES, {"detail": REQUEST_TOO_LARGE}
+    return REQUEST_MAX_BYTES, {"detail": REQUEST_TOO_LARGE}
 
 
 def _declared_length(scope: Scope) -> int | None:
@@ -103,10 +105,10 @@ class BodyLimit:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
-        cap, detail = body_cap(scope["path"])
+        cap, answer = body_cap(scope["path"])
         declared = _declared_length(scope)
         if declared is not None and declared > cap:
-            await JSONResponse({"detail": detail}, status_code=status.HTTP_413_CONTENT_TOO_LARGE)(scope, receive, send)
+            await JSONResponse(answer, status_code=status.HTTP_413_CONTENT_TOO_LARGE)(scope, receive, send)
             return
         seen = 0
 
@@ -116,7 +118,7 @@ class BodyLimit:
             if message["type"] == "http.request":
                 seen += len(message.get("body", b""))
                 if seen > cap:
-                    raise BodyTooLarge(detail)
+                    raise BodyTooLarge(answer["detail"])
             return message
 
         await self.app(scope, counted, send)

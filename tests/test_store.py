@@ -15,7 +15,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment, Chat, Message, Result, ToolStep
 from ghostwriter.schemas import AttachmentOut, ResultOut, StepOut, TablePreviewOut
-from ghostwriter.store import AttachmentNotPending, ChatNotFound, ChatStore, FileRef
+from ghostwriter.store import AttachmentNotPending, ChatNotFound, ChatStore, FileRef, TooManyPending
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -294,6 +294,20 @@ def test_an_attachment_keeps_the_id_it_was_given(store: ChatStore) -> None:
     minted = store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX).id
     assert UUID(minted).version == 4 and minted != given
     assert {a.id for a in store.chat_detail("user-a", chat.id).pending_attachments} == {given, minted}
+
+
+def test_the_pending_cap_is_counted_inside_the_write(store: ChatStore) -> None:
+    """At the cap an attachment is refused by the transaction that would store it; a sent one frees its place."""
+    chat = store.create_chat("user-a")
+    first = _attach(store, chat.id)
+    _attach(store, chat.id)
+    path, name = "/workspace/s/sales.xlsx", "sales.xlsx"
+    with pytest.raises(TooManyPending):
+        store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
+    assert store.pending_count(chat.id) == 2
+    store.add_user_message("user-a", chat.id, "Hallo", [first.id])
+    store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
+    assert store.pending_count(chat.id) == 2
 
 
 def test_a_longer_file_period_brings_back_nothing_expired(store: ChatStore, engine: Engine, clock: Clock) -> None:

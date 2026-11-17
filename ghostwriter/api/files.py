@@ -23,19 +23,21 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
+from loguru import logger
 from starlette.responses import Response
 from starlette.types import Receive, Scope, Send
 from typing_extensions import override
 
 from ghostwriter.api.chats import CHAT_NOT_FOUND, owned_chat
 from ghostwriter.audit import Operation, audited, forward_headers
-from ghostwriter.body_limit import FILE_TOO_LARGE
+from ghostwriter.body_limit import FILE_TOO_LARGE, TOO_LARGE_CODE
 from ghostwriter.identity import Principal, resolve_principal
 from ghostwriter.schemas import AttachmentOut
-from ghostwriter.store import ChatNotFound, ChatStore
+from ghostwriter.store import ChatNotFound, ChatStore, TooManyPending
 from ghostwriter.upload import (
     MAX_PENDING,
     BadUpload,
+    FilePart,
     TooLarge,
     attachment_type,
     name_problem,
@@ -47,6 +49,7 @@ from ghostwriter.workbench import (
     MAX_ATTACHMENT_BYTES,
     CallFor,
     StorageFull,
+    UploadedFile,
     UploadTooLarge,
     WorkbenchClient,
     WorkbenchNotFound,
@@ -113,6 +116,19 @@ def _checked_name(raw: str) -> tuple[str, str] | JSONResponse:
     return name, mime
 
 
+async def _drop_orphan(workbench: WorkbenchClient, call: CallFor) -> None:
+    """Delete a vanished chat's folder in workbench, best effort, so no file stored after its delete waits there.
+
+    Args:
+        workbench: The client.
+        call: The chat.
+    """
+    try:
+        await workbench.delete_chat(call=call)
+    except Exception as exc:
+        logger.warning("A vanished chat's folder could not be deleted in workbench: {}", type(exc).__name__)
+
+
 async def _child_failed(op: Operation, operation: str, target: Target, recipient: str, reason: str) -> None:
     await run_in_threadpool(
         op.child,
@@ -150,10 +166,12 @@ async def attach_file(
             the hand-over; ``disclose`` / ``chat.attachment`` children record the hand-over.
 
     Returns:
-        The pending attachment, or the refusal.
+        The pending attachment, or the refusal: 409 also when parallel uploads filled the chat
+        meanwhile, counted again as the attachment is stored.
 
     Raises:
-        HTTPException: 404 for another owner's chat or an unknown one, also one deleted meanwhile.
+        HTTPException: 404 for another owner's chat or an unknown one, also one deleted meanwhile;
+            deleted once workbench stored the file, the chat's folder is deleted there, best effort.
     """
     store = _store(request)
     await run_in_threadpool(owned_chat, store, user.name, chat_id)
@@ -165,29 +183,66 @@ async def attach_file(
     try:
         part = await read_file_part(request, max_bytes=MAX_ATTACHMENT_BYTES)
     except TooLarge:
-        return _refused(status.HTTP_413_CONTENT_TOO_LARGE, FILE_TOO_LARGE)
+        return _refused(status.HTTP_413_CONTENT_TOO_LARGE, FILE_TOO_LARGE, TOO_LARGE_CODE)
     except BadUpload:
         return _refused(status.HTTP_400_BAD_REQUEST, UNREADABLE)
-    checked = _checked_name(part.filename)
-    if isinstance(checked, JSONResponse):
-        await part.aclose()
-        return checked
-    name, mime = checked
-    attachment_id = str(uuid4())
-    target = Target(kind="attachment", ids=(attachment_id,))
-    op.container = chat_id
     try:
+        checked = _checked_name(part.filename)
+        if isinstance(checked, JSONResponse):
+            return checked
+        name, mime = checked
+        attachment_id = str(uuid4())
+        target = Target(kind="attachment", ids=(attachment_id,))
+        op.container = chat_id
         await run_in_threadpool(op.record, target=target, criteria={"mime": mime})
         await run_in_threadpool(op.child, "disclose", ATTACHMENT, target=target, recipient=UPLOAD_RECIPIENT)
-    except BaseException:
+        call = CallFor(user.name, chat_id, forward_headers(op.context))
+        stored = await _hand_over(workbench, op, call, name, mime, target, part)
+    finally:
         await part.aclose()
-        raise
-    call = CallFor(user.name, chat_id, forward_headers(op.context))
+    if isinstance(stored, JSONResponse):
+        return stored
     try:
-        stored = await workbench.upload(call=call, filename=name, mime=mime, chunks=part.chunks)
+        return await run_in_threadpool(
+            store.add_attachment,
+            chat_id,
+            file_id=stored.id,
+            path=stored.path,
+            name=name,
+            size=stored.size,
+            mime=mime,
+            id=attachment_id,
+            max_pending=MAX_PENDING,
+        )
+    except TooManyPending:
+        return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING)
+    except ChatNotFound:
+        await _drop_orphan(workbench, call)
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
+
+
+async def _hand_over(
+    workbench: WorkbenchClient, op: Operation, call: CallFor, name: str, mime: str, target: Target, part: FilePart
+) -> UploadedFile | JSONResponse:
+    """Stream the part into the chat's folder, recording a failed hand-over as the upload's ``error`` child.
+
+    Args:
+        workbench: The client.
+        op: The upload's operation, its ``disclose`` child written.
+        call: The chat.
+        name: The file's safe name.
+        mime: Its type.
+        target: The attachment, by its id.
+        part: The file part, its bytes still to come.
+
+    Returns:
+        What workbench stored, or the refusal.
+    """
+    try:
+        return await workbench.upload(call=call, filename=name, mime=mime, chunks=part.chunks)
     except (TooLarge, UploadTooLarge):
-        await _child_failed(op, ATTACHMENT, target, UPLOAD_RECIPIENT, "too_large")
-        return _refused(status.HTTP_413_CONTENT_TOO_LARGE, FILE_TOO_LARGE, "too_large")
+        await _child_failed(op, ATTACHMENT, target, UPLOAD_RECIPIENT, TOO_LARGE_CODE)
+        return _refused(status.HTTP_413_CONTENT_TOO_LARGE, FILE_TOO_LARGE, TOO_LARGE_CODE)
     except StorageFull:
         await _child_failed(op, ATTACHMENT, target, UPLOAD_RECIPIENT, "storage_full")
         return _refused(status.HTTP_507_INSUFFICIENT_STORAGE, STORAGE_FULL, "storage_full")
@@ -202,19 +257,6 @@ async def attach_file(
     except Exception:
         await _child_failed(op, ATTACHMENT, target, UPLOAD_RECIPIENT, "error")
         raise
-    try:
-        return await run_in_threadpool(
-            store.add_attachment,
-            chat_id,
-            file_id=stored.id,
-            path=stored.path,
-            name=name,
-            size=stored.size,
-            mime=mime,
-            id=attachment_id,
-        )
-    except ChatNotFound:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
 
 
 class FileStream(StreamingResponse):

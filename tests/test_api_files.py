@@ -4,10 +4,12 @@ Every name, id and value here is invented.
 """
 
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+import anyio
 import httpx
 import httpx2
 import pytest
@@ -16,12 +18,13 @@ from fastapi.testclient import TestClient
 
 from ghostwriter.db import utcnow
 from ghostwriter.main import create_app
-from ghostwriter.workbench import chat_folder
+from ghostwriter.workbench import chat_folder, session_pseudonym
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings
 from tests.fakes import UPLOAD_ID, XLSX, FakeDoor
 
 MIB = 1024 * 1024
-TOO_LARGE = {"detail": "The file is larger than 50 MB."}
+TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
+BOUNDARY = "gwtest"
 NOT_FOUND = (404, {"detail": "File not found."})
 GONE = (410, {"detail": "The file has expired."})
 FID = UPLOAD_ID
@@ -146,15 +149,28 @@ def test_extensions_match_in_any_case(client: TestClient, door: FakeDoor) -> Non
 def test_a_file_over_50_mib_is_refused_with_413(
     client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
 ) -> None:
-    """A declared length past the cap is refused unread and unrecorded; a file past 50 MiB within it is cut off."""
+    """Past the cap as declared or before the part begins, refused unrecorded; past 50 MiB cut off; one answer."""
     cid = _new(client)
     before = len(events(audit_stream))
     r = _attach(client, cid, headers={**as_user(), "Content-Length": str(52 * MIB)})
     assert (r.status_code, r.json()) == (413, TOO_LARGE)
     assert door.requests == [] and _since(audit_stream, before) == []
 
+    head = f'--{BOUNDARY}\r\nContent-Disposition: form-data; name="x"\r\n\r\n'.encode()
+    tail = f'\r\n--{BOUNDARY}\r\nContent-Disposition: form-data; name="file"; filename="sales.xlsx"\r\n\r\nPK'.encode()
+
+    def body() -> Iterator[bytes]:
+        yield head
+        yield from (b"x" * MIB for _ in range(52))
+        yield tail + f"\r\n--{BOUNDARY}--\r\n".encode()
+
+    form = {**as_user(), "Content-Type": f"multipart/form-data; boundary={BOUNDARY}"}
+    r = client.post(f"/api/chats/{cid}/attachments", content=body(), headers=form)
+    assert (r.status_code, r.json()) == (413, TOO_LARGE)
+    assert door.requests == [] and _since(audit_stream, before) == []
+
     r = _attach(client, cid, data=b"\x00" * (50 * MIB + 1))
-    assert (r.status_code, r.json()) == (413, {**TOO_LARGE, "code": "too_large"})
+    assert (r.status_code, r.json()) == (413, TOO_LARGE)
     assert door.uploads == [] and _state(client).store.pending_count(cid) == 0
     disclosed = [e for e in _since(audit_stream, before) if e["action"] == "disclose"]
     assert [(e["outcome"], e.get("criteria")) for e in disclosed] == [("ok", None), ("error", {"reason": "too_large"})]
@@ -216,18 +232,24 @@ def test_any_other_failure_of_workbench_is_502(
     assert failed["criteria"] == {"reason": "unreachable"}
 
 
-def test_a_chat_deleted_during_the_upload_is_not_found(client: TestClient, door: FakeDoor) -> None:
-    """Workbench refusing a chat deleted meanwhile, or the chat gone once workbench stored the file: 404, no row."""
+def test_a_chat_deleted_during_the_upload_is_not_found(
+    client: TestClient, door: FakeDoor, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A chat deleted meanwhile: 404, no row; gone once workbench stored the file, its folder is deleted too."""
     cid = _new(client)
     door.answers["/files/upload"] = httpx.Response(404, json={"detail": "not found"})
     r = _attach(client, cid)
     assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
 
-    other = _new(client)
-    door.answers["/files/upload"] = lambda folder: _state(client).store.delete_chat_rows(other)
-    r = _attach(client, other)
-    assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
-    assert door.uploads[-1].filename == "sales.xlsx"
+    for answer in ({"deleted": 1}, httpx.ConnectError("connection refused")):
+        other = _new(client)
+        door.answers["/files/upload"] = lambda folder, chat=other: _state(client).store.delete_chat_rows(chat)
+        door.answers["/files/chat"] = answer
+        r = _attach(client, other)
+        assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
+        assert door.uploads[-1].filename == "sales.xlsx"
+        assert door.last("/files/chat").headers["x-session-id"] == session_pseudonym(KEY, other)
+    assert "WorkbenchUnavailable" in loguru_caplog.text and other not in loguru_caplog.text
 
 
 def test_uploads_need_workbench(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
@@ -250,6 +272,34 @@ def test_more_than_ten_pending_attachments_wait(client: TestClient, door: FakeDo
     r = _attach(client, cid, "sales-10.xlsx")
     assert (r.status_code, r.json()) == (409, {"detail": "Send the attached files before adding more."})
     assert len(door.uploads) == 10
+
+
+def test_two_parallel_uploads_at_nine_pending_leave_ten(
+    tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor
+) -> None:
+    """Both pass the first count before either is stored; the count under the store's write lock refuses one."""
+    arrived = 0
+
+    async def together(request: httpx.Request) -> httpx.Response:
+        nonlocal arrived
+        if request.url.path == "/files/upload":
+            arrived += 1
+            with anyio.fail_after(5):
+                while arrived < 2:
+                    await anyio.sleep(0.01)
+        return await door(request)
+
+    transport = httpx.MockTransport(together)
+    with TestClient(
+        create_app(make_settings(tmp_path), audit_stream=audit_stream, workbench_transport=transport)
+    ) as client:
+        cid = _new(client)
+        store = _state(client).store
+        for n in range(9):
+            store.add_attachment(cid, file_id=f"{n:032x}", path=f"/w/{n}", name=f"{n}.xlsx", size=1, mime=XLSX)
+        with ThreadPoolExecutor(2) as pool:
+            statuses = sorted(pool.map(lambda n: _attach(client, cid, f"sales-{n}.xlsx").status_code, range(2)))
+        assert (statuses, arrived, store.pending_count(cid)) == ([201, 409], 2, 10)
 
 
 def test_an_upload_is_recorded_as_collect_then_disclose(client: TestClient, audit_stream: CapturedAuditStream) -> None:

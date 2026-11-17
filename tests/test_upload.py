@@ -3,18 +3,43 @@
 Every name, id and value here is invented.
 """
 
+from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
 import pytest
 from starlette.requests import Request
 from starlette.types import Message
+from typing_extensions import override
 
 from ghostwriter.upload import BadUpload, TooLarge, name_problem, read_file_part, safe_filename
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 BOUNDARY = "gwtest"
 KIB = 1024
+
+
+class TrackedRequest(Request):
+    """A request that tells when its body stream was closed.
+
+    Attributes:
+        closed: Whether the stream's ``finally`` ran.
+    """
+
+    closed: bool = False
+
+    @override
+    async def stream(self) -> AsyncGenerator[bytes]:
+        """Yield the body as Starlette does, noting when the stream ends or is closed.
+
+        Yields:
+            The body's pieces.
+        """
+        try:
+            async for chunk in super().stream():
+                yield chunk
+        finally:
+            self.closed = True
 
 
 class Body:
@@ -53,7 +78,7 @@ def _form(name: str, data: bytes, mime: str = XLSX) -> tuple[bytes, str]:
     return request.read(), request.headers["content-type"]
 
 
-def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[Request, Body]:
+def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[TrackedRequest, Body]:
     fed = Body(body, piece)
     scope: dict[str, Any] = {
         "type": "http",
@@ -62,7 +87,7 @@ def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[
         "query_string": b"",
         "headers": [(b"content-type", content_type.encode("latin-1"))],
     }
-    return Request(scope, fed.receive), fed
+    return TrackedRequest(scope, fed.receive), fed
 
 
 @pytest.mark.parametrize(
@@ -73,6 +98,7 @@ def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[
         ("re\u0301sume\u0301.docx", "résumé.docx"),
         ('Q3 "final".xlsx', "Q3 _final_.xlsx"),
         ("line\nbreak.csv", "linebreak.csv"),
+        ("in\u202evoice\u200b.pdf", "invoice.pdf"),
         (" .hidden notes.txt. ", "hidden notes.txt"),
         ("..", None),
         (".pdf", None),
@@ -80,7 +106,7 @@ def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[
     ],
 )
 def test_upload_names_are_reduced_to_a_safe_basename(raw: str, safe: str | None) -> None:
-    """Review Focus 1: a basename, NFC, control characters dropped, ``"*:<>?|`` replaced, ends stripped."""
+    """Review Focus 1: a basename, NFC, control and format characters dropped, ``"*:<>?|`` replaced, ends stripped."""
     assert safe_filename(raw) == safe
 
 
@@ -103,6 +129,16 @@ async def test_the_file_part_streams_without_being_kept_whole() -> None:
             assert fed.received < fed.total
         got += chunk
     assert bytes(got) == data and fed.received == fed.total
+
+
+async def test_a_part_closed_unread_closes_the_request_body_at_once() -> None:
+    """The route's 415 and 422 close the part unread; the request's stream closes then, not once collected."""
+    body, content_type = _form("tool.exe", b"\x00" * (2 * KIB))
+    request, _ = _request(body, content_type, piece=256)
+    part = await read_file_part(request, max_bytes=KIB)
+    assert not request.closed
+    await part.aclose()
+    assert request.closed
 
 
 async def test_a_body_past_the_cap_stops_reading() -> None:

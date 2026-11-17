@@ -51,6 +51,10 @@ class AttachmentNotPending(ValueError):
     """An attachment is not waiting in this chat for a message."""
 
 
+class TooManyPending(Exception):
+    """The chat already holds as many attachments waiting for a message as it may."""
+
+
 @dataclass(frozen=True)
 class FileRef:
     """Where a chat's file is in workbench.
@@ -719,7 +723,16 @@ class ChatStore:
             return self._result_out(row, now)
 
     def add_attachment(
-        self, chat_id: str, *, file_id: str, path: str, name: str, size: int, mime: str, id: str | None = None
+        self,
+        chat_id: str,
+        *,
+        file_id: str,
+        path: str,
+        name: str,
+        size: int,
+        mime: str,
+        id: str | None = None,
+        max_pending: int | None = None,
     ) -> AttachmentOut:
         """Store a file handed to workbench, by reference, pending until a message sends it.
 
@@ -731,18 +744,23 @@ class ChatStore:
             size: Its size in bytes.
             mime: Its MIME type.
             id: The attachment's id, when it was recorded before the hand-over; minted otherwise.
+            max_pending: The most attachments the chat may hold waiting, counted under the write
+                lock, so parallel uploads cannot pass it; ``None`` counts nothing.
 
         Returns:
             The attachment.
 
         Raises:
             ChatNotFound: If the chat is gone, as one deleted while its file was handed over.
+            TooManyPending: If the chat already holds ``max_pending`` waiting attachments.
         """
         now = self._now()
         with self._transaction() as s:
             self._mark_first_file(s, chat_id, now)
             if s.get(Chat, chat_id) is None:
                 raise ChatNotFound("chat not found")
+            if max_pending is not None and self._pending(s, chat_id) >= max_pending:
+                raise TooManyPending("too many pending attachments")
             attachment = Attachment(
                 id=str(uuid4()) if id is None else id,
                 chat_id=chat_id,
@@ -757,6 +775,23 @@ class ChatStore:
             s.add(attachment)
             return self._attachment_out(attachment, now)
 
+    @staticmethod
+    def _pending(s: Session, chat_id: str) -> int:
+        """Count a chat's attachments not yet sent with a message, in an open session.
+
+        Args:
+            s: The session.
+            chat_id: The chat.
+
+        Returns:
+            The count.
+        """
+        return s.execute(
+            select(func.count())
+            .select_from(Attachment)
+            .where(Attachment.chat_id == chat_id, Attachment.message_id.is_(None))
+        ).scalar_one()
+
     def pending_count(self, chat_id: str) -> int:
         """Count a chat's attachments not yet sent with a message.
 
@@ -767,11 +802,7 @@ class ChatStore:
             The count.
         """
         with self._transaction() as s:
-            return s.execute(
-                select(func.count())
-                .select_from(Attachment)
-                .where(Attachment.chat_id == chat_id, Attachment.message_id.is_(None))
-            ).scalar_one()
+            return self._pending(s, chat_id)
 
     def pending_ids(self, chat_id: str) -> set[str]:
         """Return the ids of a chat's attachments not yet sent with a message.
