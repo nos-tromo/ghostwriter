@@ -33,6 +33,8 @@ export const de: Strings = {
   'chat.answer_pending': 'Antwort wird erstellt…',
   'chat.thinking': 'denkt nach…',
   'chat.regenerate': 'Neu erzeugen',
+  'chat.copy_answer': 'Antwort kopieren',
+  'chat.copy_code': 'Code kopieren',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
   'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
 

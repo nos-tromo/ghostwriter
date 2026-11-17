@@ -1,7 +1,17 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { screen, within } from '@testing-library/react'
+import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import { LanguageContext } from '../i18n/LanguageContext'
-import { CONFIG, StreamedConversation, detail, message, renderWithClient, result, serve, step } from '../test/fixtures'
+import {
+  CONFIG,
+  StreamedConversation,
+  detail,
+  message,
+  renderWithClient,
+  result,
+  serve,
+  step,
+  stubClipboard,
+} from '../test/fixtures'
 
 afterEach(() => vi.unstubAllGlobals())
 
@@ -77,5 +87,23 @@ describe('Conversation', () => {
     const last = screen.getByText('Spalte C ist leer.').closest('[data-role="assistant"]') as HTMLElement
     expect(within(last).getByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Regenerate' })).toHaveLength(1)
+  })
+
+  it('copies a finished answer as its Markdown; a question has no copy button', async () => {
+    const markdown = 'Die **Summe** ist 42.\n\n| Monat | Betrag |\n|---|---|\n| Jan | 42 |'
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([
+        message({ id: 'm1', role: 'user', content: 'Summe der Spalte B?' }),
+        message({ id: 'm2', role: 'assistant', content: markdown }),
+      ]),
+    })
+    const writeText = stubClipboard()
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const answer = (await screen.findByText('Summe', { selector: 'strong' })).closest('[data-role="assistant"]') as HTMLElement
+    const question = screen.getByText('Summe der Spalte B?').closest('[data-role="user"]') as HTMLElement
+    expect(within(question).queryByRole('button', { name: 'Copy answer' })).not.toBeInTheDocument()
+    fireEvent.click(within(answer).getByRole('button', { name: 'Copy answer' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith(markdown))
+    expect(await within(answer).findByRole('button', { name: 'Copied' })).toBeInTheDocument()
   })
 })

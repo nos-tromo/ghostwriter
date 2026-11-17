@@ -1,10 +1,29 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { LanguageContext } from '../i18n/LanguageContext'
+import { stubClipboard } from '../test/fixtures'
 import { MarkdownProse } from './MarkdownProse'
 
 afterEach(() => vi.unstubAllGlobals())
 
 describe('MarkdownProse', () => {
+  it('copies a code block\'s code, without the fence or the text around it', async () => {
+    const writeText = stubClipboard()
+    render(<MarkdownProse text={'Die Summe:\n\n```python\nprint(sum([1, 2]))\nprint("Ende")\n```\n\nFertig.'} />)
+    fireEvent.click(screen.getByRole('button', { name: 'Copy code' }))
+    await waitFor(() => expect(writeText).toHaveBeenCalledWith('print(sum([1, 2]))\nprint("Ende")'))
+    expect(await screen.findByRole('button', { name: 'Copied' })).toBeInTheDocument()
+  })
+
+  it('names the copy button in German too, and only for code blocks', () => {
+    render(
+      <LanguageContext value="de">
+        <MarkdownProse text={'Mit `inline` Code.\n\n```\nSumme\n```'} />
+      </LanguageContext>,
+    )
+    expect(screen.getAllByRole('button', { name: 'Code kopieren' })).toHaveLength(1)
+  })
+
   it('highlights code without any network request', () => {
     const fetch = vi.fn()
     vi.stubGlobal('fetch', fetch)

@@ -31,6 +31,8 @@ export const en = {
   'chat.answer_pending': 'Working on an answer…',
   'chat.thinking': 'thinking…',
   'chat.regenerate': 'Regenerate',
+  'chat.copy_answer': 'Copy answer',
+  'chat.copy_code': 'Copy code',
   'chat.answer_busy': 'An answer is still being written in this chat.',
   'chat.no_answer': 'There is no answer to regenerate.',
 

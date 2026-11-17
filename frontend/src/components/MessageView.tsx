@@ -1,4 +1,4 @@
-import { Badge, RefreshButton, Spinner } from '@infra/ui'
+import { Badge, CopyButton, RefreshButton, Spinner } from '@infra/ui'
 import type { AttachmentOut, MessageOut } from '../api/types'
 import type { DraftAnswer, PendingMessage } from '../hooks/useChatStream'
 import { useLang, useT } from '../i18n/LanguageContext'
@@ -56,8 +56,9 @@ function Pending({ reasoning }: { reasoning: boolean }) {
 
 /**
  * One message: the user's text with its attachments, or an answer with its
- * trail, its text as Markdown and its result cards. The last answer offers to
- * be regenerated (`onRegenerate`).
+ * trail, its text as Markdown and its result cards. An answer with text can
+ * be copied as its Markdown; the last answer offers to be regenerated
+ * (`onRegenerate`).
  */
 export function MessageView({
   chatId,
@@ -79,9 +80,12 @@ export function MessageView({
       {message.results.map((result) => (
         <ResultCard key={result.id} chatId={chatId} result={result} />
       ))}
-      {onRegenerate && (
-        <div className="flex justify-end">
-          <RefreshButton label={t('chat.regenerate')} onClick={onRegenerate} />
+      {(message.content || onRegenerate) && (
+        <div className="flex justify-end gap-1">
+          {message.content && (
+            <CopyButton text={message.content} label={t('chat.copy_answer')} copiedLabel={t('common.copied')} />
+          )}
+          {onRegenerate && <RefreshButton label={t('chat.regenerate')} onClick={onRegenerate} />}
         </div>
       )}
     </div>

@@ -80,6 +80,13 @@ export function serve(routes: Record<string, Answer>): Call[] {
   return calls
 }
 
+/** Stub the clipboard; returns its `writeText`, which every copy calls. */
+export function stubClipboard() {
+  const writeText = vi.fn(async (_text: string) => {})
+  vi.spyOn(navigator, 'clipboard', 'get').mockReturnValue({ writeText } as unknown as Clipboard)
+  return writeText
+}
+
 /** The calls to one route. */
 export function callsTo(calls: Call[], method: string, url: string): Call[] {
   return calls.filter((call) => call.method === method && call.url === url)

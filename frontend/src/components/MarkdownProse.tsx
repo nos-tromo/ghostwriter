@@ -1,9 +1,12 @@
 // Copied from docint's frontend/src/components/common/MarkdownProse.tsx, with
-// bundled code highlighting (rehype-highlight) and the code block the trail uses.
-import Markdown, { type Components, type Options as MarkdownOptions } from 'react-markdown'
+// bundled code highlighting (rehype-highlight), a copy button per code block,
+// and the code block the trail uses.
+import type { ComponentProps } from 'react'
+import Markdown, { type Components, type ExtraProps, type Options as MarkdownOptions } from 'react-markdown'
 import rehypeHighlight, { type Options as HighlightOptions } from 'rehype-highlight'
 import remarkGfm from 'remark-gfm'
-import { cn, useTheme } from '@infra/ui'
+import { CopyButton, cn, useTheme } from '@infra/ui'
+import { useT } from '../i18n/LanguageContext'
 import { languages } from '../lib/highlight'
 
 /** Where a link may go: the web and mail. Anything else (`javascript:` and
@@ -34,7 +37,26 @@ function saysWhere(text: string, href: string): boolean {
   return text === href || `http://${text}` === href || `mailto:${text}` === href
 }
 
+/** A code block with a button that copies its code, as written: no fence,
+ *  no highlighting. The wrapper takes the block's margins, so the button sits
+ *  on the block's corner. */
+function CopyablePre({ node, ...props }: ComponentProps<'pre'> & ExtraProps) {
+  const t = useT()
+  return (
+    <div className="relative my-3 first:mt-0 last:mb-0 [&>pre]:my-0">
+      <pre {...props} />
+      <CopyButton
+        text={textOf(node).replace(/\n$/, '')}
+        label={t('chat.copy_code')}
+        copiedLabel={t('common.copied')}
+        className="absolute right-1 top-1"
+      />
+    </div>
+  )
+}
+
 const components: Components = {
+  pre: CopyablePre,
   // A model-written table is often wider than its panel, so it scrolls in its own box.
   table: ({ node: _node, ...props }) => (
     <div className="overflow-x-auto" data-testid="markdown-table">
