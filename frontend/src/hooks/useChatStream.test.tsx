@@ -344,6 +344,12 @@ describe('useChatStream', () => {
   })
 })
 
+/** Hands the app's registry of chat streams to the test. */
+function RegistryProbe({ onStreams }: { onStreams: (streams: ChatStreams) => void }) {
+  onStreams(useChatStreams())
+  return null
+}
+
 /** Two chats, one open at a time, keyed as the app keys its pane; `onStreams` gets the registry. */
 function TwoChats({ onStreams }: { onStreams: (streams: ChatStreams) => void }) {
   const [open, setOpen] = useState('c1')
@@ -386,6 +392,46 @@ function serveTwoChats() {
 }
 
 describe('answers in chats the user has left', () => {
+  it('shows each message once on return, as the server lists the chat while its answer runs', async () => {
+    const sse = sseStream()
+    let sent = false
+    const reading = step({ id: 's1', tool: 'read_document', status: 'ok', detail: 'sales.xlsx' })
+    // What the backend's chat_detail returns once the send stored the question and opened the answer.
+    const midStream = detail([
+      message({ id: 'm1', role: 'user', content: 'Summe der Spalte B?' }),
+      message({ id: 'm2', role: 'assistant', content: '', steps: [reading] }),
+    ])
+    const calls = serve({
+      'GET /ghostwriter/api/chats/c1': () => json(sent ? midStream : detail([])),
+      'GET /ghostwriter/api/chats/c2': () => json(detail([], { ...CHAT, id: 'c2' })),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages': () => {
+        sent = true
+        return sse.response()
+      },
+    })
+    renderWithClient(<TwoChats onStreams={() => {}} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('start', { message_id: 'm2', user_message_id: 'm1' })
+    sse.push('step', reading)
+    sse.push('token', { text: 'Zwischen' })
+    await screen.findByText('Zwischen')
+
+    await user.click(screen.getByRole('button', { name: 'Open c2' }))
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Open c1' }))
+    // The chat is read anew mid-stream: the stored question and the empty answer it lists are the turn's own.
+    await waitFor(() => expect(callsTo(calls, 'GET', '/ghostwriter/api/chats/c1').length).toBeGreaterThan(1))
+    await screen.findByText('Zwischen')
+    expect(screen.getAllByText('Summe der Spalte B?')).toHaveLength(1)
+    const answers = document.querySelectorAll('[data-role="assistant"]')
+    expect(answers).toHaveLength(1)
+    expect(answers[0]).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getAllByText(/sales\.xlsx/)).toHaveLength(1)
+  })
+
   it('keeps writing while another chat is open, and shows the live draft on return', async () => {
     const { calls, streams, finish } = serveTwoChats()
     let registry!: ChatStreams
@@ -444,5 +490,40 @@ describe('answers in chats the user has left', () => {
       expect(post.signal?.aborted).toBe(false)
     }
     await waitFor(() => expect(registry.running()).toEqual([]))
+  })
+})
+
+describe('a stream that goes silent', () => {
+  afterEach(() => vi.useRealTimers())
+
+  it('ends after 60 s without a byte, frees the chat and says so; a keep-alive counts as a byte', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    const { calls, sse } = serveChat(detail([]), detail([]), 'messages')
+    let registry!: ChatStreams
+    renderWithClient(
+      <>
+        <RegistryProbe onStreams={(r) => (registry = r)} />
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />
+      </>,
+    )
+    const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('token', { text: 'Sum' })
+    await screen.findByText('Sum')
+
+    await vi.advanceTimersByTimeAsync(50_000)
+    sse.comment('keep-alive')
+    await vi.advanceTimersByTimeAsync(50_000)
+    expect(registry.running()).toEqual(['c1'])
+    const [post] = callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages')
+    expect(post.signal?.aborted).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(10_000)
+    await waitFor(() => expect(registry.running()).toEqual([]))
+    expect(post.signal?.aborted).toBe(true)
+    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong.')
+    // The chat is free: the composer may send again.
+    expect(screen.getByRole('button', { name: 'Ask' })).toBeEnabled()
   })
 })

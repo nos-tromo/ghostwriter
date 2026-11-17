@@ -135,10 +135,24 @@ def _read(lines: Iterator[str]) -> Iterator[Frame]:
             event = None
 
 
-def _frames(response: httpx2.Response) -> list[Frame]:
+def _all_frames(response: httpx2.Response) -> list[Frame]:
     assert response.status_code == 200, response.text
     assert response.headers["content-type"].startswith("text/event-stream")
     return list(_read(iter(response.text.split("\n"))))
+
+
+def _frames(response: httpx2.Response) -> list[Frame]:
+    """Return the frames after ``start``, which every stream sends first."""
+    frames = _all_frames(response)
+    assert frames[0].event == "start", frames
+    return frames[1:]
+
+
+def _read_after_start(lines: Iterator[str]) -> Iterator[Frame]:
+    """Read a stream's frames as they come, past its ``start``."""
+    frames = _read(lines)
+    assert next(frames).event == "start"
+    return frames
 
 
 def _read_call(cid: str) -> list[Chunk]:
@@ -261,7 +275,7 @@ def test_the_chat_is_free_once_the_final_frame_is_out(client: TestClient, fake_o
     cid = _new(client)
     fake_openai.script = [ANSWER, ANSWER]
     with client.stream("POST", f"/api/chats/{cid}/messages", json={"content": "Hallo"}, headers=as_user()) as response:
-        frames = _read(response.iter_lines())
+        frames = _read_after_start(response.iter_lines())
         assert next(frames).event == "token" and next(frames).event == "final"
         assert not _state(client).turns.running(cid)
         assert _send(client, cid, content="Und jetzt?").status_code == 200
@@ -292,7 +306,7 @@ def test_stop_ends_the_turn_and_keeps_the_text(client: TestClient, fake_openai: 
     ]
     tokens: list[str] = []
     with client.stream("POST", f"/api/chats/{cid}/messages", json={"content": "Zähl"}, headers=as_user()) as response:
-        frames = _read(response.iter_lines())
+        frames = _read_after_start(response.iter_lines())
         for frame in frames:
             assert frame.event == "token"
             tokens.append(frame.data["text"])
@@ -315,7 +329,7 @@ def test_a_stop_mid_tool_call_keeps_what_was_done_and_frees_the_chat(
     door.delays["tools/call"] = 0.5
     fake_openai.script = [_read_call(cid)]
     with client.stream("POST", f"/api/chats/{cid}/messages", json={"content": "Lies"}, headers=as_user()) as response:
-        first = next(_read(response.iter_lines()))
+        first = next(_read_after_start(response.iter_lines()))
         assert (first.event, first.data["status"]) == ("step", "running")
     turns = _state(client).turns
     _wait_until(lambda: not turns.running(cid))
@@ -335,7 +349,7 @@ def test_a_round_that_fails_after_a_stop_ends_as_stopped(
     timeout = openai.APITimeoutError(request=httpx2.Request("POST", "http://router.test/v1/chat/completions"))
     fake_openai.script = [[text_chunk("Eins."), _gate(stopped, timeout)]]
     with client.stream("POST", f"/api/chats/{cid}/messages", json={"content": "Zähl"}, headers=as_user()) as response:
-        frames = _read(response.iter_lines())
+        frames = _read_after_start(response.iter_lines())
         assert next(frames) == Frame("token", {"text": "Eins."})
         assert client.post(f"/api/chats/{cid}/stop", headers=as_user()).status_code == 204
         stopped.set()
@@ -788,7 +802,7 @@ def test_a_stop_ends_a_turn_still_waiting_for_a_thread(client: TestClient, fake_
             assert r.status_code == 200 and turns.running(cid)
             assert client.post(f"/api/chats/{cid}/stop", headers=as_user()).status_code == 204
             _wait_until(lambda: not turns.running(cid), timeout_s=2.0)
-            frames = list(_read(r.iter_lines()))
+            frames = list(_read_after_start(r.iter_lines()))
         assert [f.event for f in frames] == ["final"] and frames[0].data["stopped"] is True
         assert frames[0].data["message_id"] == _detail(client, cid)["messages"][-1]["id"]
     finally:
@@ -797,6 +811,23 @@ def test_a_stop_ends_a_turn_still_waiting_for_a_thread(client: TestClient, fake_
     assert fake_openai.calls == []
     fake_openai.script = [ANSWER]
     assert _send(client, cid, content="Noch da?").status_code == 200
+
+
+def test_the_first_frame_names_the_rows_the_turn_stored(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """``start`` comes first, naming the stored question and answer as ``final`` does.
+
+    A regenerate names no question.
+    """
+    cid = _new(client)
+    fake_openai.script = [ANSWER]
+    frames = _all_frames(_send(client, cid))
+    assert [f.event for f in frames] == ["start", "token", "final"]
+    start, final = frames[0].data, frames[-1].data
+    assert start == {"message_id": final["message_id"], "user_message_id": final["user_message_id"]}
+    assert [m["id"] for m in _detail(client, cid)["messages"]] == [start["user_message_id"], start["message_id"]]
+    fake_openai.script = [ANSWER]
+    frames = _all_frames(client.post(f"/api/chats/{cid}/regenerate", headers=as_user()))
+    assert frames[0] == Frame("start", {"message_id": frames[-1].data["message_id"], "user_message_id": None})
 
 
 def test_a_quiet_turn_keeps_its_stream_open_with_comments(

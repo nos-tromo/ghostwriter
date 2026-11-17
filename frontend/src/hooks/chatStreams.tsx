@@ -2,8 +2,8 @@ import { createContext, use, useEffect, useState, type ReactNode } from 'react'
 import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { stopChat } from '../api/chats'
 import { ApiError } from '../api/client'
-import { streamSse } from '../api/sse'
-import type { ErrorFrame, MessageIn, MessageOut, RegenerateIn, ResultOut, StepOut } from '../api/types'
+import { SseIdle, streamSse } from '../api/sse'
+import type { ErrorFrame, MessageIn, MessageOut, RegenerateIn, ResultOut, StartFrame, StepOut } from '../api/types'
 import { chatKey, chatsKey } from './useChats'
 
 /** The answer being written, as its frames have built it so far. */
@@ -23,16 +23,29 @@ export type StreamFailure = { kind: 'answer'; code: ErrorFrame['code'] } | { kin
 /** The message being sent, as its bubble shows it: its text and the files it binds. */
 export type PendingMessage = Pick<MessageOut, 'content' | 'attachments'>
 
+/** The rows the server stored for the answer being written, from its `start` frame. */
+export interface StoredTurn {
+  answerId: string
+  /** The message sent; null for a regenerate. */
+  questionId: string | null
+}
+
 /** A chat's answer as the view shows it. */
 export interface StreamState {
   streaming: boolean
   draft: DraftAnswer | null
   /** The message being sent, until the chat is read again; null for a regenerate. */
   pendingUser: PendingMessage | null
+  /** The rows the turn stored, which a read of the chat lists while it streams; the view
+   *  shows the draft and `pendingUser` in their place. Null until `start` has come. */
+  stored: StoredTurn | null
   failure: StreamFailure | null
 }
 
-export const IDLE: StreamState = { streaming: false, draft: null, pendingUser: null, failure: null }
+export const IDLE: StreamState = { streaming: false, draft: null, pendingUser: null, stored: null, failure: null }
+
+/** How long a stream may go without a byte (the server sends a keep-alive every 15 s) before it is given up. */
+export const STREAM_IDLE_MS = 60_000
 
 const ERROR_CODES: ReadonlySet<string> = new Set<ErrorFrame['code']>(['model', 'audit', 'internal'])
 
@@ -76,8 +89,8 @@ interface Live {
  * stored, the chat has moved up the list), then the stream drops out and the
  * stored messages take the draft's place. Why an answer ended early stays
  * with its chat until the next one starts. The stop asks the server; a stream
- * ends without one only when the app goes away (a closed tab), which the
- * server takes as a stop.
+ * ends without one when the app goes away (a closed tab), which the server
+ * takes as a stop, or when it stays silent for `STREAM_IDLE_MS`.
  */
 export class ChatStreams {
   private readonly live = new Map<string, Live>()
@@ -130,7 +143,7 @@ export class ChatStreams {
     if (this.live.has(chatId)) return null
     const controller = new AbortController()
     let draft: DraftAnswer = { text: '', steps: [], results: [], error: null, reasoning: body.reasoning }
-    const entry: Live = { controller, state: { streaming: true, draft, pendingUser, failure: null } }
+    const entry: Live = { controller, state: { ...IDLE, streaming: true, draft, pendingUser } }
     this.live.set(chatId, entry)
     this.ended.delete(chatId)
     this.emit(chatId)
@@ -138,12 +151,19 @@ export class ChatStreams {
     let failure: StreamFailure | null = null
     let finished = false
     try {
-      const frames = streamSse(`/chats/${encodeURIComponent(chatId)}/${route}`, body, controller.signal)
+      const path = `/chats/${encodeURIComponent(chatId)}/${route}`
+      const frames = streamSse(path, body, controller.signal, STREAM_IDLE_MS)
       for await (const { event, data } of frames) {
         // `final` is always last; nothing after it counts.
         if (finished) continue
         if (event === 'final') {
           finished = true
+          continue
+        }
+        if (event === 'start') {
+          const { message_id, user_message_id } = data as StartFrame
+          entry.state = { ...entry.state, stored: { answerId: message_id, questionId: user_message_id } }
+          this.emit(chatId)
           continue
         }
         draft = applyFrame(draft, event, data)
@@ -152,7 +172,11 @@ export class ChatStreams {
       }
       if (!finished) failure = { kind: 'answer', code: 'internal' }
     } catch (error) {
-      if (!controller.signal.aborted) failure = { kind: 'request', error }
+      if (error instanceof SseIdle) {
+        // Silent past the keep-alive: given up as a stream cut off; the server stops it when the connection goes.
+        controller.abort()
+        failure = { kind: 'answer', code: 'internal' }
+      } else if (!controller.signal.aborted) failure = { kind: 'request', error }
     }
     if (draft.error) failure = { kind: 'answer', code: draft.error }
     // Refused with a status, never begun: a cut connection may have been taken.

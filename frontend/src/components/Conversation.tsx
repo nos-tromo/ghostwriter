@@ -78,9 +78,13 @@ export function Conversation({
   const fileDays = config.file_retention_days
 
   let messages = chat.data?.messages ?? []
-  // The server dropped the answer a regenerate replaces; the draft takes its place.
-  if (stream.streaming && stream.pendingUser === null && messages.at(-1)?.role === 'assistant') {
-    messages = messages.slice(0, -1)
+  if (stream.streaming) {
+    // A read of the chat meanwhile lists the turn's own rows: the question sent and the
+    // answer being written; `pendingUser` and the draft stand in their place.
+    const own = stream.stored
+    if (own) messages = messages.filter((m) => m.id !== own.answerId && m.id !== own.questionId)
+    // The server dropped the answer a regenerate replaces; the draft takes its place.
+    if (stream.pendingUser === null && messages.at(-1)?.role === 'assistant') messages = messages.slice(0, -1)
   }
   const last = messages.at(-1)
   const lastAnswer = !stream.streaming && last?.role === 'assistant' ? last.id : null

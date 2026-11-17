@@ -118,8 +118,14 @@ export interface TranscriptOut {
   text: string
 }
 
-// The SSE frames of /messages and /regenerate. `step` carries a StepOut and
-// `result` a ResultOut; `final` is always last.
+// The SSE frames of /messages and /regenerate. `start` is always first,
+// `step` carries a StepOut and `result` a ResultOut; `final` is always last.
+
+/** The rows the turn stored before it streams: the answer, and the message sent (null for a regenerate). */
+export interface StartFrame {
+  message_id: string
+  user_message_id: string | null
+}
 
 export interface TokenFrame {
   text: string

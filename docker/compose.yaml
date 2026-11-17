@@ -160,7 +160,8 @@ services:
           - ghostwriter-frontend
     mem_limit: 256m
     memswap_limit: 256m
-    pids_limit: 64
+    # nginx's `worker_processes auto` forks a worker per CPU; GPU hosts have 64 and more.
+    pids_limit: 256
     depends_on:
       backend:
         condition: service_healthy

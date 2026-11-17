@@ -3,7 +3,8 @@
 A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most one per chat
 (:class:`~ghostwriter.turns.TurnRegistry`), on a thread of the app's turn limiter
 (``TURN_THREADS``) rather than the shared pool; a turn beyond them waits for one. The frames
-are ``token``, ``step``, ``result``, ``error`` and ``final``, which is always last; a quiet
+are ``start`` (the stored question's and answer's ids), always first, then ``token``,
+``step``, ``result`` and ``error``, and ``final``, which is always last; a quiet
 stream carries a keep-alive comment every 15 s, which is no frame. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
@@ -280,11 +281,15 @@ class TurnStream:
         return True
 
     def attach(self, put: Callable[[str | None], None]) -> None:
-        """Let a stop end the turn while it still waits for a thread, with ``final`` as the stream's last frame.
+        """Send ``start`` first, and let a stop end the turn while it still waits for a thread.
+
+        ``start`` names the rows the turn stored, so a view that reads the chat meanwhile
+        shows them once. A stop before the worker starts ends the stream with ``final``.
 
         Args:
             put: Queues a frame for the response from any thread; ``None`` ends the response.
         """
+        put(sse_frame("start", {key: self._final[key] for key in ("message_id", "user_message_id")}))
 
         def stopped() -> None:
             if self._end_waiting():
