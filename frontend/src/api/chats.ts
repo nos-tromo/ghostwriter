@@ -28,9 +28,11 @@ export async function uploadAttachment(chatId: string, file: File, signal?: Abor
   return apiResult<AttachmentOut>(await apiFetch(`${chatPath(chatId)}/attachments`, { method: 'POST', body, signal }))
 }
 
-/** A file of the chat, an attachment or a tool's output, as a blob. */
-export async function fileBlob(chatId: string, fileId: string): Promise<Blob> {
-  const res = await apiFetch(`${chatPath(chatId)}/files/${encodeURIComponent(fileId)}`)
+/** A file of the chat, an attachment or a tool's output, as a blob. 410 once
+ *  it has expired, also when workbench no longer holds it; 404 for one this
+ *  chat does not hold. */
+export async function fileBlob(chatId: string, fileId: string, signal?: AbortSignal): Promise<Blob> {
+  const res = await apiFetch(`${chatPath(chatId)}/files/${encodeURIComponent(fileId)}`, { signal })
   if (!res.ok) throw await apiErrorOf(res)
   return res.blob()
 }

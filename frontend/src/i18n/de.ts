@@ -25,6 +25,51 @@ export const de: Strings = {
   'chat.delete_confirm': 'Diesen Chat und seine Dateien löschen?',
   'chat.delete_busy': 'Beende die Antwort, bevor du den Chat löschst.',
 
+  // conversation
+  'chat.empty': 'Frag, was du willst, oder hänge ein Dokument an.',
+  'chat.empty_text_only': 'Frag, was du willst.',
+  'chat.loading_messages': 'Chat wird geladen…',
+  'chat.answer_pending': 'Antwort wird erstellt…',
+  'chat.thinking': 'denkt nach…',
+  'chat.regenerate': 'Neu erzeugen',
+
+  // the trail of tool steps
+  'trail.steps': '{n} Schritte',
+  'trail.steps_one': '1 Schritt',
+  'trail.list_files': 'Dateien aufgelistet',
+  'trail.read_document': '{detail} gelesen',
+  'trail.read_document_unnamed': 'Ein Dokument gelesen',
+  'trail.search_files': 'Nach {detail} gesucht',
+  'trail.search_files_unnamed': 'Dateien durchsucht',
+  'trail.run_python': 'Python ausgeführt',
+  'trail.inspect_template': 'Vorlage {detail} geprüft',
+  'trail.inspect_template_unnamed': 'Eine Vorlage geprüft',
+  'trail.fill_template': 'Vorlage {detail} ausgefüllt',
+  'trail.fill_template_unnamed': 'Eine Vorlage ausgefüllt',
+  'trail.write_table': 'Tabelle {detail} geschrieben',
+  'trail.write_table_unnamed': 'Eine Tabelle geschrieben',
+  'trail.write_document': 'Dokument {detail} geschrieben',
+  'trail.write_document_unnamed': 'Ein Dokument geschrieben',
+  'trail.other': '{tool} verwendet',
+  'trail.details': 'Details',
+  'trail.expired': 'Details nach {days} Tagen gelöscht',
+  'trail.status_running': 'Läuft',
+  'trail.status_ok': 'Erledigt',
+  'trail.status_error': 'Fehlgeschlagen',
+
+  // result cards
+  'result.more_rows': '{count} weitere Zeilen',
+  'result.more_rows_one': '1 weitere Zeile',
+  'result.more_rows_unknown': 'Weitere Zeilen in der Datei',
+  'result.expired': 'Abgelaufen',
+  'result.download': 'Herunterladen',
+  'result.loading': '{name} wird geladen…',
+
+  // why an answer ended early
+  'error.model': 'Das Modell hat nicht geantwortet. Bitte erneut versuchen.',
+  'error.audit': 'Die Antwort wurde abgebrochen: Sie konnte nicht protokolliert werden.',
+  'error.internal': 'Etwas ist schiefgelaufen.',
+
   // retention banner
   'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',
   'retention.files': 'Dateien und Tool-Ergebnisse werden nach {days} Tagen gelöscht.',

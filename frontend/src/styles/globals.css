@@ -1,21 +1,144 @@
 @import 'tailwindcss';
 @import '@infra/ui/theme.css';
 @source '../../node_modules/@infra/ui/dist';
+/* The prose of model-written Markdown (MarkdownProse). */
+@plugin '@tailwindcss/typography';
 
 :root {
   /* ghostwriter's single design-system knob; primary derives from this.
      Light default is darkened for WCAG AA as text on white (~4.5:1). */
   --app-accent: hsl(217 91% 45%);
+
+  /* Code highlighting: rehype-highlight emits hljs-* classes only (no inline
+     styles), coloured here. After highlight.js's GitHub themes, darkened
+     where needed so each token is at least 4.5:1 on --color-muted, the
+     code block's surface, in light and in dark. */
+  --hljs-comment: #57606a;
+  --hljs-keyword: #cf222e;
+  --hljs-string: #0a3069;
+  --hljs-constant: #0550ae;
+  --hljs-title: #6f42c1;
+  --hljs-built-in: #953800;
+  --hljs-tag: #116329;
+  --hljs-bullet: #735c0f;
+  --hljs-addition: #116329;
+  --hljs-addition-bg: #dafbe1;
+  --hljs-deletion: #82071e;
+  --hljs-deletion-bg: #ffebe9;
 }
 
 :root[data-theme='dark'] {
   --app-accent: hsl(217 91% 60%);
+
+  --hljs-comment: #8b949e;
+  --hljs-keyword: #ff7b72;
+  --hljs-string: #a5d6ff;
+  --hljs-constant: #79c0ff;
+  --hljs-title: #d2a8ff;
+  --hljs-built-in: #ffa657;
+  --hljs-tag: #7ee787;
+  --hljs-bullet: #f2cc60;
+  --hljs-addition: #aff5b4;
+  --hljs-addition-bg: #033a16;
+  --hljs-deletion: #ffdcd7;
+  --hljs-deletion-bg: #67060c;
 }
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
     --app-accent: hsl(217 91% 60%);
+
+    --hljs-comment: #8b949e;
+    --hljs-keyword: #ff7b72;
+    --hljs-string: #a5d6ff;
+    --hljs-constant: #79c0ff;
+    --hljs-title: #d2a8ff;
+    --hljs-built-in: #ffa657;
+    --hljs-tag: #7ee787;
+    --hljs-bullet: #f2cc60;
+    --hljs-addition: #aff5b4;
+    --hljs-addition-bg: #033a16;
+    --hljs-deletion: #ffdcd7;
+    --hljs-deletion-bg: #67060c;
   }
+}
+
+.hljs-doctag,
+.hljs-keyword,
+.hljs-meta .hljs-keyword,
+.hljs-template-tag,
+.hljs-template-variable,
+.hljs-type,
+.hljs-variable.language_ {
+  color: var(--hljs-keyword);
+}
+
+.hljs-title,
+.hljs-title.class_,
+.hljs-title.class_.inherited__,
+.hljs-title.function_ {
+  color: var(--hljs-title);
+}
+
+.hljs-attr,
+.hljs-attribute,
+.hljs-literal,
+.hljs-meta,
+.hljs-number,
+.hljs-operator,
+.hljs-variable,
+.hljs-selector-attr,
+.hljs-selector-class,
+.hljs-selector-id,
+.hljs-section {
+  color: var(--hljs-constant);
+}
+
+.hljs-regexp,
+.hljs-string,
+.hljs-meta .hljs-string {
+  color: var(--hljs-string);
+}
+
+.hljs-built_in,
+.hljs-symbol {
+  color: var(--hljs-built-in);
+}
+
+.hljs-comment,
+.hljs-code,
+.hljs-formula {
+  color: var(--hljs-comment);
+}
+
+.hljs-name,
+.hljs-quote,
+.hljs-selector-tag,
+.hljs-selector-pseudo {
+  color: var(--hljs-tag);
+}
+
+.hljs-bullet {
+  color: var(--hljs-bullet);
+}
+
+.hljs-section,
+.hljs-strong {
+  font-weight: 600;
+}
+
+.hljs-emphasis {
+  font-style: italic;
+}
+
+.hljs-addition {
+  color: var(--hljs-addition);
+  background-color: var(--hljs-addition-bg);
+}
+
+.hljs-deletion {
+  color: var(--hljs-deletion);
+  background-color: var(--hljs-deletion-bg);
 }
 
 html,
