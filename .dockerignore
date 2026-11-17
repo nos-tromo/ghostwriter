@@ -85,3 +85,6 @@ frontend/node_modules
 # Exceptions
 !frontend/index.html
 !frontend/nginx/
+
+# The SPA keeps code in src/lib; **/lib/ above is for Python build output.
+!frontend/src/lib/

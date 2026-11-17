@@ -157,6 +157,13 @@ def test_the_spa_lives_under_ghostwriter() -> None:
     assert "base: '/ghostwriter/'" in vite and "'/ghostwriter/api'" in vite
 
 
+def test_the_image_build_keeps_the_spas_lib() -> None:
+    """``**/lib/`` keeps Python build output out of the context; the SPA's src/lib is let back in after it."""
+    lines = [line.strip() for line in (ROOT / ".dockerignore").read_text(encoding="utf-8").splitlines()]
+    assert "**/lib/" in lines and "!frontend/src/lib/" in lines
+    assert lines.index("!frontend/src/lib/") > lines.index("**/lib/")
+
+
 def test_env_example_tags_follow_the_contract_amendment() -> None:
     """The shared keys carry exactly the tags deploy's env-sync rows ask for."""
     lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
