@@ -71,6 +71,14 @@ describe('App', () => {
     expect(document.title).toBe('Ghostwriter · Chat assistant')
   })
 
+  it('shows no purpose bar where the deployment requires no purpose', async () => {
+    render(<App />)
+    const [header] = await screen.findAllByRole('banner')
+    expect(await within(header).findByText('v0.1.0')).toBeInTheDocument()
+    expect(within(header).queryByRole('button', { name: /purpose/i })).not.toBeInTheDocument()
+    expect(within(header).queryByText('No purpose stated')).not.toBeInTheDocument()
+  })
+
   it("speaks the deployment's language, with the purpose bar, the chats and the periods in place", async () => {
     serve({ ...CONFIG, ui_language: 'de', require_purpose: ['collect'] })
     render(<App />)

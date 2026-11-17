@@ -10,9 +10,10 @@ collects. Start-up writes `admin` / `config.audit` with the operating mode.
 - **Fail closed.** An event that cannot be written stops its action: a request
   gets `500 Request failed.`, an answer ends with the `audit` error frame, a
   sweep batch deletes nothing.
-- **Purpose.** Optional, from the SPA's purpose bar (`X-Audit-Purpose`). A
-  request whose actions `AUDIT_REQUIRE_PURPOSE` lists and that states none gets
-  428 and a `denied` event. workbench gets the stated purpose, or the reason
+- **Purpose.** From the SPA's purpose bar (`X-Audit-Purpose`), which the SPA
+  shows only while `AUDIT_REQUIRE_PURPOSE` lists actions; without that, no
+  purpose is stated. A request whose actions `AUDIT_REQUIRE_PURPOSE` lists and
+  that states none gets 428 and a `denied` event. workbench gets the stated purpose, or the reason
   `ghostwriter chat`.
 - **Request id.** The gateway's `X-Request-ID`, minted when none (or an invalid
   one) arrives; it goes on to the router and workbench. Each sweep batch has its own.
