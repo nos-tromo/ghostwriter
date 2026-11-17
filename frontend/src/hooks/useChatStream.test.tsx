@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
+import { useState } from 'react'
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { clearAllPurposes } from '@infra/ui'
 import { LanguageContext } from '../i18n/LanguageContext'
 import type { AttachmentOut } from '../api/types'
+import { useChatStreams, type ChatStreams } from './chatStreams'
 import type { ChatStream } from './useChatStream'
 import { useChats } from './useChats'
 import {
@@ -11,6 +13,7 @@ import {
   CONFIG,
   callsTo,
   detail,
+  json,
   message,
   renderWithClient,
   result,
@@ -302,7 +305,7 @@ describe('useChatStream', () => {
     expect(await screen.findByRole('alert')).toHaveTextContent('Etwas ist schiefgelaufen (500)')
   })
 
-  it('asks the server to stop, and aborts the stream when the conversation goes away', async () => {
+  it('asks the server to stop, and stops the stream when the app closes', async () => {
     const { calls, sse } = serveChat(detail([]), detail([]), 'messages')
     const view = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
@@ -316,7 +319,111 @@ describe('useChatStream', () => {
 
     const [post] = callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages')
     expect(post.signal?.aborted).toBe(false)
+    // As a closed tab does, the app going away closes the connection, which stops the answer.
     view.unmount()
     expect(post.signal?.aborted).toBe(true)
+  })
+})
+
+/** Two chats, one open at a time, keyed as the app keys its pane; `onStreams` gets the registry. */
+function TwoChats({ onStreams }: { onStreams: (streams: ChatStreams) => void }) {
+  const [open, setOpen] = useState('c1')
+  onStreams(useChatStreams())
+  return (
+    <>
+      <button type="button" onClick={() => setOpen('c1')}>
+        Open c1
+      </button>
+      <button type="button" onClick={() => setOpen('c2')}>
+        Open c2
+      </button>
+      <StreamedConversation key={open} chatId={open} config={CONFIG} reasoning={false} composer={controls} />
+    </>
+  )
+}
+
+/** Chats c1 and c2, each empty until its answer is done, each answering over its own SSE body. */
+function serveTwoChats() {
+  const streams = { c1: sseStream(), c2: sseStream() }
+  const done = { c1: false, c2: false }
+  const answered = (id: 'c1' | 'c2') =>
+    detail(
+      [QUESTION, message({ id: `${id}-m2`, role: 'assistant', content: `Stored answer of ${id}` })],
+      { ...CHAT, id },
+    )
+  const calls = serve({
+    'GET /ghostwriter/api/chats/c1': () => json(done.c1 ? answered('c1') : detail([])),
+    'GET /ghostwriter/api/chats/c2': () => json(done.c2 ? answered('c2') : detail([], { ...CHAT, id: 'c2' })),
+    'GET /ghostwriter/api/chats': [CHAT],
+    'POST /ghostwriter/api/chats/c1/messages': () => streams.c1.response(),
+    'POST /ghostwriter/api/chats/c2/messages': () => streams.c2.response(),
+  })
+  const finish = (id: 'c1' | 'c2') => {
+    done[id] = true
+    streams[id].push('final', { ...FINAL, chat: { ...CHAT, id } })
+    streams[id].end()
+  }
+  return { calls, streams, finish }
+}
+
+describe('answers in chats the user has left', () => {
+  it('keeps writing while another chat is open, and shows the live draft on return', async () => {
+    const { calls, streams, finish } = serveTwoChats()
+    let registry!: ChatStreams
+    renderWithClient(<TwoChats onStreams={(r) => (registry = r)} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    streams.c1.push('token', { text: 'Zwischen' })
+    await screen.findByText('Zwischen')
+    expect(registry.running()).toEqual(['c1'])
+
+    await user.click(screen.getByRole('button', { name: 'Open c2' }))
+    await screen.findByText('Ask anything, or attach a document.')
+    expect(screen.queryByText('Zwischen')).not.toBeInTheDocument()
+    // Written while the user is away.
+    streams.c1.push('token', { text: 'stand' })
+
+    await user.click(screen.getByRole('button', { name: 'Open c1' }))
+    const draft = await screen.findByText('Zwischenstand')
+    expect(draft.closest('[aria-busy="true"]')).not.toBeNull()
+    finish('c1')
+    expect(await screen.findByText('Stored answer of c1')).toBeInTheDocument()
+    const [post] = callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages')
+    expect(post.signal?.aborted).toBe(false)
+    expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/stop')).toEqual([])
+    // A finished stream drops out of the registry.
+    await waitFor(() => expect(registry.running()).toEqual([]))
+  })
+
+  it('writes two chats\' answers at once', async () => {
+    const { calls, streams, finish } = serveTwoChats()
+    let registry!: ChatStreams
+    renderWithClient(<TwoChats onStreams={(r) => (registry = r)} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    streams.c1.push('token', { text: 'Erste' })
+    await screen.findByText('Erste')
+
+    await user.click(screen.getByRole('button', { name: 'Open c2' }))
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    streams.c2.push('token', { text: 'Zweite' })
+    await screen.findByText('Zweite')
+    expect(registry.running().sort()).toEqual(['c1', 'c2'])
+
+    finish('c2')
+    expect(await screen.findByText('Stored answer of c2')).toBeInTheDocument()
+    await waitFor(() => expect(registry.running()).toEqual(['c1']))
+    await user.click(screen.getByRole('button', { name: 'Open c1' }))
+    expect(await screen.findByText('Erste')).toBeInTheDocument()
+    finish('c1')
+    expect(await screen.findByText('Stored answer of c1')).toBeInTheDocument()
+    for (const id of ['c1', 'c2']) {
+      const [post] = callsTo(calls, 'POST', `/ghostwriter/api/chats/${id}/messages`)
+      expect(post.signal?.aborted).toBe(false)
+    }
+    await waitFor(() => expect(registry.running()).toEqual([]))
   })
 })

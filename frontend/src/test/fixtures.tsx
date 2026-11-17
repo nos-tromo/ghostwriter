@@ -6,6 +6,7 @@ import { render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AppConfig, ChatDetail, ChatOut, MessageOut, ResultOut, StepOut } from '../api/types'
 import { Conversation } from '../components/Conversation'
+import { ChatStreamsProvider } from '../hooks/chatStreams'
 import { useChatStream, type ChatStream } from '../hooks/useChatStream'
 
 export const CONFIG: AppConfig = {
@@ -104,11 +105,17 @@ export function sseStream() {
   }
 }
 
-/** Render under a fresh query client that does not retry. */
+/** Render under a fresh query client that does not retry, and the app's
+ *  registry of chat streams; `rerender` keeps both. */
 export function renderWithClient(ui: ReactElement) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
-  const view = render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>)
-  return { client, ...view }
+  const wrap = (node: ReactElement) => (
+    <QueryClientProvider client={client}>
+      <ChatStreamsProvider>{node}</ChatStreamsProvider>
+    </QueryClientProvider>
+  )
+  const view = render(wrap(ui))
+  return { ...view, client, rerender: (next: ReactElement) => view.rerender(wrap(next)) }
 }
 
 /** The conversation over a stream of its own, as `ChatPane` gives it one;

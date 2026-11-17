@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { act, createEvent, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { QueryClientProvider } from '@tanstack/react-query'
 import { PURPOSE_HEADER, PurposeBar, clearAllPurposes } from '@infra/ui'
 import type { AppConfig, AttachmentOut } from '../api/types'
 import { LanguageContext } from '../i18n/LanguageContext'
@@ -506,7 +505,7 @@ describe('the reasoning switch', () => {
   it('starts off, per chat, and says its state in its name', async () => {
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'GET /ghostwriter/api/chats/c2': detail([]) })
     const user = userEvent.setup()
-    const { client, rerender } = renderWithClient(<ChatPane key="c1" chatId="c1" config={CONFIG} />)
+    const { rerender } = renderWithClient(<ChatPane key="c1" chatId="c1" config={CONFIG} />)
     const off = await screen.findByRole('button', { name: 'Reasoning: Off — faster, plain answer' })
     expect(off).toHaveAttribute('aria-pressed', 'false')
 
@@ -515,11 +514,7 @@ describe('the reasoning switch', () => {
     expect(on).toHaveAttribute('aria-pressed', 'true')
 
     // Another chat starts off again.
-    rerender(
-      <QueryClientProvider client={client}>
-        <ChatPane key="c2" chatId="c2" config={CONFIG} />
-      </QueryClientProvider>,
-    )
+    rerender(<ChatPane key="c2" chatId="c2" config={CONFIG} />)
     expect(await screen.findByRole('button', { name: 'Reasoning: Off — faster, plain answer' })).toHaveAttribute(
       'aria-pressed',
       'false',

@@ -9,10 +9,11 @@ import { Conversation } from './Conversation'
  * The open chat: its one stream, the files its next message sends, and the
  * reasoning switch, shared by the conversation and the composer below it.
  *
- * Keyed by the chat's id where it is used, so leaving a chat closes its
- * stream and nothing of it, the switch included, carries over: a chat opens
- * with reasoning off. Files dropped on the conversation go to the same
- * attachments as the paperclip's, while attachments are on.
+ * Keyed by the chat's id where it is used, so nothing of it, the switch
+ * included, carries over: a chat opens with reasoning off. Its answer lives
+ * in the app's registry, so leaving the chat keeps it being written. Files
+ * dropped on the conversation go to the same attachments as the paperclip's,
+ * while attachments are on.
  */
 export function ChatPane({ chatId, config }: { chatId: string; config: AppConfig }) {
   const stream = useChatStream(chatId)

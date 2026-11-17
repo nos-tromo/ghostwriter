@@ -1,7 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { QueryClientProvider } from '@tanstack/react-query'
 import { PURPOSE_HEADER, clearAllPurposes, setPurpose } from '@infra/ui'
 import { ResultCard } from './ResultCard'
 import { LanguageContext } from '../i18n/LanguageContext'
@@ -65,7 +64,7 @@ describe('ResultCard', () => {
     const user = userEvent.setup()
     const image = result({ id: 'r1', kind: 'image', name: 'chart.png', mime: 'image/png' })
     // The draft's card and the stored message's: two mounts of one file.
-    const { client, rerender } = renderWithClient(
+    const { rerender } = renderWithClient(
       <>
         <ResultCard key="draft" chatId="c1" result={image} />
         <ResultCard key="stored" chatId="c1" result={{ ...image, id: 'r1-stored' }} />
@@ -84,11 +83,9 @@ describe('ResultCard', () => {
 
     // The draft gives way to the stored message: its URL goes, the other stays.
     rerender(
-      <QueryClientProvider client={client}>
-        <>
-          <ResultCard key="stored" chatId="c1" result={{ ...image, id: 'r1-stored' }} />
-        </>
-      </QueryClientProvider>,
+      <>
+        <ResultCard key="stored" chatId="c1" result={{ ...image, id: 'r1-stored' }} />
+      </>,
     )
     await waitFor(() => expect(revoke).toHaveBeenCalledWith(urls[0]))
     expect(revoke).not.toHaveBeenCalledWith(urls[1])
