@@ -315,6 +315,34 @@ async def test_workbench_failures_do_not_keep_expired_chats(
     assert (child["criteria"], child["outcome"]) == ({"files_deleted": 2, "failed": 1}, "error")
 
 
+@pytest.mark.parametrize("batch", [200, 1])
+async def test_a_workbench_timeout_ends_the_sweeps_calls_to_it(
+    settled: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch, batch: int
+) -> None:
+    """After one timeout no chat of the sweep is sent to workbench, also in later batches; the rows go all the same."""
+    env = settled
+    monkeypatch.setattr("ghostwriter.retention.SWEEP_BATCH", batch)
+    first = env.chat(NOW - 100 * DAY)
+    second = env.chat(NOW - 95 * DAY, owner="user-b")
+    env.door.answers["/files/chat"] = lambda folder: (
+        httpx.ReadTimeout("synthetic") if folder == chat_folder(KEY, first) else {"deleted": 2}
+    )
+    assert await env.sweeper.sweep() == SweepReport(chats=2, workbench_failed=2)
+    assert [r.headers["x-session-id"] for r in _deletes(env.door)] == [session_pseudonym(KEY, first)]
+    assert not env.has_rows(first) and not env.has_rows(second)
+    assert not env.turns.running(first) and not env.turns.running(second)
+    children = _of(audit_stream, "retention.chat.workbench")
+    assert [(c["criteria"]["failed"], c["outcome"]) for c in children] == (
+        [(2, "error")] if batch == 200 else [(1, "error"), (1, "error")]
+    )
+    assert {c["criteria"]["files_deleted"] for c in children} == {0}
+
+    later = env.chat(NOW - 95 * DAY + DAY)
+    env.clock.now = NOW + DAY
+    assert await env.sweeper.sweep() == SweepReport(chats=1)
+    assert _deletes(env.door)[-1].headers["x-session-id"] == session_pseudonym(KEY, later)
+
+
 async def test_the_sweep_names_the_chat_and_the_system_reason_to_workbench(
     settled: Env, audit_stream: CapturedAuditStream
 ) -> None:

@@ -14,9 +14,10 @@ Each batch of chats:
    reads again what is due, so a chat deleted meanwhile is not named;
 2. records ``delete`` / ``retention.chat``: the chats, the period and the cutoff, the sweep's time;
 3. deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
-   under the batch's request id;
+   under the batch's request id. After one timeout, workbench is not called again in this
+   sweep, so a hung workbench holds it up once, not once per chat;
 4. records the child ``delete`` / ``retention.chat.workbench``: the files workbench deleted and
-   the chats it failed, ``error`` when it failed any;
+   the chats it failed or was not asked for, ``error`` when there are any;
 5. deletes the chats' rows, also where workbench failed: the chat is due, and workbench's own
    retention (``WORKBENCH_RETENTION_DAYS``) removes its files.
 
@@ -117,6 +118,7 @@ class Sweeper:
         self._settings = settings
         self._turns = turns
         self._now = now
+        self._workbench_timed_out = False
 
     async def sweep(self) -> SweepReport:
         """Delete the due chats, empty the expired contents, then checkpoint the log.
@@ -129,6 +131,7 @@ class Sweeper:
         """
         now = self._now()
         report = SweepReport()
+        self._workbench_timed_out = False
         busy = await self._sweep_chats(now, report)
         await self._sweep_contents(now, report)
         await anyio.to_thread.run_sync(self._store.checkpoint)
@@ -201,10 +204,16 @@ class Sweeper:
             headers = forward_headers(op.context)
             deleted = failed = 0
             for chat_id, owner in batch:
+                if self._workbench_timed_out:
+                    failed += 1
+                    continue
                 try:
                     deleted += await self._workbench.delete_chat(call=CallFor(owner, chat_id, headers))
-                except WorkbenchUnavailable:
+                except WorkbenchUnavailable as exc:
                     failed += 1
+                    if exc.token == "timeout":
+                        self._workbench_timed_out = True
+                        logger.warning("workbench timed out; this sweep calls it no more.")
             report.workbench_failed += failed
             child = partial(
                 op.child,
