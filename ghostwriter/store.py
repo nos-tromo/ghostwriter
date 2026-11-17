@@ -571,7 +571,7 @@ class ChatStore:
             )
 
     def start_assistant_message(self, chat_id: str) -> str:
-        """Open an empty answer after the chat's last message.
+        """Open an empty answer after the chat's last message; the chat moves to the top of its owner's list.
 
         Args:
             chat_id: The chat.
@@ -581,6 +581,7 @@ class ChatStore:
         """
         now = self._now()
         with self._transaction() as s:
+            s.execute(update(Chat).where(Chat.id == chat_id).values(updated_at=now))
             message = Message(
                 id=str(uuid4()),
                 chat_id=chat_id,

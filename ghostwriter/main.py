@@ -9,7 +9,8 @@ workbench client, ``None`` while workbench is off, and ``app.state.turns`` the
 process's one turn registry (:mod:`ghostwriter.turns`). The lifespan also holds
 ``app.state.agent``, the agent loop (:mod:`ghostwriter.agent.loop`), and
 ``app.state.turn_threads``, the limiter whose ``TURN_THREADS`` threads the turns
-run on, apart from the pool that serves every other request.
+run on, apart from the pool that serves every other request. Every request body
+is capped per route (:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
 from collections.abc import AsyncIterator
@@ -32,6 +33,7 @@ from ghostwriter.agent.limits import TURN_THREADS
 from ghostwriter.agent.loop import AgentLoop
 from ghostwriter.api import chats, messages, meta
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
+from ghostwriter.body_limit import BodyLimit
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
@@ -173,5 +175,6 @@ def create_app(
     app.include_router(meta.router)
     app.include_router(chats.router)
     app.include_router(messages.router)
+    app.add_middleware(BodyLimit)
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     return app

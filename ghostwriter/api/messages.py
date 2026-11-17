@@ -6,7 +6,8 @@ A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most o
 are ``token``, ``step``, ``result``, ``error`` and ``final``, which is always last. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
-turn has ended. A turn that never got its thread ends when its response does.
+turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
+only frame, and when its response ends.
 
 A turn is recorded as one primary event, written before anything is stored (``collect`` /
 ``chat.message``, or ``modify`` / ``chat.regenerate``), with a child per model round
@@ -16,7 +17,7 @@ A turn is recorded as one primary event, written before anything is stored (``co
 """
 
 import threading
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Annotated, Final, Literal, Self
 from uuid import uuid4
 
@@ -224,8 +225,8 @@ def _frame(event: TurnEvent) -> str:
 class TurnStream:
     """One turn's frames, written on a worker thread, and who ends the turn.
 
-    The worker ends the turn once it ran; a turn whose response ended before the worker
-    started is ended by :meth:`close` and never runs.
+    The worker ends the turn once it ran. A turn stopped, or whose response ended, before the
+    worker started is ended at once by :meth:`attach`'s hook or by :meth:`close`, and never runs.
     """
 
     def __init__(
@@ -267,6 +268,28 @@ class TurnStream:
             self._state = "running"
             return True
 
+    def _end_waiting(self) -> bool:
+        with self._lock:
+            if self._state != "waiting":
+                return False
+            self._state = "ended"
+        self._turns.end(self._turn.chat_id, self._turn.cancel)
+        return True
+
+    def attach(self, put: Callable[[str | None], None]) -> None:
+        """Let a stop end the turn while it still waits for a thread, with ``final`` as the stream's last frame.
+
+        Args:
+            put: Queues a frame for the response from any thread; ``None`` ends the response.
+        """
+
+        def stopped() -> None:
+            if self._end_waiting():
+                put(sse_frame("final", {**self._final, "stopped": True}))
+                put(None)
+
+        self._turns.on_stop(self._turn.chat_id, self._turn.cancel, stopped)
+
     def frames(self) -> Iterator[str]:
         """Run the turn and write its frames; the turn ends just before ``final``, which comes last.
 
@@ -303,12 +326,7 @@ class TurnStream:
     def close(self) -> None:
         """Stop the turn, as its response has ended; end it here if it never ran."""
         self._turn.cancel.set()
-        with self._lock:
-            unstarted = self._state == "waiting"
-            if unstarted:
-                self._state = "ended"
-        if unstarted:
-            self._turns.end(self._turn.chat_id, self._turn.cancel)
+        self._end_waiting()
 
 
 class TurnResponse(StreamingResponse):
@@ -323,7 +341,9 @@ class TurnResponse(StreamingResponse):
             limiter: The turn threads.
         """
         super().__init__(
-            aiter_sync_gen(stream.frames, request, limiter), media_type="text/event-stream", headers=STREAM_HEADERS
+            aiter_sync_gen(stream.frames, request, limiter, feed=stream.attach),
+            media_type="text/event-stream",
+            headers=STREAM_HEADERS,
         )
         self._stream = stream
 

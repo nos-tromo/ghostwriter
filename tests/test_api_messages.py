@@ -778,6 +778,43 @@ def test_a_turn_waiting_for_a_thread_frees_its_chat_when_the_tab_closes(
     assert _send(client, cid, content="Noch da?").status_code == 200
 
 
+def test_a_stop_ends_a_turn_still_waiting_for_a_thread(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """With every turn thread taken, a stop gives ``final``, stopped, at once and frees the chat; no round runs."""
+    cid = _new(client)
+    limiter = _state(client).turn_threads
+    turns = _state(client).turns
+    borrowers = _take_all(client, limiter)
+    try:
+        with client.stream("POST", f"/api/chats/{cid}/messages", json={"content": "Hallo"}, headers=as_user()) as r:
+            assert r.status_code == 200 and turns.running(cid)
+            assert client.post(f"/api/chats/{cid}/stop", headers=as_user()).status_code == 204
+            _wait_until(lambda: not turns.running(cid), timeout_s=2.0)
+            frames = list(_read(r.iter_lines()))
+        assert [f.event for f in frames] == ["final"] and frames[0].data["stopped"] is True
+        assert frames[0].data["message_id"] == _detail(client, cid)["messages"][-1]["id"]
+    finally:
+        _give_back(client, limiter, borrowers)
+    time.sleep(0.2)
+    assert fake_openai.calls == []
+    fake_openai.script = [ANSWER]
+    assert _send(client, cid, content="Noch da?").status_code == 200
+
+
+def test_a_regenerated_answer_moves_its_chat_to_the_top(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """Regenerating is activity, as a new message is: the chat list orders by it."""
+    first, second = _new(client), _new(client)
+    for cid in (first, second):
+        fake_openai.script = [ANSWER]
+        assert _send(client, cid).status_code == 200
+    listed = client.get("/api/chats", headers=as_user()).json()
+    assert [c["id"] for c in listed] == [second, first]
+    fake_openai.script = [[text_chunk("Summe: 43")]]
+    final = _frames(client.post(f"/api/chats/{first}/regenerate", headers=as_user()))[-1].data
+    listed = client.get("/api/chats", headers=as_user()).json()
+    assert [c["id"] for c in listed] == [first, second]
+    assert final["chat"] == listed[0]
+
+
 def test_a_fresh_table_may_come_without_its_preview(client: TestClient, fake_openai: FakeOpenAI) -> None:
     """When the chat's earliest file is past the file period, a new table's card has no preview and is live."""
     cid = _new(client)

@@ -2,7 +2,8 @@
 
 :func:`aiter_sync_gen` is copied from docint's ``_aiter_sync_gen`` (``docint/core/api.py``),
 with the same poll interval; it also takes the capacity limiter whose threads the generator
-runs on, so a long stream holds none of the shared pool's.
+runs on, so a long stream holds none of the shared pool's, and a ``feed`` through which another
+thread may end the stream before the generator has a thread.
 """
 
 import asyncio
@@ -35,6 +36,7 @@ async def aiter_sync_gen(
     gen_factory: Callable[[], Iterator[Any]],
     request: Request | None = None,
     limiter: CapacityLimiter | None = None,
+    feed: Callable[[Callable[[Any], None]], None] | None = None,
 ) -> AsyncIterator[Any]:
     """Drive a blocking sync generator on a worker thread, yielding its items.
 
@@ -54,6 +56,10 @@ async def aiter_sync_gen(
             runs to completion and its remaining output is discarded.
         limiter (CapacityLimiter | None): The limiter whose threads the
             generator runs on; ``None`` for the shared default pool.
+        feed (Callable[[Callable[[Any], None]], None] | None): Called once,
+            before the generator is started, with the thread-safe function
+            that queues an item from any thread; queuing ``None`` ends the
+            iteration as the generator's own end does.
 
     Yields:
         Any: Each item produced by the generator, in order.
@@ -79,6 +85,8 @@ async def aiter_sync_gen(
         except Exception as exc:  # surface to the loop, then stop
             _safe_put(exc)
 
+    if feed is not None:
+        feed(_safe_put)
     task = asyncio.create_task(to_thread.run_sync(_pump, limiter=limiter))
     try:
         while True:
