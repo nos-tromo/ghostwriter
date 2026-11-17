@@ -1,4 +1,7 @@
 export const en = {
+  // the page
+  'app.title': 'Ghostwriter · Chat assistant',
+
   // appheader
   'appheader.home': 'Apps',
   'appheader.theme_system': 'system',
@@ -13,11 +16,12 @@ export const en = {
   'chat.loading': 'Loading chats…',
   'chat.new': 'New chat',
   'chat.untitled': 'New chat',
-  'chat.options': 'Chat options',
+  'chat.options': 'Options for {title}',
   'chat.rename': 'Rename',
   'chat.title': 'Chat title',
   'chat.delete': 'Delete',
   'chat.delete_confirm': 'Delete this chat and its files?',
+  'chat.delete_busy': 'Stop the answer before deleting the chat.',
 
   // retention banner
   'retention.chats': 'Chats are deleted {days} days after they were started.',

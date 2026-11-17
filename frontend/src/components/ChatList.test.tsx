@@ -107,7 +107,7 @@ describe('ChatList', () => {
     const user = userEvent.setup()
     const list = await chatList()
 
-    await user.click(within(rowOf(list, 'Draft letter')).getByRole('button', { name: 'Chat options' }))
+    await user.click(within(rowOf(list, 'Draft letter')).getByRole('button', { name: 'Options for Draft letter' }))
     await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
     const field = within(list).getByRole('textbox', { name: 'Chat title' })
     expect(field).toHaveFocus()
@@ -129,7 +129,7 @@ describe('ChatList', () => {
     const user = userEvent.setup()
     const list = await chatList()
 
-    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Chat options' }))
+    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Options for Quarterly figures' }))
     await user.click(screen.getByRole('menuitem', { name: 'Rename' }))
     await user.type(within(list).getByRole('textbox', { name: 'Chat title' }), ' draft{Escape}')
 
@@ -152,7 +152,7 @@ describe('ChatList', () => {
     const user = userEvent.setup()
     const list = await chatList()
 
-    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Chat options' }))
+    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Options for Quarterly figures' }))
     await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
     expect(screen.getByText('Delete this chat and its files?')).toBeInTheDocument()
     expect(calls.filter((c) => c.method === 'DELETE')).toEqual([])
@@ -167,6 +167,8 @@ describe('ChatList', () => {
     answer()
     await waitFor(() => expect(rows(list)).toEqual(['Draft letter']))
     expect(onSelect).toHaveBeenCalledWith(null)
+    // Focus stays in the list, on the row that followed the deleted one.
+    await waitFor(() => expect(within(list).getByRole('button', { name: 'Draft letter' })).toHaveFocus())
   })
 
   it('keeps the open chat when another one is deleted', async () => {
@@ -175,12 +177,14 @@ describe('ChatList', () => {
     const user = userEvent.setup()
     const list = await chatList()
 
-    await user.click(within(rowOf(list, 'Draft letter')).getByRole('button', { name: 'Chat options' }))
+    await user.click(within(rowOf(list, 'Draft letter')).getByRole('button', { name: 'Options for Draft letter' }))
     await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
     await user.click(screen.getByRole('button', { name: 'Delete' }))
 
     await waitFor(() => expect(rows(list)).toEqual(['Quarterly figures']))
     expect(onSelect).not.toHaveBeenCalled()
+    // The last row has none after it, so focus goes to the list's own control.
+    await waitFor(() => expect(screen.getByRole('button', { name: 'New chat' })).toHaveFocus())
   })
 
   it('says why a delete did not happen, and keeps the chat', async () => {
@@ -193,12 +197,29 @@ describe('ChatList', () => {
     const user = userEvent.setup()
     const list = await chatList()
 
-    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Chat options' }))
+    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Options for Quarterly figures' }))
     await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
     await user.click(screen.getByRole('button', { name: 'Delete' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (409).')
+    // A 409 is an answer still running in the chat: the user is told what to do.
+    expect(await screen.findByRole('alert')).toHaveTextContent('Stop the answer before deleting the chat.')
     expect(rows(list)[0]).toContain('Quarterly figures')
+  })
+
+  it('says what else went wrong in its own words', async () => {
+    serve({
+      'GET /ghostwriter/api/chats': [FIGURES, LETTER],
+      'DELETE /ghostwriter/api/chats/c1': () => new Response(JSON.stringify({ detail: 'boom' }), { status: 500 }),
+    })
+    renderList('c1')
+    const user = userEvent.setup()
+    const list = await chatList()
+
+    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Options for Quarterly figures' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (500).')
   })
 
   it('shows an untitled chat as "New chat"', async () => {
@@ -206,6 +227,9 @@ describe('ChatList', () => {
     renderList()
     const list = await chatList()
     expect(rows(list)).toEqual(['New chat', 'Draft letter'])
+    // Every row's menu is named with its chat, so a screen reader tells them apart.
+    expect(within(rowOf(list, 'New chat')).getByRole('button', { name: 'Options for New chat' })).toBeInTheDocument()
+    expect(within(rowOf(list, 'Draft letter')).getByRole('button', { name: 'Options for Draft letter' })).toBeInTheDocument()
   })
 
   it('says so while there is no chat yet', async () => {

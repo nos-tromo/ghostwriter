@@ -12,6 +12,7 @@ import {
   Spinner,
   cn,
 } from '@infra/ui'
+import { ApiError } from '../api/client'
 import { describeError } from '../api/errorMessage'
 import type { ChatOut } from '../api/types'
 import { useChats, useCreateChat, useDeleteChat, useRenameChat } from '../hooks/useChats'
@@ -20,15 +21,21 @@ import { useT } from '../i18n/LanguageContext'
 /** The longest title the backend takes (`MAX_TITLE_CHARS`). */
 const MAX_TITLE_CHARS = 200
 
-function ErrorLine({ error }: { error: unknown }) {
+/** Why a request failed. A delete refused with 409 has an answer still
+ *  running in the chat, which the user can do something about. */
+function ErrorLine({ error, deleting = false }: { error: unknown; deleting?: boolean }) {
   const t = useT()
   const { key, vars } = describeError(error)
+  const busy = deleting && error instanceof ApiError && error.status === 409
   return (
     <p role="alert" className="px-3 text-xs text-danger">
-      {t(key, vars)}
+      {busy ? t('chat.delete_busy') : t(key, vars)}
     </p>
   )
 }
+
+/** A request that failed in a row, and whether it was the delete. */
+type Failure = { error: unknown; deleting: boolean }
 
 /** The user's chats, the latest activity first: start one, open one, rename
  *  or delete it. */
@@ -42,9 +49,20 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
   useEffect(() => {
     selectedRef.current = selected
   })
+  // Each row's button and the new-chat button, where focus goes after a delete.
+  const rowsRef = useRef(new Map<string, HTMLButtonElement>())
+  const newRef = useRef<HTMLButtonElement>(null)
+  const registerRow = (id: string, node: HTMLButtonElement | null) => {
+    if (node) rowsRef.current.set(id, node)
+    else rowsRef.current.delete(id)
+  }
 
   const start = () => create.mutate(undefined, { onSuccess: (chat) => onSelect(chat.id) })
-  const onDeleted = (id: string) => {
+  // The deleted row takes its menu with it, so focus moves to the row that
+  // followed it, or to the new-chat button after the last one, never to <body>.
+  const onDeleted = (id: string, nextId: string | null) => {
+    const next = nextId === null ? undefined : rowsRef.current.get(nextId)
+    ;(next?.isConnected ? next : newRef.current)?.focus()
     if (selectedRef.current === id) onSelect(null)
   }
 
@@ -54,7 +72,7 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
         <h2 id={headingId} className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
           {t('chat.list')}
         </h2>
-        <NewButton label={t('chat.new')} busy={create.isPending} onClick={start} className="h-7" />
+        <NewButton ref={newRef} label={t('chat.new')} busy={create.isPending} onClick={start} className="h-7" />
       </div>
       {create.isError && <ErrorLine error={create.error} />}
       {chats.isPending ? (
@@ -65,13 +83,15 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
         <p className="px-3 text-sm text-muted-foreground">{t('chat.list_empty')}</p>
       ) : (
         <ul aria-labelledby={headingId} className="flex flex-col gap-1">
-          {chats.data.map((chat) => (
+          {chats.data.map((chat, i) => (
             <ChatRow
               key={chat.id}
               chat={chat}
+              nextId={chats.data[i + 1]?.id ?? null}
               active={chat.id === selected}
               onSelect={onSelect}
               onDeleted={onDeleted}
+              registerRow={registerRow}
             />
           ))}
         </ul>
@@ -82,20 +102,25 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
 
 function ChatRow({
   chat,
+  nextId,
   active,
   onSelect,
   onDeleted,
+  registerRow,
 }: {
   chat: ChatOut
+  /** The chat below this one, if any. */
+  nextId: string | null
   active: boolean
   onSelect: (id: string) => void
-  onDeleted: (id: string) => void
+  onDeleted: (id: string, nextId: string | null) => void
+  registerRow: (id: string, node: HTMLButtonElement | null) => void
 }) {
   const t = useT()
   const del = useDeleteChat()
   const [editing, setEditing] = useState(false)
   const [confirming, setConfirming] = useState(false)
-  const [failure, setFailure] = useState<unknown>(null)
+  const [failure, setFailure] = useState<Failure | null>(null)
   // Set when a rename ends by key, so focus goes back to the row it left.
   const refocusRef = useRef(false)
   const title = chat.title || t('chat.untitled')
@@ -109,9 +134,12 @@ function ChatRow({
     setFailure(null)
     try {
       await del.mutateAsync(chat.id)
-      onDeleted(chat.id)
+      // Closed first: an open menu pulls focus back into its panel on its
+      // next render, and the trigger it hands focus to goes with the row.
+      close()
+      onDeleted(chat.id, nextId)
     } catch (error) {
-      setFailure(error)
+      setFailure({ error, deleting: true })
       close()
     }
   }
@@ -119,11 +147,16 @@ function ChatRow({
   return (
     <li>
       {editing ? (
-        <RenameField chat={chat} onDone={finishRename} onFailed={setFailure} />
+        <RenameField
+          chat={chat}
+          onDone={finishRename}
+          onFailed={(error) => setFailure(error === null ? null : { error, deleting: false })}
+        />
       ) : (
         <div className="group relative flex items-center">
           <button
             ref={(node) => {
+              registerRow(chat.id, node)
               if (node && refocusRef.current) {
                 refocusRef.current = false
                 node.focus()
@@ -149,7 +182,7 @@ function ChatRow({
             trigger={(props) => (
               <HoverIconAction
                 icon={<ChevronDownIcon className="h-4 w-4" />}
-                label={t('chat.options')}
+                label={t('chat.options', { title })}
                 className="h-7"
                 {...props}
               />
@@ -190,7 +223,7 @@ function ChatRow({
           </Menu>
         </div>
       )}
-      {failure !== null && <ErrorLine error={failure} />}
+      {failure !== null && <ErrorLine error={failure.error} deleting={failure.deleting} />}
     </li>
   )
 }

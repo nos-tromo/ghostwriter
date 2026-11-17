@@ -1,6 +1,9 @@
 import type { Strings } from './index'
 
 export const de: Strings = {
+  // the page
+  'app.title': 'Ghostwriter · Chatassistent',
+
   // appheader
   'appheader.home': 'Übersicht',
   'appheader.theme_system': 'System',
@@ -15,11 +18,12 @@ export const de: Strings = {
   'chat.loading': 'Chats werden geladen…',
   'chat.new': 'Neuer Chat',
   'chat.untitled': 'Neuer Chat',
-  'chat.options': 'Chat-Optionen',
+  'chat.options': 'Optionen für {title}',
   'chat.rename': 'Umbenennen',
   'chat.title': 'Chat-Titel',
   'chat.delete': 'Löschen',
   'chat.delete_confirm': 'Diesen Chat und seine Dateien löschen?',
+  'chat.delete_busy': 'Beende die Antwort, bevor du den Chat löschst.',
 
   // retention banner
   'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',

@@ -11,9 +11,11 @@ export function LanguageProvider({ children }: { children: React.ReactNode }) {
   const { data, isLoading } = useConfig()
   const language: Lang = data?.ui_language === 'de' ? 'de' : 'en'
   // Keep the document's lang attribute in sync so a de deployment never
-  // renders German text inside a lang="en" document.
+  // renders German text inside a lang="en" document, and the page title in
+  // the same language (index.html carries the English one until then).
   useEffect(() => {
     document.documentElement.lang = language
+    document.title = catalogs[language]['app.title']
   }, [language])
   // Block only the very first paint so a de deployment never flashes English;
   // a failed config fetch falls through to 'en' — it can never blank the UI.

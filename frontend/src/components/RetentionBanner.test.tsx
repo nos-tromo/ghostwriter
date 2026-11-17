@@ -36,6 +36,18 @@ describe('RetentionBanner', () => {
     expect(german).toHaveTextContent('Dateien und Tool-Ergebnisse werden nach 7 Tagen gelöscht.')
   })
 
+  it('names only the chat period while attachments are off', () => {
+    const { unmount } = render(<RetentionBanner config={{ ...CONFIG, attachments: false }} />)
+    const banner = screen.getByRole('status')
+    expect(banner).toHaveTextContent('Chats are deleted 90 days after they were started.')
+    expect(banner).not.toHaveTextContent('Files and tool results')
+    unmount()
+
+    // Neither period applies: no banner at all.
+    render(<RetentionBanner config={{ ...CONFIG, attachments: false, chat_retention_days: null }} />)
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+  })
+
   it('names only the file period while chats are kept', () => {
     render(<RetentionBanner config={{ ...CONFIG, chat_retention_days: null }} />)
     const banner = screen.getByRole('status')

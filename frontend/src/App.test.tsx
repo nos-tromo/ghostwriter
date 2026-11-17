@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { render, screen, within } from '@testing-library/react'
 import { clearAllPurposes } from '@infra/ui'
 import App from './App'
+import indexHtml from '../index.html?raw'
 import { queryClient } from './api/queryClient'
 import type { AppConfig } from './api/types'
 
@@ -54,12 +55,21 @@ describe('App', () => {
     expect(within(header).getByText('Ghostwriter')).toBeInTheDocument()
   })
 
+  it('presents the chat assistant first in the page title', async () => {
+    // What the browser shows before the SPA has loaded.
+    expect(/<title>(.*)<\/title>/.exec(indexHtml)?.[1]).toBe('Ghostwriter · Chat assistant')
+    render(<App />)
+    await screen.findAllByRole('banner')
+    expect(document.title).toBe('Ghostwriter · Chat assistant')
+  })
+
   it("speaks the deployment's language, with the purpose bar, the chats and the periods in place", async () => {
     serve({ ...CONFIG, ui_language: 'de', require_purpose: ['collect'] })
     render(<App />)
     const [header] = await screen.findAllByRole('banner')
 
     expect(document.documentElement.lang).toBe('de')
+    expect(document.title).toBe('Ghostwriter · Chatassistent')
     expect(within(header).getByRole('button', { name: 'Zweck erforderlich' })).toBeInTheDocument()
     expect(within(header).getByText('v0.1.0')).toBeInTheDocument()
     expect(await within(header).findByRole('button', { name: /user-a/ })).toBeInTheDocument()
