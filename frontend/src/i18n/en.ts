@@ -32,6 +32,34 @@ export const en = {
   'chat.regenerate': 'Regenerate',
   'chat.answer_busy': 'An answer is still being written in this chat.',
 
+  // the reasoning switch
+  'chat.reasoning_state': 'Reasoning: {mode}',
+  'chat.reasoning_on': 'On — the model thinks before answering',
+  'chat.reasoning_off': 'Off — faster, plain answer',
+
+  // the composer
+  'composer.placeholder': 'Write a message',
+  'composer.attach': 'Attach files',
+  'composer.drop': 'Drop files to attach them',
+  'composer.files_stay': 'Attached files stay in this chat until it is deleted, for {days} days at most.',
+  'composer.uploading': 'Attaching {name}…',
+  'composer.remove': 'Remove {name}',
+  'composer.error_type': '{name}: this file type is not supported.',
+  'composer.error_size': '{name} is larger than 50 MB.',
+  'composer.error_upload': '{name} could not be attached.',
+  'composer.error_storage_full':
+    'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
+  'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
+  'composer.send': 'Send',
+  'composer.stop': 'Stop',
+
+  // dictation
+  'mic.start': 'Dictate',
+  'mic.stop': 'Stop dictating',
+  'mic.denied': 'Microphone access was denied.',
+  'mic.unsupported': 'This browser cannot record audio.',
+  'mic.limit': '{s} s left',
+
   // the trail of tool steps
   'trail.steps': '{n} steps',
   'trail.steps_one': '1 step',

@@ -1,8 +1,8 @@
-import type { ReactNode } from 'react'
+import { useState, type DragEvent, type ReactNode } from 'react'
 import { EmptyState, Spinner } from '@infra/ui'
 import { ApiError } from '../api/client'
 import type { AppConfig, ErrorFrame } from '../api/types'
-import { useChatStream, type ChatStream, type StreamFailure } from '../hooks/useChatStream'
+import type { ChatStream, StreamFailure } from '../hooks/useChatStream'
 import { useChat } from '../hooks/useChats'
 import { useStickToBottom } from '../hooks/useStickToBottom'
 import type { Strings } from '../i18n'
@@ -29,29 +29,40 @@ function FailureLine({ failure }: { failure: StreamFailure }) {
   )
 }
 
+/** Whether a drag carries files, not text or a link dragged out of the page. */
+function carriesFiles(event: DragEvent): boolean {
+  return Array.from(event.dataTransfer?.types ?? []).includes('Files')
+}
+
 /**
  * A chat's messages, the answer being written below them, and why the last
  * one ended early; the view follows new text while the user is at its bottom.
  *
  * A chat with no messages invites a question, and a document only while
  * attachments are on. A regenerate's draft stands where the answer it
- * replaces was. `reasoning` is the composer's switch, sent with a regenerate;
- * `composer` renders below the messages over the same stream.
+ * replaces was. `stream` is the chat's one stream, which `composer`, rendered
+ * below the messages, sends on too; `reasoning` is the composer's switch,
+ * sent with a regenerate. Files dropped anywhere on it go to `onDropFiles`;
+ * without it, a drop is left to the browser.
  */
 export function Conversation({
   chatId,
   config,
+  stream,
   reasoning,
   composer,
+  onDropFiles,
 }: {
   chatId: string
   config: AppConfig
+  stream: ChatStream
   reasoning: boolean
-  composer?: (stream: ChatStream) => ReactNode
+  composer?: ReactNode
+  onDropFiles?: (files: File[]) => void
 }) {
   const t = useT()
   const chat = useChat(chatId)
-  const stream = useChatStream(chatId)
+  const [dragging, setDragging] = useState(false)
   const { ref, onScroll } = useStickToBottom<HTMLDivElement>(stream.draft ?? stream.pendingUser ?? chat.data)
   const fileDays = config.file_retention_days
 
@@ -67,8 +78,31 @@ export function Conversation({
     : stream.failure
   const empty = chat.isSuccess && messages.length === 0 && !stream.streaming
 
+  const drops = onDropFiles && {
+    onDragOver: (event: DragEvent<HTMLDivElement>) => {
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      event.dataTransfer.dropEffect = 'copy'
+      setDragging(true)
+    },
+    onDragLeave: (event: DragEvent<HTMLDivElement>) => {
+      if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setDragging(false)
+    },
+    onDrop: (event: DragEvent<HTMLDivElement>) => {
+      setDragging(false)
+      if (!carriesFiles(event)) return
+      event.preventDefault()
+      onDropFiles(Array.from(event.dataTransfer.files))
+    },
+  }
+
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="relative flex h-full min-h-0 flex-col" {...drops}>
+      {dragging && (
+        <div className="pointer-events-none absolute inset-2 z-10 flex items-center justify-center rounded-lg border-2 border-dashed border-primary bg-background/90 text-sm text-foreground">
+          {t('composer.drop')}
+        </div>
+      )}
       <div ref={ref} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-6">
           {chat.isPending && <Spinner label={t('chat.loading_messages')} />}
@@ -88,7 +122,7 @@ export function Conversation({
           {failure && <FailureLine failure={failure} />}
         </div>
       </div>
-      {composer?.(stream)}
+      {composer}
     </div>
   )
 }

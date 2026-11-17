@@ -2,7 +2,6 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { clearAllPurposes } from '@infra/ui'
-import { Conversation } from '../components/Conversation'
 import { LanguageContext } from '../i18n/LanguageContext'
 import type { AttachmentOut } from '../api/types'
 import type { ChatStream } from './useChatStream'
@@ -18,6 +17,7 @@ import {
   serve,
   sseStream,
   step,
+  StreamedConversation,
 } from '../test/fixtures'
 
 afterEach(() => {
@@ -105,7 +105,7 @@ function serveChat(before: ReturnType<typeof detail>, after: ReturnType<typeof d
 describe('useChatStream', () => {
   it('streams tokens, steps and results into the draft, then refetches the chat', async () => {
     const { calls, sse, finish } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
-    renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
 
@@ -138,7 +138,7 @@ describe('useChatStream', () => {
 
   it('says it is thinking while a reasoning answer holds its text, and that it is working otherwise', async () => {
     const thinking = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
-    const first = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
 
@@ -161,7 +161,7 @@ describe('useChatStream', () => {
     first.unmount()
 
     serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
-    renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     await screen.findByText('Ask anything, or attach a document.')
     await user.click(screen.getByRole('button', { name: 'Ask' }))
     expect(await screen.findByText('Working on an answer…')).toBeInTheDocument()
@@ -174,7 +174,7 @@ describe('useChatStream', () => {
     renderWithClient(
       <>
         <ListObserver />
-        <Conversation chatId="c1" config={CONFIG} reasoning={true} />
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={true} />
       </>,
     )
     const user = userEvent.setup()
@@ -200,7 +200,7 @@ describe('useChatStream', () => {
 
   it('ends a step left running when the record failed, and keeps the reason in view', async () => {
     const { sse, finish } = serveChat(detail([]), detail([QUESTION, message({ id: 'm2', role: 'assistant' })]), 'messages')
-    renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
     await user.click(screen.getByRole('button', { name: 'Ask' }))
@@ -225,7 +225,7 @@ describe('useChatStream', () => {
       detail([message({ id: 'm1', role: 'user', attachments: [SALES] }), ANSWER]),
       'messages',
     )
-    renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
 
@@ -245,7 +245,7 @@ describe('useChatStream', () => {
     const busy = () =>
       new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.' }), { status: 409 })
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'POST /ghostwriter/api/chats/c1/messages': busy })
-    const first = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
     await user.click(screen.getByRole('button', { name: 'Ask' }))
@@ -256,7 +256,7 @@ describe('useChatStream', () => {
 
     // A regenerate refused the same way says the same.
     serve({ 'GET /ghostwriter/api/chats/c1': detail([QUESTION, ANSWER]), 'POST /ghostwriter/api/chats/c1/regenerate': busy })
-    const second = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const second = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
     await user.click(await screen.findByRole('button', { name: 'Regenerate' }))
     expect(await screen.findByRole('alert')).toHaveTextContent('An answer is still being written in this chat.')
     second.unmount()
@@ -268,7 +268,7 @@ describe('useChatStream', () => {
     })
     renderWithClient(
       <LanguageContext value="de">
-        <Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />
       </LanguageContext>,
     )
     await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')
@@ -278,7 +278,7 @@ describe('useChatStream', () => {
 
   it('asks the server to stop, and aborts the stream when the conversation goes away', async () => {
     const { calls, sse } = serveChat(detail([]), detail([]), 'messages')
-    const view = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const view = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
     await user.click(screen.getByRole('button', { name: 'Ask' }))

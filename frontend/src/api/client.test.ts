@@ -1,6 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { PURPOSE_HEADER, clearAllPurposes, setPurpose } from '@infra/ui'
-import { ApiError, apiBase } from './client'
+import { createElement } from 'react'
+import { render, screen } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
+import { PURPOSE_HEADER, PurposeBar, clearAllPurposes, setPurpose } from '@infra/ui'
+import { ApiError, PURPOSE_SCOPE, apiBase } from './client'
 import {
   createChat,
   deleteChat,
@@ -151,6 +154,54 @@ describe('the API client', () => {
       code: 'too_large',
     } satisfies Partial<ApiError>)
     await expect(deleteChat('c1')).rejects.toMatchObject({ status: 409, code: null })
+  })
+
+  it('sends the same file again after a 428, once a purpose is stated', async () => {
+    let tries = 0
+    const fetchFn = serve({
+      'POST /ghostwriter/api/chats/c1/attachments': () =>
+        ++tries === 1
+          ? json({ detail: 'A stated purpose is required for this request.' }, 428)
+          : json({ id: 'a1', file_id: 'f1', name: 'sales.csv' }, 201),
+    })
+    const user = userEvent.setup()
+    render(createElement(PurposeBar, { scope: PURPOSE_SCOPE, required: true }))
+
+    const upload = uploadAttachment('c1', new File(['a,b'], 'sales.csv', { type: 'text/csv' }))
+    await user.type(await screen.findByLabelText('Case reference'), 'case-0001{Enter}')
+    expect((await upload).id).toBe('a1')
+
+    const [refused, resent] = sent(fetchFn)
+    expect(refused.headers[PURPOSE_HEADER]).toBeUndefined()
+    expect(resent.headers[PURPOSE_HEADER]).toBe('case_ref=case-0001')
+    // The multipart body is built once and sent twice, whole.
+    expect(resent.body).toBe(refused.body)
+    const file = (resent.body as FormData).get('file') as File
+    expect(file.name).toBe('sales.csv')
+    expect(await file.text()).toBe('a,b')
+  })
+
+  it('sends the same recording again after a 428, once a purpose is stated', async () => {
+    let tries = 0
+    const fetchFn = serve({
+      'POST /ghostwriter/api/transcribe': () =>
+        ++tries === 1
+          ? json({ detail: 'A stated purpose is required for this request.' }, 428)
+          : json({ text: 'Summe der Spalte B' }),
+    })
+    const user = userEvent.setup()
+    render(createElement(PurposeBar, { scope: PURPOSE_SCOPE, required: true }))
+
+    const text = transcribe(new Blob(['synthetic voice']), 'audio/ogg;codecs=opus')
+    await user.type(await screen.findByLabelText('Reason'), 'Prüfung{Enter}')
+    expect(await text).toBe('Summe der Spalte B')
+
+    const [refused, resent] = sent(fetchFn)
+    expect(resent.headers[PURPOSE_HEADER]).toBe('reason=Pr%C3%BCfung')
+    expect(resent.body).toBe(refused.body)
+    const recording = (resent.body as FormData).get('file') as File
+    expect(recording.type).toBe('audio/ogg;codecs=opus')
+    expect(await recording.text()).toBe('synthetic voice')
   })
 
   it('reads a file that is gone as an ApiError, not as a blob', async () => {

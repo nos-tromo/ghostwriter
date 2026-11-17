@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { stopChat } from '../api/chats'
+import { ApiError } from '../api/client'
 import { streamSse } from '../api/sse'
 import type { AttachmentOut, ErrorFrame, MessageIn, MessageOut, RegenerateIn, ResultOut, StepOut } from '../api/types'
 import { chatKey, chatsKey } from './useChats'
@@ -28,8 +29,10 @@ export interface ChatStream {
   /** The message being sent, until the chat is read again; null for a regenerate. */
   pendingUser: PendingMessage | null
   failure: StreamFailure | null
-  /** Send a message with the chat's pending attachments it binds (sent by their ids). */
-  send(content: string, attachments: readonly AttachmentOut[], reasoning: boolean): Promise<void>
+  /** Send a message with the chat's pending attachments it binds (sent by their ids).
+   *  Resolves false when the server refused it with an error status, so it was
+   *  not stored; true once it was taken, also when its answer ended early. */
+  send(content: string, attachments: readonly AttachmentOut[], reasoning: boolean): Promise<boolean>
   regenerate(reasoning: boolean): Promise<void>
   stop(): Promise<void>
 }
@@ -97,8 +100,12 @@ export function useChatStream(chatId: string | null): ChatStream {
   )
 
   const run = useCallback(
-    async (route: 'messages' | 'regenerate', body: MessageIn | RegenerateIn, pendingUser: PendingMessage | null) => {
-      if (chatId === null || busyRef.current) return
+    async (
+      route: 'messages' | 'regenerate',
+      body: MessageIn | RegenerateIn,
+      pendingUser: PendingMessage | null,
+    ): Promise<boolean> => {
+      if (chatId === null || busyRef.current) return false
       busyRef.current = true
       const me = ++runRef.current
       const live = () => runRef.current === me
@@ -127,6 +134,8 @@ export function useChatStream(chatId: string | null): ChatStream {
         if (!controller.signal.aborted) failure = { kind: 'request', error }
       }
       if (draft.error) failure = { kind: 'answer', code: draft.error }
+      // Refused with a status, never begun: a cut connection may have been taken.
+      const taken = !(failure?.kind === 'request' && failure.error instanceof ApiError)
 
       // What the server stored, even of an answer cut short: the chat with its
       // messages, and the list, which a new answer or a regenerate reorders.
@@ -134,10 +143,11 @@ export function useChatStream(chatId: string | null): ChatStream {
         qc.invalidateQueries({ queryKey: chatKey(chatId) }),
         qc.invalidateQueries({ queryKey: chatsKey }),
       ])
-      if (!live()) return
+      if (!live()) return taken
       busyRef.current = false
       controllerRef.current = null
       setState({ ...IDLE, failure })
+      return taken
     },
     [chatId, qc],
   )
@@ -153,7 +163,9 @@ export function useChatStream(chatId: string | null): ChatStream {
   )
 
   const regenerate = useCallback(
-    (reasoning: boolean) => run('regenerate', { reasoning } satisfies RegenerateIn, null),
+    async (reasoning: boolean) => {
+      await run('regenerate', { reasoning } satisfies RegenerateIn, null)
+    },
     [run],
   )
 

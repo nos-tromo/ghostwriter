@@ -1,26 +1,25 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { screen, within } from '@testing-library/react'
-import { Conversation } from './Conversation'
 import { LanguageContext } from '../i18n/LanguageContext'
-import { CONFIG, detail, message, renderWithClient, result, serve, step } from '../test/fixtures'
+import { CONFIG, StreamedConversation, detail, message, renderWithClient, result, serve, step } from '../test/fixtures'
 
 afterEach(() => vi.unstubAllGlobals())
 
 describe('Conversation', () => {
   it('invites a question, and a document only when attachments are on', async () => {
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]) })
-    const first = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
     expect(await screen.findByText('Ask anything, or attach a document.')).toBeInTheDocument()
     first.unmount()
 
-    const second = renderWithClient(<Conversation chatId="c1" config={{ ...CONFIG, attachments: false }} reasoning={false} />)
+    const second = renderWithClient(<StreamedConversation chatId="c1" config={{ ...CONFIG, attachments: false }} reasoning={false} />)
     expect(await screen.findByText('Ask anything.')).toBeInTheDocument()
     expect(screen.queryByText(/attach a document/)).not.toBeInTheDocument()
     second.unmount()
 
     const german = renderWithClient(
       <LanguageContext value="de">
-        <Conversation chatId="c1" config={CONFIG} reasoning={false} />
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
       </LanguageContext>,
     )
     expect(await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')).toBeInTheDocument()
@@ -28,7 +27,7 @@ describe('Conversation', () => {
 
     renderWithClient(
       <LanguageContext value="de">
-        <Conversation chatId="c1" config={{ ...CONFIG, attachments: false }} reasoning={false} />
+        <StreamedConversation chatId="c1" config={{ ...CONFIG, attachments: false }} reasoning={false} />
       </LanguageContext>,
     )
     expect(await screen.findByText('Fragen Sie, was Sie möchten.')).toBeInTheDocument()
@@ -64,7 +63,7 @@ describe('Conversation', () => {
         message({ id: 'm4', role: 'assistant', content: 'Spalte C ist leer.' }),
       ]),
     })
-    renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} />)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
 
     const question = (await screen.findByText('Summe der Spalte B?')).closest('[data-role="user"]') as HTMLElement
     expect(within(question).getByText('sales.xlsx')).toBeInTheDocument()

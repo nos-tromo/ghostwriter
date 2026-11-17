@@ -1,10 +1,12 @@
 // Synthetic chats, messages, steps and results, a fetch stub and an SSE body
 // for the conversation's tests. Invented data only.
-import type { ReactElement } from 'react'
+import type { ComponentProps, ReactElement, ReactNode } from 'react'
 import { vi } from 'vitest'
 import { render } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import type { AppConfig, ChatDetail, ChatOut, MessageOut, ResultOut, StepOut } from '../api/types'
+import { Conversation } from '../components/Conversation'
+import { useChatStream, type ChatStream } from '../hooks/useChatStream'
 
 export const CONFIG: AppConfig = {
   ui_language: 'en',
@@ -107,4 +109,16 @@ export function renderWithClient(ui: ReactElement) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   const view = render(<QueryClientProvider client={client}>{ui}</QueryClientProvider>)
   return { client, ...view }
+}
+
+/** The conversation over a stream of its own, as `ChatPane` gives it one;
+ *  `composer` renders below it over the same stream. */
+export function StreamedConversation({
+  composer,
+  ...props
+}: Omit<ComponentProps<typeof Conversation>, 'stream' | 'composer'> & {
+  composer?: (stream: ChatStream) => ReactNode
+}) {
+  const stream = useChatStream(props.chatId)
+  return <Conversation {...props} stream={stream} composer={composer?.(stream)} />
 }

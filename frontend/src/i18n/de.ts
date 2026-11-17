@@ -34,6 +34,35 @@ export const de: Strings = {
   'chat.regenerate': 'Neu erzeugen',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
 
+  // the reasoning switch
+  'chat.reasoning_state': 'Reasoning: {mode}',
+  'chat.reasoning_on': 'An — das Modell denkt vor der Antwort nach',
+  'chat.reasoning_off': 'Aus — schneller, direkte Antwort',
+
+  // the composer
+  'composer.placeholder': 'Nachricht schreiben',
+  'composer.attach': 'Dateien anhängen',
+  'composer.drop': 'Dateien zum Anhängen ablegen',
+  'composer.files_stay': 'Angehängte Dateien bleiben in diesem Chat, bis er gelöscht wird, höchstens {days} Tage.',
+  'composer.uploading': '{name} wird angehängt…',
+  'composer.remove': '{name} entfernen',
+  'composer.error_type': '{name}: Dieser Dateityp wird nicht unterstützt.',
+  'composer.error_size': '{name} ist größer als 50 MB.',
+  'composer.error_upload': '{name} konnte nicht angehängt werden.',
+  'composer.error_storage_full':
+    'Ihre Dateien füllen den von workbench erlaubten Platz; löschen Sie einen Chat oder warten Sie, bis Dateien ablaufen.',
+  'composer.error_purpose':
+    '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
+  'composer.send': 'Senden',
+  'composer.stop': 'Stopp',
+
+  // dictation
+  'mic.start': 'Diktieren',
+  'mic.stop': 'Diktat beenden',
+  'mic.denied': 'Der Zugriff auf das Mikrofon wurde verweigert.',
+  'mic.unsupported': 'Dieser Browser kann kein Audio aufnehmen.',
+  'mic.limit': 'noch {s} s',
+
   // the trail of tool steps
   'trail.steps': '{n} Schritte',
   'trail.steps_one': '1 Schritt',
