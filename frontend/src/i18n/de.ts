@@ -106,7 +106,7 @@ export const de: Strings = {
   'error.audit': 'Die Antwort wurde abgebrochen, weil sie nicht protokolliert werden konnte.',
   'error.internal': 'Etwas ist schiefgelaufen.',
 
-  // retention banner
+  // retention note
   'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',
   'retention.files': 'Dateien und Tool-Ergebnisse werden nach {days} Tagen gelöscht.',
 

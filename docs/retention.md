@@ -7,9 +7,9 @@
 | The files | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download answers 410 |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
-after start, then daily (`ghostwriter/retention.py`). A banner and a line under
-attached files state the periods, leaving out the chat period while chat
-retention is off and the file period while attachments are off.
+after start, then daily (`ghostwriter/retention.py`). A line under the composer
+and a line under attached files state the periods, leaving out the chat period
+while chat retention is off and the file period while attachments are off.
 
 ## The chat period and its notice
 
