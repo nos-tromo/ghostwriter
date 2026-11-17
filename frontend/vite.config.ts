@@ -27,5 +27,8 @@ export default defineConfig({
     environment: 'happy-dom',
     globals: true,
     setupFiles: ['./src/test/setup.ts'],
+    // Vitest serves BASE_URL as '/'; the tests run under the sub-path the SPA
+    // is served from, so every request they check goes where production's does.
+    env: { BASE_URL: '/ghostwriter/' },
   },
 })

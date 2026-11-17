@@ -1,8 +1,14 @@
 import { useQuery } from '@tanstack/react-query'
-import type { Lang } from '../i18n'
+import { getConfig } from '../api/chats'
 
-/** The SPA's bootstrap config, under the query key ['config']. Nothing
- *  fetches it yet (GET /api/config comes later), so the UI stays English. */
+/** The deployment's switches, limits and periods, under the query key
+ *  ['config']. The backend reads them from env at start and serves them
+ *  without auth, so they are read first, once, and never again. */
 export function useConfig() {
-  return useQuery<{ ui_language: Lang }>({ queryKey: ['config'], enabled: false })
+  return useQuery({
+    queryKey: ['config'],
+    queryFn: getConfig,
+    staleTime: Infinity,
+    gcTime: Infinity,
+  })
 }

@@ -4,7 +4,7 @@ import { de } from './de'
 import { format } from './index'
 
 describe('i18n', () => {
-  it('en and de have identical key sets', () => {
+  it('keeps de in step with en', () => {
     expect(Object.keys(de).sort()).toEqual(Object.keys(en).sort())
   })
   it('interpolates named placeholders', () => {

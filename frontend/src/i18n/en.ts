@@ -5,6 +5,23 @@ export const en = {
   'appheader.theme_light': 'light',
   'appheader.theme_dark': 'dark',
   'appheader.sign_out': 'Sign out',
+  'appheader.sidebar_toggle': 'Toggle sidebar',
+
+  // chat list
+  'chat.list': 'Chats',
+  'chat.list_empty': 'No chats yet.',
+  'chat.loading': 'Loading chats…',
+  'chat.new': 'New chat',
+  'chat.untitled': 'New chat',
+  'chat.options': 'Chat options',
+  'chat.rename': 'Rename',
+  'chat.title': 'Chat title',
+  'chat.delete': 'Delete',
+  'chat.delete_confirm': 'Delete this chat and its files?',
+
+  // retention banner
+  'retention.chats': 'Chats are deleted {days} days after they were started.',
+  'retention.files': 'Files and tool results are deleted after {days} days.',
 
   // purpose (PurposeBar; {max} is filled in by the bar)
   'purpose.label': 'Purpose',
@@ -25,6 +42,7 @@ export const en = {
   'purpose.error_empty': 'Enter a case reference or a reason.',
 
   // common
+  'common.cancel': 'Cancel',
   'common.copied': 'Copied',
   'common.error_request': 'Something went wrong ({status}). Please try again or contact support.',
   'common.error_unknown': 'Something went wrong. Please try again or contact support.',

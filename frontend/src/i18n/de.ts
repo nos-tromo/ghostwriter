@@ -7,6 +7,23 @@ export const de: Strings = {
   'appheader.theme_light': 'Hell',
   'appheader.theme_dark': 'Dunkel',
   'appheader.sign_out': 'Abmelden',
+  'appheader.sidebar_toggle': 'Seitenleiste ein- oder ausblenden',
+
+  // chat list
+  'chat.list': 'Chats',
+  'chat.list_empty': 'Noch keine Chats.',
+  'chat.loading': 'Chats werden geladen…',
+  'chat.new': 'Neuer Chat',
+  'chat.untitled': 'Neuer Chat',
+  'chat.options': 'Chat-Optionen',
+  'chat.rename': 'Umbenennen',
+  'chat.title': 'Chat-Titel',
+  'chat.delete': 'Löschen',
+  'chat.delete_confirm': 'Diesen Chat und seine Dateien löschen?',
+
+  // retention banner
+  'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',
+  'retention.files': 'Dateien und Tool-Ergebnisse werden nach {days} Tagen gelöscht.',
 
   // purpose (PurposeBar; {max} is filled in by the bar)
   'purpose.label': 'Zweck',
@@ -27,6 +44,7 @@ export const de: Strings = {
   'purpose.error_empty': 'Bitte geben Sie ein Aktenzeichen oder eine Begründung an.',
 
   // common
+  'common.cancel': 'Abbrechen',
   'common.copied': 'Kopiert',
   'common.error_request': 'Etwas ist schiefgelaufen ({status}) – Bitte versuchen Sie es erneut oder kontaktieren Sie den Support.',
   'common.error_unknown': 'Etwas ist schiefgelaufen – Bitte versuchen Sie es erneut oder kontaktieren Sie den Support.',
