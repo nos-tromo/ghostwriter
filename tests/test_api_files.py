@@ -140,6 +140,21 @@ def test_other_types_are_refused_with_415(
     assert door.uploads == [] and _since(audit_stream, before) == []
 
 
+@pytest.mark.parametrize(
+    ("name", "mime"),
+    [
+        ("orders.json", "application/json"),
+        ("events.jsonl", "application/x-ndjson"),
+        ("events.ndjson", "application/x-ndjson"),
+    ],
+)
+def test_json_files_are_attached(client: TestClient, door: FakeDoor, name: str, mime: str) -> None:
+    """JSON and JSON Lines go to workbench like any document, on their own MIME types."""
+    r = _attach(client, _new(client), name, b'{"order": "A-0001", "total": 12.5}')
+    assert (r.status_code, r.json()["name"], r.json()["mime"]) == (201, name, mime)
+    assert door.uploads[-1].content_type == mime
+
+
 def test_extensions_match_in_any_case(client: TestClient, door: FakeDoor) -> None:
     """``.PDF`` is a pdf; the name keeps its case."""
     r = _attach(client, _new(client), "Bericht März.PDF")
