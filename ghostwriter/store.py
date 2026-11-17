@@ -5,7 +5,9 @@ rows. A lookup a user can reach names the owner. A chat is due under the chat
 period (:mod:`ghostwriter.retention_rule`). A tool step's content and a result's
 preview expire with the chat's earliest file, which the chat remembers when the
 rows that named it are gone: nothing derived from a file outlives it (spec
-§5.6). An attachment or a result itself lives as long as its own file.
+§5.6). An attachment or a result itself lives as long as its own file. The
+retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
+deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`).
 """
 
 import json
@@ -16,7 +18,8 @@ from datetime import datetime, timedelta
 from typing import Any, Final, cast
 from uuid import uuid4
 
-from sqlalchemy import Engine, delete, func, select, union_all, update
+from loguru import logger
+from sqlalchemy import Engine, delete, func, or_, select, union_all, update
 from sqlalchemy.orm import Session
 
 from ghostwriter.agent.context import PastCall, PastTurn, user_content
@@ -526,6 +529,77 @@ class ChatStore:
         """
         with self._transaction() as s:
             s.execute(delete(Chat).where(Chat.id == chat_id))
+
+    def due_chats(self, now: datetime, limit: int) -> list[tuple[str, str]]:
+        """Return the chats whose deadline has come, the earliest first.
+
+        Args:
+            now: The time of the sweep.
+            limit: The most chats returned.
+
+        Returns:
+            Each chat's id and owner.
+        """
+        with self._transaction() as s:
+            rows = s.execute(
+                select(Chat.id, Chat.owner)
+                .where(Chat.expires_at.is_not(None), Chat.expires_at <= now)
+                .order_by(Chat.expires_at, Chat.id)
+                .limit(limit)
+            ).all()
+            return [(chat_id, owner) for chat_id, owner in rows]
+
+    def due_contents(self, now: datetime, limit: int) -> tuple[list[str], list[str]]:
+        """Return the tool steps and results whose content has expired and is not yet emptied.
+
+        Args:
+            now: The time of the sweep.
+            limit: The most steps, and the most results, returned.
+
+        Returns:
+            The steps' ids and the results' ids, the earliest deadline first.
+        """
+        with self._transaction() as s:
+            steps = s.scalars(
+                select(ToolStep.id)
+                .where(
+                    ToolStep.content_expires_at <= now,
+                    or_(ToolStep.arguments.is_not(None), ToolStep.result.is_not(None)),
+                )
+                .order_by(ToolStep.content_expires_at, ToolStep.id)
+                .limit(limit)
+            ).all()
+            results = s.scalars(
+                select(Result.id)
+                .where(Result.preview_expires_at <= now, Result.preview.is_not(None))
+                .order_by(Result.preview_expires_at, Result.id)
+                .limit(limit)
+            ).all()
+            return list(steps), list(results)
+
+    def empty_contents(self, step_ids: Sequence[str], result_ids: Sequence[str]) -> None:
+        """Empty steps' arguments and results and results' previews; the tool, status, name, size and type stay.
+
+        Args:
+            step_ids: The steps.
+            result_ids: The results.
+        """
+        with self._transaction() as s:
+            if step_ids:
+                s.execute(update(ToolStep).where(ToolStep.id.in_(step_ids)).values(arguments=None, result=None))
+            if result_ids:
+                s.execute(update(Result).where(Result.id.in_(result_ids)).values(preview=None))
+
+    def checkpoint(self) -> None:
+        """Copy the write-ahead log into the database file and empty it, outside any transaction.
+
+        ``secure_delete`` overwrites deleted rows in the database file, but their earlier
+        versions can still sit in the log until it is checkpointed.
+        """
+        with self._engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+            busy, _, _ = conn.exec_driver_sql("PRAGMA wal_checkpoint(TRUNCATE)").one()
+        if busy:
+            logger.warning("The database was busy; the write-ahead log is checkpointed by a later sweep.")
 
     def add_user_message(
         self, owner: str, chat_id: str, content: str, attachment_ids: Sequence[str], *, id: str | None = None

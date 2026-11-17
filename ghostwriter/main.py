@@ -13,12 +13,15 @@ run on, apart from the pool that serves every other request. ``app.state.model``
 is the model client, which dictation (:mod:`ghostwriter.api.speech`, registered
 only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns; dictation
 runs on ``app.state.speech_threads``, a limiter of ``SPEECH_THREADS`` threads of
-its own. Every request body is capped per route (:mod:`ghostwriter.body_limit`),
+its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retention`),
+which the lifespan runs a minute after start and then daily, and cancels at
+shutdown. Every request body is capped per route (:mod:`ghostwriter.body_limit`),
 as nginx caps it.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime
 from typing import Final, TextIO
 from urllib.parse import quote
@@ -43,6 +46,8 @@ from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.inference import SPEECH_THREADS, ModelClient
 from ghostwriter.log_cfg import setup_logger
+from ghostwriter.retention import FIRST_SWEEP_DELAY_S, SWEEP_INTERVAL_S, Sweeper
+from ghostwriter.retention_rule import run_retention_loop
 from ghostwriter.store import ChatStore
 from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditWriteError
@@ -88,7 +93,8 @@ def create_app(
         """Run the audit chain and the chat store for as long as the app serves; if either cannot open, startup fails.
 
         The store's schema is brought to this release's version and the
-        configured periods are put in force before the first request.
+        configured periods are put in force before the first request; then
+        the retention sweep starts, and it is cancelled first at shutdown.
 
         Args:
             app: The application being served.
@@ -98,6 +104,7 @@ def create_app(
         """
         emitter = open_emitter(__version__, audit_stream)
         engine: Engine | None = None
+        sweeps: asyncio.Task[None] | None = None
         try:
             start_chain(app, emitter)
             engine = make_engine(settings.db_path)
@@ -108,8 +115,23 @@ def create_app(
             app.state.agent = AgentLoop(model=chat_model, workbench=app.state.workbench, store=store, settings=settings)
             app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
             app.state.speech_threads = anyio.CapacityLimiter(SPEECH_THREADS)
+            app.state.sweeper = Sweeper(
+                store=store,
+                workbench=app.state.workbench,
+                emitter=emitter,
+                settings=settings,
+                turns=app.state.turns,
+                now=now,
+            )
+            sweeps = asyncio.create_task(
+                run_retention_loop(app.state.sweeper.sweep, first_delay=FIRST_SWEEP_DELAY_S, interval=SWEEP_INTERVAL_S)
+            )
             yield
         finally:
+            if sweeps is not None:
+                sweeps.cancel()
+                with suppress(asyncio.CancelledError):
+                    await sweeps
             if engine is not None:
                 engine.dispose()
             emitter.close()
