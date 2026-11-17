@@ -1,0 +1,187 @@
+### ghostwriter app compose — app services only.
+###
+### The chats live in SQLite on the external `ghostwriter-data` volume, so
+### `docker compose down -v` never touches them; only `make nuke` does.
+###
+### Production shape: no host ports. The dev overlay in
+### compose.override.yaml publishes ports for local browsing; production
+### reaches the frontend through the edge gateway on edge-net.
+
+name: ghostwriter
+
+x-no-proxy-env: &no-proxy-env
+  NO_PROXY: "backend,frontend,localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8${EXTRA_NO_PROXY:-}"
+  no_proxy: "backend,frontend,localhost,127.0.0.1,172.16.0.0/12,10.0.0.0/8${EXTRA_NO_PROXY:-}"
+
+x-env-file: &env-file
+  - path: ../.env
+    required: false
+
+##########################################################
+# Shared logging — the local driver rotates and compresses
+# per-container; tail with `docker compose logs -f <svc>`.
+##########################################################
+x-logging: &default-logging
+  driver: "local"
+  options:
+    max-size: "50m"
+    max-file: "5"
+    compress: "true"
+
+##########################################################
+# Shared hardening (deploy ADR 0001) — no privilege
+# escalation, no capabilities; both images run non-root
+# with read-only root filesystems.
+##########################################################
+x-hardened: &hardened
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+
+services:
+  ##########################################################
+  # Volume ownership (deploy ADR 0001), as in docint: a fresh
+  # external volume is root-owned, and the backend runs as
+  # uid 10001. This one-shot root container, on the backend
+  # image, fixes only wrong-owner entries before it starts.
+  ##########################################################
+  volume-permissions:
+    <<: *hardened
+    image: ghostwriter-backend:${GHOSTWRITER_VERSION:-latest}
+    logging: *default-logging
+    user: "0:0"
+    # CHOWN fixes owners; DAC_OVERRIDE lets find walk 0700 directories (not DAC_READ_SEARCH, which opens open_by_handle_at).
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+    read_only: true
+    network_mode: none
+    entrypoint:
+      - /bin/sh
+      - -c
+      - find /var/lib/ghostwriter -xdev ! -user 10001 -exec chown -h 10001:10001 {} +
+    volumes:
+      - ghostwriter-data:/var/lib/ghostwriter
+    restart: "no"
+
+  backend:
+    <<: *hardened
+    image: ghostwriter-backend:${GHOSTWRITER_VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.backend
+    logging: *default-logging
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    environment:
+      <<: *no-proxy-env
+      OPENAI_API_BASE: ${OPENAI_API_BASE:-http://vllm-router:4000/v1}
+      INFERENCE_PROVIDER: ${INFERENCE_PROVIDER:-vllm}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-dummy}
+      TEXT_MODEL: ${TEXT_MODEL:-Qwen/Qwen3.8-27B-FP8}
+      WHISPER_MODEL: ${WHISPER_MODEL:-openai/whisper-large-v3}
+      WORKBENCH_API_BASE: ${WORKBENCH_API_BASE:-http://workbench-api:8000}
+      # Same value as workbench's GHOSTWRITER_WORKBENCH_KEY. Unset: tools and
+      # attachments are off, and plain chat works as before.
+      WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}
+      WORKBENCH_TIMEOUT: ${WORKBENCH_TIMEOUT:-150}
+      WORKBENCH_RETENTION_DAYS: ${WORKBENCH_RETENTION_DAYS:-7}
+      # Shared with the edge gateway, which sends it as X-Edge-Secret. Set:
+      # identity headers count only on requests carrying it. Unset: the dev
+      # fallback, which trusts them from any caller.
+      GHOSTWRITER_EDGE_SECRET: ${GHOSTWRITER_EDGE_SECRET:-}
+      GHOSTWRITER_SPEECH_INPUT: ${GHOSTWRITER_SPEECH_INPUT:-on}
+      GHOSTWRITER_CHAT_RETENTION_DAYS: ${GHOSTWRITER_CHAT_RETENTION_DAYS:-90}
+      RETENTION_NOTICE_DAYS: ${RETENTION_NOTICE_DAYS:-30}
+      RESPONSE_LANGUAGE: ${RESPONSE_LANGUAGE:-en}
+      # The hash-chained audit events go to the container's main stdout under
+      # a container-wide lock (on the /tmp tmpfs); ops logs go to stderr.
+      AUDIT_OUTPUT: container
+      # Colon-less on purpose: the default applies only while the variable is
+      # unset, so an empty value in .env requires no purpose.
+      AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-}
+    env_file: *env-file
+    volumes:
+      - ghostwriter-data:/var/lib/ghostwriter
+    networks:
+      ghostwriter-net:
+        aliases:
+          - backend
+      inference-net:
+        aliases:
+          - ghostwriter-backend
+      workbench-net:
+        aliases:
+          - ghostwriter-backend
+    expose:
+      - "8000"
+    healthcheck:
+      # Liveness: uvicorn serving /api/health is exactly when the frontend
+      # can safely proxy. python3 urllib avoids adding curl to the image;
+      # start_interval marks it healthy ~5s after boot (Docker >=25) instead
+      # of at the first 30s probe.
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health').read()"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+      start_interval: 3s
+    # workbench's api limits. Memory and swap together are the same limit.
+    mem_limit: 2g
+    memswap_limit: 2g
+    # Threads of the one process: 40 for the routes, 16 turns, 4 dictations, one per workbench call, a few more.
+    pids_limit: 128
+    depends_on:
+      volume-permissions:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  frontend:
+    <<: *hardened
+    image: ghostwriter-frontend:${GHOSTWRITER_VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.frontend
+    logging: *default-logging
+    # nginx (unprivileged image) writes pid + temp files under /tmp only.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    environment:
+      <<: *no-proxy-env
+    networks:
+      ghostwriter-net:
+        aliases:
+          - frontend
+      edge-net:
+        aliases:
+          - ghostwriter-frontend
+    mem_limit: 256m
+    memswap_limit: 256m
+    # nginx's `worker_processes auto` forks a worker per CPU; GPU hosts have 64 and more.
+    pids_limit: 256
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "8080"
+    restart: unless-stopped
+
+volumes:
+  ghostwriter-data:
+    external: true
+    name: ghostwriter-data
+
+networks:
+  ghostwriter-net: {}
+  inference-net:
+    external: true
+    name: ${INFERENCE_NETWORK:-inference-net}
+  edge-net:
+    external: true
+    name: ${EDGE_NET:-edge-net}
+  workbench-net:
+    external: true
+    name: ${WORKBENCH_NET:-workbench-net}

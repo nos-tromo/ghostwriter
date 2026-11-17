@@ -1,0 +1,22 @@
+### Dev-only override: publish backend + frontend to the host.
+###
+### Production reaches the frontend through the edge gateway and relies on
+### the internal `expose` ports in compose.yaml, so this file is
+### intentionally *not* loaded by direct
+### `docker compose -f docker/compose.yaml` invocations. `make up-dev`
+### layers both files so the dev shape is reachable on localhost;
+### `make up` runs compose.yaml alone (production shape).
+
+services:
+  backend:
+    ports:
+      - "${GHOSTWRITER_BACKEND_HOST_PORT:-8004}:8000"
+    environment:
+      # No gateway in dev → no request carries X-Auth-User, so set a fallback
+      # account here; requests without one answer 401. Ignored while
+      # GHOSTWRITER_EDGE_SECRET is set. Production leaves this unset
+      # (fail-closed).
+      GHOSTWRITER_DEFAULT_IDENTITY: ${GHOSTWRITER_DEFAULT_IDENTITY:-dev}
+  frontend:
+    ports:
+      - "${GHOSTWRITER_FRONTEND_HOST_PORT:-8504}:8080"

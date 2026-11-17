@@ -1,0 +1,64 @@
+{
+  "name": "ghostwriter-frontend",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Ghostwriter: the federation's chat assistant. Talk to it, or attach a document and download the result in the chat.",
+  "type": "module",
+  "packageManager": "pnpm@9.12.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "eslint .",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@fontsource/inter": "^5.3.0",
+    "@infra/ui": "https://codeload.github.com/nos-tromo/infra-ui/tar.gz/f1fe39abfe0fa06c6916f282ebf54e14d65bd9ba",
+    "@tanstack/react-query": "^5.105.1",
+    "highlight.js": "~11.11.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1",
+    "react-markdown": "^10.1.0",
+    "rehype-highlight": "^7.0.2",
+    "remark-gfm": "^4.0.1"
+  },
+  "devDependencies": {
+    "@eslint-react/eslint-plugin": "^5.28.8",
+    "@eslint/js": "^10.0.1",
+    "@tailwindcss/postcss": "^4.3.5",
+    "@tailwindcss/typography": "^0.5.20",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.8",
+    "@types/node": "^26.6.5",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.2.1",
+    "eslint": "^10.14.0",
+    "eslint-plugin-react-hooks": "^7.1.1",
+    "globals": "^17.14.0",
+    "happy-dom": "^21.0.4",
+    "postcss": "^8.5.32",
+    "tailwindcss": "^4.3.5",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.72.1",
+    "vite": "^8.3.6",
+    "vitest": "^5.1.0"
+  },
+  "pnpm": {
+    "overrides": {
+      "js-yaml@<4.3.2": "4.3.2",
+      "brace-expansion@<1.1.21": "1.1.21",
+      "brace-expansion@>=3.0.0 <5.0.12": "5.0.12",
+      "nanoid@<3.3.18": "3.3.18",
+      "browserslist@<4.28.7": "4.28.7",
+      "postcss": "^8.5.32",
+      "source-map-js@<1.2.2": "1.2.2",
+      "zod@<4.6.6": "4.6.7",
+      "minimatch@<11.0.1": "11.0.3"
+    }
+  }
+}
