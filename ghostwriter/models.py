@@ -1,4 +1,4 @@
-"""Ghostwriter's tables: chats, their messages, tool steps, attachments and results, and the chat period.
+"""Ghostwriter's tables: chats, their messages, tool steps, attachments, results and file marks, and the periods.
 
 A chat's rows go with it: every foreign key cascades, except an attachment's
 message, which is set to ``NULL``. Files are kept by reference only (workbench
@@ -18,12 +18,7 @@ class Base(DeclarativeBase):
 
 
 class Chat(Base):
-    """A chat, its owner and its deadline.
-
-    ``first_file_at`` is the chat's first attachment, tool step or result: from
-    then on its workbench folder may hold files, some named by no row. It is
-    set once and never cleared.
-    """
+    """A chat, its owner and its deadline."""
 
     __tablename__ = "chats"
 
@@ -33,7 +28,21 @@ class Chat(Base):
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
     updated_at: Mapped[datetime] = mapped_column(UtcDateTime())
     expires_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), index=True)
-    first_file_at: Mapped[datetime | None] = mapped_column(UtcDateTime())
+
+
+class FileMark(Base):
+    """A time from which a chat's workbench folder may hold a file, some named by no row.
+
+    One is written with every attachment, tool step and result, and before every
+    hand-over and tool call. A chat without one never used workbench. Marks go
+    only with their chat.
+    """
+
+    __tablename__ = "file_marks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    chat_id: Mapped[str] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime())
 
 
 class Message(Base):

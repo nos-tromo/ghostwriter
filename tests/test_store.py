@@ -13,7 +13,7 @@ from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ghostwriter.db import init_db, make_engine
-from ghostwriter.models import Attachment, Chat, Message, Result, ToolStep
+from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, ToolStep
 from ghostwriter.schemas import AttachmentOut, ResultOut, StepOut, TablePreviewOut
 from ghostwriter.store import AttachmentNotPending, ChatNotFound, ChatStore, FileRef, TooManyPending
 
@@ -114,7 +114,7 @@ def _counts(engine: Engine) -> dict[str, int]:
     with Session(engine) as s:
         return {
             model.__tablename__: s.execute(select(func.count()).select_from(model)).scalar_one()
-            for model in (Chat, Message, ToolStep, Result, Attachment)
+            for model in (Chat, Message, ToolStep, Result, Attachment, FileMark)
         }
 
 
@@ -179,6 +179,7 @@ def test_off_clears_every_deadline(store: ChatStore) -> None:
 
 def test_tool_contents_expire_with_the_files(store: ChatStore, engine: Engine, clock: Clock) -> None:
     """A step or a preview expires with the chat's earliest file, or after its own period without one."""
+    store.apply_periods(90)
     alone = store.create_chat("user-a")
     answer = store.start_assistant_message(alone.id)
     first_step = _step(store, answer)
@@ -217,6 +218,63 @@ def test_tool_contents_expire_with_the_files(store: ChatStore, engine: Engine, c
     ):
         assert _value(engine, column, row_id) == T0 + 3 * DAY
     assert _value(engine, ToolStep.content_expires_at, emptied.id) == T0 - 3 * DAY
+
+
+def test_content_made_after_a_week_lives_its_own_period(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A file on day 0, then a step and a table on day 10: the day-0 file is gone, so they live until day 17."""
+    chat = store.create_chat("user-a")
+    _attach(store, chat.id)
+    clock.now = T0 + 10 * DAY
+    store.add_user_message("user-a", chat.id, "Und pro Quartal?", [])
+    answer = store.start_assistant_message(chat.id)
+    step = _step(store, answer)
+    result = _result(store, answer)
+    store.finish_assistant_message(answer, "Summe: 42")
+    assert (step.expired, step.detail, step.result) == (False, "sales.xlsx", "Umsatz 42")
+    assert (result.preview, result.expired) == (TablePreviewOut(**PREVIEW), False)
+    assert _value(engine, ToolStep.content_expires_at, step.id) == T0 + 17 * DAY
+    assert _value(engine, Result.preview_expires_at, result.id) == T0 + 17 * DAY
+
+    clock.now = T0 + 12 * DAY
+    ChatStore(engine, file_days=7, notice_days=30, now=clock).apply_periods(90)
+    assert _value(engine, ToolStep.content_expires_at, step.id) == T0 + 17 * DAY
+    assert _value(engine, Result.preview_expires_at, result.id) == T0 + 17 * DAY
+    reply = store.chat_detail("user-a", chat.id).messages[1]
+    assert (reply.steps[0].expired, reply.results[0].preview) == (False, TablePreviewOut(**PREVIEW))
+    turns, expired = store.past_turns(chat.id, before_position=2)
+    assert expired is False
+    assert [len(calls) for calls in turns[0].rounds] == [1]
+
+
+def test_content_is_capped_by_the_earliest_file_that_still_exists(
+    store: ChatStore, engine: Engine, clock: Clock
+) -> None:
+    """Files on day 0 and day 5, then a step on day 6: the day-0 file is still there, so the step goes on day 7."""
+    chat = store.create_chat("user-a")
+    _attach(store, chat.id)
+    clock.now = T0 + 5 * DAY
+    _attach(store, chat.id)
+    clock.now = T0 + 6 * DAY
+    step = _step(store, store.start_assistant_message(chat.id))
+    assert _value(engine, ToolStep.content_expires_at, step.id) == T0 + 7 * DAY
+
+
+def test_a_chat_has_used_workbench_once_it_holds_a_file_mark(store: ChatStore) -> None:
+    """Plain conversation leaves no mark; a hand-over, an attachment or a step does, and it goes only with the chat."""
+    plain, attached, called, handed = (store.create_chat("user-a") for _ in range(4))
+    store.add_user_message("user-a", plain.id, "Hallo", [])
+    store.finish_assistant_message(store.start_assistant_message(plain.id), "Hallo!")
+    _attach(store, attached.id)
+    dropped = store.start_assistant_message(called.id)
+    _step(store, dropped)
+    store.drop_message(dropped)
+    store.mark_files(handed.id)
+    chats = [plain.id, attached.id, called.id, handed.id]
+    assert store.workbench_chats(chats) == {attached.id, called.id, handed.id}
+    store.delete_chat_rows(attached.id)
+    assert store.workbench_chats(chats) == {called.id, handed.id}
+    with pytest.raises(ChatNotFound):
+        store.mark_files(attached.id)
 
 
 def test_a_step_without_any_file_row_still_caps_later_steps(store: ChatStore, engine: Engine, clock: Clock) -> None:
@@ -427,7 +485,14 @@ def test_deleting_a_chat_takes_every_row_with_it(store: ChatStore, engine: Engin
     fill(other.id)
     assert store.chat_counts(chat.id) == {"messages": 2, "steps": 1, "results": 1, "attachments": 2}
     store.delete_chat_rows(chat.id)
-    assert _counts(engine) == {"chats": 1, "messages": 2, "tool_steps": 1, "results": 1, "attachments": 2}
+    assert _counts(engine) == {
+        "chats": 1,
+        "messages": 2,
+        "tool_steps": 1,
+        "results": 1,
+        "attachments": 2,
+        "file_marks": 4,
+    }
     assert store.chat_counts(chat.id) == {"messages": 0, "steps": 0, "results": 0, "attachments": 0}
     with pytest.raises(ChatNotFound):
         store.get_chat("user-a", chat.id)

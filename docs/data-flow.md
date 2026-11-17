@@ -9,12 +9,13 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 
 | Table | Columns | Kept |
 |---|---|---|
-| `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at, first_file_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
+| `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
 | `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at | with the chat |
 | `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 12,000 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, created_at | with the chat |
 | `results` | id, message_id, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
-| `retention_periods` | the chat period's state | no personal data |
+| `file_marks` | chat_id, created_at: when the chat's workbench folder may have got a file (an attachment, a hand-over, a tool call, a step or a result) | with the chat |
+| `retention_periods` | the chat period's state, and the file period the content deadlines were set under | no personal data |
 
 ## What is never stored
 

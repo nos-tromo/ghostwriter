@@ -73,6 +73,12 @@ def _new(client: TestClient, user: str = "user-a") -> str:
     return str(response.json()["id"])
 
 
+def _used(client: TestClient, cid: str) -> str:
+    """Mark the chat as one that handed workbench a file, as an upload or a tool call does."""
+    _state(client).store.mark_files(cid)
+    return cid
+
+
 def _ids(client: TestClient, user: str = "user-a") -> list[str]:
     return [chat["id"] for chat in client.get("/api/chats", headers=as_user(user)).json()]
 
@@ -157,7 +163,7 @@ def test_deleting_records_first_then_workbench_then_rows(
     client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
 ) -> None:
     """The event is written before workbench is asked, and the rows go only after workbench deleted the files."""
-    cid = _new(client)
+    cid = _used(client, _new(client))
     store = _state(client).store
     store.add_user_message("user-a", cid, "Summe der Spalte B", [])
     seen: list[tuple[list[str], list[str]]] = []
@@ -199,7 +205,7 @@ def test_a_failed_workbench_delete_keeps_the_chat(
     client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, answer: object, reason: str
 ) -> None:
     """A failed workbench delete is a 502; the child says why, the chat stays, and the delete can be tried again."""
-    cid = _new(client)
+    cid = _used(client, _new(client))
     door.answers["/files/chat"] = answer
     before = len(events(audit_stream))
     response = client.delete(f"/api/chats/{cid}", headers=as_user())
@@ -211,6 +217,24 @@ def test_a_failed_workbench_delete_keeps_the_chat(
     door.answers["/files/chat"] = {"deleted": 0}
     assert client.delete(f"/api/chats/{cid}", headers=as_user()).status_code == 204
     assert _ids(client) == []
+
+
+def test_a_chat_that_never_used_workbench_is_deleted_while_it_is_down(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """A plain conversation never handed workbench a file: its delete asks nothing of workbench, and says why."""
+    cid = _new(client)
+    store = _state(client).store
+    store.add_user_message("user-a", cid, "Summe der Spalte B", [])
+    store.finish_assistant_message(store.start_assistant_message(cid), "Summe: 42")
+    door.answers["/files/chat"] = httpx.ConnectError("refused")
+    before = len(events(audit_stream))
+    response = client.delete(f"/api/chats/{cid}", headers=as_user())
+    assert (response.status_code, response.content) == (204, b"")
+    assert _operations(audit_stream, before) == [("delete", "chat.delete", "ok"), ("delete", "chat.workbench", "ok")]
+    assert events(audit_stream)[-1]["criteria"] == {"workbench": "not_used"}
+    assert door.requests == []
+    assert _ids(client) == [] and store.chat_counts(cid) == NO_COUNTS
 
 
 def test_without_workbench_the_chat_is_deleted_alone(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
@@ -245,7 +269,7 @@ def test_a_chat_with_a_running_answer_is_not_deleted(
 
 def test_no_answer_starts_while_the_chat_is_being_deleted(client: TestClient, door: FakeDoor) -> None:
     """The delete holds the chat's turn until it ends, so no answer writes into a chat being deleted."""
-    cid = _new(client)
+    cid = _used(client, _new(client))
     turns = _state(client).turns
     seen: list[threading.Event | None] = []
     door.on_delete = lambda: seen.append(turns.begin(cid))
@@ -255,7 +279,7 @@ def test_no_answer_starts_while_the_chat_is_being_deleted(client: TestClient, do
 
 def test_a_stale_end_does_not_release_a_deletes_claim(client: TestClient, door: FakeDoor) -> None:
     """An end with an event other than the delete's own leaves the chat held until the delete ends."""
-    cid = _new(client)
+    cid = _used(client, _new(client))
     turns = _state(client).turns
     held: list[bool] = []
 
@@ -287,7 +311,7 @@ def test_a_delete_that_claims_the_turn_after_another_finds_the_chat_gone(
     client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
 ) -> None:
     """The second of two deletes, past its lookup before the first ended, records and sends nothing and answers 404."""
-    cid = _new(client)
+    cid = _used(client, _new(client))
     state = _state(client)
     first: list[int] = []
     state.turns = _LateClaim(lambda: first.append(client.delete(f"/api/chats/{cid}", headers=as_user()).status_code))

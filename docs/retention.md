@@ -3,7 +3,7 @@
 | What | Kept | How it goes |
 |---|---|---|
 | A chat: its messages, steps, attachments and results | `GHOSTWRITER_CHAT_RETENTION_DAYS` (90) after it started | the daily sweep deletes it |
-| Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), counted from the chat's earliest file | read as expired at once; the daily sweep empties them |
+| Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
 | The files | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download answers 410 |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
@@ -27,10 +27,10 @@ the notice, not on 11 March; one started 20 days before on 10 April, its new dat
 
 ## Tool contents and previews
 
-They expire `WORKBENCH_RETENTION_DAYS` after the chat's earliest file (its
-first attachment, tool step or result), or after they were made if that is
-earlier, so nothing derived from a file outlives it. Example: first file on
-day 0, a step on day 6: both go on day 7. From then on the trail reads "Details
+They expire `WORKBENCH_RETENTION_DAYS` after they were made, or with the
+earliest file that may still be in the chat's folder then, if that goes first,
+so nothing derived from a file outlives it. Example: a file on day 0; a step on
+day 6 goes on day 7, a step on day 10 on day 17. From then on the trail reads "Details
 deleted after 7 days", follow-ups replay nothing of them, and the model is told
 that earlier files have expired. The tool, status, file name, size and type stay.
 A changed file period applies at the next start to what has not expired yet,
@@ -41,7 +41,8 @@ without a notice; nothing expired comes back.
 1. Hold the chat's turn: while an answer runs, the owner's delete gets 409 and
    the sweep leaves the chat to its next run.
 2. Record the `delete` event.
-3. Delete the chat's folder in workbench (`DELETE /files/chat`), then record what went.
+3. Delete the chat's folder in workbench (`DELETE /files/chat`), then record what
+   went. A chat that never used workbench is not sent.
 4. Delete the chat's rows. The owner's delete stops when workbench fails (502,
    the chat is kept); the sweep goes on, as the chat is due and workbench's own
    period takes its files.

@@ -232,6 +232,15 @@ def test_a_turn_reads_calls_and_answers(loop_env: LoopEnv) -> None:
     assert [(s.id, s.status, s.result) for s in stored] == [(done.step.id, "ok", RESULT.text)]
 
 
+def test_a_call_marks_the_chat_before_it_is_sent(loop_env: LoopEnv) -> None:
+    """While a call runs, the chat is already one that used workbench, so its delete asks workbench."""
+    seen: list[set[str]] = []
+    loop_env.workbench.answers = [_then(lambda: seen.append(loop_env.store.workbench_chats([CHAT])), RESULT)]
+    assert loop_env.store.workbench_chats([CHAT]) == set()
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    assert seen == [{CHAT}]
+
+
 def test_outputs_become_result_cards(loop_env: LoopEnv) -> None:
     """Each new output is a card: a small raster image inline, a table with its preview, the rest as files."""
     preview = TablePreview(("Monat", "Summe"), (("2026-01", "1200"),), 12, True)

@@ -6,7 +6,8 @@ chat's folder; the chat keeps only its reference, pending until a message sends 
 is found through its own chat, by owner, chat and file id, and streamed back from workbench's
 view route with workbench's type, length and disposition, and its hardening headers.
 
-Records name a file by its id, never by its name. An attachment is ``collect`` /
+The chat is marked as one that used workbench before its file goes out, so its delete asks
+workbench too. Records name a file by its id, never by its name. An attachment is ``collect`` /
 ``chat.attachment``, written before its first byte goes on, with the hand-over as its child
 ``disclose`` / ``chat.attachment`` (``workbench:upload``) and a second, ``error``, child when the
 hand-over fails; when the chat vanished during the hand-over, the delete of its folder is a
@@ -227,6 +228,10 @@ async def attach_file(
         if isinstance(checked, JSONResponse):
             return checked
         name, mime = checked
+        try:
+            await run_in_threadpool(store.mark_files, chat_id)
+        except ChatNotFound:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
         attachment_id = str(uuid4())
         target = Target(kind="attachment", ids=(attachment_id,))
         op.container = chat_id

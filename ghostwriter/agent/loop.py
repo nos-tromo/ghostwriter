@@ -451,6 +451,8 @@ class AgentLoop:
             expired=False,
         )
         yield StepEvent(running)
+        # Before anything goes out: the chat may hold files from now on, and its delete asks workbench.
+        self._store.mark_files(turn.chat_id)
         timeout = self._settings.workbench_timeout_s
         attempt = 1
         while True:

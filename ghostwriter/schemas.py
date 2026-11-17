@@ -99,7 +99,7 @@ class ResultOut(BaseModel):
         mime: Its MIME type.
         size: Its size in bytes.
         preview: The table's head; ``None`` without one, or once it has expired
-            with the chat's earliest file.
+            with the files it may come from.
         expired: Whether workbench's period for its own file has passed.
     """
 

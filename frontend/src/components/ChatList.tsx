@@ -21,15 +21,21 @@ import { useT } from '../i18n/LanguageContext'
 /** The longest title the backend takes (`MAX_TITLE_CHARS`). */
 const MAX_TITLE_CHARS = 200
 
-/** Why a request failed. A delete refused with 409 has an answer still
- *  running in the chat, which the user can do something about. */
+/** What a delete's refusal tells the user to do: stop the answer still
+ *  running (409), or try again once workbench can delete the files (502). */
+const DELETE_REFUSALS: Partial<Record<number, 'chat.delete_busy' | 'chat.delete_files'>> = {
+  409: 'chat.delete_busy',
+  502: 'chat.delete_files',
+}
+
+/** Why a request failed; a delete's refusal says what the user can do about it. */
 function ErrorLine({ error, deleting = false }: { error: unknown; deleting?: boolean }) {
   const t = useT()
   const { key, vars } = describeError(error)
-  const busy = deleting && error instanceof ApiError && error.status === 409
+  const refusal = deleting && error instanceof ApiError ? DELETE_REFUSALS[error.status] : undefined
   return (
     <p role="alert" className="px-3 text-xs text-danger">
-      {busy ? t('chat.delete_busy') : t(key, vars)}
+      {refusal ? t(refusal) : t(key, vars)}
     </p>
   )
 }

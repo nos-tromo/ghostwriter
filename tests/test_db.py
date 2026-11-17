@@ -10,7 +10,7 @@ from sqlalchemy.exc import IntegrityError, StatementError
 from ghostwriter import db
 from ghostwriter.db import UtcDateTime, init_db, make_engine, utcnow
 
-TABLES = {"chats", "messages", "tool_steps", "attachments", "results", "retention_periods"}
+TABLES = {"chats", "messages", "tool_steps", "attachments", "results", "retention_periods", "file_marks"}
 
 
 def _pragma(engine: Engine, name: str) -> object:

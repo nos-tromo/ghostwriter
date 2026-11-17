@@ -2,15 +2,20 @@
 
 Every method runs one short transaction and returns schema objects, never ORM
 rows. A lookup a user can reach names the owner. A chat is due under the chat
-period (:mod:`ghostwriter.retention_rule`). A tool step's content and a result's
-preview expire with the chat's earliest file, which the chat remembers when the
-rows that named it are gone: nothing derived from a file outlives it (spec
-§5.6). An attachment or a result itself lives as long as its own file. The
-retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
+period (:mod:`ghostwriter.retention_rule`). Every attachment, tool step and result,
+and every hand-over and tool call before it goes out, leaves a file mark: a time
+from which the chat's workbench folder may hold a file, also once the row that
+named it is gone. Content made at ``t`` (a step's arguments and result, a
+result's preview) expires with the earliest file that can still exist then, the
+earliest mark after ``t`` minus the file period, or a file period after ``t``:
+nothing derived from a file outlives it (spec §5.6). An attachment or a result
+itself lives as long as its own file. A chat without marks never used workbench.
+The retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
 deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`).
 """
 
 import json
+from bisect import bisect_right
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,13 +24,13 @@ from typing import Any, Final, cast
 from uuid import uuid4
 
 from loguru import logger
-from sqlalchemy import Engine, delete, func, or_, select, union_all, update
+from sqlalchemy import Engine, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from ghostwriter.agent.context import PastCall, PastTurn, user_content
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
-from ghostwriter.models import Attachment, Chat, Message, Result, RetentionPeriod, ToolStep
+from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, next_period_state
 from ghostwriter.schemas import (
     AttachmentOut,
@@ -42,6 +47,8 @@ from ghostwriter.schemas import (
 
 #: The chat period's row in ``retention_periods``.
 CHATS_STORE: Final = "chats"
+#: The file period's row in ``retention_periods``: the period the content deadlines were set under.
+FILES_STORE: Final = "files"
 #: The longest title the first message gives a chat.
 TITLE_CHARS: Final = 60
 
@@ -251,55 +258,49 @@ class ChatStore:
         return RetentionPeriodState(row.days, row.set_at, row.grace_until, row.in_force_days, row.in_force_grace)
 
     @staticmethod
-    def _earliest_files(s: Session, chat_id: str | None = None) -> dict[str, datetime]:
-        """Return when each chat's earliest file was made: its first file, attachment or result.
+    def _cap_start(marks: Sequence[datetime], made: datetime, period: timedelta) -> datetime:
+        """Return the earliest of ``made`` and the files that can still exist then.
 
         Args:
-            s: The session.
-            chat_id: One chat; every chat when ``None``.
+            marks: The chat's file marks, oldest first.
+            made: When the content was made.
+            period: How long a file lives.
 
         Returns:
-            The earliest time per chat id, for chats that hold a file.
+            ``made``, or the earliest mark later than ``made - period`` when that is earlier.
         """
-        first = select(Chat.id.label("chat_id"), Chat.first_file_at.label("created_at")).where(
-            Chat.first_file_at.is_not(None)
-        )
-        attachments = select(Attachment.chat_id, Attachment.created_at)
-        results = select(Message.chat_id, Result.created_at).join(Message, Result.message_id == Message.id)
-        if chat_id is not None:
-            first = first.where(Chat.id == chat_id)
-            attachments = attachments.where(Attachment.chat_id == chat_id)
-            results = results.where(Message.chat_id == chat_id)
-        files = union_all(first, attachments, results).subquery()
-        rows = s.execute(select(files.c.chat_id, func.min(files.c.created_at)).group_by(files.c.chat_id)).all()
-        return {chat: earliest for chat, earliest in rows}
+        index = bisect_right(marks, made - period)
+        return made if index == len(marks) else min(made, marks[index])
 
-    def _content_deadline(self, made: datetime, earliest_file: datetime | None) -> datetime:
-        """Return when content made at ``made`` expires: with the chat's earliest file, or after its own period.
-
-        The earliest file counts only when it is older than the content, so a
-        file that came later never moves the deadline.
-
-        Args:
-            made: When the step ran or the result was written.
-            earliest_file: When the chat's earliest file was made, if it holds one.
-
-        Returns:
-            The deadline.
-        """
-        start = made if earliest_file is None else min(made, earliest_file)
-        return start + self._file_period
-
-    @staticmethod
-    def _mark_first_file(s: Session, chat_id: str, now: datetime) -> None:
-        """Remember when a chat's folder may first have held a file, unless it is known already.
+    def _content_deadline(self, s: Session, chat_id: str, made: datetime) -> datetime:
+        """Return when content made now expires: with the earliest file that can still exist.
 
         Args:
             s: The session.
             chat_id: The chat.
-            now: The time of the attachment, step or result.
+            made: When the step ran or the result was written.
+
+        Returns:
+            The deadline.
         """
-        s.execute(update(Chat).where(Chat.id == chat_id, Chat.first_file_at.is_(None)).values(first_file_at=now))
+        marks = s.scalars(
+            select(FileMark.created_at)
+            .where(FileMark.chat_id == chat_id, FileMark.created_at > made - self._file_period)
+            .order_by(FileMark.created_at)
+            .limit(1)
+        ).all()
+        return self._cap_start(marks, made, self._file_period) + self._file_period
+
+    @staticmethod
+    def _mark(s: Session, chat_id: str, now: datetime) -> None:
+        """Remember that the chat's workbench folder may hold a file from ``now`` on.
+
+        Args:
+            s: The session.
+            chat_id: The chat.
+            now: The time of the attachment, step, result, hand-over or call.
+        """
+        s.add(FileMark(chat_id=chat_id, created_at=now))
 
     @staticmethod
     def _next_position(s: Session, chat_id: str) -> int:
@@ -320,9 +321,12 @@ class ChatStore:
 
         Records the chat period's next state and gives every chat its
         deadline under it. Tool contents and previews whose deadline has not
-        passed get theirs again under the current file period; one already
-        passed keeps it, so a longer period brings back nothing a read has
-        shown as expired, and nothing the sweep has emptied.
+        passed get theirs again under the current file period: capped by the
+        files that could still exist when they were made, under the period
+        then in force (recorded here too), so a shorter period never moves a
+        deadline later. One already passed keeps it, so a longer period
+        brings back nothing a read has shown as expired, and nothing the
+        sweep has emptied.
 
         Args:
             chat_days: The chat period; ``None`` is off.
@@ -346,7 +350,19 @@ class ChatStore:
                         for chat_id, created in chats
                     ],
                 )
-            earliest = self._earliest_files(s)
+            files = s.get(RetentionPeriod, FILES_STORE)
+            before = self._file_period if files is None or files.days is None else timedelta(days=files.days)
+            if files is None:
+                s.add(RetentionPeriod(store=FILES_STORE, days=self._file_period.days, set_at=now))
+            elif files.days != self._file_period.days:
+                files.days, files.set_at = self._file_period.days, now
+            marks: dict[str, list[datetime]] = {}
+            for chat_id, at in s.execute(select(FileMark.chat_id, FileMark.created_at).order_by(FileMark.created_at)):
+                marks.setdefault(chat_id, []).append(at)
+
+            def deadline(chat_id: str, made: datetime) -> datetime:
+                return self._cap_start(marks.get(chat_id, []), made, before) + self._file_period
+
             steps = s.execute(
                 select(ToolStep.id, ToolStep.created_at, Message.chat_id)
                 .join(Message, ToolStep.message_id == Message.id)
@@ -356,7 +372,7 @@ class ChatStore:
                 s.execute(
                     update(ToolStep),
                     [
-                        {"id": step_id, "content_expires_at": self._content_deadline(made, earliest.get(chat_id))}
+                        {"id": step_id, "content_expires_at": deadline(chat_id, made)}
                         for step_id, made, chat_id in steps
                     ],
                 )
@@ -369,7 +385,7 @@ class ChatStore:
                 s.execute(
                     update(Result),
                     [
-                        {"id": result_id, "preview_expires_at": self._content_deadline(made, earliest.get(chat_id))}
+                        {"id": result_id, "preview_expires_at": deadline(chat_id, made)}
                         for result_id, made, chat_id in results
                     ],
                 )
@@ -710,8 +726,8 @@ class ChatStore:
     ) -> StepOut:
         """Store a tool step under the id its ``running`` frame carried.
 
-        Its content expires with the chat's earliest file, or after the file
-        period without one.
+        Its content expires with the earliest file that can still exist now,
+        or after the file period without one; it leaves a file mark.
 
         Args:
             message_id: The answer it belongs to.
@@ -730,7 +746,6 @@ class ChatStore:
         now = self._now()
         with self._transaction() as s:
             chat_id = s.execute(select(Message.chat_id).where(Message.id == message_id)).scalar_one()
-            self._mark_first_file(s, chat_id, now)
             step = ToolStep(
                 id=id,
                 message_id=message_id,
@@ -742,9 +757,10 @@ class ChatStore:
                 result=result,
                 status=status,
                 created_at=now,
-                content_expires_at=self._content_deadline(now, self._earliest_files(s, chat_id).get(chat_id)),
+                content_expires_at=self._content_deadline(s, chat_id, now),
             )
             s.add(step)
+            self._mark(s, chat_id, now)
             return _step_out(step, now)
 
     def add_result(
@@ -761,7 +777,8 @@ class ChatStore:
     ) -> ResultOut:
         """Store a file a tool wrote, by reference, with its table preview.
 
-        The preview expires after the file period, or earlier with the chat's earliest file.
+        The preview expires after the file period, or earlier with the earliest
+        file that can still exist now; the result leaves a file mark.
 
         Args:
             message_id: The answer it belongs to.
@@ -779,7 +796,6 @@ class ChatStore:
         now = self._now()
         with self._transaction() as s:
             chat_id = s.execute(select(Message.chat_id).where(Message.id == message_id)).scalar_one()
-            self._mark_first_file(s, chat_id, now)
             row = Result(
                 id=str(uuid4()),
                 message_id=message_id,
@@ -791,9 +807,10 @@ class ChatStore:
                 size=size,
                 preview=None if preview is None else json.dumps(preview, ensure_ascii=False, separators=(",", ":")),
                 created_at=now,
-                preview_expires_at=self._content_deadline(now, self._earliest_files(s, chat_id).get(chat_id)),
+                preview_expires_at=self._content_deadline(s, chat_id, now),
             )
             s.add(row)
+            self._mark(s, chat_id, now)
             return self._result_out(row, now)
 
     def add_attachment(
@@ -808,7 +825,7 @@ class ChatStore:
         id: str | None = None,
         max_pending: int | None = None,
     ) -> AttachmentOut:
-        """Store a file handed to workbench, by reference, pending until a message sends it.
+        """Store a file handed to workbench, by reference, pending until a message sends it; it leaves a file mark.
 
         Args:
             chat_id: The chat.
@@ -831,7 +848,6 @@ class ChatStore:
         """
         now = self._now()
         with self._transaction() as s:
-            self._mark_first_file(s, chat_id, now)
             if s.get(Chat, chat_id) is None:
                 raise ChatNotFound("chat not found")
             if max_pending is not None and self._pending(s, chat_id, now) >= max_pending:
@@ -848,7 +864,35 @@ class ChatStore:
                 created_at=now,
             )
             s.add(attachment)
+            self._mark(s, chat_id, now)
             return self._attachment_out(attachment, now)
+
+    def mark_files(self, chat_id: str) -> None:
+        """Remember that the chat's workbench folder may hold files from now on, before a hand-over or a call goes out.
+
+        Args:
+            chat_id: The chat.
+
+        Raises:
+            ChatNotFound: If the chat is gone.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            if s.get(Chat, chat_id) is None:
+                raise ChatNotFound("chat not found")
+            self._mark(s, chat_id, now)
+
+    def workbench_chats(self, chat_ids: Sequence[str]) -> set[str]:
+        """Return those of the chats that used workbench: the ones with a file mark.
+
+        Args:
+            chat_ids: The chats.
+
+        Returns:
+            Their ids; a chat left out never handed workbench a file or called a tool.
+        """
+        with self._transaction() as s:
+            return set(s.scalars(select(FileMark.chat_id).where(FileMark.chat_id.in_(chat_ids)).distinct()))
 
     def _pending(self, s: Session, chat_id: str, now: datetime) -> int:
         """Count a chat's attachments not yet sent with a message whose file has not expired, in an open session.

@@ -19,7 +19,6 @@ import pytest
 from anyio import CapacityLimiter
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import update
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
@@ -29,7 +28,7 @@ from ghostwriter.api.messages import TurnStream
 from ghostwriter.db import make_engine, utcnow
 from ghostwriter.inference import ModelClient
 from ghostwriter.main import create_app
-from ghostwriter.models import Chat
+from ghostwriter.models import FileMark
 from ghostwriter.schemas import AttachmentOut, ChatOut
 from ghostwriter.sse import sse_frame
 from ghostwriter.turns import TurnRegistry
@@ -815,13 +814,16 @@ def test_a_regenerated_answer_moves_its_chat_to_the_top(client: TestClient, fake
     assert final["chat"] == listed[0]
 
 
-def test_a_fresh_table_may_come_without_its_preview(client: TestClient, fake_openai: FakeOpenAI) -> None:
-    """When the chat's earliest file is past the file period, a new table's card has no preview and is live."""
+def test_a_fresh_table_keeps_its_preview_in_a_chat_older_than_the_file_period(
+    client: TestClient, fake_openai: FakeOpenAI
+) -> None:
+    """The chat's first file was 10 days ago and is gone: a table written today has its preview, live."""
     cid = _new(client)
     engine = make_engine(_state(client).settings.db_path)
     with Session(engine) as s, s.begin():
-        s.execute(update(Chat).where(Chat.id == cid).values(first_file_at=utcnow() - timedelta(days=8)))
+        s.add(FileMark(chat_id=cid, created_at=utcnow() - timedelta(days=10)))
     engine.dispose()
     fake_openai.script = [_read_call(cid), ANSWER]
     [result] = [f.data for f in _frames(_send(client, cid)) if f.event == "result"]
-    assert (result["kind"], result["preview"], result["expired"]) == ("table", None, False)
+    assert (result["kind"], result["expired"]) == ("table", False)
+    assert result["preview"] is not None

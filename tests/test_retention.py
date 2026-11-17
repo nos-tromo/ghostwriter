@@ -103,18 +103,21 @@ class Env:
     emitter: AuditEmitter
     sweeper: Sweeper
 
-    def chat(self, started: datetime, owner: str = "user-a") -> str:
+    def chat(self, started: datetime, owner: str = "user-a", *, files: bool = True) -> str:
         """Start a chat at ``started``, then set the clock to ``NOW``.
 
         Args:
             started: When it starts.
             owner: Its owner.
+            files: Whether it handed workbench a file then, as most chats here do.
 
         Returns:
             Its id.
         """
         self.clock.now = started
         chat_id = self.store.create_chat(owner).id
+        if files:
+            self.store.mark_files(chat_id)
         self.clock.now = NOW
         return chat_id
 
@@ -271,7 +274,7 @@ async def test_due_chats_are_recorded_before_anything_is_deleted(
     assert primary["target"] == {"kind": "chat", "ids": [cid], "count": 1}
     assert primary["criteria"] == {"period_days": 90, "cutoff": "2027-04-15T00:00:00Z"}
     assert (child["action"], child["parent_event_id"], child["outcome"]) == ("delete", primary["event_id"], "ok")
-    assert child["criteria"] == {"files_deleted": 3, "failed": 0}
+    assert child["criteria"] == {"files_deleted": 3, "failed": 0, "not_used": 0}
     assert "Summe der Spalte B" not in audit_stream.getvalue()
 
 
@@ -312,7 +315,7 @@ async def test_workbench_failures_do_not_keep_expired_chats(
     assert report == SweepReport(chats=2, workbench_failed=1)
     assert not env.has_rows(failing) and not env.has_rows(other)
     [child] = _of(audit_stream, "retention.chat.workbench")
-    assert (child["criteria"], child["outcome"]) == ({"files_deleted": 2, "failed": 1}, "error")
+    assert (child["criteria"], child["outcome"]) == ({"files_deleted": 2, "failed": 1, "not_used": 0}, "error")
 
 
 @pytest.mark.parametrize("batch", [200, 1])
@@ -374,6 +377,26 @@ async def test_without_workbench_due_chats_go_with_their_rows(settled: Env, audi
     assert (child["criteria"], child["outcome"]) == ({"workbench": "not_configured"}, "ok")
 
 
+async def test_chats_that_never_used_workbench_go_without_it(settled: Env, audit_stream: CapturedAuditStream) -> None:
+    """A due chat without a file mark is not sent to workbench, also while workbench is down; its rows go."""
+    env = settled
+    used = env.chat(NOW - 96 * DAY)
+    plain = env.chat(NOW - 95 * DAY, owner="user-b", files=False)
+    assert await env.sweeper.sweep() == SweepReport(chats=2)
+    assert not env.has_rows(used) and not env.has_rows(plain)
+    assert [r.headers["x-session-id"] for r in _deletes(env.door)] == [session_pseudonym(KEY, used)]
+    [child] = _of(audit_stream, "retention.chat.workbench")
+    assert (child["criteria"], child["outcome"]) == ({"files_deleted": 3, "failed": 0, "not_used": 1}, "ok")
+
+    later = env.chat(NOW - 90 * DAY + DAY, files=False)
+    env.door.answers["/files/chat"] = httpx.ConnectError("refused")
+    env.clock.now = NOW + DAY
+    assert await env.sweeper.sweep() == SweepReport(chats=1)
+    assert not env.has_rows(later) and len(_deletes(env.door)) == 1
+    child = _of(audit_stream, "retention.chat.workbench")[-1]
+    assert (child["criteria"], child["outcome"]) == ({"workbench": "not_used"}, "ok")
+
+
 async def test_a_due_chat_with_a_running_turn_is_skipped(settled: Env, audit_stream: CapturedAuditStream) -> None:
     """A chat whose turn is held (an answer, or its owner's delete) is left to the next sweep, unrecorded."""
     env = settled
@@ -424,6 +447,8 @@ async def test_batches_hold_at_most_200_ids(settled: Env, audit_stream: Captured
     env = settled
     env.clock.now = NOW - 95 * DAY
     chats = {env.store.create_chat(f"user-{n % 7}").id for n in range(450)}
+    for chat_id in chats:
+        env.store.mark_files(chat_id)
     env.clock.now = NOW - 30 * DAY
     answer = env.store.start_assistant_message(env.store.create_chat("user-a").id)
     steps = {_step(env.store, answer) for _ in range(201)}
@@ -435,8 +460,8 @@ async def test_batches_hold_at_most_200_ids(settled: Env, audit_stream: Captured
     assert {i for e in primaries for i in e["target"]["ids"]} == chats
     children = _of(audit_stream, "retention.chat.workbench")
     assert [c["parent_event_id"] for c in children] == [p["event_id"] for p in primaries]
-    assert [c["criteria"] for c in children] == [{"files_deleted": 600, "failed": 0}] * 2 + [
-        {"files_deleted": 150, "failed": 0}
+    assert [c["criteria"] for c in children] == [{"files_deleted": 600, "failed": 0, "not_used": 0}] * 2 + [
+        {"files_deleted": 150, "failed": 0, "not_used": 0}
     ]
     emptied = _of(audit_stream, "retention.tool_content")
     assert [len(e["target"]["ids"]) for e in emptied] == [200, 1]

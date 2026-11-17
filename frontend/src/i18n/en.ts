@@ -22,6 +22,7 @@ export const en = {
   'chat.delete': 'Delete',
   'chat.delete_confirm': 'Delete this chat and its files?',
   'chat.delete_busy': 'Stop the answer before deleting the chat.',
+  'chat.delete_files': "The chat's files could not be deleted; try again.",
 
   // conversation
   'chat.empty': 'Ask anything, or attach a document.',

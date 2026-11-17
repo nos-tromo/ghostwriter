@@ -46,7 +46,8 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
 - A primary event records an authorised attempt. A chat its owner deletes is
   gone only once its `chat.workbench` child is `ok` and its rows went; the sweep
   deletes the rows also when workbench failed (`retention.chat.workbench`
-  `error`), and workbench's own period takes the files. A retry after a 502, or
+  `error`), and workbench's own period takes the files. A chat that never used
+  workbench goes without it (`workbench: not_used`). A retry after a 502, or
   the next sweep after an interrupted one, writes a second primary.
 - A failed upload records `disclose` `ok`, then `error`. A refusal after the
   hand-over leaves `collect` / `disclose` `ok` for an attachment without a row;

@@ -14,10 +14,12 @@ Each batch of chats:
    reads again what is due, so a chat deleted meanwhile is not named;
 2. records ``delete`` / ``retention.chat``: the chats, the period and the cutoff, the sweep's time;
 3. deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
-   under the batch's request id. After one timeout, workbench is not called again in this
-   sweep, so a hung workbench holds it up once, not once per chat;
-4. records the child ``delete`` / ``retention.chat.workbench``: the files workbench deleted and
-   the chats it failed or was not asked for, ``error`` when there are any;
+   under the batch's request id; a chat that never used workbench (no file mark) is not sent.
+   After one timeout, workbench is not called again in this sweep, so a hung workbench holds
+   it up once, not once per chat;
+4. records the child ``delete`` / ``retention.chat.workbench``: the files workbench deleted, the
+   chats it failed or was not asked for, ``error`` when there are any, and the chats that never
+   used it;
 5. deletes the chats' rows, also where workbench failed: the chat is due, and workbench's own
    retention (``WORKBENCH_RETENTION_DAYS``) removes its files.
 
@@ -206,12 +208,17 @@ class Sweeper:
                 criteria={"period_days": self._settings.chat_days, "cutoff": _iso(now)},
             )
         )
+        used = set() if self._workbench is None else await anyio.to_thread.run_sync(self._store.workbench_chats, ids)
         if self._workbench is None:
             child = partial(op.child, "delete", WORKBENCH_DELETE, criteria={"workbench": "not_configured"})
+        elif not used:
+            child = partial(op.child, "delete", WORKBENCH_DELETE, criteria={"workbench": "not_used"})
         else:
             headers = forward_headers(op.context)
             deleted = failed = 0
             for chat_id, owner in batch:
+                if chat_id not in used:
+                    continue
                 if self._workbench_timed_out:
                     failed += 1
                     continue
@@ -227,7 +234,7 @@ class Sweeper:
                 op.child,
                 "delete",
                 WORKBENCH_DELETE,
-                criteria={"files_deleted": deleted, "failed": failed},
+                criteria={"files_deleted": deleted, "failed": failed, "not_used": len(ids) - len(used)},
                 outcome="error" if failed else "ok",
             )
         await anyio.to_thread.run_sync(child)

@@ -24,6 +24,7 @@ export const de: Strings = {
   'chat.delete': 'Löschen',
   'chat.delete_confirm': 'Diesen Chat und seine Dateien löschen?',
   'chat.delete_busy': 'Beenden Sie die Antwort, bevor Sie den Chat löschen.',
+  'chat.delete_files': 'Die Dateien des Chats konnten nicht gelöscht werden. Versuchen Sie es erneut.',
 
   // conversation
   'chat.empty': 'Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.',

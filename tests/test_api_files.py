@@ -231,6 +231,27 @@ def test_any_other_failure_of_workbench_is_502(
     assert _state(client).store.pending_count(cid) == 0
     [failed] = [e for e in _since(audit_stream, before) if e["outcome"] == "error"]
     assert failed["criteria"] == {"reason": "unreachable"}
+    # The hand-over was attempted: the chat may hold a file, so its delete asks workbench.
+    assert _state(client).store.workbench_chats([cid]) == {cid}
+
+
+def test_a_chat_deleted_before_the_hand_over_is_not_found(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The chat is marked before its file goes out; a chat gone by then gets 404, nothing sent or recorded."""
+    cid = _new(client)
+    store = _state(client).store
+    mark = store.mark_files
+
+    def deleted_first(chat_id: str) -> None:
+        store.delete_chat_rows(chat_id)
+        mark(chat_id)
+
+    monkeypatch.setattr(store, "mark_files", deleted_first)
+    before = len(events(audit_stream))
+    r = _attach(client, cid)
+    assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
+    assert door.requests == [] and _since(audit_stream, before) == []
 
 
 def test_a_chat_deleted_during_the_upload_is_not_found(

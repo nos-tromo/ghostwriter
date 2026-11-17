@@ -10,7 +10,8 @@ A delete (spec §6.2) is refused while an answer runs, and holds the chat's turn
 while it runs itself; holding it, it looks the chat up again, so of two deletes
 only the first acts. It records ``chat.delete``, then asks workbench to delete
 the chat's folder, and deletes the chat's rows only after that worked. If
-workbench fails, the rows stay and the user may try again.
+workbench fails, the rows stay and the user may try again. A chat that never
+used workbench (no file mark) is deleted without asking it.
 """
 
 from functools import partial
@@ -190,7 +191,8 @@ def delete_chat(
         request: The request.
         user: Who asks.
         op: ``delete`` / ``chat.delete``, recorded first with what the chat holds; its child
-            ``delete`` / ``chat.workbench`` records how many files workbench deleted, or why not.
+            ``delete`` / ``chat.workbench`` records how many files workbench deleted, or why not:
+            not configured, or never used by the chat.
 
     Raises:
         HTTPException: 404 for another owner's chat or an unknown one, also once another delete
@@ -209,6 +211,8 @@ def delete_chat(
         workbench: WorkbenchClient | None = request.app.state.workbench
         if workbench is None:
             op.child("delete", "chat.workbench", criteria={"workbench": "not_configured"})
+        elif not store.workbench_chats([chat_id]):
+            op.child("delete", "chat.workbench", criteria={"workbench": "not_used"})
         else:
             call = CallFor(user.name, chat_id, forward_headers(op.context))
             try:

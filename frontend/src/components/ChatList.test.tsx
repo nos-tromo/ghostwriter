@@ -206,6 +206,24 @@ describe('ChatList', () => {
     expect(rows(list)[0]).toContain('Quarterly figures')
   })
 
+  it('says when the chat was kept because its files could not be deleted', async () => {
+    serve({
+      'GET /ghostwriter/api/chats': [FIGURES, LETTER],
+      'DELETE /ghostwriter/api/chats/c1': () =>
+        new Response(JSON.stringify({ detail: "The chat's files could not be deleted; try again." }), { status: 502 }),
+    })
+    renderList('c1')
+    const user = userEvent.setup()
+    const list = await chatList()
+
+    await user.click(within(rowOf(list, 'Quarterly figures')).getByRole('button', { name: 'Options for Quarterly figures' }))
+    await user.click(screen.getByRole('menuitem', { name: 'Delete' }))
+    await user.click(screen.getByRole('button', { name: 'Delete' }))
+
+    expect(await screen.findByRole('alert')).toHaveTextContent("The chat's files could not be deleted; try again.")
+    expect(rows(list)[0]).toContain('Quarterly figures')
+  })
+
   it('says what else went wrong in its own words', async () => {
     serve({
       'GET /ghostwriter/api/chats': [FIGURES, LETTER],
