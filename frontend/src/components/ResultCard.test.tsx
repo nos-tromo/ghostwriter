@@ -1,10 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
+import { QueryClientProvider } from '@tanstack/react-query'
 import { PURPOSE_HEADER, clearAllPurposes, setPurpose } from '@infra/ui'
 import { ResultCard } from './ResultCard'
 import { LanguageContext } from '../i18n/LanguageContext'
-import { callsTo, json, result, serve } from '../test/fixtures'
+import { callsTo, json, renderWithClient, result, serve } from '../test/fixtures'
 
 afterEach(() => {
   clearAllPurposes()
@@ -38,7 +39,7 @@ describe('ResultCard', () => {
     setPurpose('ghostwriter', { reason: 'review' })
     const calls = serve({ [`GET ${FILE_URL}`]: blobResponse('image/png') })
     const revoke = vi.spyOn(URL, 'revokeObjectURL')
-    const { unmount } = render(
+    const { unmount } = renderWithClient(
       <ResultCard chatId="c1" result={result({ id: 'r1', kind: 'image', name: 'chart.png', mime: 'image/png' })} />,
     )
 
@@ -54,8 +55,49 @@ describe('ResultCard', () => {
     expect(revoke).toHaveBeenCalledWith(src)
   })
 
+  it('fetches an image once for the draft card, the stored card and its download', async () => {
+    const calls = serve({ [`GET ${FILE_URL}`]: blobResponse('image/png') })
+    const revoke = vi.spyOn(URL, 'revokeObjectURL')
+    const saved: string[] = []
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push(this.download)
+    })
+    const user = userEvent.setup()
+    const image = result({ id: 'r1', kind: 'image', name: 'chart.png', mime: 'image/png' })
+    // The draft's card and the stored message's: two mounts of one file.
+    const { client, rerender } = renderWithClient(
+      <>
+        <ResultCard key="draft" chatId="c1" result={image} />
+        <ResultCard key="stored" chatId="c1" result={{ ...image, id: 'r1-stored' }} />
+      </>,
+    )
+
+    const [draft, stored] = await screen.findAllByRole('img', { name: 'chart.png' })
+    await waitFor(() => expect(stored.getAttribute('src')).toMatch(/^blob:/))
+    const urls = [draft.getAttribute('src'), stored.getAttribute('src')]
+    // Each mount its own object URL, so one unmount cannot revoke the other's.
+    expect(urls[0]).not.toBe(urls[1])
+    await user.click(screen.getAllByRole('button', { name: 'Download' })[1])
+    await waitFor(() => expect(saved).toEqual(['chart.png']))
+    // One fetch, so one audited disclose.
+    expect(callsTo(calls, 'GET', FILE_URL)).toHaveLength(1)
+
+    // The draft gives way to the stored message: its URL goes, the other stays.
+    rerender(
+      <QueryClientProvider client={client}>
+        <>
+          <ResultCard key="stored" chatId="c1" result={{ ...image, id: 'r1-stored' }} />
+        </>
+      </QueryClientProvider>,
+    )
+    await waitFor(() => expect(revoke).toHaveBeenCalledWith(urls[0]))
+    expect(revoke).not.toHaveBeenCalledWith(urls[1])
+    expect(screen.getByRole('img', { name: 'chart.png' })).toHaveAttribute('src', urls[1])
+    expect(callsTo(calls, 'GET', FILE_URL)).toHaveLength(1)
+  })
+
   it('previews at most five rows and counts the rest', () => {
-    const { container, unmount } = render(<ResultCard chatId="c1" result={table(12, 6)} />)
+    const { container, unmount } = renderWithClient(<ResultCard chatId="c1" result={table(12, 6)} />)
     expect(screen.getByText('summe.csv', { selector: 'caption' })).toBeInTheDocument()
     expect(within(screen.getByRole('table')).getAllByRole('columnheader').map((th) => th.textContent)).toEqual([
       'Monat',
@@ -67,27 +109,27 @@ describe('ResultCard', () => {
     expect(screen.getByRole('button', { name: 'Download' })).toBeInTheDocument()
     unmount()
 
-    const { container: whole, unmount: again } = render(<ResultCard chatId="c1" result={table(3, 3)} />)
+    const { container: whole, unmount: again } = renderWithClient(<ResultCard chatId="c1" result={table(3, 3)} />)
     expect(whole.querySelectorAll('tbody tr')).toHaveLength(3)
     expect(screen.queryByText(/more rows?/)).not.toBeInTheDocument()
     again()
 
-    render(<ResultCard chatId="c1" result={table(6, 5)} />)
+    renderWithClient(<ResultCard chatId="c1" result={table(6, 5)} />)
     expect(screen.getByText('1 more row')).toBeInTheDocument()
   })
 
   it('says more rows follow when they were not counted', () => {
-    const { unmount } = render(<ResultCard chatId="c1" result={table(null, 5, true)} />)
+    const { unmount } = renderWithClient(<ResultCard chatId="c1" result={table(null, 5, true)} />)
     expect(screen.getByText('More rows in the file')).toBeInTheDocument()
     unmount()
 
-    render(<ResultCard chatId="c1" result={table(null, 2, false)} />)
+    renderWithClient(<ResultCard chatId="c1" result={table(null, 2, false)} />)
     expect(screen.queryByText('More rows in the file')).not.toBeInTheDocument()
   })
 
   it('shows a csv without a preview as a plain file', () => {
     const csv = result({ id: 'r1', kind: 'file', name: 'export.csv', mime: 'text/csv', size: 2048 })
-    const { unmount } = render(<ResultCard chatId="c1" result={csv} />)
+    const { unmount } = renderWithClient(<ResultCard chatId="c1" result={csv} />)
     expect(screen.getByText('export.csv')).toBeInTheDocument()
     expect(screen.getByText('2 KB')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Download' })).toBeInTheDocument()
@@ -95,7 +137,7 @@ describe('ResultCard', () => {
     unmount()
 
     // A fresh table may come without a preview: the same file card.
-    const { unmount: again } = render(
+    const { unmount: again } = renderWithClient(
       <ResultCard chatId="c1" result={{ ...csv, kind: 'table', name: 'summe.xlsx', size: 1536, preview: null }} />,
     )
     expect(screen.getByText('summe.xlsx')).toBeInTheDocument()
@@ -104,7 +146,7 @@ describe('ResultCard', () => {
     expect(screen.queryByRole('table')).not.toBeInTheDocument()
     again()
 
-    render(
+    renderWithClient(
       <LanguageContext value="de">
         <ResultCard chatId="c1" result={{ ...csv, size: 1536 }} />
       </LanguageContext>,
@@ -123,7 +165,7 @@ describe('ResultCard', () => {
     })
     const user = userEvent.setup()
     const csv = result({ id: 'r1', kind: 'file', name: 'export.csv', mime: 'text/csv' })
-    const { unmount } = render(<ResultCard chatId="c1" result={csv} />)
+    const { unmount } = renderWithClient(<ResultCard chatId="c1" result={csv} />)
 
     await user.click(screen.getByRole('button', { name: 'Download' }))
     await waitFor(() => expect(saved).toHaveLength(1))
@@ -134,7 +176,7 @@ describe('ResultCard', () => {
     unmount()
 
     // Expired: a muted card that says so, and nothing to fetch.
-    const { unmount: again } = render(<ResultCard chatId="c1" result={{ ...csv, expired: true }} />)
+    const { unmount: again } = renderWithClient(<ResultCard chatId="c1" result={{ ...csv, expired: true }} />)
     expect(screen.getByText('export.csv')).toBeInTheDocument()
     expect(screen.getByText('Expired')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Download' })).not.toBeInTheDocument()
@@ -142,7 +184,7 @@ describe('ResultCard', () => {
 
     // workbench deleted it meanwhile: the download's 410 turns the card expired.
     serve({ [`GET ${FILE_URL}`]: () => json({ detail: 'The file has expired.' }, 410) })
-    render(<ResultCard chatId="c1" result={csv} />)
+    renderWithClient(<ResultCard chatId="c1" result={csv} />)
     await user.click(screen.getByRole('button', { name: 'Download' }))
     expect(await screen.findByText('Expired')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: 'Download' })).not.toBeInTheDocument()
@@ -151,12 +193,12 @@ describe('ResultCard', () => {
   it('shows an image that is gone as expired, and never fetches an expired one', async () => {
     const calls = serve({ [`GET ${FILE_URL}`]: () => json({ detail: 'not found' }, 404) })
     const image = result({ id: 'r1', kind: 'image', name: 'chart.png', mime: 'image/png' })
-    const { unmount } = render(<ResultCard chatId="c1" result={image} />)
+    const { unmount } = renderWithClient(<ResultCard chatId="c1" result={image} />)
     expect(await screen.findByText('Expired')).toBeInTheDocument()
     expect(screen.queryByRole('img', { name: 'chart.png' })).not.toBeInTheDocument()
     unmount()
 
-    render(<ResultCard chatId="c1" result={{ ...image, expired: true }} />)
+    renderWithClient(<ResultCard chatId="c1" result={{ ...image, expired: true }} />)
     expect(screen.getByText('Expired')).toBeInTheDocument()
     expect(callsTo(calls, 'GET', FILE_URL)).toHaveLength(1)
   })

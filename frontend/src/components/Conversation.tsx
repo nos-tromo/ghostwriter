@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { EmptyState, Spinner } from '@infra/ui'
+import { ApiError } from '../api/client'
 import type { AppConfig, ErrorFrame } from '../api/types'
 import { useChatStream, type ChatStream, type StreamFailure } from '../hooks/useChatStream'
 import { useChat } from '../hooks/useChats'
@@ -15,12 +16,15 @@ const ERROR_KEYS: Record<ErrorFrame['code'], keyof Strings> = {
   internal: 'error.internal',
 }
 
+/** Why the last answer ended early, or never started: a 409 is the chat's
+ *  answer still being written, which a chat left and reopened can meet. */
 function FailureLine({ failure }: { failure: StreamFailure }) {
   const t = useT()
-  if (failure.kind === 'request') return <RequestError error={failure.error} className="text-sm text-danger" />
+  const busy = failure.kind === 'request' && failure.error instanceof ApiError && failure.error.status === 409
+  if (failure.kind === 'request' && !busy) return <RequestError error={failure.error} className="text-sm text-danger" />
   return (
     <p role="alert" className="text-sm text-danger">
-      {t(ERROR_KEYS[failure.code])}
+      {t(failure.kind === 'answer' ? ERROR_KEYS[failure.code] : 'chat.answer_busy')}
     </p>
   )
 }
@@ -79,7 +83,7 @@ export function Conversation({
               onRegenerate={message.id === lastAnswer ? () => void stream.regenerate(reasoning) : undefined}
             />
           ))}
-          {stream.pendingUser !== null && <PendingUser content={stream.pendingUser} />}
+          {stream.pendingUser !== null && <PendingUser message={stream.pendingUser} />}
           {stream.draft && <DraftView chatId={chatId} draft={stream.draft} fileDays={fileDays} />}
           {failure && <FailureLine failure={failure} />}
         </div>

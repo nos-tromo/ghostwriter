@@ -1,6 +1,6 @@
 import { Badge, RefreshButton, Spinner } from '@infra/ui'
 import type { AttachmentOut, MessageOut } from '../api/types'
-import type { DraftAnswer } from '../hooks/useChatStream'
+import type { DraftAnswer, PendingMessage } from '../hooks/useChatStream'
 import { useLang, useT } from '../i18n/LanguageContext'
 import { formatSize } from '../lib/format'
 import { MarkdownProse } from './MarkdownProse'
@@ -101,7 +101,7 @@ export function DraftView({ chatId, draft, fileDays }: { chatId: string; draft: 
   )
 }
 
-/** The message being sent, shown until the chat is read again. */
-export function PendingUser({ content }: { content: string }) {
-  return <UserMessage message={{ content, attachments: [] }} />
+/** The message being sent, with the files it binds, shown until the chat is read again. */
+export function PendingUser({ message }: { message: PendingMessage }) {
+  return <UserMessage message={message} />
 }

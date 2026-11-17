@@ -3,6 +3,8 @@ import { screen, waitFor } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { clearAllPurposes } from '@infra/ui'
 import { Conversation } from '../components/Conversation'
+import { LanguageContext } from '../i18n/LanguageContext'
+import type { AttachmentOut } from '../api/types'
 import type { ChatStream } from './useChatStream'
 import { useChats } from './useChats'
 import {
@@ -43,6 +45,15 @@ const TABLE = result({
   preview: { columns: ['Monat', 'Betrag'], rows: [['Jan', '42']], row_count: 1, truncated: false },
 })
 const FINAL = { message_id: 'm2', user_message_id: 'm1', chat: CHAT, stopped: false }
+const SALES: AttachmentOut = {
+  id: 'a1',
+  file_id: 'F0',
+  name: 'sales.xlsx',
+  size: 4096,
+  mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  created_at: '2026-11-02T09:00:00Z',
+  expired: false,
+}
 
 /** A stand-in for Task 14's composer: buttons over the conversation's stream. */
 function controls(stream: ChatStream) {
@@ -53,6 +64,9 @@ function controls(stream: ChatStream) {
       </button>
       <button type="button" onClick={() => void stream.send('Summe der Spalte B?', [], true)}>
         Ask and think
+      </button>
+      <button type="button" onClick={() => void stream.send('', [SALES], false)}>
+        Send the file
       </button>
       <button type="button" onClick={() => void stream.stop()}>
         Halt
@@ -205,19 +219,61 @@ describe('useChatStream', () => {
     expect(screen.getByRole('alert')).toHaveTextContent('The answer stopped: it could not be recorded.')
   })
 
-  it('says why a message could not be sent', async () => {
-    serve({
-      'GET /ghostwriter/api/chats/c1': detail([]),
-      'POST /ghostwriter/api/chats/c1/messages': () =>
-        new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.' }), { status: 409 }),
-    })
+  it('shows the files of a message sent without text in its bubble', async () => {
+    const { calls, finish } = serveChat(
+      detail([]),
+      detail([message({ id: 'm1', role: 'user', attachments: [SALES] }), ANSWER]),
+      'messages',
+    )
     renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+
+    await user.click(screen.getByRole('button', { name: 'Send the file' }))
+    const bubble = (await screen.findByText('sales.xlsx')).closest('[data-role="user"]') as HTMLElement
+    expect(bubble).toHaveTextContent('sales.xlsx4 KB')
+    expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages').map((c) => c.body)).toEqual([
+      { content: '', attachment_ids: ['a1'], reasoning: false },
+    ])
+
+    finish()
+    await screen.findByText('Summe: 42')
+    expect(screen.getAllByText('sales.xlsx')).toHaveLength(1)
+  })
+
+  it('says why a message could not be sent, and that an answer is still being written', async () => {
+    const busy = () =>
+      new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.' }), { status: 409 })
+    serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'POST /ghostwriter/api/chats/c1/messages': busy })
+    const first = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
     await user.click(screen.getByRole('button', { name: 'Ask' }))
 
-    expect(await screen.findByRole('alert')).toHaveTextContent('Something went wrong (409).')
+    expect(await screen.findByRole('alert')).toHaveTextContent('An answer is still being written in this chat.')
     expect(screen.queryByText('Summe der Spalte B?')).not.toBeInTheDocument()
+    first.unmount()
+
+    // A regenerate refused the same way says the same.
+    serve({ 'GET /ghostwriter/api/chats/c1': detail([QUESTION, ANSWER]), 'POST /ghostwriter/api/chats/c1/regenerate': busy })
+    const second = renderWithClient(<Conversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await user.click(await screen.findByRole('button', { name: 'Regenerate' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('An answer is still being written in this chat.')
+    second.unmount()
+
+    // Any other refusal stays the generic line with its status.
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([]),
+      'POST /ghostwriter/api/chats/c1/messages': () => new Response(JSON.stringify({ detail: 'boom' }), { status: 500 }),
+    })
+    renderWithClient(
+      <LanguageContext value="de">
+        <Conversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />
+      </LanguageContext>,
+    )
+    await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Etwas ist schiefgelaufen (500)')
   })
 
   it('asks the server to stop, and aborts the stream when the conversation goes away', async () => {

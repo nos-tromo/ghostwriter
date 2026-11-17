@@ -30,6 +30,7 @@ export const en = {
   'chat.answer_pending': 'Working on an answer…',
   'chat.thinking': 'thinking…',
   'chat.regenerate': 'Regenerate',
+  'chat.answer_busy': 'An answer is still being written in this chat.',
 
   // the trail of tool steps
   'trail.steps': '{n} steps',

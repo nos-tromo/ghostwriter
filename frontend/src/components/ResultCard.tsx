@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useId, useState } from 'react'
+import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { Badge, DownloadButton, Spinner } from '@infra/ui'
 import { fileBlob } from '../api/chats'
 import { ApiError } from '../api/client'
@@ -13,6 +14,42 @@ function isGone(error: unknown): boolean {
   return error instanceof ApiError && (error.status === 410 || error.status === 404)
 }
 
+/** A file's blob in the query cache, shared by every card that shows it. */
+const fileKey = (chatId: string, fileId: string) => ['file', chatId, fileId] as const
+
+/** How long a blob stays in memory once no card shows it: long enough for the
+ *  draft's card to hand it to the stored message's. */
+const FILE_GC_MS = 60_000
+
+/** A file of the chat, fetched once: every fetch is an audited `disclose`, so
+ *  the draft's card, the stored message's card and Download share one blob.
+ *  Never refetched (a file does not change) and never retried. */
+function fileQuery(chatId: string, fileId: string) {
+  return queryOptions({
+    queryKey: fileKey(chatId, fileId),
+    queryFn: ({ signal }) => fileBlob(chatId, fileId, signal),
+    staleTime: Infinity,
+    gcTime: FILE_GC_MS,
+    retry: false,
+  })
+}
+
+/** An object URL of this mount's own for a blob, revoked when the mount goes
+ *  or the blob changes, so one card's unmount never breaks another's image. */
+function useObjectUrl(blob: Blob | undefined): string | null {
+  const [url, setUrl] = useState<string | null>(null)
+  useEffect(() => {
+    if (!blob) return
+    const created = URL.createObjectURL(blob)
+    setUrl(created)
+    return () => {
+      URL.revokeObjectURL(created)
+      setUrl(null)
+    }
+  }, [blob])
+  return url
+}
+
 /** Save a blob under its name through a transient object URL, revoked once the click has been dispatched. */
 function saveBlob(blob: Blob, name: string) {
   const url = URL.createObjectURL(blob)
@@ -24,35 +61,19 @@ function saveBlob(blob: Blob, name: string) {
 }
 
 /**
- * The image itself, fetched as a blob: an `<img src>` could not send the
- * stated purpose, so it shows an object URL made here and revoked on unmount.
+ * The image itself, from the file's blob: an `<img src>` could not send the
+ * stated purpose, so it shows an object URL of its own.
  */
 function InlineImage({ chatId, result, onGone }: { chatId: string; result: ResultOut; onGone: () => void }) {
   const t = useT()
-  const [url, setUrl] = useState<string | null>(null)
-  const [failure, setFailure] = useState<unknown>(null)
+  const { data: blob, error } = useQuery(fileQuery(chatId, result.file_id))
+  const url = useObjectUrl(blob)
+  const gone = error !== null && isGone(error)
   useEffect(() => {
-    const controller = new AbortController()
-    let created: string | null = null
-    fileBlob(chatId, result.file_id, controller.signal).then(
-      (blob) => {
-        if (controller.signal.aborted) return
-        created = URL.createObjectURL(blob)
-        setUrl(created)
-      },
-      (error: unknown) => {
-        if (controller.signal.aborted) return
-        if (isGone(error)) onGone()
-        else setFailure(error)
-      },
-    )
-    return () => {
-      controller.abort()
-      if (created) URL.revokeObjectURL(created)
-    }
-  }, [chatId, result.file_id, onGone])
+    if (gone) onGone()
+  }, [gone, onGone])
 
-  if (failure !== null) return <RequestError error={failure} />
+  if (error !== null && !gone) return <RequestError error={error} />
   if (url === null) return <Spinner label={t('result.loading', { name: result.name })} />
   return (
     <img
@@ -77,14 +98,19 @@ function FileLine({
 }) {
   const t = useT()
   const lang = useLang()
+  const qc = useQueryClient()
   const [busy, setBusy] = useState(false)
   const [failure, setFailure] = useState<unknown>(null)
 
+  // A blob a card holds, or is fetching, is reused; any other file is fetched
+  // for this download alone and not kept in memory.
   const download = async () => {
     setBusy(true)
     setFailure(null)
     try {
-      saveBlob(await fileBlob(chatId, result.file_id), result.name)
+      const query = fileQuery(chatId, result.file_id)
+      const blob = qc.getQueryState(query.queryKey) ? await qc.fetchQuery(query) : await fileBlob(chatId, result.file_id)
+      saveBlob(blob, result.name)
     } catch (error) {
       if (isGone(error)) onGone()
       else setFailure(error)

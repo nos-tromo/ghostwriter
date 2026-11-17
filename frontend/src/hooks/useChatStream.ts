@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { useQueryClient } from '@tanstack/react-query'
 import { stopChat } from '../api/chats'
 import { streamSse } from '../api/sse'
-import type { ErrorFrame, MessageIn, RegenerateIn, ResultOut, StepOut } from '../api/types'
+import type { AttachmentOut, ErrorFrame, MessageIn, MessageOut, RegenerateIn, ResultOut, StepOut } from '../api/types'
 import { chatKey, chatsKey } from './useChats'
 
 /** The answer being written, as its frames have built it so far. */
@@ -19,13 +19,17 @@ export interface DraftAnswer {
  *  off), or never started (`request`); kept in view until the next one. */
 export type StreamFailure = { kind: 'answer'; code: ErrorFrame['code'] } | { kind: 'request'; error: unknown }
 
+/** The message being sent, as its bubble shows it: its text and the files it binds. */
+export type PendingMessage = Pick<MessageOut, 'content' | 'attachments'>
+
 export interface ChatStream {
   streaming: boolean
   draft: DraftAnswer | null
   /** The message being sent, until the chat is read again; null for a regenerate. */
-  pendingUser: string | null
+  pendingUser: PendingMessage | null
   failure: StreamFailure | null
-  send(content: string, attachmentIds: string[], reasoning: boolean): Promise<void>
+  /** Send a message with the chat's pending attachments it binds (sent by their ids). */
+  send(content: string, attachments: readonly AttachmentOut[], reasoning: boolean): Promise<void>
   regenerate(reasoning: boolean): Promise<void>
   stop(): Promise<void>
 }
@@ -93,7 +97,7 @@ export function useChatStream(chatId: string | null): ChatStream {
   )
 
   const run = useCallback(
-    async (route: 'messages' | 'regenerate', body: MessageIn | RegenerateIn, pendingUser: string | null) => {
+    async (route: 'messages' | 'regenerate', body: MessageIn | RegenerateIn, pendingUser: PendingMessage | null) => {
       if (chatId === null || busyRef.current) return
       busyRef.current = true
       const me = ++runRef.current
@@ -139,8 +143,12 @@ export function useChatStream(chatId: string | null): ChatStream {
   )
 
   const send = useCallback(
-    (content: string, attachmentIds: string[], reasoning: boolean) =>
-      run('messages', { content, attachment_ids: attachmentIds, reasoning } satisfies MessageIn, content),
+    (content: string, attachments: readonly AttachmentOut[], reasoning: boolean) =>
+      run(
+        'messages',
+        { content, attachment_ids: attachments.map((a) => a.id), reasoning } satisfies MessageIn,
+        { content, attachments: [...attachments] },
+      ),
     [run],
   )
 

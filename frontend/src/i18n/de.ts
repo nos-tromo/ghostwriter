@@ -32,6 +32,7 @@ export const de: Strings = {
   'chat.answer_pending': 'Antwort wird erstellt…',
   'chat.thinking': 'denkt nach…',
   'chat.regenerate': 'Neu erzeugen',
+  'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
 
   // the trail of tool steps
   'trail.steps': '{n} Schritte',
@@ -67,7 +68,7 @@ export const de: Strings = {
 
   // why an answer ended early
   'error.model': 'Das Modell hat nicht geantwortet. Bitte erneut versuchen.',
-  'error.audit': 'Die Antwort wurde abgebrochen: Sie konnte nicht protokolliert werden.',
+  'error.audit': 'Die Antwort wurde abgebrochen, weil sie nicht protokolliert werden konnte.',
   'error.internal': 'Etwas ist schiefgelaufen.',
 
   // retention banner
