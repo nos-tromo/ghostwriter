@@ -13,8 +13,9 @@ run on, apart from the pool that serves every other request. Every request body
 is capped per route (:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Final, TextIO
 from urllib.parse import quote
 
@@ -31,11 +32,11 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from ghostwriter import __version__
 from ghostwriter.agent.limits import TURN_THREADS
 from ghostwriter.agent.loop import AgentLoop
-from ghostwriter.api import chats, messages, meta
+from ghostwriter.api import chats, files, messages, meta
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.body_limit import BodyLimit
 from ghostwriter.config import Settings, load_settings
-from ghostwriter.db import init_db, make_engine
+from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.inference import ModelClient
 from ghostwriter.log_cfg import setup_logger
 from ghostwriter.store import ChatStore
@@ -55,6 +56,7 @@ def create_app(
     audit_stream: TextIO | None = None,
     workbench_transport: httpx.AsyncBaseTransport | None = None,
     model: ModelClient | None = None,
+    now: Callable[[], datetime] = utcnow,
 ) -> FastAPI:
     """Build the application.
 
@@ -65,6 +67,7 @@ def create_app(
             ``None`` uses httpx's own.
         model: The chat model (tests pass one over a fake router); the router of the
             settings when omitted.
+        now: The store's clock (tests pass one set by hand).
 
     Returns:
         The app, with ``settings`` on ``app.state.settings``.
@@ -95,7 +98,7 @@ def create_app(
             start_chain(app, emitter)
             engine = make_engine(settings.db_path)
             init_db(engine)
-            store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
+            store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days, now=now)
             app.state.store = store
             store.apply_periods(settings.chat_days)
             app.state.agent = AgentLoop(model=chat_model, workbench=app.state.workbench, store=store, settings=settings)
@@ -175,6 +178,7 @@ def create_app(
     app.include_router(meta.router)
     app.include_router(chats.router)
     app.include_router(messages.router)
+    app.include_router(files.router)
     app.add_middleware(BodyLimit)
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     return app

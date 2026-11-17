@@ -90,11 +90,11 @@ def test_a_chunked_body_past_the_cap_is_refused(
 
 
 def test_an_attachment_within_its_own_limit_passes(client: TestClient) -> None:
-    """A 2 MiB upload is over the general cap but within the attachment route's, so the cap lets it through."""
+    """A 2 MiB upload is over the general cap but within the attachment route's, so it is attached."""
     cid = _new(client)
     files = {"file": ("sales.xlsx", b"\x00" * (2 * MIB), "application/octet-stream")}
     r = client.post(f"/api/chats/{cid}/attachments", files=files, headers=as_user())
-    assert r.status_code != 413
+    assert (r.status_code, r.json()["size"]) == (201, 2 * MIB)
 
 
 class Drive:

@@ -150,6 +150,18 @@ class ChatStore:
         with Session(self._engine) as s, s.begin():
             yield s
 
+    def _gone(self, created_at: datetime, now: datetime) -> bool:
+        """Tell whether workbench's period for a file made at ``created_at`` has passed at ``now``.
+
+        Args:
+            created_at: When the file was attached or written.
+            now: The time of the read.
+
+        Returns:
+            Whether it has passed.
+        """
+        return created_at + self._file_period <= now
+
     def _attachment_out(self, attachment: Attachment, now: datetime) -> AttachmentOut:
         """Serve an attachment row.
 
@@ -167,7 +179,7 @@ class ChatStore:
             size=attachment.size,
             mime=attachment.mime,
             created_at=attachment.created_at,
-            expired=attachment.created_at + self._file_period <= now,
+            expired=self._gone(attachment.created_at, now),
         )
 
     def _result_out(self, result: Result, now: datetime) -> ResultOut:
@@ -181,7 +193,7 @@ class ChatStore:
             The result, expired once workbench's period for its file has
             passed; its preview goes earlier, at ``preview_expires_at``.
         """
-        expired = result.created_at + self._file_period <= now
+        expired = self._gone(result.created_at, now)
         preview: TablePreviewOut | None = None
         if not expired and result.preview_expires_at > now and result.preview is not None:
             preview = TablePreviewOut.model_validate_json(result.preview)
@@ -722,10 +734,15 @@ class ChatStore:
 
         Returns:
             The attachment.
+
+        Raises:
+            ChatNotFound: If the chat is gone, as one deleted while its file was handed over.
         """
         now = self._now()
         with self._transaction() as s:
             self._mark_first_file(s, chat_id, now)
+            if s.get(Chat, chat_id) is None:
+                raise ChatNotFound("chat not found")
             attachment = Attachment(
                 id=str(uuid4()) if id is None else id,
                 chat_id=chat_id,
@@ -795,6 +812,17 @@ class ChatStore:
                     .where(Message.chat_id.in_(owned), Result.workbench_file_id == file_id)
                 ).first()
             return None if found is None else FileRef(path=found[0], created_at=found[1])
+
+    def file_expired(self, ref: FileRef) -> bool:
+        """Tell whether a file is gone by now: the rule its attachment or result reads ``expired`` by.
+
+        Args:
+            ref: The file, as :meth:`find_file` found it.
+
+        Returns:
+            Whether workbench's period for it has passed.
+        """
+        return self._gone(ref.created_at, self._now())
 
     def _prompt_text(self, message: Message, attachments: Sequence[Attachment], now: datetime) -> str:
         """Return a user's message as the model reads it.

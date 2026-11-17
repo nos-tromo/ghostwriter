@@ -253,7 +253,7 @@ class FakeDoor:
         }
         self.delays: dict[str, float] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
-        self.upload_id = UPLOAD_ID
+        self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
         self.on_delete: Callable[[], None] | None = None
 

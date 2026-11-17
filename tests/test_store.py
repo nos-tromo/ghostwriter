@@ -422,6 +422,27 @@ def test_a_file_is_found_only_through_its_own_chat(store: ChatStore, clock: Cloc
     assert store.find_file("user-a", chat.id, uuid4().hex) is None
 
 
+def test_a_file_expires_by_the_rule_its_card_reads(store: ChatStore, clock: Clock) -> None:
+    """A file is gone once workbench's period for it has passed, as its attachment or result reads ``expired``."""
+    chat = store.create_chat("user-a")
+    attachment = _attach(store, chat.id)
+    ref = store.find_file("user-a", chat.id, attachment.file_id)
+    assert ref is not None
+    clock.now = T0 + 7 * DAY - timedelta(microseconds=1)
+    assert not store.file_expired(ref)
+    clock.now = T0 + 7 * DAY
+    assert store.file_expired(ref)
+    assert store.chat_detail("user-a", chat.id).pending_attachments[0].expired is True
+
+
+def test_an_attachment_for_a_chat_deleted_meanwhile_is_refused(store: ChatStore) -> None:
+    """A chat deleted while its file was being handed over takes no attachment row."""
+    chat = store.create_chat("user-a")
+    store.delete_chat_rows(chat.id)
+    with pytest.raises(ChatNotFound):
+        _attach(store, chat.id)
+
+
 def test_the_last_answer_can_be_replaced(store: ChatStore) -> None:
     """Only an answer that ends the chat is the last answer; dropping it takes its steps and results."""
     chat = store.create_chat("user-a")
