@@ -379,11 +379,25 @@ def test_a_call_id_the_record_cannot_hold_is_refused(loop_env: LoopEnv) -> None:
     assistant, *answers = loop_env.sent(2)[-4:]
     ids = [call["id"] for call in assistant["tool_calls"]]
     assert ids[2] == "call_ok-1" and len(set(ids)) == 3
-    assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", i) for i in ids)
+    assert all(re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", i) for i in ids)
     assert [answer["tool_call_id"] for answer in answers] == ids
     assert [json.loads(answer["content"]).get("error") for answer in answers[:2]] == ["bad_arguments"] * 2
     [turn], _ = loop_env.store.past_turns(CHAT, before_position=99)
     assert [call.call_id for calls in turn.rounds for call in calls] == ["call_ok-1"]
+
+
+def test_a_call_id_with_dots_and_colons_is_kept(loop_env: LoopEnv) -> None:
+    """Some models name a call ``functions.<tool>:<n>``: it is sent, stored and answered under that id."""
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(
+        [call_chunk(0, "functions.read_document:0", "read_document", READ_SALES)], [text_chunk("Summe: 42")]
+    )
+    assert len(loop_env.workbench.calls) == 1 and len(_steps(events)) == 2
+    assistant, answer = loop_env.sent(2)[-2:]
+    assert [c["id"] for c in assistant["tool_calls"]] == ["functions.read_document:0"]
+    assert answer["tool_call_id"] == "functions.read_document:0"
+    [turn], _ = loop_env.store.past_turns(CHAT, before_position=99)
+    assert [call.call_id for calls in turn.rounds for call in calls] == ["functions.read_document:0"]
 
 
 def test_at_most_four_calls_run_per_round(loop_env: LoopEnv) -> None:

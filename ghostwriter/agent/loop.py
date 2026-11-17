@@ -66,7 +66,7 @@ from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.workbench import CallFor, OutputFile, ToolFailure, ToolResult, WorkbenchClient, chat_folder
 
 #: A call id the store and the audit take; a call with another is refused, and answered under one the loop mints.
-CALL_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
+CALL_ID: Final = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 #: What the user is told when a model round failed.
 MODEL_ERROR = "The model did not answer."
 #: What the user is told when anything else broke the answer.
