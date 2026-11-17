@@ -105,11 +105,88 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
 with one worker: the process holds the one audit chain, the turn registry and
 the sweep. Never add workers or replicas.
 
+## A message, end to end
+
+1. `api/messages.py` resolves the owner (`identity.py`) and writes the primary
+   audit event (`collect` / `chat.message`, or `modify` / `chat.regenerate`)
+   before anything is stored. A failed write raises `AuditWriteError`, which
+   `main.py` answers with the generic 500.
+2. `TurnRegistry.begin` claims the chat. A delete holds the same claim.
+3. `AgentLoop` is a blocking generator. It runs on `app.state.turn_threads`
+   (`TURN_THREADS`), not the shared pool, and `sse.aiter_sync_gen` bridges it to
+   the event loop.
+4. Each round: `context.fit` builds the messages within the prompt budget,
+   replaying earlier turns newest first. `agent/stream.py` streams the round
+   through `ModelClient` and strips the reasoning. Each tool call is disclosed
+   (`disclose` / `chat.tool`) before it goes to `WorkbenchClient.call_tool`
+   over MCP, which never raises. Each round is then recorded (`ai_call` /
+   `chat.answer`). With workbench off, `app.state.workbench` is `None` and no
+   tool is offered.
+5. The frames are `start` (always first), then `token`, `step`, `result` and
+   `error`, then `final` (always last), with a keep-alive comment every 15 s.
+   A stop or a disconnect sets the turn's event: the call in flight finishes
+   and is stored, and no further round starts.
+6. Every `ChatStore` method is one short transaction that returns schema
+   objects. File marks set how long content derived from a file may live
+   (`store.py` docstring); the daily sweep (`retention.py`) deletes by the same
+   deadlines.
+
 ## Commands
 
+Python 3.11 only. Settings come from `.env` (`cp .env.example .env`, then set
+`OPENAI_API_KEY`).
+
 ```bash
+uv sync --locked                  # backend deps, dev group included
+make network                      # once per host: inference-net, edge-net, workbench-net
+make dev                          # build + up with host ports: SPA localhost:8504/ghostwriter/, backend :8004
+cd frontend && pnpm dev           # Vite on :5173; /ghostwriter/api proxied to :8004 (GHOSTWRITER_BACKEND_ORIGIN)
 make verify                       # pre-push gate: pre-commit (ruff, pyrefly) + frontend lint and build
-make test                         # pytest, then vitest
+make test                         # pytest, then vitest (make test-backend / make test-frontend for one)
+uv run pytest tests/test_store.py -k <name> -q                 # one backend test
+cd frontend && pnpm test src/components/Composer.test.tsx -t '<name>'   # one frontend test
 make retention-dry-run CHAT_DAYS=60   # in the running backend: what retention would delete; changes nothing
 make nuke                         # DESTROY ghostwriter-data, every chat (type 'ghostwriter')
 ```
+
+In dev, the account is `dev`: `GHOSTWRITER_DEFAULT_IDENTITY`, which
+`docker/compose.override.yaml` sets. It is ignored while
+`GHOSTWRITER_EDGE_SECRET` is set, and every request then answers 401. Ruff
+requires Google-style docstrings (`D`) and annotations (`ANN`); pyrefly runs
+strict; lines are 120 characters.
+
+## Testing
+
+- Settings come from `make_settings(tmp_path, **overrides)` in
+  `tests/conftest.py`, never from the environment. `as_user(name)` returns the
+  gateway's headers.
+- For the full app, build it as `_app` in `tests/test_api_messages.py` does:
+  `create_app(settings, audit_stream=..., workbench_transport=httpx.MockTransport(FakeDoor()),
+  model=ModelClient(settings, client=FakeOpenAI().as_client()))`. Script the
+  model's rounds with `text_chunk`, `call_chunk`, `reasoning_chunk` and
+  `usage_chunk` (`tests/fakes.py`).
+- The `audit_stream` fixture checks the hash chain at teardown, so a test that
+  breaks the chain fails even after its asserts pass. `loguru_caplog` captures
+  loguru warnings in `caplog`.
+- Every name, id and value in the fakes is invented; keep it that way.
+
+## What changes together
+
+- A body cap: `ghostwriter/body_limit.py` and `client_max_body_size` in
+  `frontend/nginx/default.conf`.
+- `tests/test_scaffold.py` checks the text of `docker/compose.yaml`, the
+  `Makefile`, nginx, Vite's `base` and `.env.example` (its tag comments,
+  lines under 80 characters).
+- A setting: `load_settings` in `config.py`, `.env.example`, `docs/configuration.md`.
+- The schema: raise `SCHEMA_VERSION` in `db.py` and add
+  `MIGRATIONS[<previous version>]`, one step per version. A file from a newer
+  version is refused.
+- A new audit action goes into `ENDPOINT_ACTIONS` in `audit.py` first, or
+  `audited()` raises. `docs/audit.md` lists what each route records.
+- UI strings go into both `frontend/src/i18n/en.ts` and `de.ts`;
+  `i18n.test.ts` checks that their keys match.
+- These files are copied from `nos-tromo/.github`, and CI checks them against
+  the originals, so change them there: `ghostwriter/utils/audit_*.py`,
+  `make/common.mk`, `scripts/bundle-lib.sh`, `frontend/eslint.config.js`, and
+  the `[tool.ruff]` / `[tool.pyrefly]` sections of `pyproject.toml` (only
+  `target-version` may differ).
