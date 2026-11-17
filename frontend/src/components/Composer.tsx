@@ -187,28 +187,19 @@ export function Composer({
         event.preventDefault()
         void submit()
       }}
-      className="shrink-0 border-t border-border px-4 py-3"
+      className="shrink-0 py-2"
     >
-      <div className="mx-auto w-full max-w-3xl space-y-2">
+      {/* As wide as the message column (Conversation), whose padding is inside its max width too. */}
+      <div className="mx-auto w-full max-w-3xl space-y-2 px-4">
         <AttachmentChips pending={attachments.pending} onDismiss={attachments.dismiss} />
         {attachments.pending.some((f) => f.status !== 'error') && (
           <p className="text-xs text-muted-foreground">
             {t('composer.files_stay', { days: config.file_retention_days })}
           </p>
         )}
-        <div className="rounded-lg border border-border bg-background focus-within:border-primary">
-          <textarea
-            ref={textRef}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={onKeyDown}
-            onPaste={onPaste}
-            rows={2}
-            aria-label={t('composer.placeholder')}
-            placeholder={t('composer.placeholder')}
-            className="block max-h-48 min-h-14 w-full resize-none bg-transparent px-3 py-2 text-sm outline-none field-sizing-content placeholder:text-muted-foreground"
-          />
-          <div className="flex items-center gap-1 px-2 pb-2">
+        {/* One row: the buttons stay on the bottom line while the text grows upward. */}
+        <div className="flex items-end gap-1 rounded-3xl border border-border bg-muted px-2 py-1.5 focus-within:border-primary [&_button]:rounded-full">
+          <div className="flex shrink-0 items-center gap-1">
             {config.attachments && (
               <>
                 <AttachButton label={t('composer.attach')} onClick={() => pickerRef.current?.click()} />
@@ -243,14 +234,25 @@ export function Composer({
                 {t('mic.limit', { s: Math.max(0, config.max_recording_s - recorder.elapsedS) })}
               </span>
             )}
-            <div className="ml-auto flex items-center gap-1">
-              <ReasoningToggle reasoning={reasoning} onChange={onReasoningChange} />
-              {stream.streaming ? (
-                <StopButton label={t('composer.stop')} onClick={() => void stream.stop()} />
-              ) : (
-                <SendButton type="submit" variant="primary" label={t('composer.send')} disabled={!canSend} />
-              )}
-            </div>
+          </div>
+          <textarea
+            ref={textRef}
+            value={text}
+            onChange={(event) => setText(event.target.value)}
+            onKeyDown={onKeyDown}
+            onPaste={onPaste}
+            rows={1}
+            aria-label={t('composer.placeholder')}
+            placeholder={t('composer.placeholder')}
+            className="block max-h-48 min-h-8 min-w-0 flex-1 resize-none self-center bg-transparent px-2 py-1.5 text-sm outline-none field-sizing-content placeholder:text-muted-foreground"
+          />
+          <div className="flex shrink-0 items-center gap-1">
+            <ReasoningToggle reasoning={reasoning} onChange={onReasoningChange} />
+            {stream.streaming ? (
+              <StopButton label={t('composer.stop')} onClick={() => void stream.stop()} />
+            ) : (
+              <SendButton type="submit" variant="primary" label={t('composer.send')} disabled={!canSend} />
+            )}
           </div>
         </div>
         {(recorder.state === 'denied' || recorder.state === 'unavailable') && (
