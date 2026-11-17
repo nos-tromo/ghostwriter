@@ -11,8 +11,10 @@ process's one turn registry (:mod:`ghostwriter.turns`). The lifespan also holds
 ``app.state.turn_threads``, the limiter whose ``TURN_THREADS`` threads the turns
 run on, apart from the pool that serves every other request. ``app.state.model``
 is the model client, which dictation (:mod:`ghostwriter.api.speech`, registered
-only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns. Every
-request body is capped per route (:mod:`ghostwriter.body_limit`), as nginx caps it.
+only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns; dictation
+runs on ``app.state.speech_threads``, a limiter of ``SPEECH_THREADS`` threads of
+its own. Every request body is capped per route (:mod:`ghostwriter.body_limit`),
+as nginx caps it.
 """
 
 from collections.abc import AsyncIterator, Callable
@@ -39,7 +41,7 @@ from ghostwriter.audit import open_emitter, settle_failed_operations, start_chai
 from ghostwriter.body_limit import BodyLimit
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine, utcnow
-from ghostwriter.inference import ModelClient
+from ghostwriter.inference import SPEECH_THREADS, ModelClient
 from ghostwriter.log_cfg import setup_logger
 from ghostwriter.store import ChatStore
 from ghostwriter.turns import TurnRegistry
@@ -105,6 +107,7 @@ def create_app(
             store.apply_periods(settings.chat_days)
             app.state.agent = AgentLoop(model=chat_model, workbench=app.state.workbench, store=store, settings=settings)
             app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
+            app.state.speech_threads = anyio.CapacityLimiter(SPEECH_THREADS)
             yield
         finally:
             if engine is not None:

@@ -46,6 +46,8 @@ MAX_RECORDING_BYTES: Final = 10 * 1024 * 1024
 RECORDING_TYPES: Final = frozenset({"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"})
 #: Seconds each wait on the router may take while it transcribes.
 TRANSCRIBE_TIMEOUT_S: Final = 60.0
+#: Worker threads transcriptions run on, apart from the shared pool; one beyond them waits.
+SPEECH_THREADS: Final = 4
 
 # Keys the cache scopes; it never leaves this process, so a scope cannot be
 # mapped back to a user anywhere else. A restart gives every user a new scope.

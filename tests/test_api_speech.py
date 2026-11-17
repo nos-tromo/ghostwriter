@@ -3,7 +3,10 @@
 Every name, id and value here is invented.
 """
 
+import threading
+import time
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -203,6 +206,35 @@ def test_a_required_purpose_refuses_a_transcription_unread(
     assert fake_openai.transcriptions == []
     [denied] = _transcriptions(audit_stream)
     assert denied["outcome"] == "denied"
+
+
+def test_dictations_run_on_their_own_threads(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """Four stalled dictations hold the four speech threads, a fifth waits for one, and health still answers."""
+    app = client.app
+    assert isinstance(app, FastAPI)
+    started: list[int] = []
+    release = threading.Event()
+    answer = fake_openai.audio.transcriptions.create
+
+    def stalled(**kwargs: Any) -> Transcription:
+        started.append(1)
+        release.wait(10)
+        return answer(**kwargs)
+
+    fake_openai.audio.transcriptions.create = stalled
+    with ThreadPoolExecutor(5) as pool:
+        try:
+            dictations = [pool.submit(_record, client) for _ in range(5)]
+            deadline = time.monotonic() + 5
+            while len(started) < 4 and time.monotonic() < deadline:
+                time.sleep(0.01)
+            time.sleep(0.2)
+            assert len(started) == 4
+            assert app.state.speech_threads.borrowed_tokens == 4
+            assert client.get("/api/health").json() == {"status": "ok"}
+        finally:
+            release.set()
+        assert [dictation.result().status_code for dictation in dictations] == [200] * 5
 
 
 def test_speech_off_removes_the_route_and_says_so(tmp_path: Path) -> None:

@@ -7,9 +7,9 @@ import pytest
 from ghostwriter.log_cfg import setup_logger
 
 
-@pytest.mark.parametrize("name", ["httpx", "httpcore"])
-def test_the_http_loggers_are_pinned_to_warning(name: str, caplog: pytest.LogCaptureFixture) -> None:
-    """Below WARNING nothing is emitted: httpx logs each request URL at INFO, and a view URL carries a file name."""
+@pytest.mark.parametrize("name", ["httpx", "httpcore", "httpx2", "httpcore2", "openai"])
+def test_the_http_and_sdk_loggers_are_pinned_to_warning(name: str, caplog: pytest.LogCaptureFixture) -> None:
+    """Below WARNING nothing is emitted: the HTTP clients log request URLs, older OpenAI SDKs request options."""
     logging.getLogger(name).setLevel(logging.NOTSET)
     setup_logger()
     pinned = logging.getLogger(name)

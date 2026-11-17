@@ -9,10 +9,11 @@ view route with workbench's type, length and disposition, and its hardening head
 Records name a file by its id, never by its name. An attachment is ``collect`` /
 ``chat.attachment``, written before its first byte goes on, with the hand-over as its child
 ``disclose`` / ``chat.attachment`` (``workbench:upload``) and a second, ``error``, child when the
-hand-over fails. A download is ``disclose`` / ``file.download`` (``download``), written before
-workbench is asked, with an ``error`` child when workbench cannot serve it. A refusal before
-those records records nothing; the 5xx among them are answered directly, so no failure is
-settled for them either.
+hand-over fails; when the chat vanished during the hand-over, the delete of its folder is a
+``delete`` / ``chat.workbench`` child, recorded before it is sent. A download is ``disclose`` /
+``file.download`` (``download``), written before workbench is asked, with an ``error`` child when
+workbench cannot serve it. A refusal before those records records nothing; the 5xx among them are
+answered directly, so no failure is settled for them either.
 """
 
 from contextlib import AsyncExitStack
@@ -116,17 +117,50 @@ def _checked_name(raw: str) -> tuple[str, str] | JSONResponse:
     return name, mime
 
 
-async def _drop_orphan(workbench: WorkbenchClient, call: CallFor) -> None:
+async def _drop_orphan(workbench: WorkbenchClient, op: Operation, call: CallFor) -> None:
     """Delete a vanished chat's folder in workbench, best effort, so no file stored after its delete waits there.
+
+    The delete is recorded first, as the upload's child ``delete`` / ``chat.workbench`` (reason
+    ``chat_gone``), and its outcome after it, as a chat delete records it. Unrecorded, nothing is
+    sent, and the folder is left to workbench's retention. Nothing here raises; a failure is
+    logged by its type only.
 
     Args:
         workbench: The client.
+        op: The upload's operation, its primary event written.
         call: The chat.
     """
+    folder = Target(kind="file", container=call.chat_id)
+    if not await _workbench_child(op, folder, {"reason": "chat_gone"}):
+        return
     try:
-        await workbench.delete_chat(call=call)
+        deleted = await workbench.delete_chat(call=call)
     except Exception as exc:
         logger.warning("A vanished chat's folder could not be deleted in workbench: {}", type(exc).__name__)
+        reason = exc.token if isinstance(exc, WorkbenchUnavailable) else "error"
+        await _workbench_child(op, folder, {"reason": reason}, outcome="error")
+        return
+    await _workbench_child(op, folder, {"files_deleted": deleted})
+
+
+async def _workbench_child(op: Operation, folder: Target, criteria: dict[str, object], *, outcome: str = "ok") -> bool:
+    """Record a ``delete`` / ``chat.workbench`` child of the upload, logging a failure by its type only.
+
+    Args:
+        op: The upload's operation.
+        folder: The chat's files, by the chat's id.
+        criteria: Why, or how many files went.
+        outcome: The outcome.
+
+    Returns:
+        Whether it was written.
+    """
+    try:
+        await run_in_threadpool(op.child, "delete", "chat.workbench", target=folder, criteria=criteria, outcome=outcome)
+    except Exception as exc:
+        logger.warning("A vanished chat's folder delete could not be recorded: {}", type(exc).__name__)
+        return False
+    return True
 
 
 async def _child_failed(op: Operation, operation: str, target: Target, recipient: str, reason: str) -> None:
@@ -217,7 +251,7 @@ async def attach_file(
     except TooManyPending:
         return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING)
     except ChatNotFound:
-        await _drop_orphan(workbench, call)
+        await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
 
 

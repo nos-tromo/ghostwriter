@@ -3,7 +3,9 @@
 The route exists only while ``GHOSTWRITER_SPEECH_INPUT`` is on (:mod:`ghostwriter.main`). The
 multipart field ``file`` is read as it arrives (:func:`~ghostwriter.upload.read_file_part`) into one
 ``bytearray``, never Starlette's ``UploadFile``, which spools to disk, and is sent on under a name of
-its type, never the browser's. Neither the recording nor its transcript is logged or stored.
+its type, never the browser's. Neither the recording nor its transcript is logged or stored. The
+call runs on the app's speech threads (``app.state.speech_threads``), so stalled dictations never
+hold the pool that serves every other request.
 
 The call is recorded once it has ended, as ``ai_call`` / ``speech.transcribe`` (``inference:asr``):
 the recording's size and type, the model, and the transcript by its hash only; a failed call with
@@ -11,8 +13,10 @@ the recording's size and type, the model, and the transcript by its hash only; a
 the transcript.
 """
 
+from functools import partial
 from typing import Annotated, Final
 
+import anyio.to_thread
 import openai
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -117,12 +121,15 @@ async def transcribe(
     model: ModelClient = request.app.state.model
     criteria = {"bytes": len(audio), "mime": mime}
     try:
-        transcript = await run_in_threadpool(
-            model.transcribe,
-            audio=bytes(audio),
-            filename=f"recording.{_EXTENSIONS.get(mime, mime.partition('/')[2])}",
-            mime=mime,
-            headers=inference_headers(user.name, op.context.request_id),
+        transcript = await anyio.to_thread.run_sync(
+            partial(
+                model.transcribe,
+                audio=bytes(audio),
+                filename=f"recording.{_EXTENSIONS.get(mime, mime.partition('/')[2])}",
+                mime=mime,
+                headers=inference_headers(user.name, op.context.request_id),
+            ),
+            limiter=request.app.state.speech_threads,
         )
     except openai.OpenAIError as exc:
         logger.warning("A transcription failed: {}", type(exc).__name__)

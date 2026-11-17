@@ -49,8 +49,8 @@ NAME_BYTES: Final = 255
 
 #: A file part's type when it names none.
 UNTYPED: Final = "application/octet-stream"
-#: The Unicode categories dropped from a name: control and format characters.
-_DROPPED: Final = frozenset({"Cc", "Cf"})
+#: The Unicode categories dropped from a name: control and format characters, line and paragraph separators.
+_DROPPED: Final = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _REPLACED: Final = re.compile(r'["*:<>?|]')
 _SEPARATORS: Final = re.compile(r"[/\\]")
 _BROWSER_ESCAPES: Final = {"%22": '"', "%0A": "\n", "%0D": "\r"}
@@ -94,9 +94,9 @@ def safe_filename(raw: str) -> str | None:
     """Reduce a file name as a user's system sent it to one safe name.
 
     It keeps the text after the last ``/`` or backslash, drops control and format characters
-    (bidi overrides, zero-width characters), replaces ``"*:<>?|`` with ``_``, NFCs it and strips
-    spaces and dots at both ends; the stem is cut so the whole stays within :data:`NAME_CHARS`
-    characters, keeping the extension.
+    (bidi overrides, zero-width characters) and the line and paragraph separators U+2028 and
+    U+2029, replaces ``"*:<>?|`` with ``_``, NFCs it and strips spaces and dots at both ends; the
+    stem is cut so the whole stays within :data:`NAME_CHARS` characters, keeping the extension.
 
     Args:
         raw: The name sent.

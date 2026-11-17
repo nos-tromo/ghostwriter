@@ -233,23 +233,61 @@ def test_any_other_failure_of_workbench_is_502(
 
 
 def test_a_chat_deleted_during_the_upload_is_not_found(
-    client: TestClient, door: FakeDoor, loguru_caplog: pytest.LogCaptureFixture
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, loguru_caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A chat deleted meanwhile: 404, no row; gone once workbench stored the file, its folder is deleted too."""
+    """A chat deleted meanwhile: 404, no row; gone once workbench stored the file, its folder is deleted too.
+
+    The folder's delete is recorded first, as a child of the upload, and its outcome after it.
+    """
     cid = _new(client)
     door.answers["/files/upload"] = httpx.Response(404, json={"detail": "not found"})
     r = _attach(client, cid)
     assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
 
-    for answer in ({"deleted": 1}, httpx.ConnectError("connection refused")):
+    for answer, criteria, outcome in (
+        ({"deleted": 1}, {"files_deleted": 1}, "ok"),
+        (httpx.ConnectError("connection refused"), {"reason": "unreachable"}, "error"),
+    ):
         other = _new(client)
         door.answers["/files/upload"] = lambda folder, chat=other: _state(client).store.delete_chat_rows(chat)
         door.answers["/files/chat"] = answer
+        before = len(events(audit_stream))
         r = _attach(client, other)
         assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
         assert door.uploads[-1].filename == "sales.xlsx"
         assert door.last("/files/chat").headers["x-session-id"] == session_pseudonym(KEY, other)
+        collect, _, recorded, settled = _since(audit_stream, before)
+        folder = {"kind": "file", "container": other}
+        for child in (recorded, settled):
+            assert (child["action"], child["operation"], child["parent_event_id"], child["target"]) == (
+                "delete",
+                "chat.workbench",
+                collect["event_id"],
+                folder,
+            )
+        assert (recorded["criteria"], recorded["outcome"]) == ({"reason": "chat_gone"}, "ok")
+        assert (settled["criteria"], settled["outcome"]) == (criteria, outcome)
     assert "WorkbenchUnavailable" in loguru_caplog.text and other not in loguru_caplog.text
+
+
+@pytest.mark.parametrize(("writes", "sent"), [(2, ["/files/upload"]), (3, ["/files/upload", "/files/chat"])])
+def test_an_orphan_delete_whose_record_fails_never_raises(
+    client: TestClient,
+    door: FakeDoor,
+    audit_stream: CapturedAuditStream,
+    loguru_caplog: pytest.LogCaptureFixture,
+    writes: int,
+    sent: list[str],
+) -> None:
+    """Unrecorded, the folder's delete is not sent and is left to workbench's retention; its outcome unrecorded, 404."""
+    cid = _new(client)
+    door.answers["/files/upload"] = lambda folder: _state(client).store.delete_chat_rows(cid)
+    audit_stream.writes_left = writes
+    r = _attach(client, cid)
+    audit_stream.writes_left = None
+    assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
+    assert [request.url.path for request, _ in door.requests] == sent
+    assert "AuditWriteError" in loguru_caplog.text and cid not in loguru_caplog.text
 
 
 def test_uploads_need_workbench(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:

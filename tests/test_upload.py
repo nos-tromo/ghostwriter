@@ -99,6 +99,7 @@ def _request(body: bytes, content_type: str, *, piece: int = 64 * KIB) -> tuple[
         ('Q3 "final".xlsx', "Q3 _final_.xlsx"),
         ("line\nbreak.csv", "linebreak.csv"),
         ("in\u202evoice\u200b.pdf", "invoice.pdf"),
+        ("line\u2028sep\u2029arated.txt", "lineseparated.txt"),
         (" .hidden notes.txt. ", "hidden notes.txt"),
         ("..", None),
         (".pdf", None),
