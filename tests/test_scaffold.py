@@ -126,6 +126,7 @@ def test_nginx_serves_under_ghostwriter_streams_and_allows_the_microphone() -> N
     )
     transcribe = _location(conf, "= /api/transcribe")
     assert "client_max_body_size 11m;" in transcribe and "proxy_request_buffering off;" in transcribe
+    assert "proxy_read_timeout 3m;" in transcribe
     assert "proxy_buffering off;" in _location(conf, "~ ^/api/chats/[^/]+/files/")
     assert "client_max_body_size 1m;" in _location(conf, "/api/")
     for spec in (

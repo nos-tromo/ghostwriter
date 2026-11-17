@@ -9,8 +9,10 @@ workbench client, ``None`` while workbench is off, and ``app.state.turns`` the
 process's one turn registry (:mod:`ghostwriter.turns`). The lifespan also holds
 ``app.state.agent``, the agent loop (:mod:`ghostwriter.agent.loop`), and
 ``app.state.turn_threads``, the limiter whose ``TURN_THREADS`` threads the turns
-run on, apart from the pool that serves every other request. Every request body
-is capped per route (:mod:`ghostwriter.body_limit`), as nginx caps it.
+run on, apart from the pool that serves every other request. ``app.state.model``
+is the model client, which dictation (:mod:`ghostwriter.api.speech`, registered
+only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns. Every
+request body is capped per route (:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
 from collections.abc import AsyncIterator, Callable
@@ -32,7 +34,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from ghostwriter import __version__
 from ghostwriter.agent.limits import TURN_THREADS
 from ghostwriter.agent.loop import AgentLoop
-from ghostwriter.api import chats, files, messages, meta
+from ghostwriter.api import chats, files, messages, meta, speech
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
 from ghostwriter.body_limit import BodyLimit
 from ghostwriter.config import Settings, load_settings
@@ -116,6 +118,7 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.settings = settings
+    app.state.model = chat_model
     app.state.workbench = (
         WorkbenchClient(settings, transport=workbench_transport) if settings.workbench_enabled else None
     )
@@ -179,6 +182,8 @@ def create_app(
     app.include_router(chats.router)
     app.include_router(messages.router)
     app.include_router(files.router)
+    if settings.speech_input:
+        app.include_router(speech.router)
     app.add_middleware(BodyLimit)
     Instrumentator().instrument(app).expose(app, endpoint="/metrics", include_in_schema=False)
     return app

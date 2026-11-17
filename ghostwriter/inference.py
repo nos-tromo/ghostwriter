@@ -1,4 +1,4 @@
-"""The model client: chat rounds through the router's OpenAI-compatible API, and nothing else.
+"""The model client: chat rounds and transcriptions through the router's OpenAI-compatible API, and nothing else.
 
 Inference goes only to ``OPENAI_API_BASE``, the federation's LiteLLM router. Every call
 carries ``X-Cache-Scope``, a pseudonym of the user keyed in this process, so the router keeps
@@ -11,13 +11,19 @@ On vllm, the federation's provider, every round sets the chat template's thinkin
 (``chat_template_kwargs.enable_thinking``) to the message's reasoning switch, in both states,
 as docint does: a template that opens a think block in the prompt would otherwise begin the
 reply inside it unasked. Other providers get no such field, as OpenAI proper refuses unknown ones.
+
+A transcription sends one recording, held in memory, to the router's ``/audio/transcriptions``
+with ``WHISPER_MODEL``; :data:`TRANSCRIBE_TIMEOUT_S` bounds each wait on it. The limits a
+recording has are here too, beside the client that sends it, as :mod:`ghostwriter.body_limit`
+caps the route's body by them.
 """
 
 import hashlib
 import hmac
 import secrets
 from collections.abc import Mapping
-from typing import Any, TypedDict, cast
+from dataclasses import dataclass
+from typing import Any, Final, TypedDict, cast
 
 import openai
 from openai.types.chat import (
@@ -31,6 +37,15 @@ from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import REQUEST_ID_HEADER
 
 CACHE_SCOPE_HEADER = "X-Cache-Scope"
+
+#: The longest recording, in seconds; the SPA stops its recorder there.
+MAX_RECORDING_S: Final = 120
+#: The largest recording, in bytes; the server refuses one past it.
+MAX_RECORDING_BYTES: Final = 10 * 1024 * 1024
+#: The recordings taken, by base type: what Firefox, Chrome and Safari record, and mp3 and wav.
+RECORDING_TYPES: Final = frozenset({"audio/webm", "audio/ogg", "audio/mp4", "audio/mpeg", "audio/wav", "audio/x-wav"})
+#: Seconds each wait on the router may take while it transcribes.
+TRANSCRIBE_TIMEOUT_S: Final = 60.0
 
 # Keys the cache scopes; it never leaves this process, so a scope cannot be
 # mapped back to a user anywhere else. A restart gives every user a new scope.
@@ -66,6 +81,23 @@ def inference_headers(owner: str, request_id: str) -> dict[str, str]:
     return {CACHE_SCOPE_HEADER: cache_scope_for(owner), REQUEST_ID_HEADER: request_id}
 
 
+@dataclass(frozen=True)
+class Transcript:
+    """What the router's speech-to-text made of a recording.
+
+    Attributes:
+        text: The transcript.
+        model_id: The model that served it, when the router names one; the SDK's result has no such field.
+    """
+
+    text: str
+    model_id: str | None
+
+
+class BadTranscript(openai.OpenAIError):
+    """The router answered a transcription without its text."""
+
+
 class _Options(TypedDict, total=False):
     """A request's keys sent only where they apply: the tools while any are offered, the thinking switch on vllm."""
 
@@ -75,11 +107,12 @@ class _Options(TypedDict, total=False):
 
 
 class ModelClient:
-    """The chat model behind the router.
+    """The chat and speech-to-text models behind the router.
 
     Attributes:
         client: The SDK's client.
         model: The chat model every round asks for, ``TEXT_MODEL``.
+        whisper_model: The model every transcription asks for, ``WHISPER_MODEL``.
         provider: The provider behind the endpoint, ``INFERENCE_PROVIDER``.
     """
 
@@ -87,11 +120,12 @@ class ModelClient:
         """Build the client.
 
         Args:
-            settings: The router's base URL and key, and the chat model.
+            settings: The router's base URL and key, and the models.
             client: The SDK's client (tests pass a fake); built from ``settings`` when omitted,
                 making one attempt per call.
         """
         self.model = settings.text_model
+        self.whisper_model = settings.whisper_model
         self.provider = settings.inference_provider
         self.client = (
             client
@@ -144,3 +178,32 @@ class ModelClient:
             extra_headers=dict(headers),
             **options,
         )
+
+    def transcribe(self, *, audio: bytes, filename: str, mime: str, headers: Mapping[str, str]) -> Transcript:
+        """Transcribe one recording.
+
+        Args:
+            audio: The recording.
+            filename: The name it is sent under.
+            mime: Its type.
+            headers: The extra headers, :func:`inference_headers`.
+
+        Returns:
+            The transcript, and the served model when the router names one.
+
+        Raises:
+            openai.OpenAIError: When the router refuses the request, cannot be reached, or answers
+                without a transcript (:class:`BadTranscript`).
+        """
+        result = self.client.audio.transcriptions.create(
+            model=self.whisper_model,
+            file=(filename, audio, mime),
+            response_format="json",
+            timeout=TRANSCRIBE_TIMEOUT_S,
+            extra_headers=dict(headers),
+        )
+        text = getattr(result, "text", None)
+        if not isinstance(text, str):
+            raise BadTranscript("the transcription has no text")
+        served = getattr(result, "model", None)
+        return Transcript(text=text, model_id=served if isinstance(served, str) and served else None)

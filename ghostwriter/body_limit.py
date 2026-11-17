@@ -20,6 +20,7 @@ from fastapi import HTTPException, status
 from fastapi.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from ghostwriter.inference import MAX_RECORDING_BYTES
 from ghostwriter.workbench import MAX_ATTACHMENT_BYTES
 
 _MIB: Final = 1024 * 1024
@@ -30,13 +31,15 @@ REQUEST_MAX_BYTES: Final = _MIB
 MULTIPART_SLACK: Final = _MIB
 #: The attachment route's cap: one file and its framing (nginx ``51m``).
 ATTACHMENT_MAX_BYTES: Final = MAX_ATTACHMENT_BYTES + MULTIPART_SLACK
-#: ``/api/transcribe``'s cap (nginx ``11m``).
-TRANSCRIBE_MAX_BYTES: Final = 11 * _MIB
+#: ``/api/transcribe``'s cap: one recording and its framing (nginx ``11m``).
+TRANSCRIBE_MAX_BYTES: Final = MAX_RECORDING_BYTES + MULTIPART_SLACK
 
 REQUEST_TOO_LARGE: Final = "Request too large."
 #: The attachment route's answer, the one it gives a file past 50 MB itself, with its code.
 FILE_TOO_LARGE: Final = "The file is larger than 50 MB."
 TOO_LARGE_CODE: Final = "too_large"
+#: ``/api/transcribe``'s answer, the one it gives a recording past its limit itself.
+RECORDING_TOO_LONG: Final = "The recording is longer than allowed."
 
 ATTACHMENTS_PATH: Final = re.compile(r"/api/chats/[^/]+/attachments")
 TRANSCRIBE_PATH: Final = "/api/transcribe"
@@ -66,7 +69,7 @@ def body_cap(path: str) -> tuple[int, dict[str, str]]:
     if ATTACHMENTS_PATH.fullmatch(path):
         return ATTACHMENT_MAX_BYTES, {"detail": FILE_TOO_LARGE, "code": TOO_LARGE_CODE}
     if path == TRANSCRIBE_PATH:
-        return TRANSCRIBE_MAX_BYTES, {"detail": REQUEST_TOO_LARGE}
+        return TRANSCRIBE_MAX_BYTES, {"detail": RECORDING_TOO_LONG}
     return REQUEST_MAX_BYTES, {"detail": REQUEST_TOO_LARGE}
 
 

@@ -564,6 +564,8 @@ class FakeOpenAI:
         calls: Every chat call's keyword arguments, in order.
         streams: The stream each answered chat call returned.
         transcript: What every transcription answers: its text, or an exception to raise.
+        transcript_model: The model a transcription names, as a router may add it; ``None`` names
+            none, as the SDK's own result has no such field.
         transcriptions: Every transcription call's keyword arguments, in order.
         chat: Holds ``completions.create``.
         audio: Holds ``transcriptions.create``.
@@ -580,6 +582,7 @@ class FakeOpenAI:
         self.calls: list[dict[str, Any]] = []
         self.streams: list[FakeStream] = []
         self.transcript = transcript
+        self.transcript_model: str | None = None
         self.transcriptions: list[dict[str, Any]] = []
         self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._complete))
         self.audio = SimpleNamespace(transcriptions=SimpleNamespace(create=self._transcribe))
@@ -630,7 +633,9 @@ class FakeOpenAI:
         self.transcriptions.append(kwargs)
         if isinstance(self.transcript, Exception):
             raise self.transcript
-        return Transcription(text=self.transcript)
+        if self.transcript_model is None:
+            return Transcription(text=self.transcript)
+        return Transcription.model_validate({"text": self.transcript, "model": self.transcript_model})
 
 
 # --- workbench and the audit, as the agent loop reaches them ------------------

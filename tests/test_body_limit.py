@@ -167,7 +167,7 @@ def drive(path: str, *, declared: int | None, chunks: list[bytes], method: str =
         ("/api/chats/c-1/messages", MIB, {"detail": "Request too large."}),
         ("/api/chats", MIB, {"detail": "Request too large."}),
         ("/api/chats/c-1/attachments", 51 * MIB, {"detail": "The file is larger than 50 MB.", "code": "too_large"}),
-        ("/api/transcribe", 11 * MIB, {"detail": "Request too large."}),
+        ("/api/transcribe", 11 * MIB, {"detail": "The recording is longer than allowed."}),
     ],
 )
 def test_each_route_class_has_the_cap_nginx_gives_it(path: str, cap: int, answer: dict[str, str]) -> None:

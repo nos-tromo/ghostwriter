@@ -1,11 +1,17 @@
-"""Metadata routes: who the SPA's user is."""
+"""Metadata routes: who the SPA's user is, and what this deployment switches on."""
 
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
+from ghostwriter import __version__
+from ghostwriter.audit import required_endpoint_actions
+from ghostwriter.config import Settings
 from ghostwriter.identity import Principal, trusted_identity
+from ghostwriter.inference import MAX_RECORDING_BYTES, MAX_RECORDING_S
+from ghostwriter.upload import ATTACHMENT_TYPES
+from ghostwriter.workbench import MAX_ATTACHMENT_BYTES
 
 router = APIRouter(prefix="/api", tags=["Metadata"])
 
@@ -35,3 +41,62 @@ def whoami(principal: Annotated[Principal | None, Depends(trusted_identity)]) ->
     if principal is None:
         return WhoamiOut(username=None, display_name=None)
     return WhoamiOut(username=principal.name, display_name=principal.display_name)
+
+
+class ConfigOut(BaseModel):
+    """What the SPA needs to know of this deployment.
+
+    Attributes:
+        ui_language: The SPA's language, ``RESPONSE_LANGUAGE``.
+        require_purpose: The actions of these routes that need a stated purpose, sorted.
+        speech_input: Whether dictation is offered.
+        attachments: Whether files can be attached, that is whether workbench is configured.
+        attachment_types: The extensions an attachment may have, sorted.
+        max_attachment_bytes: The largest attachment.
+        max_recording_s: The longest recording; the recorder stops there.
+        max_recording_bytes: The largest recording.
+        chat_retention_days: How long a chat is kept after it starts; ``None`` while retention is off.
+        file_retention_days: How long workbench keeps a chat's files.
+        version: The running release.
+    """
+
+    ui_language: Literal["en", "de"]
+    require_purpose: list[str]
+    speech_input: bool
+    attachments: bool
+    attachment_types: list[str]
+    max_attachment_bytes: int
+    max_recording_s: int
+    max_recording_bytes: int
+    chat_retention_days: int | None
+    file_retention_days: int
+    version: str
+
+
+@router.get("/config", summary="What the SPA needs to know of this deployment")
+def config(request: Request) -> ConfigOut:
+    """Return the deployment's switches, limits and periods.
+
+    Unauthenticated and not audited, as translator's and docint's: it describes the deployment,
+    never a caller or their data, and the SPA reads it first.
+
+    Args:
+        request: The request.
+
+    Returns:
+        The configuration in force.
+    """
+    settings: Settings = request.app.state.settings
+    return ConfigOut(
+        ui_language=settings.ui_language,
+        require_purpose=required_endpoint_actions(settings),
+        speech_input=settings.speech_input,
+        attachments=settings.workbench_enabled,
+        attachment_types=sorted(ATTACHMENT_TYPES),
+        max_attachment_bytes=MAX_ATTACHMENT_BYTES,
+        max_recording_s=MAX_RECORDING_S,
+        max_recording_bytes=MAX_RECORDING_BYTES,
+        chat_retention_days=settings.chat_days,
+        file_retention_days=settings.file_days,
+        version=__version__,
+    )
