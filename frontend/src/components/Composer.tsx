@@ -4,6 +4,7 @@ import {
   BrainActiveIcon,
   BrainIcon,
   Button,
+  ChatComposer,
   MicButton,
   SendButton,
   StopButton,
@@ -197,64 +198,65 @@ export function Composer({
             {t('composer.files_stay', { days: config.file_retention_days })}
           </p>
         )}
-        {/* One row: the buttons stay on the bottom line while the text grows upward. */}
-        <div className="flex items-end gap-1 rounded-3xl border border-border bg-muted px-2 py-1.5 focus-within:border-primary [&_button]:rounded-full">
-          <div className="flex shrink-0 items-center gap-1">
-            {config.attachments && (
+        <ChatComposer
+          ref={textRef}
+          value={text}
+          onChange={(event) => setText(event.target.value)}
+          onKeyDown={onKeyDown}
+          onPaste={onPaste}
+          aria-label={t('composer.placeholder')}
+          placeholder={t('composer.placeholder')}
+          start={
+            config.attachments || config.speech_input ? (
               <>
-                <AttachButton label={t('composer.attach')} onClick={() => pickerRef.current?.click()} />
-                <input
-                  ref={pickerRef}
-                  type="file"
-                  multiple
-                  hidden
-                  accept={config.attachment_types.join(',')}
-                  onChange={(event) => {
-                    attachments.add(Array.from(event.target.files ?? []))
-                    event.target.value = ''
-                  }}
-                />
+                {config.attachments && (
+                  <>
+                    <AttachButton label={t('composer.attach')} onClick={() => pickerRef.current?.click()} />
+                    <input
+                      ref={pickerRef}
+                      type="file"
+                      multiple
+                      hidden
+                      accept={config.attachment_types.join(',')}
+                      onChange={(event) => {
+                        attachments.add(Array.from(event.target.files ?? []))
+                        event.target.value = ''
+                      }}
+                    />
+                  </>
+                )}
+                {config.speech_input &&
+                  (recording ? (
+                    <StopButton label={t('mic.stop')} onClick={recorder.stop} />
+                  ) : (
+                    <MicButton
+                      label={t('mic.start')}
+                      busy={transcribing}
+                      disabled={recorder.state === 'unsupported'}
+                      hint={recorder.state === 'unsupported' ? t('mic.unsupported') : undefined}
+                      onClick={() => void recorder.start()}
+                    />
+                  ))}
+                {/* A ticking count, deliberately not a live region. */}
+                {recording && (
+                  <span className="text-xs tabular-nums text-muted-foreground">
+                    {t('mic.limit', { s: Math.max(0, config.max_recording_s - recorder.elapsedS) })}
+                  </span>
+                )}
               </>
-            )}
-            {config.speech_input &&
-              (recording ? (
-                <StopButton label={t('mic.stop')} onClick={recorder.stop} />
+            ) : undefined
+          }
+          end={
+            <>
+              <ReasoningToggle reasoning={reasoning} onChange={onReasoningChange} />
+              {stream.streaming ? (
+                <StopButton label={t('composer.stop')} onClick={() => void stream.stop()} />
               ) : (
-                <MicButton
-                  label={t('mic.start')}
-                  busy={transcribing}
-                  disabled={recorder.state === 'unsupported'}
-                  hint={recorder.state === 'unsupported' ? t('mic.unsupported') : undefined}
-                  onClick={() => void recorder.start()}
-                />
-              ))}
-            {/* A ticking count, deliberately not a live region. */}
-            {recording && (
-              <span className="text-xs tabular-nums text-muted-foreground">
-                {t('mic.limit', { s: Math.max(0, config.max_recording_s - recorder.elapsedS) })}
-              </span>
-            )}
-          </div>
-          <textarea
-            ref={textRef}
-            value={text}
-            onChange={(event) => setText(event.target.value)}
-            onKeyDown={onKeyDown}
-            onPaste={onPaste}
-            rows={1}
-            aria-label={t('composer.placeholder')}
-            placeholder={t('composer.placeholder')}
-            className="block max-h-48 min-h-8 min-w-0 flex-1 resize-none self-center bg-transparent px-2 py-1.5 text-sm outline-none field-sizing-content placeholder:text-muted-foreground"
-          />
-          <div className="flex shrink-0 items-center gap-1">
-            <ReasoningToggle reasoning={reasoning} onChange={onReasoningChange} />
-            {stream.streaming ? (
-              <StopButton label={t('composer.stop')} onClick={() => void stream.stop()} />
-            ) : (
-              <SendButton type="submit" variant="primary" label={t('composer.send')} disabled={!canSend} />
-            )}
-          </div>
-        </div>
+                <SendButton type="submit" variant="primary" label={t('composer.send')} disabled={!canSend} />
+              )}
+            </>
+          }
+        />
         {(recorder.state === 'denied' || recorder.state === 'unavailable') && (
           <p role="alert" className="text-xs text-danger">
             {t(recorder.state === 'denied' ? 'mic.denied' : 'mic.unavailable')}

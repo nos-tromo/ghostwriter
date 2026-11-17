@@ -1,4 +1,4 @@
-import { Badge, CopyButton, RefreshButton, Spinner } from '@infra/ui'
+import { Badge, CopyButton, RefreshButton, Spinner, UserBubble } from '@infra/ui'
 import type { AttachmentOut, MessageOut } from '../api/types'
 import type { DraftAnswer, PendingMessage } from '../hooks/useChatStream'
 import { useLang, useT } from '../i18n/LanguageContext'
@@ -12,11 +12,11 @@ function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
   const t = useT()
   const lang = useLang()
   return (
-    <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-primary-foreground/30 bg-primary-foreground/15 px-2 py-0.5 text-xs">
+    <span className="inline-flex max-w-full items-center gap-1 rounded-full border border-bubble-foreground/30 bg-bubble-foreground/15 px-2 py-0.5 text-xs">
       <span title={attachment.name} className="min-w-0 truncate">
         {attachment.name}
       </span>
-      <span className="shrink-0 text-primary-foreground/80">{formatSize(attachment.size, lang)}</span>
+      <span className="shrink-0 text-bubble-foreground/80">{formatSize(attachment.size, lang)}</span>
       {attachment.expired && <Badge>{t('result.expired')}</Badge>}
     </span>
   )
@@ -25,20 +25,18 @@ function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
 /** What the user wrote, as written (never Markdown), and the files it bound. */
 function UserMessage({ message }: { message: Pick<MessageOut, 'content' | 'attachments'> }) {
   return (
-    <div data-role="user" className="flex justify-end">
-      <div className="max-w-[85%] space-y-2 rounded-2xl rounded-br-md bg-(--app-bubble) px-4 py-2 text-sm text-primary-foreground">
-        {message.content && <p className="whitespace-pre-wrap break-words">{message.content}</p>}
-        {message.attachments.length > 0 && (
-          <ul className="flex flex-wrap gap-1">
-            {message.attachments.map((attachment) => (
-              <li key={attachment.id} className="max-w-full">
-                <AttachmentChip attachment={attachment} />
-              </li>
-            ))}
-          </ul>
-        )}
-      </div>
-    </div>
+    <UserBubble data-role="user">
+      {message.content && <p className="whitespace-pre-wrap break-words">{message.content}</p>}
+      {message.attachments.length > 0 && (
+        <ul className="flex flex-wrap gap-1">
+          {message.attachments.map((attachment) => (
+            <li key={attachment.id} className="max-w-full">
+              <AttachmentChip attachment={attachment} />
+            </li>
+          ))}
+        </ul>
+      )}
+    </UserBubble>
   )
 }
 
