@@ -32,8 +32,9 @@ function usePurposeLabels(): PurposeBarLabels {
   )
 }
 
-/** The chrome: the purpose bar in the header, the chats beside, and the
- *  retention periods in a line under the conversation, which is `children`. */
+/** The chrome: the purpose bar in the header where the deployment requires a
+ *  purpose, the chats beside, and the retention periods in a line under the
+ *  conversation, which is `children`. */
 export function Shell({
   selected,
   onSelect,
@@ -47,6 +48,7 @@ export function Shell({
   const { data: config } = useConfig()
   const { data: whoami } = useWhoami()
   const purposeLabels = usePurposeLabels()
+  const purposeRequired = (config?.require_purpose?.length ?? 0) > 0
   return (
     <AppShell
       title="Ghostwriter"
@@ -65,14 +67,11 @@ export function Shell({
       signOutLabel={t('appheader.sign_out')}
       sidebarToggleLabel={t('appheader.sidebar_toggle')}
       // Where the purpose every request carries is stated (`apiFetch`), and
-      // the dialog a 428 opens. The backend says which actions it refuses
-      // without one; any at all make the empty bar a warning.
+      // the dialog a 428 opens. Shown only where the backend refuses some
+      // actions without one: elsewhere no 428 comes and the header stays bare.
+      // `/api/config` is never refused, so the bar cannot wait on itself.
       headerActions={
-        <PurposeBar
-          scope={PURPOSE_SCOPE}
-          required={(config?.require_purpose?.length ?? 0) > 0}
-          labels={purposeLabels}
-        />
+        purposeRequired ? <PurposeBar scope={PURPOSE_SCOPE} required labels={purposeLabels} /> : undefined
       }
       sidebar={<ChatList selected={selected} onSelect={onSelect} />}
     >

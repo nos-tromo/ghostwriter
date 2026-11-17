@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useId, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Badge, DownloadButton, Spinner } from '@infra/ui'
+import { DownloadButton, Spinner, cn } from '@infra/ui'
 import { fileBlob } from '../api/chats'
 import { ApiError } from '../api/client'
 import type { ResultOut } from '../api/types'
@@ -20,6 +20,9 @@ const fileKey = (chatId: string, fileId: string) => ['file', chatId, fileId] as 
 /** How long a blob stays in memory once no card shows it: long enough for the
  *  draft's card to hand it to the stored message's. */
 const FILE_GC_MS = 60_000
+
+/** A file's line: a pill, as the composer and the attachment chips are, as wide as its name. */
+const PILL = 'inline-flex max-w-full items-center gap-2 rounded-full border text-sm'
 
 /** A file of the chat, fetched once: every fetch is an audited `disclose`, so
  *  the draft's card, the stored message's card and Download share one blob.
@@ -79,7 +82,7 @@ function InlineImage({ chatId, result, onGone }: { chatId: string; result: Resul
     <img
       src={url}
       alt={result.name}
-      className="max-h-96 w-auto max-w-full rounded border border-border bg-white object-contain"
+      className="max-h-96 w-auto max-w-full rounded-lg border border-border bg-white object-contain"
     />
   )
 }
@@ -121,8 +124,8 @@ function FileLine({
 
   return (
     <div className="space-y-1">
-      <div className="flex items-center gap-2">
-        <span id={nameId} title={result.name} className="min-w-0 flex-1 truncate">
+      <div className={cn(PILL, 'border-border bg-muted py-0.5 pr-0.5 pl-3.5')}>
+        <span id={nameId} title={result.name} className="min-w-0 truncate">
           {result.name}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{formatSize(result.size, lang)}</span>
@@ -130,6 +133,7 @@ function FileLine({
           label={t('result.download')}
           aria-describedby={nameId}
           busy={busy}
+          className="h-7 w-7 shrink-0 rounded-full"
           onClick={() => void download()}
         />
       </div>
@@ -140,9 +144,9 @@ function FileLine({
 
 /**
  * A file a tool wrote, below the answer: an image inline, a table's preview,
- * then for every file its name, size and download. Once workbench's period
- * for the file has passed, or a fetch finds it gone, the card is muted and
- * says so, with nothing left to fetch.
+ * then for every file a pill with its name, size and download. Once
+ * workbench's period for the file has passed, or a fetch finds it gone, the
+ * pill is dashed and muted and says so, with nothing left to fetch.
  */
 export function ResultCard({ chatId, result }: { chatId: string; result: ResultOut }) {
   const t = useT()
@@ -152,20 +156,18 @@ export function ResultCard({ chatId, result }: { chatId: string; result: ResultO
 
   if (result.expired || gone) {
     return (
-      <div
-        role="group"
-        aria-labelledby={nameId}
-        className="flex items-center gap-2 rounded-md border border-dashed border-border px-3 py-2 text-sm text-muted-foreground"
-      >
-        <span id={nameId} title={result.name} className="min-w-0 flex-1 truncate">
-          {result.name}
-        </span>
-        <Badge>{t('result.expired')}</Badge>
+      <div role="group" aria-labelledby={nameId}>
+        <div className={cn(PILL, 'border-dashed border-border px-3.5 py-1.5 text-muted-foreground')}>
+          <span id={nameId} title={result.name} className="min-w-0 truncate">
+            {result.name}
+          </span>
+          <span className="shrink-0 text-xs">{t('result.expired')}</span>
+        </div>
       </div>
     )
   }
   return (
-    <div role="group" aria-labelledby={nameId} className="space-y-2 rounded-md border border-border bg-background p-3 text-sm">
+    <div role="group" aria-labelledby={nameId} className="space-y-2">
       {result.kind === 'image' && <InlineImage chatId={chatId} result={result} onGone={markGone} />}
       {result.kind === 'table' && result.preview && <TablePreview preview={result.preview} caption={result.name} />}
       <FileLine chatId={chatId} result={result} nameId={nameId} onGone={markGone} />
