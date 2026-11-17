@@ -18,12 +18,20 @@ describe('Conversation', () => {
     expect(screen.queryByText(/attach a document/)).not.toBeInTheDocument()
     second.unmount()
 
+    const german = renderWithClient(
+      <LanguageContext value="de">
+        <Conversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    expect(await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')).toBeInTheDocument()
+    german.unmount()
+
     renderWithClient(
       <LanguageContext value="de">
         <Conversation chatId="c1" config={{ ...CONFIG, attachments: false }} reasoning={false} />
       </LanguageContext>,
     )
-    expect(await screen.findByText('Frag, was du willst.')).toBeInTheDocument()
+    expect(await screen.findByText('Fragen Sie, was Sie möchten.')).toBeInTheDocument()
   })
 
   it("shows the user's text with its attachments, and each answer with its trail, text and cards", async () => {

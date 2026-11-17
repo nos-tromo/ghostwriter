@@ -6,6 +6,34 @@ import remarkGfm from 'remark-gfm'
 import { cn, useTheme } from '@infra/ui'
 import { languages } from '../lib/highlight'
 
+/** Where a link may go: the web and mail. Anything else (`javascript:` and
+ *  `data:`, which react-markdown already empties, or a path into this app) is
+ *  shown as its text, never as an empty href that would reload the app. */
+const LINK_PROTOCOLS: ReadonlySet<string> = new Set(['http:', 'https:', 'mailto:'])
+
+function linkTarget(href: string | undefined): string | null {
+  if (!href) return null
+  try {
+    return LINK_PROTOCOLS.has(new URL(href).protocol) ? href : null
+  } catch {
+    return null
+  }
+}
+
+/** The text of a hast node and everything in it. */
+function textOf(node: unknown): string {
+  if (!node || typeof node !== 'object') return ''
+  const { type, value, children } = node as { type?: unknown; value?: unknown; children?: unknown }
+  if (type === 'text') return typeof value === 'string' ? value : ''
+  return Array.isArray(children) ? children.map(textOf).join('') : ''
+}
+
+/** Whether a link's text already says where it goes: a bare URL, or GFM's
+ *  autolinked `www.` and e-mail forms. */
+function saysWhere(text: string, href: string): boolean {
+  return text === href || `http://${text}` === href || `mailto:${text}` === href
+}
+
 const components: Components = {
   // A model-written table is often wider than its panel, so it scrolls in its own box.
   table: ({ node: _node, ...props }) => (
@@ -13,6 +41,27 @@ const components: Components = {
       <table {...props} />
     </div>
   ),
+  // The model's text is no place to load from: an image would be fetched
+  // without the stated purpose, or carry data off in its URL. Image results
+  // come as cards; here only the alt text is shown.
+  img: ({ alt }) => (alt ? <span>{alt}</span> : null),
+  // A link opens in a new tab, which keeps a streaming answer running, and
+  // sends no referrer. When its text says something else, the full URL is
+  // shown beside it, so a hidden target cannot pass for another.
+  a: ({ node, href, children }) => {
+    const target = linkTarget(href)
+    if (target === null) return <span>{children}</span>
+    return (
+      <>
+        <a href={target} target="_blank" rel="noopener noreferrer">
+          {children}
+        </a>
+        {!saysWhere(textOf(node).trim(), target) && (
+          <span className="break-all text-muted-foreground"> ({target})</span>
+        )}
+      </>
+    )
+  },
 }
 
 /** Only the bundled grammars, and only for a block that names its language:

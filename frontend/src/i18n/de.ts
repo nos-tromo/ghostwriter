@@ -23,11 +23,11 @@ export const de: Strings = {
   'chat.title': 'Chat-Titel',
   'chat.delete': 'Löschen',
   'chat.delete_confirm': 'Diesen Chat und seine Dateien löschen?',
-  'chat.delete_busy': 'Beende die Antwort, bevor du den Chat löschst.',
+  'chat.delete_busy': 'Beenden Sie die Antwort, bevor Sie den Chat löschen.',
 
   // conversation
-  'chat.empty': 'Frag, was du willst, oder hänge ein Dokument an.',
-  'chat.empty_text_only': 'Frag, was du willst.',
+  'chat.empty': 'Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.',
+  'chat.empty_text_only': 'Fragen Sie, was Sie möchten.',
   'chat.loading_messages': 'Chat wird geladen…',
   'chat.answer_pending': 'Antwort wird erstellt…',
   'chat.thinking': 'denkt nach…',
