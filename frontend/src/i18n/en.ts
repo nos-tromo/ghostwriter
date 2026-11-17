@@ -103,7 +103,7 @@ export const en = {
   'error.audit': 'The answer stopped: it could not be recorded.',
   'error.internal': 'Something went wrong.',
 
-  // retention banner
+  // retention note
   'retention.chats': 'Chats are deleted {days} days after they were started.',
   'retention.files': 'Files and tool results are deleted after {days} days.',
 

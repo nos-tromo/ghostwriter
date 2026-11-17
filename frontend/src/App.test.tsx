@@ -85,6 +85,6 @@ describe('App', () => {
     expect(within(sidebar).getByRole('button', { name: 'Neuer Chat' })).toBeInTheDocument()
     expect(await within(sidebar).findByText('Noch keine Chats.')).toBeInTheDocument()
     const main = screen.getByRole('main')
-    expect(within(main).getByRole('status')).toHaveTextContent('Chats werden 90 Tage nach ihrem Beginn gelöscht.')
+    expect(within(main).getByText(/Chats werden 90 Tage nach ihrem Beginn gelöscht\./)).toBeInTheDocument()
   })
 })

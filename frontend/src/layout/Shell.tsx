@@ -2,7 +2,7 @@ import { useMemo, type ReactNode } from 'react'
 import { AppShell, PurposeBar, type PurposeBarLabels } from '@infra/ui'
 import { PURPOSE_SCOPE } from '../api/client'
 import { ChatList } from '../components/ChatList'
-import { RetentionBanner } from '../components/RetentionBanner'
+import { RetentionNote } from '../components/RetentionNote'
 import { useT } from '../i18n/LanguageContext'
 import { useConfig } from '../hooks/useConfig'
 import { useWhoami } from '../hooks/useWhoami'
@@ -33,7 +33,7 @@ function usePurposeLabels(): PurposeBarLabels {
 }
 
 /** The chrome: the purpose bar in the header, the chats beside, and the
- *  retention periods above the conversation, which is `children`. */
+ *  retention periods in a line under the conversation, which is `children`. */
 export function Shell({
   selected,
   onSelect,
@@ -77,12 +77,8 @@ export function Shell({
       sidebar={<ChatList selected={selected} onSelect={onSelect} />}
     >
       <div className="flex h-full min-h-0 flex-col">
-        {config && (
-          <div className="shrink-0 px-4 pt-4">
-            <RetentionBanner config={config} />
-          </div>
-        )}
         <div className="min-h-0 flex-1">{children}</div>
+        {config && <RetentionNote config={config} />}
       </div>
     </AppShell>
   )

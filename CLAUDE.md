@@ -80,7 +80,7 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
 | `ghostwriter/api/meta.py` | `/api/whoami`, `/api/config` |
 | `frontend/src/api/` | `apiFetch` (the purpose on every request), routes, SSE reader |
 | `frontend/src/hooks/` | chats, the chat streams (one per chat, held above the open chat), attachments, the recorder, the stray-drop guard |
-| `frontend/src/components/` | chat list, conversation, trail, result cards, composer, banner |
+| `frontend/src/components/` | chat list, conversation, trail, result cards, composer, retention note |
 | `frontend/src/i18n/` | en and de with key parity; German uses "Sie" |
 | `frontend/nginx/` | sub-path, the stream, body caps, security headers |
 
