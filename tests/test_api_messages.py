@@ -799,6 +799,26 @@ def test_a_stop_ends_a_turn_still_waiting_for_a_thread(client: TestClient, fake_
     assert _send(client, cid, content="Noch da?").status_code == 200
 
 
+def test_a_quiet_turn_keeps_its_stream_open_with_comments(
+    client: TestClient, fake_openai: FakeOpenAI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """While nothing is written, a comment line goes out every interval; it is no frame."""
+    monkeypatch.setattr("ghostwriter.sse.STREAM_DISCONNECT_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr("ghostwriter.sse.KEEPALIVE_INTERVAL_S", 0.05)
+    cid = _new(client)
+
+    def slow() -> Chunk:
+        time.sleep(0.4)
+        return text_chunk("Summe: 42")
+
+    fake_openai.script = [[slow, usage_chunk(950, 5, "served-model")]]
+    response = _send(client, cid)
+    lines = response.text.split("\n")
+    assert lines.count(": keep-alive") >= 2
+    assert all(line in ("", ": keep-alive") or line.startswith(("event: ", "data: ")) for line in lines)
+    assert [f.event for f in _frames(response)] == ["token", "final"]
+
+
 def test_a_regenerated_answer_moves_its_chat_to_the_top(client: TestClient, fake_openai: FakeOpenAI) -> None:
     """Regenerating is activity, as a new message is: the chat list orders by it."""
     first, second = _new(client), _new(client)

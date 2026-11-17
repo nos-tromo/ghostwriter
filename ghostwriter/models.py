@@ -88,7 +88,7 @@ class Attachment(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     chat_id: Mapped[str] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True)
-    message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"))
+    message_id: Mapped[str | None] = mapped_column(ForeignKey("messages.id", ondelete="SET NULL"), index=True)
     workbench_file_id: Mapped[str] = mapped_column(String(32))
     path: Mapped[str] = mapped_column(String(1024))
     name: Mapped[str] = mapped_column(String(255))
@@ -98,13 +98,14 @@ class Attachment(Base):
 
 
 class Result(Base):
-    """A file a tool wrote, held in workbench; its preview is emptied at ``preview_expires_at``."""
+    """A file a tool wrote, held in workbench, in order in its answer; the preview ends at ``preview_expires_at``."""
 
     __tablename__ = "results"
     __table_args__ = (CheckConstraint("kind IN ('image', 'table', 'file')", name="ck_results_kind"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     message_id: Mapped[str] = mapped_column(ForeignKey("messages.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int]
     kind: Mapped[str] = mapped_column(String(8))
     workbench_file_id: Mapped[str] = mapped_column(String(32))
     path: Mapped[str] = mapped_column(String(1024))

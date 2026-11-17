@@ -37,6 +37,17 @@ def test_a_fresh_database_gets_the_schema_and_its_version(tmp_path: Path) -> Non
     assert _pragma(engine, "user_version") == 1
 
 
+def test_the_lookups_by_message_and_chat_are_indexed(tmp_path: Path) -> None:
+    """An answer's attachments and a chat's file marks are found by index."""
+    engine = make_engine(str(tmp_path / "a.sqlite3"))
+    init_db(engine)
+    indexed = {
+        table: [index["column_names"] for index in inspect(engine).get_indexes(table)]
+        for table in ("attachments", "file_marks")
+    }
+    assert ["message_id"] in indexed["attachments"] and ["chat_id"] in indexed["file_marks"]
+
+
 def test_a_newer_database_stops_startup(tmp_path: Path) -> None:
     """A file from a later release is never opened by an older one."""
     engine = make_engine(str(tmp_path / "a.sqlite3"))

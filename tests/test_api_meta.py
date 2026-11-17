@@ -1,4 +1,4 @@
-"""What ``/api/config`` tells the SPA is switched on.
+"""What ``/api/config`` tells the SPA is switched on, and what the backend does not serve.
 
 Every name, id and value here is invented.
 """
@@ -54,3 +54,9 @@ def test_config_follows_the_settings_and_needs_no_identity(tmp_path: Path) -> No
     with TestClient(create_app(settings, audit_stream=CapturedAuditStream())) as client:
         config = client.get("/api/config").json()
     assert (config["ui_language"], config["attachments"], config["chat_retention_days"]) == ("de", False, None)
+
+
+def test_no_api_documentation_is_served(client: TestClient) -> None:
+    """Swagger UI, ReDoc and the schema are off: a peer on the backend's networks gets nothing of them."""
+    for path in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        assert client.get(path, headers=as_user()).status_code == 404

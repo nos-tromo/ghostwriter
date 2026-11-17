@@ -5,11 +5,11 @@ fitted to the prompt budget (:func:`~ghostwriter.agent.context.fit`); a reasonin
 the smaller budget and every round of it asks the model to think. Text goes out as it
 arrives, a blank line between two rounds' texts, and the answer stored is exactly what went
 out. A round that asks for calls runs them in order, at most ``MAX_CALLS_PER_ROUND``: a call
-to a tool not offered, with arguments that are not an object, or without its full timeout
-left of the message's wall is refused to the model and never sent; the last also withdraws
-the tools for the rest of the message. A call workbench answers busy is sent once more after
-``BUSY_RETRY_S``, while its timeout still fits. Every call is disclosed before it is sent, and
-every round recorded after it ends.
+to a tool not offered, with arguments that are not an object or an id the record cannot hold
+(:data:`CALL_ID`), or without its full timeout left of the message's wall is refused to the
+model and never sent; the last also withdraws the tools for the rest of the message. A call
+workbench answers busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
+Every call is disclosed before it is sent, and every round recorded after it ends.
 
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
@@ -22,12 +22,13 @@ call and each retry.
 The log holds round numbers, counts and exception types; never a message, an argument or a result.
 """
 
+import re
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Literal, Protocol, TypeAlias
+from typing import Any, Final, Literal, Protocol, TypeAlias
 from uuid import uuid4
 
 from loguru import logger
@@ -64,6 +65,8 @@ from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.workbench import CallFor, OutputFile, ToolFailure, ToolResult, WorkbenchClient, chat_folder
 
+#: A call id the store and the audit take; a call with another is refused, and answered under one the loop mints.
+CALL_ID: Final = re.compile(r"[A-Za-z0-9_-]{1,64}")
 #: What the user is told when a model round failed.
 MODEL_ERROR = "The model did not answer."
 #: What the user is told when anything else broke the answer.
@@ -371,14 +374,15 @@ class AgentLoop:
                 if turn.cancel.is_set():
                     return
                 outcome = yield from self._call(turn, audit, message, workbench, call, index, round_no, names)
+                call_id = call.id if CALL_ID.fullmatch(call.id) else f"call_{uuid4().hex}"
                 calls.append(
                     {
-                        "id": call.id,
+                        "id": call_id,
                         "type": "function",
                         "function": {"name": call.name, "arguments": echoed_arguments(call.arguments)},
                     }
                 )
-                answers.append({"role": "tool", "tool_call_id": call.id, "content": tool_message(outcome)})
+                answers.append({"role": "tool", "tool_call_id": call_id, "content": tool_message(outcome)})
             current.append({"role": "assistant", "content": done.text, "tool_calls": calls})
             current.extend(answers)
 
@@ -400,7 +404,7 @@ class AgentLoop:
             text = REFUSALS["unknown_tool"].format(name=call.name, names=", ".join(names) or "none")
             return Refusal("unknown_tool", text)
         arguments = parse_arguments(call.arguments)
-        if arguments is None:
+        if arguments is None or not CALL_ID.fullmatch(call.id):
             return Refusal("bad_arguments", REFUSALS["bad_arguments"].format(name=call.name))
         if message.withdrawn or self._left(message) < self._settings.workbench_timeout_s:
             message.withdrawn = True

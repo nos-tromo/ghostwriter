@@ -26,7 +26,7 @@ Repository = "https://github.com/nos-tromo/ghostwriter.git"
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.16.2",
+    "httpx2>=2.16.0",
     "pre-commit>=4.7.0",
     "pyrefly==1.1.1",
     "pytest>=9.2.0",

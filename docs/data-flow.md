@@ -13,7 +13,7 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 | `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at | with the chat |
 | `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 12,000 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, created_at | with the chat |
-| `results` | id, message_id, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
+| `results` | id, message_id, position, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `file_marks` | chat_id, created_at: when the chat's workbench folder may have got a file (an attachment, a hand-over, a tool call, a step or a result) | with the chat |
 | `retention_periods` | the chat period's state, and the file period the content deadlines were set under | no personal data |
 
@@ -47,12 +47,13 @@ No account name and no chat id reach the router or workbench.
 
 ## Who can read it
 
-The owner only. Every lookup names the request's own account; another owner's
-chat answers 404, and there is no admin path or `owner` parameter. Anyone with
-root on the host can read the volume.
+The owner only. Every request first resolves the chat by the request's own
+account; another owner's chat answers 404, and there is no admin path or
+`owner` parameter. Anyone with root on the host can read the volume.
 
 ## Residual
 
 A tool call cut short by the message's wall time may still leave outputs in the
-chat's folder without a card, and so may outputs past a message's 20 cards.
-`list_files` shows them; they go with the chat, or after 7 days.
+chat's folder without a card, and so may outputs past a message's 20 cards and
+those of a regenerated answer. `list_files` shows them; they go with the chat,
+or after 7 days.

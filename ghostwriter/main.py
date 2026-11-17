@@ -136,11 +136,16 @@ def create_app(
                 engine.dispose()
             emitter.close()
 
+    # No Swagger UI, ReDoc or schema: every peer on inference-net and workbench-net reaches
+    # the backend, and Swagger UI would load its assets from a CDN.
     app = FastAPI(
         title="Ghostwriter",
         description="The federation's chat assistant.",
         version=__version__,
         lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.settings = settings
     app.state.model = chat_model

@@ -330,6 +330,25 @@ def test_a_result_lives_as_long_as_its_file_and_its_preview_with_the_earliest(st
     assert (card().preview, card().expired) == (None, True)
 
 
+def test_cards_reload_in_the_order_the_tools_wrote_them(store: ChatStore) -> None:
+    """Results written in the same moment come back in their order, not by their ids."""
+    chat = store.create_chat("user-a")
+    answer = store.start_assistant_message(chat.id)
+    names = [f"teil-{n}.csv" for n in range(8)]
+    for name in names:
+        store.add_result(
+            answer,
+            kind="file",
+            file_id=uuid4().hex,
+            path=f"/workspace/s/{name}",
+            name=name,
+            mime="text/csv",
+            size=10,
+            preview=None,
+        )
+    assert [r.name for r in store.chat_detail("user-a", chat.id).messages[0].results] == names
+
+
 def test_a_user_message_keeps_the_id_it_was_given(store: ChatStore) -> None:
     """The id recorded before the insert is the stored message's; without one, a uuid4 is minted."""
     chat = store.create_chat("user-a")

@@ -139,6 +139,25 @@ describe('useChatStream', () => {
     expect(screen.queryByText('summe.csv', { selector: 'caption' })).not.toBeInTheDocument()
   })
 
+  it('skips the keep-alive comments a quiet answer carries', async () => {
+    const { sse, finish } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+
+    sse.comment('keep-alive')
+    sse.push('token', { text: 'Sum' })
+    sse.comment('keep-alive')
+    sse.comment('keep-alive')
+    sse.push('token', { text: 'me' })
+    expect(await screen.findByText('Summe')).toBeInTheDocument()
+    expect(screen.queryByText(/keep-alive/)).not.toBeInTheDocument()
+    finish()
+    expect(await screen.findByText('Summe: 42')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
   it('says it is thinking while a reasoning answer holds its text, and that it is working otherwise', async () => {
     const thinking = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
     const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)

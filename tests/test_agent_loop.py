@@ -5,6 +5,7 @@ here is invented.
 """
 
 import json
+import re
 import threading
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
@@ -360,6 +361,31 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     assert loop_env.audit.log == ["model:1:ok", "model:2:ok"]
 
 
+def test_a_call_id_the_record_cannot_hold_is_refused(loop_env: LoopEnv) -> None:
+    """An id past 64 characters, or with other characters, never reaches workbench, the store or the audit.
+
+    The call is refused as bad arguments, and the round is answered under an id the loop mints.
+    """
+    long_id, odd_id = "x" * 65, "call 1\nAnmerkung"
+    chunks = [
+        call_chunk(0, long_id, "read_document", READ_SALES),
+        call_chunk(1, odd_id, "read_document", READ_SALES),
+        call_chunk(2, "call_ok-1", "read_document", READ_SALES),
+    ]
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(chunks, [text_chunk("Summe: 42")])
+    assert len(loop_env.workbench.calls) == 1 and len(_steps(events)) == 2
+    assert loop_env.audit.log == ["model:1:ok", "disclose:read_document:1:1", "model:2:ok"]
+    assistant, *answers = loop_env.sent(2)[-4:]
+    ids = [call["id"] for call in assistant["tool_calls"]]
+    assert ids[2] == "call_ok-1" and len(set(ids)) == 3
+    assert all(re.fullmatch(r"[A-Za-z0-9_-]{1,64}", i) for i in ids)
+    assert [answer["tool_call_id"] for answer in answers] == ids
+    assert [json.loads(answer["content"]).get("error") for answer in answers[:2]] == ["bad_arguments"] * 2
+    [turn], _ = loop_env.store.past_turns(CHAT, before_position=99)
+    assert [call.call_id for calls in turn.rounds for call in calls] == ["call_ok-1"]
+
+
 def test_at_most_four_calls_run_per_round(loop_env: LoopEnv) -> None:
     """The first four calls of a round run; the rest are refused, to be asked again in the next round."""
     loop_env.run(_calls(*[json.dumps({"path": f"{FOLDER}/teil-{n}.pdf"}) for n in range(6)]), [text_chunk("Fertig.")])
@@ -569,7 +595,10 @@ def test_arguments_that_cannot_be_encoded_are_refused(loop_env: LoopEnv) -> None
 
 
 def test_lone_surrogates_from_the_stream_are_replaced(loop_env: LoopEnv) -> None:
-    """A stray surrogate in a text delta, a call's id or its name becomes U+FFFD; the next round still goes out."""
+    """A stray surrogate in a text delta, a call's id or its name becomes U+FFFD; the next round still goes out.
+
+    An id holding U+FFFD is no id the record takes: that call is refused and answered under one the loop mints.
+    """
     loop_env.workbench.answers = [RESULT]
     first = [
         text_chunk("Ich lese\ud800."),
@@ -580,9 +609,11 @@ def test_lone_surrogates_from_the_stream_are_replaced(loop_env: LoopEnv) -> None
     tokens = [e.text for e in events if isinstance(e, TokenEvent)]
     assert tokens == ["Ich lese\ufffd.", "\n\n", "Summe: 42, Größe ✓ 😀"]
     assert loop_env.stored() == "".join(tokens)
-    assert len(loop_env.fake.calls) == 2 and [c.name for c in loop_env.workbench.calls] == ["read_document"]
+    assert len(loop_env.fake.calls) == 2 and loop_env.workbench.calls == []
     sent = loop_env.sent(2)
-    assert [c["id"] for c in sent[2]["tool_calls"]] == ["call_\ufffd", "call_1"]
+    minted, kept = (c["id"] for c in sent[2]["tool_calls"])
+    assert re.fullmatch(r"call_[0-9a-f]{32}", minted) and kept == "call_1"
+    assert [m["tool_call_id"] for m in sent[3:]] == [minted, kept]
     assert sent[2]["tool_calls"][1]["function"]["name"] == "read\ufffd"
     json.dumps(sent, ensure_ascii=False).encode("utf-8")
     loop_env.store.chat_detail("user-a", CHAT).model_dump_json()

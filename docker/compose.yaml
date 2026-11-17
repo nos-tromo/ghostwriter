@@ -128,6 +128,11 @@ services:
       retries: 3
       start_period: 30s
       start_interval: 3s
+    # workbench's api limits. Memory and swap together are the same limit.
+    mem_limit: 2g
+    memswap_limit: 2g
+    # Threads of the one process: 40 for the routes, 16 turns, 4 dictations, one per workbench call, a few more.
+    pids_limit: 128
     depends_on:
       volume-permissions:
         condition: service_completed_successfully
@@ -153,6 +158,9 @@ services:
       edge-net:
         aliases:
           - ghostwriter-frontend
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 64
     depends_on:
       backend:
         condition: service_healthy

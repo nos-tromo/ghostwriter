@@ -106,6 +106,10 @@ export function sseStream() {
     push(event: string, data: unknown) {
       controller.enqueue(encoder.encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`))
     },
+    /** A comment line, as the backend's keep-alive: no frame. */
+    comment(text: string) {
+      controller.enqueue(encoder.encode(`: ${text}\n\n`))
+    },
     end() {
       controller.close()
     },

@@ -3,7 +3,8 @@
 A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most one per chat
 (:class:`~ghostwriter.turns.TurnRegistry`), on a thread of the app's turn limiter
 (``TURN_THREADS``) rather than the shared pool; a turn beyond them waits for one. The frames
-are ``token``, ``step``, ``result``, ``error`` and ``final``, which is always last. A stop, or
+are ``token``, ``step``, ``result``, ``error`` and ``final``, which is always last; a quiet
+stream carries a keep-alive comment every 15 s, which is no frame. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
@@ -343,7 +344,7 @@ class TurnResponse(StreamingResponse):
             limiter: The turn threads.
         """
         super().__init__(
-            aiter_sync_gen(stream.frames, request, limiter, feed=stream.attach),
+            aiter_sync_gen(stream.frames, request, limiter, feed=stream.attach, keepalive=True),
             media_type="text/event-stream",
             headers=STREAM_HEADERS,
         )

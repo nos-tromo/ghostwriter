@@ -7,19 +7,19 @@
 | The files | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download answers 410 |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
-after start, then daily (`ghostwriter/retention.py`).
+after start, then daily (`ghostwriter/retention.py`). A banner and a line under
+attached files state the periods, leaving out the chat period while chat
+retention is off and the file period while attachments are off.
 
 ## The chat period and its notice
 
-Each start puts the configured period in force by docint's rule
-(`ghostwriter/retention_rule.py`, as open-webui-service's `StoreRule`):
+Each start puts the configured period in force (docint's rule, `ghostwriter/retention_rule.py`):
 
 | Change | Effect |
 |---|---|
 | First start, or on again after `off` | nothing is deleted for `RETENTION_NOTICE_DAYS` (30) |
-| A longer period | applies at once |
+| A longer period | applies at once (or when a running notice ends) |
 | A shorter period | the notice holds only what it makes due sooner; the period before keeps deleting meanwhile |
-| The notice alone | moves nothing |
 
 Example: 90 days shortened to 60 on 1 March. A chat started 70 days before goes
 on 21 March, its old date; one started 50 days before on 31 March, the end of
@@ -30,11 +30,9 @@ the notice, not on 11 March; one started 20 days before on 10 April, its new dat
 They expire `WORKBENCH_RETENTION_DAYS` after they were made, or with the
 earliest file that may still be in the chat's folder then, if that goes first,
 so nothing derived from a file outlives it. Example: a file on day 0; a step on
-day 6 goes on day 7, a step on day 10 on day 17. From then on the trail reads "Details
-deleted after 7 days", follow-ups replay nothing of them, and the model is told
-that earlier files have expired. The tool, status, file name, size and type stay.
-A changed file period applies at the next start to what has not expired yet,
-without a notice; nothing expired comes back.
+day 6 goes on day 7, a step on day 10 on day 17. Emptied, a step reads "Details
+deleted after 7 days". A changed file period applies at the next start to what
+has not expired yet, without a notice; nothing expired comes back.
 
 ## The delete order
 
@@ -58,17 +56,3 @@ this caller no single-file delete. Otherwise it goes after its 7 days.
 `make retention-dry-run` asks the running backend what a sweep would delete
 now, in counts, ages and dates only; `CHAT_DAYS=n` previews another chat
 period, with the notice it would get. It records and changes nothing.
-
-```text
-chats due now: 2 (started 95 to 120 days ago; period 90 days, in force since 2026-11-16)
-tool contents due now: 3 steps, 1 preview (made 8 to 9 days ago; period 7 days)
-This run deletes nothing.
-```
-
-## The banner
-
-Above the conversation: "Chats are deleted 90 days after they were started.
-Files and tool results are deleted after 7 days." It leaves out the chat
-period while chat retention is off, and the file period while attachments are
-off. Under attached files the composer adds "Attached files stay in this chat
-until it is deleted, for 7 days at most."

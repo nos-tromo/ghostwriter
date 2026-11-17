@@ -98,6 +98,15 @@ def test_every_service_is_hardened() -> None:
     assert "      volume-permissions:\n        condition: service_completed_successfully" in backend
 
 
+def test_each_service_has_memory_and_process_limits() -> None:
+    """The backend has workbench's api limits, the frontend's nginx smaller ones; memory and swap together."""
+    compose = (ROOT / "docker" / "compose.yaml").read_text(encoding="utf-8")
+    for name, memory, pids in (("backend", "2g", "128"), ("frontend", "256m", "64")):
+        service = _service(compose, name)
+        assert f"    mem_limit: {memory}\n" in service and f"    memswap_limit: {memory}\n" in service
+        assert f"    pids_limit: {pids}\n" in service
+
+
 def test_make_knows_the_networks_and_the_volume() -> None:
     """The Makefile creates every external network and the volume, and includes the shared targets."""
     mk = (ROOT / "Makefile").read_text(encoding="utf-8")

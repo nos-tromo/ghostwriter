@@ -2,8 +2,9 @@
 
 :func:`aiter_sync_gen` is copied from docint's ``_aiter_sync_gen`` (``docint/core/api.py``),
 with the same poll interval; it also takes the capacity limiter whose threads the generator
-runs on, so a long stream holds none of the shared pool's, and a ``feed`` through which another
-thread may end the stream before the generator has a thread.
+runs on, so a long stream holds none of the shared pool's, a ``feed`` through which another
+thread may end the stream before the generator has a thread, and a keep-alive comment for a
+stream that is quiet a while.
 """
 
 import asyncio
@@ -17,6 +18,10 @@ from starlette.requests import Request
 
 #: Seconds between two checks for a client gone while the generator yields nothing.
 STREAM_DISCONNECT_POLL_INTERVAL_S: Final = 1.0
+#: Seconds without a frame after which a keep-alive comment goes out, so an idle proxy keeps the stream.
+KEEPALIVE_INTERVAL_S: Final = 15.0
+#: An SSE comment: no frame, and every reader skips it.
+KEEPALIVE: Final = ": keep-alive\n\n"
 
 
 def sse_frame(event: str, data: Mapping[str, Any]) -> str:
@@ -37,6 +42,7 @@ async def aiter_sync_gen(
     request: Request | None = None,
     limiter: CapacityLimiter | None = None,
     feed: Callable[[Callable[[Any], None]], None] | None = None,
+    keepalive: bool = False,
 ) -> AsyncIterator[Any]:
     """Drive a blocking sync generator on a worker thread, yielding its items.
 
@@ -60,6 +66,8 @@ async def aiter_sync_gen(
             before the generator is started, with the thread-safe function
             that queues an item from any thread; queuing ``None`` ends the
             iteration as the generator's own end does.
+        keepalive (bool): Yield :data:`KEEPALIVE` after each
+            :data:`KEEPALIVE_INTERVAL_S` without an item.
 
     Yields:
         Any: Each item produced by the generator, in order.
@@ -88,6 +96,7 @@ async def aiter_sync_gen(
     if feed is not None:
         feed(_safe_put)
     task = asyncio.create_task(to_thread.run_sync(_pump, limiter=limiter))
+    last = loop.time()
     try:
         while True:
             try:
@@ -98,11 +107,15 @@ async def aiter_sync_gen(
             except TimeoutError:
                 if request is not None and await request.is_disconnected():
                     return
+                if keepalive and loop.time() - last >= KEEPALIVE_INTERVAL_S:
+                    last = loop.time()
+                    yield KEEPALIVE
                 continue
             if item is None:
                 break
             if isinstance(item, Exception):
                 raise item
+            last = loop.time()
             yield item
     finally:
         if not task.done():

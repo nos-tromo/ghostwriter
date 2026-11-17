@@ -18,7 +18,7 @@ cannot work stops startup and names the variable, never its value
 | `WHISPER_MODEL` | `openai/whisper-large-v3` | The dictation model. |
 | `RESPONSE_LANGUAGE` | `en` | The SPA's language, `en` or `de`; any other value is `en`. |
 | `GHOSTWRITER_SPEECH_INPUT` | `on` | `off` removes `/api/transcribe` (404) and the microphone. |
-| `WORKBENCH_API_KEY` | unset | workbench's `GHOSTWRITER_WORKBENCH_KEY`. Unset: no tools and no attachments, chats work. Shorter than 32 characters stops startup. |
+| `WORKBENCH_API_KEY` | unset | workbench's `GHOSTWRITER_WORKBENCH_KEY`. Unset: no tools and no attachments, chats work. Shorter than 32 characters stops startup. Rotating it renames every chat's folder (the pseudonyms are keyed with it), so earlier files read as expired. |
 | `WORKBENCH_API_BASE` | `http://workbench-api:8000` | workbench on `workbench-net`. |
 | `WORKBENCH_TIMEOUT` | `150` | Seconds one tool call may take. A call starts only while this much of the message's wall is left. |
 | `AUDIT_REQUIRE_PURPOSE` | empty | Audit actions that need a stated purpose (428 without one); an unknown action stops startup. |
@@ -30,7 +30,8 @@ cannot work stops startup and names the variable, never its value
 | `GHOSTWRITER_BACKEND_HOST_PORT` | `8004` | The dev overlay's backend port. |
 
 Compose also sets `AUDIT_OUTPUT=container` (the audit chain on the container's
-stdout). `LOG_LEVEL` (default `INFO`) sets the stderr log's level.
+stdout). `LOG_LEVEL` (default `INFO`) sets the stderr log's level; it is not in
+`.env.example`, and is read from `.env`, which compose passes in whole.
 
 ## Caps per message
 
@@ -54,3 +55,4 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_RECORDING_S` / `MAX_RECORDING_BYTES` | 120 s / 10 MiB | A recording (`inference.py`) |
 | `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment (`workbench.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
+| `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |

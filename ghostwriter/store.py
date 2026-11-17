@@ -476,7 +476,7 @@ class ChatStore:
                 select(Result)
                 .join(Message, Result.message_id == Message.id)
                 .where(Message.chat_id == chat_id)
-                .order_by(Result.created_at, Result.id)
+                .order_by(Result.message_id, Result.position)
             ).all()
             return ChatDetail(
                 chat=_chat_out(chat),
@@ -775,7 +775,7 @@ class ChatStore:
         size: int,
         preview: Mapping[str, Any] | None,
     ) -> ResultOut:
-        """Store a file a tool wrote, by reference, with its table preview.
+        """Store a file a tool wrote, by reference, with its table preview, after the answer's earlier ones.
 
         The preview expires after the file period, or earlier with the earliest
         file that can still exist now; the result leaves a file mark.
@@ -796,9 +796,11 @@ class ChatStore:
         now = self._now()
         with self._transaction() as s:
             chat_id = s.execute(select(Message.chat_id).where(Message.id == message_id)).scalar_one()
+            last = s.execute(select(func.max(Result.position)).where(Result.message_id == message_id)).scalar_one()
             row = Result(
                 id=str(uuid4()),
                 message_id=message_id,
+                position=0 if last is None else last + 1,
                 kind=kind,
                 workbench_file_id=file_id,
                 path=path,
