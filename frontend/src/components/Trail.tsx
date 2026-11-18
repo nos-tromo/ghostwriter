@@ -1,5 +1,5 @@
 import { useId, useState } from 'react'
-import { DisclosureButton, StatusIcon, cn, type StatusIconStatus } from '@infra/ui'
+import { DisclosureText, StatusIcon, cn, type StatusIconStatus } from '@infra/ui'
 import type { StepOut, StepStatus } from '../api/types'
 import type { Strings } from '../i18n'
 import { useT } from '../i18n/LanguageContext'
@@ -49,58 +49,54 @@ function pythonCode(step: StepOut): string | null {
 
 const PRE = 'max-h-72 overflow-auto whitespace-pre-wrap break-words rounded-md border border-border bg-background p-2 text-xs text-foreground outline-none focus-visible:ring-1 focus-visible:ring-primary'
 
-/** A step's arguments and result, behind a disclosure of their own; the code of `run_python` highlighted. */
-function StepDetails({ step, labelId }: { step: StepOut; labelId: string }) {
-  const t = useT()
-  const [open, setOpen] = useState(false)
-  const panelId = useId()
+/**
+ * A step's arguments and result, once its text is clicked; the code of
+ * `run_python` highlighted. The panel keeps to the column: a long result
+ * wraps and a long code line scrolls in its block, rather than the panel
+ * growing to fit them.
+ */
+function StepPanel({ step, id }: { step: StepOut; id: string }) {
   const code = pythonCode(step)
   return (
-    <>
-      <DisclosureButton
-        expanded={open}
-        controls={panelId}
-        label={t('trail.details')}
-        aria-describedby={labelId}
-        onClick={() => setOpen((value) => !value)}
-        className="h-6 w-6"
-      />
-      {open && (
-        <div id={panelId} className="basis-full space-y-1">
-          {code !== null ? (
-            <CodeBlock code={code} language="python" />
-          ) : (
-            step.arguments && (
-              <pre tabIndex={0} className={PRE}>
-                {step.arguments}
-              </pre>
-            )
-          )}
-          {step.result && (
-            <pre tabIndex={0} className={PRE}>
-              {step.result}
-            </pre>
-          )}
-        </div>
+    <div id={id} className="space-y-1">
+      {code !== null ? (
+        <CodeBlock code={code} language="python" />
+      ) : (
+        step.arguments && (
+          <pre tabIndex={0} className={PRE}>
+            {step.arguments}
+          </pre>
+        )
       )}
-    </>
+      {step.result && (
+        <pre tabIndex={0} className={PRE}>
+          {step.result}
+        </pre>
+      )}
+    </div>
   )
 }
 
 function StepRow({ step, fileDays }: { step: StepOut; fileDays: number }) {
   const t = useT()
-  const labelId = useId()
+  const panelId = useId()
+  const [open, setOpen] = useState(false)
   const status = STATUS[step.status]
   const hasDetails = !step.expired && (step.arguments !== null || step.result !== null)
+  const label = stepLabel(step, t)
   return (
     <li className="flex items-start gap-2">
       <StatusIcon status={status.icon} label={t(status.label)} />
-      <div className="flex min-w-0 flex-1 flex-wrap items-center gap-x-2 gap-y-1">
-        <span id={labelId} className="min-w-0 flex-1 break-words">
-          {stepLabel(step, t)}
-        </span>
-        {hasDetails && <StepDetails step={step} labelId={labelId} />}
-        {step.expired && <span className="basis-full italic">{t('trail.expired', { days: fileDays })}</span>}
+      <div className="min-w-0 flex-1 space-y-1">
+        {hasDetails ? (
+          <DisclosureText expanded={open} controls={panelId} onClick={() => setOpen((value) => !value)}>
+            {label}
+          </DisclosureText>
+        ) : (
+          <span className="block break-words">{label}</span>
+        )}
+        {step.expired && <span className="block italic">{t('trail.expired', { days: fileDays })}</span>}
+        {hasDetails && open && <StepPanel step={step} id={panelId} />}
       </div>
     </li>
   )
@@ -120,8 +116,9 @@ function StepList({ steps, fileDays, id, className }: { steps: StepOut[]; fileDa
  * The tool steps behind an answer: collapsed behind "{n} steps" once the answer
  * is stored, and open while it is being written (`live`), so the user sees each
  * step run. Each step shows its status and what it did; its arguments and
- * result sit behind a disclosure of their own until they expire with the
- * chat's files (`fileDays`).
+ * result open from the step's text until they expire with the chat's files
+ * (`fileDays`). Both disclosures are their own words (`DisclosureText`), with
+ * no chevron beside them.
  */
 export function Trail({ steps, fileDays, live = false }: { steps: StepOut[]; fileDays: number; live?: boolean }) {
   const t = useT()
@@ -132,19 +129,9 @@ export function Trail({ steps, fileDays, live = false }: { steps: StepOut[]; fil
   const count = steps.length === 1 ? t('trail.steps_one') : t('trail.steps', { n: steps.length })
   return (
     <div className="text-xs text-muted-foreground">
-      <div className="flex items-center gap-2">
-        {/* The button carries the same words as its name. */}
-        <span aria-hidden="true" className="flex-1">
-          {count}
-        </span>
-        <DisclosureButton
-          expanded={open}
-          controls={listId}
-          label={count}
-          onClick={() => setOpen((value) => !value)}
-          className="h-6 w-6"
-        />
-      </div>
+      <DisclosureText expanded={open} controls={listId} onClick={() => setOpen((value) => !value)}>
+        {count}
+      </DisclosureText>
       {open && <StepList id={listId} steps={steps} fileDays={fileDays} className="mt-2" />}
     </div>
   )

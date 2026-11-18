@@ -18,7 +18,9 @@ describe('Trail', () => {
     const user = userEvent.setup()
     const { container } = render(<Trail steps={[CODE, EXPIRED]} fileDays={7} />)
 
+    // The words are the button: no chevron beside them.
     const toggle = screen.getByRole('button', { name: '2 steps' })
+    expect(screen.getAllByRole('button')).toHaveLength(1)
     expect(toggle).toHaveAttribute('aria-expanded', 'false')
     expect(screen.queryByText('Ran Python')).not.toBeInTheDocument()
 
@@ -26,11 +28,10 @@ describe('Trail', () => {
     expect(toggle).toHaveAttribute('aria-expanded', 'true')
     const steps = screen.getAllByRole('listitem')
     expect(steps).toHaveLength(2)
-    expect(within(steps[0]).getByText('Ran Python')).toBeInTheDocument()
     expect(within(steps[0]).getByRole('img', { name: 'Done' })).toBeInTheDocument()
-    // The code stays behind its own disclosure.
+    // The code stays behind the step's own text.
     expect(container.querySelector('pre')).toBeNull()
-    const details = within(steps[0]).getByRole('button', { name: 'Details' })
+    const details = within(steps[0]).getByRole('button', { name: 'Ran Python' })
     expect(details).toHaveAttribute('aria-expanded', 'false')
 
     await user.click(details)
@@ -41,10 +42,19 @@ describe('Trail', () => {
     expect(code?.querySelector('.hljs-keyword')).toHaveTextContent('import')
     expect(within(steps[0]).getByText('42')).toBeInTheDocument()
 
-    // Once expired, the trail keeps what was done and says why the rest is gone.
+    await user.click(details)
+    expect(details).toHaveAttribute('aria-expanded', 'false')
+    expect(container.querySelector('pre')).toBeNull()
+
+    // Once expired, the trail keeps what was done and says why the rest is gone;
+    // the text opens nothing, so it is no button.
     expect(within(steps[1]).getByText('Read a document')).toBeInTheDocument()
     expect(within(steps[1]).getByText('Details deleted after 7 days')).toBeInTheDocument()
-    expect(within(steps[1]).queryByRole('button', { name: 'Details' })).not.toBeInTheDocument()
+    expect(within(steps[1]).queryByRole('button')).not.toBeInTheDocument()
+
+    await user.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(screen.queryByRole('listitem')).not.toBeInTheDocument()
   })
 
   it('labels every workbench tool, and an unknown one by name', async () => {
@@ -92,6 +102,36 @@ describe('Trail', () => {
       'sales.xlsx gelesen',
       'make_chart verwendet',
     ])
+  })
+
+  it('opens from the keyboard, as the buttons its texts are', async () => {
+    const user = userEvent.setup()
+    render(<Trail steps={[CODE]} fileDays={7} />)
+
+    await user.tab()
+    expect(screen.getByRole('button', { name: '1 step' })).toHaveFocus()
+    await user.keyboard('{Enter}')
+    await user.tab()
+    const details = screen.getByRole('button', { name: 'Ran Python' })
+    expect(details).toHaveFocus()
+    await user.keyboard(' ')
+    expect(details).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByText('42')).toBeInTheDocument()
+  })
+
+  it('stays open when the user clicks inside the code or the result', async () => {
+    const user = userEvent.setup()
+    const { container } = render(<Trail steps={[CODE]} fileDays={7} />)
+    await user.click(screen.getByRole('button', { name: '1 step' }))
+    const details = screen.getByRole('button', { name: 'Ran Python' })
+    await user.click(details)
+
+    const code = container.querySelector('code.language-python')
+    expect(code).not.toBeNull()
+    await user.click(code as Element)
+    await user.click(screen.getByText('42'))
+    expect(details).toHaveAttribute('aria-expanded', 'true')
+    expect(screen.getByRole('button', { name: '1 step' })).toHaveAttribute('aria-expanded', 'true')
   })
 
   it('shows the steps as they run, without the disclosure', () => {

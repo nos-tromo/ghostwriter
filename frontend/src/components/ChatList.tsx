@@ -2,14 +2,16 @@ import { useEffect, useId, useRef, useState } from 'react'
 import {
   ActionBar,
   Button,
-  ChevronDownIcon,
   DeleteButton,
   HoverIconAction,
   Input,
   Menu,
   MenuItem,
+  MoreIcon,
   NewButton,
+  PencilIcon,
   Spinner,
+  TrashIcon,
   cn,
 } from '@infra/ui'
 import { ApiError } from '../api/client'
@@ -159,7 +161,14 @@ function ChatRow({
           onFailed={(error) => setFailure(error === null ? null : { error, deleting: false })}
         />
       ) : (
-        <div className="group relative flex items-center">
+        // The row is one surface: it highlights on hover with the dots inside
+        // it, and stays highlighted while its menu is open.
+        <div
+          className={cn(
+            'group relative flex items-center rounded-lg',
+            active ? 'bg-primary/15 text-primary' : 'hover:bg-accent has-[[aria-expanded=true]]:bg-accent',
+          )}
+        >
           <button
             ref={(node) => {
               registerRow(chat.id, node)
@@ -172,10 +181,7 @@ function ChatRow({
             aria-current={active ? 'true' : undefined}
             onClick={() => onSelect(chat.id)}
             title={title}
-            className={cn(
-              'min-w-0 flex-1 truncate rounded-md px-3 py-2 pr-9 text-left text-sm hover:bg-accent',
-              active && 'bg-primary/15 text-primary',
-            )}
+            className="min-w-0 flex-1 truncate rounded-lg px-3 py-2 pr-9 text-left text-sm"
           >
             {title}
           </button>
@@ -187,9 +193,9 @@ function ChatRow({
             }}
             trigger={(props) => (
               <HoverIconAction
-                icon={<ChevronDownIcon className="h-4 w-4" />}
+                icon={<MoreIcon className="h-4 w-4" />}
                 label={t('chat.options', { title })}
-                className="h-7"
+                className="h-7 hover:bg-transparent"
                 {...props}
               />
             )}
@@ -214,8 +220,11 @@ function ChatRow({
                 </div>
               ) : (
                 <>
-                  <MenuItem onSelect={() => setEditing(true)}>{t('chat.rename')}</MenuItem>
+                  <MenuItem icon={<PencilIcon />} onSelect={() => setEditing(true)}>
+                    {t('chat.rename')}
+                  </MenuItem>
                   <MenuItem
+                    icon={<TrashIcon />}
                     tone="danger"
                     closeOnSelect={false}
                     disabled={del.isPending}
