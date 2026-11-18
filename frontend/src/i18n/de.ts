@@ -99,6 +99,7 @@ export const de: Strings = {
   'result.more_rows_unknown': 'Weitere Zeilen in der Datei',
   'result.expired': 'Abgelaufen',
   'result.download': 'Herunterladen',
+  'result.download_named': '{name} herunterladen',
   'result.loading': '{name} wird geladen…',
 
   // why an answer ended early
