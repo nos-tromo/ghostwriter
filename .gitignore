@@ -9,7 +9,6 @@
 *.log
 *.pyc
 *.txt
-# Playwright MCP's screenshots, snapshots and console logs from UI checks
 .playwright-mcp/
 
 # -----------------
