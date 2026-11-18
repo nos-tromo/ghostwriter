@@ -9,6 +9,7 @@
 *.log
 *.pyc
 *.txt
+.playwright-mcp/
 
 # -----------------
 # Backend (Python)
