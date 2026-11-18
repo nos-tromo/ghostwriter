@@ -96,6 +96,7 @@ export const en = {
   'result.more_rows_unknown': 'More rows in the file',
   'result.expired': 'Expired',
   'result.download': 'Download',
+  'result.download_named': 'Download {name}',
   'result.loading': 'Loading {name}…',
 
   // why an answer ended early

@@ -152,6 +152,22 @@ describe('ResultCard', () => {
     expect(screen.getByRole('button', { name: 'Herunterladen' })).toBeInTheDocument()
   })
 
+  it('names the file in the tooltip, since the whole pill is the download', () => {
+    const csv = result({ id: 'r1', kind: 'file', name: 'export.csv', mime: 'text/csv' })
+    const { unmount } = renderWithClient(<ResultCard chatId="c1" result={csv} />)
+    // The button covers the name, so its tooltip carries the full name a truncated pill hides.
+    expect(screen.getByRole('button', { name: 'Download' })).toHaveAttribute('title', 'Download export.csv')
+    expect(screen.getByRole('button', { name: 'Download' })).toHaveAccessibleDescription('export.csv')
+    unmount()
+
+    renderWithClient(
+      <LanguageContext value="de">
+        <ResultCard chatId="c1" result={csv} />
+      </LanguageContext>,
+    )
+    expect(screen.getByRole('button', { name: 'Herunterladen' })).toHaveAttribute('title', 'export.csv herunterladen')
+  })
+
   it('offers a download per file and none once expired', async () => {
     const calls = serve({ [`GET ${FILE_URL}`]: blobResponse('text/csv') })
     const create = vi.spyOn(URL, 'createObjectURL')

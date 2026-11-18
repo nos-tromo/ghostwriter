@@ -87,7 +87,11 @@ function InlineImage({ chatId, result, onGone }: { chatId: string; result: Resul
   )
 }
 
-/** The file's name and size, and its download. */
+/**
+ * The file's name and size, and its download. The whole pill is the download:
+ * the button's `::after` covers it, so a click on the name or the size is the
+ * button's, and the button stays the one control there is.
+ */
 function FileLine({
   chatId,
   result,
@@ -124,16 +128,23 @@ function FileLine({
 
   return (
     <div className="space-y-1">
-      <div className={cn(PILL, 'border-border bg-muted py-0.5 pr-0.5 pl-3.5')}>
-        <span id={nameId} title={result.name} className="min-w-0 truncate">
+      <div
+        className={cn(
+          PILL,
+          'relative border-border bg-muted py-0.5 pr-0.5 pl-3.5 transition-colors hover:bg-accent',
+          'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-primary',
+        )}
+      >
+        <span id={nameId} className="min-w-0 truncate">
           {result.name}
         </span>
         <span className="shrink-0 text-xs text-muted-foreground">{formatSize(result.size, lang)}</span>
         <DownloadButton
           label={t('result.download')}
+          hint={t('result.download_named', { name: result.name })}
           aria-describedby={nameId}
           busy={busy}
-          className="h-7 w-7 shrink-0 rounded-full"
+          className="h-7 w-7 shrink-0 rounded-full hover:bg-transparent focus-visible:ring-0 after:absolute after:inset-0 after:rounded-full"
           onClick={() => void download()}
         />
       </div>
