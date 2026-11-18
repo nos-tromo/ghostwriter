@@ -22,7 +22,7 @@ const fileKey = (chatId: string, fileId: string) => ['file', chatId, fileId] as 
 const FILE_GC_MS = 60_000
 
 /** A file's line: a pill, as the composer and the attachment chips are, as wide as its name. */
-const PILL = 'inline-flex max-w-full items-center gap-2 rounded-full border text-sm'
+const PILL = 'inline-flex max-w-full items-center gap-1.5 rounded-full border text-xs'
 
 /** A file of the chat, fetched once: every fetch is an audited `disclose`, so
  *  the draft's card, the stored message's card and Download share one blob.
@@ -131,20 +131,20 @@ function FileLine({
       <div
         className={cn(
           PILL,
-          'relative border-border bg-muted py-0.5 pr-0.5 pl-3.5 transition-colors hover:bg-accent',
+          'relative border-border bg-muted py-0.5 pr-0.5 pl-2.5 transition-colors hover:bg-accent',
           'has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-primary',
         )}
       >
         <span id={nameId} className="min-w-0 truncate">
           {result.name}
         </span>
-        <span className="shrink-0 text-xs text-muted-foreground">{formatSize(result.size, lang)}</span>
+        <span className="shrink-0 text-muted-foreground">{formatSize(result.size, lang)}</span>
         <DownloadButton
           label={t('result.download')}
           hint={t('result.download_named', { name: result.name })}
           aria-describedby={nameId}
           busy={busy}
-          className="h-7 w-7 shrink-0 rounded-full hover:bg-transparent focus-visible:ring-0 after:absolute after:inset-0 after:rounded-full"
+          className="h-5 w-5 shrink-0 rounded-full hover:bg-transparent focus-visible:ring-0 after:absolute after:inset-0 after:rounded-full [&_svg]:h-3.5 [&_svg]:w-3.5"
           onClick={() => void download()}
         />
       </div>
@@ -168,11 +168,11 @@ export function ResultCard({ chatId, result }: { chatId: string; result: ResultO
   if (result.expired || gone) {
     return (
       <div role="group" aria-labelledby={nameId}>
-        <div className={cn(PILL, 'border-dashed border-border px-3.5 py-1.5 text-muted-foreground')}>
+        <div className={cn(PILL, 'border-dashed border-border px-2.5 py-1 text-muted-foreground')}>
           <span id={nameId} title={result.name} className="min-w-0 truncate">
             {result.name}
           </span>
-          <span className="shrink-0 text-xs">{t('result.expired')}</span>
+          <span className="shrink-0">{t('result.expired')}</span>
         </div>
       </div>
     )
