@@ -42,7 +42,7 @@ def test_config_reports_what_the_spa_needs(client: TestClient) -> None:
         "max_recording_bytes": 10485760,
         "chat_retention_days": 90,
         "file_retention_days": 7,
-        "version": "0.1.0",
+        "version": "0.2.0",
     }
 
 
