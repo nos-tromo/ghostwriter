@@ -4,6 +4,7 @@ A hand clock stands for the monotonic clock; the stop's waits pass on it. Every 
 here is invented.
 """
 
+import dataclasses
 import json
 import re
 import threading
@@ -25,6 +26,7 @@ from ghostwriter.agent.limits import (
     PROMPT_TOKENS,
     REASONING_ANSWER_TOKENS,
     REASONING_PROMPT_TOKENS,
+    prompt_tokens,
 )
 from ghostwriter.agent.loop import AgentLoop, ErrorEvent, ResultEvent, StepEvent, TokenEvent, Turn, TurnEvent
 from ghostwriter.agent.prompt import PRESENTATIONS
@@ -796,3 +798,17 @@ def test_a_reasoning_message_reasons_in_every_round_within_its_budget(loop_env: 
     assert REASONING_PROMPT_TOKENS < estimate_tokens(plain["messages"]) + estimate_tokens(plain["tools"])
     assert estimate_tokens(plain["messages"]) + estimate_tokens(plain["tools"]) <= PROMPT_TOKENS
     assert len(plain["messages"]) > reasoned
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_a_smaller_context_fits_every_round_to_what_it_leaves(loop_env: LoopEnv, reasoning: bool) -> None:
+    """At a context of 24 576 a long chat's rounds still replay earlier turns, within that context's budget."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, context_tokens=24_576)
+    for n in range(30):
+        loop_env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 700, [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), "Übersicht " * 400)
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")], reasoning=reasoning)
+    budget = prompt_tokens(24_576, reasoning=reasoning)
+    for call in loop_env.fake.calls:
+        assert estimate_tokens(call["messages"]) + estimate_tokens(call["tools"]) <= budget
+    assert len(loop_env.sent(1)) > 3

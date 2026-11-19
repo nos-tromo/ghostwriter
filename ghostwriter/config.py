@@ -13,6 +13,7 @@ from typing import Final, Literal
 
 from loguru import logger
 
+from ghostwriter.agent.limits import CONTEXT_TOKENS, MIN_CONTEXT_TOKENS
 from ghostwriter.utils.audit_event import ACTIONS
 from ghostwriter.utils.audit_runtime import parse_required_actions
 
@@ -27,6 +28,7 @@ WORKBENCH_KEY_ENV: Final = "WORKBENCH_API_KEY"
 WORKBENCH_TIMEOUT_ENV: Final = "WORKBENCH_TIMEOUT"
 CHAT_DAYS_ENV: Final = "GHOSTWRITER_CHAT_RETENTION_DAYS"
 SPEECH_INPUT_ENV: Final = "GHOSTWRITER_SPEECH_INPUT"
+CONTEXT_TOKENS_ENV: Final = "GHOSTWRITER_CONTEXT_TOKENS"
 REQUIRE_PURPOSE_ENV: Final = "AUDIT_REQUIRE_PURPOSE"
 
 MAX_DAYS: Final = 3650
@@ -47,6 +49,7 @@ class Settings:
         inference_provider: The provider behind the endpoint, lower-case: ``vllm`` (the
             federation's router), ``ollama``, ``openai`` or another.
         text_model: The chat model.
+        context_tokens: The chat model's context, in tokens; each round's prompt budget follows from it.
         whisper_model: The speech-to-text model.
         workbench_api_base: workbench's base URL, without a trailing ``/``.
         workbench_api_key: Ghostwriter's key at workbench; ``None`` switches
@@ -67,6 +70,7 @@ class Settings:
     openai_api_key: str = field(repr=False)
     inference_provider: str
     text_model: str
+    context_tokens: int
     whisper_model: str
     workbench_api_base: str
     workbench_api_key: str | None = field(repr=False)
@@ -202,6 +206,32 @@ def _timeout(environ: Mapping[str, str]) -> float:
     return seconds
 
 
+def _context_tokens(environ: Mapping[str, str]) -> int:
+    """Return the chat model's context in tokens.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        The context, :data:`~ghostwriter.agent.limits.CONTEXT_TOKENS` while unset.
+
+    Raises:
+        ValueError: If it is not a whole number of at least
+            :data:`~ghostwriter.agent.limits.MIN_CONTEXT_TOKENS`.
+    """
+    raw = _get(environ, CONTEXT_TOKENS_ENV)
+    if raw is None:
+        return CONTEXT_TOKENS
+    message = f"{CONTEXT_TOKENS_ENV} must be a whole number of tokens, at least {MIN_CONTEXT_TOKENS}."
+    try:
+        tokens = int(raw)
+    except ValueError:
+        raise ValueError(message) from None
+    if tokens < MIN_CONTEXT_TOKENS:
+        raise ValueError(message)
+    return tokens
+
+
 def _speech_input(environ: Mapping[str, str]) -> bool:
     """Return whether dictation is on.
 
@@ -295,6 +325,7 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         openai_api_key=_get(environ, "OPENAI_API_KEY") or "dummy",
         inference_provider=(_get(environ, "INFERENCE_PROVIDER") or "vllm").lower(),
         text_model=_get(environ, "TEXT_MODEL") or "Qwen/Qwen3.8-27B-FP8",
+        context_tokens=_context_tokens(environ),
         whisper_model=_get(environ, "WHISPER_MODEL") or "openai/whisper-large-v3",
         workbench_api_base=_base(environ, "WORKBENCH_API_BASE", "http://workbench-api:8000"),
         workbench_api_key=_secret(environ, WORKBENCH_KEY_ENV),

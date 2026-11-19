@@ -45,10 +45,9 @@ from ghostwriter.agent.limits import (
     MAX_RESULTS_PER_MESSAGE,
     MAX_TOOL_ROUNDS,
     MESSAGE_WALL_S,
-    PROMPT_TOKENS,
     REASONING_ANSWER_TOKENS,
-    REASONING_PROMPT_TOKENS,
     TOOL_CUTOFF_S,
+    prompt_tokens,
 )
 from ghostwriter.agent.prompt import system_prompt
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
@@ -333,7 +332,7 @@ class AgentLoop:
             expired=expired,
             presentations="write_presentation" in names,
         )
-        budget = REASONING_PROMPT_TOKENS if turn.reasoning else PROMPT_TOKENS
+        budget = prompt_tokens(self._settings.context_tokens, reasoning=turn.reasoning)
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
         current: list[dict[str, Any]] = [{"role": "user", "content": text}]

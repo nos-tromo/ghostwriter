@@ -395,11 +395,15 @@ def test_the_client_goes_to_the_router_once_per_round(settings: Settings) -> Non
 
 
 def test_the_prompt_and_the_answer_fit_the_context() -> None:
-    """The caps are the plan's; a full prompt plus a full answer fit the 40k context."""
+    """At the default 40k the caps are the plan's; at any context a full prompt, a full answer and the margin fit."""
     assert (limits.CONTEXT_TOKENS, limits.PROMPT_TOKENS, limits.MAX_ANSWER_TOKENS) == (40_000, 34_000, 4_000)
-    assert limits.PROMPT_TOKENS + limits.MAX_ANSWER_TOKENS <= limits.CONTEXT_TOKENS
     assert (limits.REASONING_PROMPT_TOKENS, limits.REASONING_ANSWER_TOKENS) == (26_000, 12_000)
-    assert limits.REASONING_PROMPT_TOKENS + limits.REASONING_ANSWER_TOKENS <= limits.CONTEXT_TOKENS
+    margin = limits.CONTEXT_MARGIN_TOKENS
+    for context in (limits.MIN_CONTEXT_TOKENS, 24_576, limits.CONTEXT_TOKENS):
+        assert limits.prompt_tokens(context, reasoning=False) + limits.MAX_ANSWER_TOKENS + margin == context
+        assert limits.prompt_tokens(context, reasoning=True) + limits.REASONING_ANSWER_TOKENS + margin == context
+    assert limits.MIN_CONTEXT_TOKENS == 22_000
+    assert limits.prompt_tokens(limits.MIN_CONTEXT_TOKENS, reasoning=True) == limits.MIN_PROMPT_TOKENS
     assert (limits.CHARS_PER_TOKEN, limits.MODEL_TIMEOUT_S) == (3, 120.0)
     assert (limits.MAX_TOOL_ROUNDS, limits.MAX_CALLS_PER_ROUND) == (8, 4)
     assert (limits.MESSAGE_WALL_S, limits.TOOL_CUTOFF_S, limits.BUSY_RETRY_S) == (300.0, 10.0, 2.0)
