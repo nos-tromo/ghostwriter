@@ -21,14 +21,26 @@ from typing_extensions import override
 from ghostwriter.agent.context import estimate_tokens
 from ghostwriter.agent.limits import BUSY_RETRY_S, PROMPT_TOKENS, REASONING_PROMPT_TOKENS
 from ghostwriter.agent.loop import AgentLoop, ErrorEvent, ResultEvent, StepEvent, TokenEvent, Turn, TurnEvent
+from ghostwriter.agent.tools import CUT_ARGUMENTS
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
-from ghostwriter.workbench import CallFor, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
+from ghostwriter.workbench import CallFor, McpTool, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
 from tests.conftest import KEY, make_settings
-from tests.fakes import Chunk, FakeOpenAI, FakeWorkbench, RecordingAudit, Round, call_chunk, text_chunk, usage_chunk
+from tests.fakes import (
+    Chunk,
+    FakeOpenAI,
+    FakeWorkbench,
+    RecordingAudit,
+    Round,
+    call_chunk,
+    contract_tools,
+    finish_chunk,
+    text_chunk,
+    usage_chunk,
+)
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 CHAT = "c0ffee00-0000-4000-8000-000000000001"
@@ -192,6 +204,12 @@ def _file(name: str, mime: str, size: int, *, id: str, preview: TablePreview | N
 
 def _router_error() -> openai.APIConnectionError:
     return openai.APIConnectionError(request=httpx2.Request("POST", "http://router.test/v1/chat/completions"))
+
+
+def _presentation_tool() -> McpTool:
+    """Return the tool workbench 0.6 adds, as discovery hands it out."""
+    schema = {"type": "object", "properties": {"name": {"type": "string"}, "slides": {"type": "array"}}}
+    return McpTool("write_presentation", "Build a presentation in a slide master.", schema)
 
 
 def _then(effect: Callable[[], object], answer: ToolResult | ToolFailure) -> Callable[[], ToolResult | ToolFailure]:
@@ -359,6 +377,61 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     }
     assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == ["{}", "{}"]
     assert loop_env.audit.log == ["model:1:ok", "model:2:ok"]
+
+
+def test_a_call_cut_at_the_length_limit_says_so(loop_env: LoopEnv) -> None:
+    """A call the stream cut at the answer's length limit is not sent; the model reads that it was cut."""
+    cut = [
+        call_chunk(0, "call_0", "write_presentation", '{"name": "deck", "slides": [{"title": "Q1", "bullets": ["a'),
+        finish_chunk("length"),
+    ]
+    loop_env.workbench = FakeWorkbench(tools=(*contract_tools(), _presentation_tool()), audit=loop_env.audit)
+    events = loop_env.run(cut, [text_chunk("Ich fasse mich kürzer.")])
+    assert loop_env.workbench.calls == [] and _steps(events) == []
+    assistant, answer = loop_env.sent(2)[-2:]
+    assert json.loads(answer["content"]) == {
+        "error": "cut_arguments",
+        "detail": CUT_ARGUMENTS.format(tool="write_presentation"),
+    }
+    assert "cut off at the answer's length limit" in answer["content"]
+    assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == ["{}"]
+    assert loop_env.audit.log == ["model:1:ok", "model:2:ok"]
+    first = loop_env.audit.rounds[0]
+    assert first is not None and first.finish_reason == "length" and len(first.calls) == 1
+
+
+def test_only_the_last_call_of_a_round_cut_at_the_limit_is_named_cut(loop_env: LoopEnv) -> None:
+    """An earlier call of that round was written whole and runs; one with bad arguments there is not called cut."""
+    chunks = [
+        call_chunk(0, "call_0", "read_document", READ_SALES),
+        call_chunk(1, "call_1", "read_document", "[1]"),
+        call_chunk(2, "call_2", "run_python", '{"code": "x = 1'),
+        finish_chunk("length"),
+    ]
+    loop_env.workbench.answers = [RESULT]
+    loop_env.run(chunks, [text_chunk("Ich fasse mich kürzer.")])
+    assert [c.name for c in loop_env.workbench.calls] == ["read_document"]
+    answers = loop_env.sent(2)[-3:]
+    assert [json.loads(a["content"]).get("error") for a in answers] == [None, "bad_arguments", "cut_arguments"]
+
+
+def test_a_round_that_ends_normally_keeps_bad_arguments_bad(loop_env: LoopEnv) -> None:
+    """Without the length limit, half-written arguments are the generic refusal."""
+    loop_env.run(
+        [call_chunk(0, "call_0", "run_python", '{"code": "x = 1'), finish_chunk("tool_calls")], [text_chunk("Ok")]
+    )
+    assert json.loads(loop_env.sent(2)[-1]["content"])["error"] == "bad_arguments"
+
+
+def test_the_loop_sets_presentations_from_the_offered_tools(loop_env: LoopEnv) -> None:
+    """Only a workbench that offers write_presentation gets the outline-first rule in the prompt."""
+    rule = "write_presentation only in a later message"
+    loop_env.run([text_chunk("Hallo!")])
+    assert rule not in loop_env.sent(1)[0]["content"]
+    offering = FakeWorkbench(tools=(*contract_tools(), _presentation_tool()), audit=loop_env.audit)
+    loop_env.run([text_chunk("Hallo!")], workbench=offering)
+    system = loop_env.fake.calls[-1]["messages"][0]["content"]
+    assert rule in system and f"This chat's files are in {FOLDER};" in system
 
 
 def test_a_call_id_the_record_cannot_hold_is_refused(loop_env: LoopEnv) -> None:

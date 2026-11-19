@@ -479,6 +479,18 @@ def call_chunk(index: int, id: str | None, name: str | None, args: str) -> Chunk
     return _delta({"tool_calls": [entry]})
 
 
+def finish_chunk(reason: str) -> Chunk:
+    """Return the chunk that ends a round's choice with its finish reason.
+
+    Args:
+        reason: The finish reason: ``stop``, ``tool_calls`` or ``length``.
+
+    Returns:
+        The chunk, its delta empty.
+    """
+    return _chunk([{"index": 0, "delta": {}, "finish_reason": reason}])
+
+
 def usage_chunk(prompt: int, completion: int, model: str) -> Chunk:
     """Return the last chunk, which ``stream_options.include_usage`` asks for: no choice, the token counts.
 

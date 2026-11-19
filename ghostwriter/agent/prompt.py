@@ -1,9 +1,21 @@
 """The system prompt: who answers, in which language, and what the chat's tools and files are."""
 
 from datetime import date
+from typing import Final
+
+#: The rule for a presentation, given only when workbench offers ``write_presentation``: the user sees an
+#: outline first and agrees to it before any deck is built.
+PRESENTATIONS: Final = (
+    "To build a presentation in a slide master (.pptx or .potx): call inspect_template on it and read the "
+    "sources, then show the user an outline (each slide's title, the layout's number and name, key points, "
+    "figures and sources) and stop. Call write_presentation only in a later message, after the user has agreed. "
+    "Images for slides are made with run_python; prefer native charts."
+)
 
 
-def system_prompt(*, today: date, folder: str | None, file_days: int, expired: bool) -> str:
+def system_prompt(
+    *, today: date, folder: str | None, file_days: int, expired: bool, presentations: bool = False
+) -> str:
     """Return the system prompt of a message.
 
     Args:
@@ -11,6 +23,8 @@ def system_prompt(*, today: date, folder: str | None, file_days: int, expired: b
         folder: The chat's folder in workbench; ``None`` when no tool is offered.
         file_days: How long workbench keeps a chat's files.
         expired: Whether files or tool results of earlier messages have expired.
+        presentations: Whether workbench offers ``write_presentation``; the outline-first rule is given
+            only then, and only when tools are offered.
 
     Returns:
         The prompt, its sentences joined by single spaces.
@@ -28,6 +42,8 @@ def system_prompt(*, today: date, folder: str | None, file_days: int, expired: b
             "the user below your answer with a download button: name them, and do not repeat their content or write "
             f"links to them. Files and tool results are deleted {file_days} days after they were made."
         )
+        if presentations:
+            parts.append(PRESENTATIONS)
     else:
         parts.append("You have no tools in this chat, and files cannot be read.")
     if expired:

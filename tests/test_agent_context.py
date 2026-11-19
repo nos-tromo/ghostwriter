@@ -432,3 +432,14 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
         "user's last message, in Markdown; write tables as Markdown tables. You have no tools in this chat, and "
         "files cannot be read."
     )
+
+
+def test_the_presentation_sentence_comes_with_the_tool() -> None:
+    """The outline-first rule is in the prompt only when write_presentation is offered and tools are."""
+    rule = "write_presentation only in a later message"
+    with_tool = system_prompt(today=date(2026, 11, 16), folder=FOLDER, file_days=7, expired=False, presentations=True)
+    assert rule in with_tool and "call inspect_template on it and read the sources" in with_tool
+    assert rule not in SYSTEM
+    assert with_tool.startswith(SYSTEM)
+    bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False, presentations=True)
+    assert "write_presentation" not in bare
