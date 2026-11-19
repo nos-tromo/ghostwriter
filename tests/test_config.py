@@ -124,6 +124,21 @@ def test_the_timeout_must_be_a_positive_finite_number(raw: str) -> None:
         load_settings({**ENV, "WORKBENCH_TIMEOUT": raw})
 
 
+def test_the_context_defaults_to_40k_and_reads_a_smaller_one() -> None:
+    """The context is the router's 40k unless set; a smaller one down to 22 000 tokens is read as given."""
+    assert load_settings(ENV).context_tokens == 40_000
+    assert load_settings({**ENV, "GHOSTWRITER_CONTEXT_TOKENS": "24576"}).context_tokens == 24_576
+    assert load_settings({**ENV, "GHOSTWRITER_CONTEXT_TOKENS": "22000"}).context_tokens == 22_000
+
+
+@pytest.mark.parametrize("raw", ["21999", "8192", "-1", "40k", "nan"])
+def test_a_context_too_small_for_a_reasoning_round_stops_startup(raw: str) -> None:
+    """Below 22 000 tokens a reasoning round's answer leaves its prompt no room; the error never quotes the value."""
+    with pytest.raises(ValueError, match="GHOSTWRITER_CONTEXT_TOKENS") as raised:
+        load_settings({**ENV, "GHOSTWRITER_CONTEXT_TOKENS": raw})
+    assert raw not in str(raised.value)
+
+
 def test_an_unknown_required_action_stops_startup() -> None:
     """A misspelt action in AUDIT_REQUIRE_PURPOSE stops startup."""
     with pytest.raises(ValueError):

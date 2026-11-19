@@ -86,6 +86,8 @@ export const de: Strings = {
   'trail.write_table_unnamed': 'Eine Tabelle geschrieben',
   'trail.write_document': 'Dokument {detail} geschrieben',
   'trail.write_document_unnamed': 'Ein Dokument geschrieben',
+  'trail.write_presentation': 'Präsentation aus {detail} erstellt',
+  'trail.write_presentation_unnamed': 'Eine Präsentation erstellt',
   'trail.other': '{tool} verwendet',
   'trail.expired': 'Details nach {days} Tagen gelöscht',
   'trail.status_running': 'Läuft',

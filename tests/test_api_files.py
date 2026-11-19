@@ -155,6 +155,22 @@ def test_json_files_are_attached(client: TestClient, door: FakeDoor, name: str, 
     assert door.uploads[-1].content_type == mime
 
 
+def test_a_potx_is_sent_on_as_a_template(client: TestClient, door: FakeDoor) -> None:
+    """A PowerPoint slide master is attached, and goes to workbench on the template MIME type."""
+    mime = "application/vnd.openxmlformats-officedocument.presentationml.template"
+    r = _attach(client, _new(client), "deck.potx")
+    assert (r.status_code, r.json()["name"], r.json()["mime"]) == (201, "deck.potx", mime)
+    assert door.uploads[-1].content_type == mime
+
+
+def test_a_dotx_is_sent_on_as_a_template(client: TestClient, door: FakeDoor) -> None:
+    """A Word template is attached, and goes to workbench on the template MIME type."""
+    mime = "application/vnd.openxmlformats-officedocument.wordprocessingml.template"
+    r = _attach(client, _new(client), "form.dotx")
+    assert (r.status_code, r.json()["name"], r.json()["mime"]) == (201, "form.dotx", mime)
+    assert door.uploads[-1].content_type == mime
+
+
 def test_extensions_match_in_any_case(client: TestClient, door: FakeDoor) -> None:
     """``.PDF`` is a pdf; the name keeps its case."""
     r = _attach(client, _new(client), "Bericht März.PDF")

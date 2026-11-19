@@ -24,6 +24,12 @@ REFUSALS: Final = {
     "no_time": "not run: the time for tools in this answer is used up; answer with what you have.",
     "busy": "workbench is busy; tell the user to try again in a minute.",
 }
+#: What the model reads when the length limit cut the call it was writing: the arguments are not whole.
+CUT_ARGUMENTS: Final = (
+    "the call to {tool} was cut off at the answer's length limit; make the arguments shorter "
+    "(fewer or shorter slides, rows or text) and call it again. If you cannot call it again in this message, "
+    "tell the user the deck was too long for one call and offer fewer or shorter slides."
+)
 #: workbench's tokens for a call it could not take on now; such a call is tried once more.
 BUSY_TOKENS: Final = frozenset({"queue_full", "wait_timeout", "executor_busy"})
 #: What ends a text that was cut.

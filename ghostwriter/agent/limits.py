@@ -1,18 +1,40 @@
-"""The caps on one message, sized for the router's 40k context."""
+"""The caps on one message; a round's prompt budget follows the model's context, 40k unless set."""
 
 from typing import Final
 
 # The model and its rounds.
-#: The model's context, in tokens.
+#: The model's context, in tokens, while ``GHOSTWRITER_CONTEXT_TOKENS`` is unset.
 CONTEXT_TOKENS: Final = 40_000
 #: Each round's ``max_tokens``.
 MAX_ANSWER_TOKENS: Final = 4_000
-#: The most a round's prompt may hold, its tool schemas included.
-PROMPT_TOKENS: Final = 34_000
 #: A reasoning round's ``max_tokens``: the thinking counts against it.
 REASONING_ANSWER_TOKENS: Final = 12_000
-#: The most a reasoning round's prompt may hold, its tool schemas included.
-REASONING_PROMPT_TOKENS: Final = CONTEXT_TOKENS - REASONING_ANSWER_TOKENS - 2_000
+#: Tokens of the context neither the prompt nor the answer may take: the estimate's error, the chat template.
+CONTEXT_MARGIN_TOKENS: Final = 2_000
+#: The least a reasoning round's prompt may hold, its tool schemas included.
+MIN_PROMPT_TOKENS: Final = 8_000
+#: The smallest context the backend starts with: a reasoning round's answer, the margin and that least prompt.
+MIN_CONTEXT_TOKENS: Final = REASONING_ANSWER_TOKENS + CONTEXT_MARGIN_TOKENS + MIN_PROMPT_TOKENS
+
+
+def prompt_tokens(context: int, *, reasoning: bool) -> int:
+    """Return the most a round's prompt may hold, its tool schemas included.
+
+    Args:
+        context: The model's context, in tokens.
+        reasoning: Whether the round reasons, and so may answer in ``REASONING_ANSWER_TOKENS``.
+
+    Returns:
+        The context less the round's answer and ``CONTEXT_MARGIN_TOKENS``.
+    """
+    answer = REASONING_ANSWER_TOKENS if reasoning else MAX_ANSWER_TOKENS
+    return context - answer - CONTEXT_MARGIN_TOKENS
+
+
+#: The most a round's prompt may hold at the default context.
+PROMPT_TOKENS: Final = prompt_tokens(CONTEXT_TOKENS, reasoning=False)
+#: The most a reasoning round's prompt may hold at the default context.
+REASONING_PROMPT_TOKENS: Final = prompt_tokens(CONTEXT_TOKENS, reasoning=True)
 #: Characters per token, the estimate.
 CHARS_PER_TOKEN: Final = 3
 #: Seconds each wait on the router may take (connecting, and each read of the stream); not a bound on the round.

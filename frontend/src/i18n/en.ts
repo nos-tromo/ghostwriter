@@ -83,6 +83,8 @@ export const en = {
   'trail.write_table_unnamed': 'Wrote a table',
   'trail.write_document': 'Wrote the document {detail}',
   'trail.write_document_unnamed': 'Wrote a document',
+  'trail.write_presentation': 'Built a presentation from {detail}',
+  'trail.write_presentation_unnamed': 'Built a presentation',
   'trail.other': 'Used {tool}',
   'trail.expired': 'Details deleted after {days} days',
   'trail.status_running': 'Running',

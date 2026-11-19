@@ -15,6 +15,7 @@ cannot work stops startup and names the variable, never its value
 | `INFERENCE_PROVIDER` | `vllm` | Must match the endpoint. On `vllm` every round sends `enable_thinking` with the composer's reasoning switch; other providers get no such field. |
 | `OPENAI_API_BASE` | `http://vllm-router:4000/v1` | The OpenAI-compatible endpoint, with `/v1`. |
 | `TEXT_MODEL` | `Qwen/Qwen3.8-27B-FP8` | The chat model. |
+| `GHOSTWRITER_CONTEXT_TOKENS` | `40000` | The chat model's context: vllm-service's `CHAT_MAX_MODEL_LEN`. Each round's prompt budget follows from it (Caps per message); under 22,000 stops startup. Larger than the model's context, a long chat's round is refused by the router. |
 | `WHISPER_MODEL` | `openai/whisper-large-v3` | The dictation model. |
 | `RESPONSE_LANGUAGE` | `en` | The SPA's language, `en` or `de`; any other value is `en`. |
 | `GHOSTWRITER_SPEECH_INPUT` | `on` | `off` removes `/api/transcribe` (404) and the microphone. |
@@ -39,9 +40,11 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 
 | Cap | Value | Meaning |
 |---|---|---|
-| `CONTEXT_TOKENS` | 40,000 | The model's context |
-| `MAX_ANSWER_TOKENS` / `PROMPT_TOKENS` | 4,000 / 34,000 | A round's `max_tokens` and prompt, tool schemas included |
-| `REASONING_ANSWER_TOKENS` / `REASONING_PROMPT_TOKENS` | 12,000 / 26,000 | The same for a reasoning round; the thinking counts against the answer |
+| `CONTEXT_TOKENS` | 40,000 | The model's context while `GHOSTWRITER_CONTEXT_TOKENS` is unset |
+| `MAX_ANSWER_TOKENS` / `REASONING_ANSWER_TOKENS` | 4,000 / 12,000 | A round's `max_tokens`, plain and reasoning; the thinking counts against the answer |
+| `CONTEXT_MARGIN_TOKENS` | 2,000 | Kept free of prompt and answer: the estimate's error, the chat template |
+| `PROMPT_TOKENS` / `REASONING_PROMPT_TOKENS` | 34,000 / 26,000 at 40k | A round's prompt, tool schemas included: the context less the answer and the margin (`prompt_tokens`) |
+| `MIN_PROMPT_TOKENS` / `MIN_CONTEXT_TOKENS` | 8,000 / 22,000 | The least a reasoning prompt may hold, and so the smallest context the backend starts with |
 | `CHARS_PER_TOKEN` | 3 | The estimate the budget is counted by |
 | `MODEL_TIMEOUT_S` | 120 | Seconds each wait on the router may take, not the whole round |
 | `MAX_TOOL_ROUNDS` / `MAX_CALLS_PER_ROUND` | 8 / 4 | Rounds offered tools; calls a round may run |

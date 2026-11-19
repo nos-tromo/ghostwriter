@@ -4,6 +4,7 @@ A hand clock stands for the monotonic clock; the stop's waits pass on it. Every 
 here is invented.
 """
 
+import dataclasses
 import json
 import re
 import threading
@@ -19,8 +20,16 @@ import pytest
 from typing_extensions import override
 
 from ghostwriter.agent.context import estimate_tokens
-from ghostwriter.agent.limits import BUSY_RETRY_S, PROMPT_TOKENS, REASONING_PROMPT_TOKENS
+from ghostwriter.agent.limits import (
+    BUSY_RETRY_S,
+    MAX_ANSWER_TOKENS,
+    PROMPT_TOKENS,
+    REASONING_ANSWER_TOKENS,
+    REASONING_PROMPT_TOKENS,
+    prompt_tokens,
+)
 from ghostwriter.agent.loop import AgentLoop, ErrorEvent, ResultEvent, StepEvent, TokenEvent, Turn, TurnEvent
+from ghostwriter.agent.prompt import PRESENTATIONS
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
@@ -28,7 +37,18 @@ from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.workbench import CallFor, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
 from tests.conftest import KEY, make_settings
-from tests.fakes import Chunk, FakeOpenAI, FakeWorkbench, RecordingAudit, Round, call_chunk, text_chunk, usage_chunk
+from tests.fakes import (
+    Chunk,
+    FakeOpenAI,
+    FakeWorkbench,
+    RecordingAudit,
+    Round,
+    call_chunk,
+    contract_tools,
+    finish_chunk,
+    text_chunk,
+    usage_chunk,
+)
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 CHAT = "c0ffee00-0000-4000-8000-000000000001"
@@ -38,6 +58,17 @@ DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 READ_SALES = json.dumps({"path": f"{FOLDER}/sales.xlsx"})
 RESULT = ToolResult('{"text": "Monat;Summe\\n2026-01;1200"}', ())
 BUSY_TEXT = "workbench is busy; tell the user to try again in a minute."
+CUT_TEXT = (
+    "the call to write_presentation was cut off at the answer's length limit; make the arguments shorter "
+    "(fewer or shorter slides, rows or text) and call it again. If you cannot call it again in this message, "
+    "tell the user the deck was too long for one call and offer fewer or shorter slides."
+)
+HALF_DECK = '{"name": "deck", "slides": [{"title": "Q1", "bullets": ["a'
+#: How a round ends at its cap: as OpenAI says, and as vLLM does once a call's name streamed.
+AT_THE_CAP = {
+    "length": [finish_chunk("length")],
+    "vllm": [finish_chunk("tool_calls"), usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")],
+}
 
 
 class HandClock:
@@ -348,7 +379,7 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     assert loop_env.workbench.calls == [] and _steps(events) == []
     assistant, unknown, bad = loop_env.sent(2)[-3:]
     names = "fill_template, inspect_template, list_files, read_document, run_python, search_files, "
-    names += "write_document, write_table"
+    names += "write_document, write_presentation, write_table"
     assert json.loads(unknown["content"]) == {
         "error": "unknown_tool",
         "detail": f"there is no tool named 'delete_everything'; the tools you can call are {names}.",
@@ -359,6 +390,109 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     }
     assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == ["{}", "{}"]
     assert loop_env.audit.log == ["model:1:ok", "model:2:ok"]
+
+
+def test_a_call_cut_at_the_length_limit_says_so(loop_env: LoopEnv) -> None:
+    """A call the stream cut at the answer's length limit is not sent; the model reads that it was cut."""
+    cut = [call_chunk(0, "call_0", "write_presentation", HALF_DECK), finish_chunk("length")]
+    events = loop_env.run(cut, [text_chunk("Ich fasse mich kürzer.")])
+    assert loop_env.workbench.calls == [] and _steps(events) == []
+    assistant, answer = loop_env.sent(2)[-2:]
+    assert json.loads(answer["content"]) == {"error": "cut_arguments", "detail": CUT_TEXT}
+    assert [c["function"]["arguments"] for c in assistant["tool_calls"]] == ["{}"]
+    assert loop_env.audit.log == ["model:1:ok", "model:2:ok"]
+    first = loop_env.audit.rounds[0]
+    assert first is not None and first.finish_reason == "length" and len(first.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("reasoning", "completion", "error"),
+    [
+        (False, MAX_ANSWER_TOKENS, "cut_arguments"),
+        (True, REASONING_ANSWER_TOKENS, "cut_arguments"),
+        (False, MAX_ANSWER_TOKENS - 1, "bad_arguments"),
+        (True, MAX_ANSWER_TOKENS, "bad_arguments"),
+    ],
+    ids=["at-the-cap", "reasoning-at-its-cap", "below-the-cap", "reasoning-below-its-cap"],
+)
+def test_a_call_cut_at_the_cap_is_named_cut_when_vllm_says_tool_calls(
+    loop_env: LoopEnv, reasoning: bool, completion: int, error: str
+) -> None:
+    """VLLM ends a round whose call's name streamed with ``tool_calls``, at the cap too: the usage tells the cut.
+
+    The round's own cap counts: a reasoning round's is the larger, its thinking included.
+    """
+    chunks = [
+        call_chunk(0, "call_0", "write_presentation", HALF_DECK),
+        finish_chunk("tool_calls"),
+        usage_chunk(900, completion, "served-model"),
+    ]
+    loop_env.run(chunks, [text_chunk("Ich fasse mich kürzer.")], reasoning=reasoning)
+    assert loop_env.workbench.calls == []
+    assert json.loads(loop_env.sent(2)[-1]["content"])["error"] == error
+
+
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_whole_last_call_of_a_round_at_the_cap_still_runs(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """The cap reached right after a call's last brace leaves it whole: it is sent."""
+    loop_env.workbench.answers = [RESULT]
+    loop_env.run([call_chunk(0, "call_0", "read_document", READ_SALES), *ending], [text_chunk("Summe: 42")])
+    assert [(c.name, c.arguments) for c in loop_env.workbench.calls] == [("read_document", json.loads(READ_SALES))]
+    assert loop_env.audit.log == ["model:1:ok", "disclose:read_document:1:1", "model:2:ok"]
+
+
+@pytest.mark.parametrize("raw", ["", " \n"], ids=["empty", "blank"])
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_last_call_cut_right_after_its_name_is_named_cut(loop_env: LoopEnv, ending: list[Chunk], raw: str) -> None:
+    """At the cap, a last call without arguments was cut after its name: it is refused as cut, never sent as ``{}``."""
+    loop_env.run([call_chunk(0, "call_0", "write_presentation", raw), *ending], [text_chunk("Ich fasse mich kürzer.")])
+    assert loop_env.workbench.calls == []
+    assert json.loads(loop_env.sent(2)[-1]["content"]) == {"error": "cut_arguments", "detail": CUT_TEXT}
+
+
+def test_a_call_without_arguments_below_the_cap_is_sent(loop_env: LoopEnv) -> None:
+    """Below the cap, no arguments are no arguments: the call goes out with ``{}``."""
+    loop_env.workbench.answers = [RESULT]
+    chunks = [
+        call_chunk(0, "call_0", "list_files", ""),
+        finish_chunk("tool_calls"),
+        usage_chunk(900, 40, "served-model"),
+    ]
+    loop_env.run(chunks, [text_chunk("Ok")])
+    assert [(c.name, c.arguments) for c in loop_env.workbench.calls] == [("list_files", {})]
+
+
+def test_only_the_last_call_of_a_round_cut_at_the_limit_is_named_cut(loop_env: LoopEnv) -> None:
+    """An earlier call of that round was written whole and runs; one with bad arguments there is not called cut."""
+    chunks = [
+        call_chunk(0, "call_0", "read_document", READ_SALES),
+        call_chunk(1, "call_1", "read_document", "[1]"),
+        call_chunk(2, "call_2", "run_python", '{"code": "x = 1'),
+        finish_chunk("length"),
+    ]
+    loop_env.workbench.answers = [RESULT]
+    loop_env.run(chunks, [text_chunk("Ich fasse mich kürzer.")])
+    assert [c.name for c in loop_env.workbench.calls] == ["read_document"]
+    answers = loop_env.sent(2)[-3:]
+    assert [json.loads(a["content"]).get("error") for a in answers] == [None, "bad_arguments", "cut_arguments"]
+
+
+def test_a_round_that_ends_normally_keeps_bad_arguments_bad(loop_env: LoopEnv) -> None:
+    """Without the length limit, and with no usage to show the cap, half-written arguments are the generic refusal."""
+    loop_env.run(
+        [call_chunk(0, "call_0", "run_python", '{"code": "x = 1'), finish_chunk("tool_calls")], [text_chunk("Ok")]
+    )
+    assert json.loads(loop_env.sent(2)[-1]["content"])["error"] == "bad_arguments"
+
+
+def test_the_loop_sets_presentations_from_the_offered_tools(loop_env: LoopEnv) -> None:
+    """Only a workbench that offers write_presentation gets the outline-first rule in the prompt."""
+    loop_env.run([text_chunk("Hallo!")])
+    system = loop_env.sent(1)[0]["content"]
+    assert PRESENTATIONS in system and f"This chat's files are in {FOLDER};" in system
+    without = tuple(tool for tool in contract_tools() if tool.name != "write_presentation")
+    loop_env.run([text_chunk("Hallo!")], workbench=FakeWorkbench(tools=without, audit=loop_env.audit))
+    assert "write_presentation" not in loop_env.fake.calls[-1]["messages"][0]["content"]
 
 
 def test_a_call_id_the_record_cannot_hold_is_refused(loop_env: LoopEnv) -> None:
@@ -664,3 +798,17 @@ def test_a_reasoning_message_reasons_in_every_round_within_its_budget(loop_env: 
     assert REASONING_PROMPT_TOKENS < estimate_tokens(plain["messages"]) + estimate_tokens(plain["tools"])
     assert estimate_tokens(plain["messages"]) + estimate_tokens(plain["tools"]) <= PROMPT_TOKENS
     assert len(plain["messages"]) > reasoned
+
+
+@pytest.mark.parametrize("reasoning", [False, True])
+def test_a_smaller_context_fits_every_round_to_what_it_leaves(loop_env: LoopEnv, reasoning: bool) -> None:
+    """At a context of 24 576 a long chat's rounds still replay earlier turns, within that context's budget."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, context_tokens=24_576)
+    for n in range(30):
+        loop_env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 700, [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), "Übersicht " * 400)
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")], reasoning=reasoning)
+    budget = prompt_tokens(24_576, reasoning=reasoning)
+    for call in loop_env.fake.calls:
+        assert estimate_tokens(call["messages"]) + estimate_tokens(call["tools"]) <= budget
+    assert len(loop_env.sent(1)) > 3

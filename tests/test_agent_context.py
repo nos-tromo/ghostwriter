@@ -22,7 +22,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import system_prompt
+from ghostwriter.agent.prompt import PRESENTATIONS, system_prompt
 from ghostwriter.agent.tools import (
     REFUSALS,
     Refusal,
@@ -432,3 +432,23 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
         "user's last message, in Markdown; write tables as Markdown tables. You have no tools in this chat, and "
         "files cannot be read."
     )
+
+
+def test_the_presentation_sentence_comes_with_the_tool() -> None:
+    """The outline-first rule is in the prompt only when write_presentation is offered and tools are.
+
+    The outline names each layout's places in order, which the deck is then built in. Without a slide master of the
+    user's, the deck is built in workbench's plain master, both tools called without a path.
+    """
+    assert PRESENTATIONS == (
+        "To build a presentation, use the user's slide master (.pptx or .potx) if the chat has one, else the plain "
+        "16:9 master (leave path out of inspect_template and write_presentation). Call inspect_template and read "
+        "the sources, then show the user an outline (each slide's title, the layout's number and name with its "
+        "places in order, key points, figures and sources) and stop. Call write_presentation only in a later "
+        "message, after the user has agreed. Images for slides are made with run_python; prefer native charts."
+    )
+    with_tool = system_prompt(today=date(2026, 11, 16), folder=FOLDER, file_days=7, expired=False, presentations=True)
+    assert with_tool == f"{SYSTEM} {PRESENTATIONS}"
+    assert PRESENTATIONS not in SYSTEM
+    bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False, presentations=True)
+    assert bare == system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
