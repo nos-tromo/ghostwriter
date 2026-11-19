@@ -68,12 +68,13 @@ describe('Trail', () => {
       step({ id: 't6', tool: 'fill_template', detail: 'brief.docx' }),
       step({ id: 't7', tool: 'write_table', detail: 'summe.xlsx' }),
       step({ id: 't8', tool: 'write_document', detail: 'bericht.docx' }),
-      step({ id: 't9', tool: 'make_chart', detail: 'chart.png' }),
-      step({ id: 't10', tool: 'search_files', status: 'error' }),
-      step({ id: 't11', tool: 'write_table', status: 'running' }),
+      step({ id: 't9', tool: 'write_presentation', detail: 'master.potx' }),
+      step({ id: 't10', tool: 'make_chart', detail: 'chart.png' }),
+      step({ id: 't11', tool: 'search_files', status: 'error' }),
+      step({ id: 't12', tool: 'write_table', status: 'running' }),
     ]
     const { unmount } = render(<Trail steps={tools} fileDays={7} />)
-    await user.click(screen.getByRole('button', { name: '11 steps' }))
+    await user.click(screen.getByRole('button', { name: '12 steps' }))
 
     expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
       'Listed the files',
@@ -84,6 +85,7 @@ describe('Trail', () => {
       'Filled the template brief.docx',
       'Wrote the table summe.xlsx',
       'Wrote the document bericht.docx',
+      'Built a presentation from master.potx',
       'Used make_chart',
       'Searched the files',
       'Wrote a table',
@@ -94,13 +96,39 @@ describe('Trail', () => {
 
     render(
       <LanguageContext value="de">
-        <Trail steps={[tools[1], tools[8]]} fileDays={7} />
+        <Trail steps={[tools[1], tools[9]]} fileDays={7} />
       </LanguageContext>,
     )
     await user.click(screen.getByRole('button', { name: '2 Schritte' }))
     expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
       'sales.xlsx gelesen',
       'make_chart verwendet',
+    ])
+  })
+
+  it('names the master a presentation was built from, or none, in both languages', async () => {
+    const user = userEvent.setup()
+    const steps = [
+      step({ id: 'p1', tool: 'write_presentation', detail: 'master.potx' }),
+      step({ id: 'p2', tool: 'write_presentation' }),
+    ]
+    const { unmount } = render(<Trail steps={steps} fileDays={7} />)
+    await user.click(screen.getByRole('button', { name: '2 steps' }))
+    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'Built a presentation from master.potx',
+      'Built a presentation',
+    ])
+    unmount()
+
+    render(
+      <LanguageContext value="de">
+        <Trail steps={steps} fileDays={7} />
+      </LanguageContext>,
+    )
+    await user.click(screen.getByRole('button', { name: '2 Schritte' }))
+    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'Präsentation aus master.potx erstellt',
+      'Eine Präsentation erstellt',
     ])
   })
 

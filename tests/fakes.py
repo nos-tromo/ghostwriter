@@ -45,7 +45,7 @@ OUTPUT_ID = "0" * 32
 UPLOAD_ID = "1" * 32
 NOT_FOUND = {"detail": "not found"}
 
-#: The eight workspace tools of the contract: name, description and input properties.
+#: The nine workspace tools of the contract: name, description and input properties.
 CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
     "list_files": ("List the files in the chat's folder.", {"path": {"type": "string"}}),
     "read_document": ("Read a document as text.", {"path": {"type": "string"}}),
@@ -55,6 +55,10 @@ CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
     "fill_template": ("Fill a template's fields.", {"path": {"type": "string"}, "values": {"type": "object"}}),
     "write_table": ("Write a table as csv or xlsx.", {"name": {"type": "string"}, "rows": {"type": "array"}}),
     "write_document": ("Write a document.", {"name": {"type": "string"}, "text": {"type": "string"}}),
+    "write_presentation": (
+        "Build a presentation in a slide master.",
+        {"path": {"type": "string"}, "name": {"type": "string"}, "slides": {"type": "array"}},
+    ),
 }
 
 _ROUTES = frozenset({("POST", "/mcp"), ("POST", "/files/upload"), ("GET", "/files/view"), ("DELETE", "/files/chat")})
@@ -111,7 +115,7 @@ def tools_result() -> dict[str, Any]:
     """Return workbench's ``tools/list`` result for the ghostwriter caller.
 
     Returns:
-        The result, the eight contract tools by name, as workbench lists them, cached for 300 s.
+        The result, the nine contract tools by name, as workbench lists them, cached for 300 s.
     """
     tools = [
         {
@@ -660,7 +664,7 @@ PLAIN_RESULT = ToolResult('{"text": "Umsatz 42"}', ())
 
 
 def contract_tools() -> tuple[McpTool, ...]:
-    """Return the eight contract tools as discovery hands them out.
+    """Return the nine contract tools as discovery hands them out.
 
     Returns:
         The tools, in workbench's order.
@@ -764,7 +768,7 @@ class FakeWorkbench:
 
         Args:
             answers: The calls' answers, in order.
-            tools: The tools discovery finds; the eight contract tools when omitted, none
+            tools: The tools discovery finds; the nine contract tools when omitted, none
                 at all (``()``) for a workbench that is not usable.
             audit: The audit whose log :attr:`sent_after` reads.
         """

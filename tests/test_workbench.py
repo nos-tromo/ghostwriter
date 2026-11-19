@@ -140,6 +140,7 @@ def test_discovery_offers_the_tools_workbench_lists() -> None:
         "run_python",
         "search_files",
         "write_document",
+        "write_presentation",
         "write_table",
     ]
     assert door.methods() == ["server/discover", "tools/list"]

@@ -19,6 +19,7 @@ const TOOL_LABELS = new Map<string, { named: Key; unnamed: Key }>([
   ['fill_template', { named: 'trail.fill_template', unnamed: 'trail.fill_template_unnamed' }],
   ['write_table', { named: 'trail.write_table', unnamed: 'trail.write_table_unnamed' }],
   ['write_document', { named: 'trail.write_document', unnamed: 'trail.write_document_unnamed' }],
+  ['write_presentation', { named: 'trail.write_presentation', unnamed: 'trail.write_presentation_unnamed' }],
 ])
 
 /** A step's status as the shared status marker draws it, and its name. */

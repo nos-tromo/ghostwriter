@@ -27,7 +27,7 @@ from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
-from ghostwriter.workbench import CallFor, McpTool, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
+from ghostwriter.workbench import CallFor, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
 from tests.conftest import KEY, make_settings
 from tests.fakes import (
     Chunk,
@@ -206,12 +206,6 @@ def _router_error() -> openai.APIConnectionError:
     return openai.APIConnectionError(request=httpx2.Request("POST", "http://router.test/v1/chat/completions"))
 
 
-def _presentation_tool() -> McpTool:
-    """Return the tool workbench 0.6 adds, as discovery hands it out."""
-    schema = {"type": "object", "properties": {"name": {"type": "string"}, "slides": {"type": "array"}}}
-    return McpTool("write_presentation", "Build a presentation in a slide master.", schema)
-
-
 def _then(effect: Callable[[], object], answer: ToolResult | ToolFailure) -> Callable[[], ToolResult | ToolFailure]:
     """Return a call's answer that first has an effect, as time passing or a stop while it runs."""
 
@@ -366,7 +360,7 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     assert loop_env.workbench.calls == [] and _steps(events) == []
     assistant, unknown, bad = loop_env.sent(2)[-3:]
     names = "fill_template, inspect_template, list_files, read_document, run_python, search_files, "
-    names += "write_document, write_table"
+    names += "write_document, write_presentation, write_table"
     assert json.loads(unknown["content"]) == {
         "error": "unknown_tool",
         "detail": f"there is no tool named 'delete_everything'; the tools you can call are {names}.",
@@ -385,7 +379,6 @@ def test_a_call_cut_at_the_length_limit_says_so(loop_env: LoopEnv) -> None:
         call_chunk(0, "call_0", "write_presentation", '{"name": "deck", "slides": [{"title": "Q1", "bullets": ["a'),
         finish_chunk("length"),
     ]
-    loop_env.workbench = FakeWorkbench(tools=(*contract_tools(), _presentation_tool()), audit=loop_env.audit)
     events = loop_env.run(cut, [text_chunk("Ich fasse mich kürzer.")])
     assert loop_env.workbench.calls == [] and _steps(events) == []
     assistant, answer = loop_env.sent(2)[-2:]
@@ -427,11 +420,11 @@ def test_the_loop_sets_presentations_from_the_offered_tools(loop_env: LoopEnv) -
     """Only a workbench that offers write_presentation gets the outline-first rule in the prompt."""
     rule = "write_presentation only in a later message"
     loop_env.run([text_chunk("Hallo!")])
-    assert rule not in loop_env.sent(1)[0]["content"]
-    offering = FakeWorkbench(tools=(*contract_tools(), _presentation_tool()), audit=loop_env.audit)
-    loop_env.run([text_chunk("Hallo!")], workbench=offering)
-    system = loop_env.fake.calls[-1]["messages"][0]["content"]
+    system = loop_env.sent(1)[0]["content"]
     assert rule in system and f"This chat's files are in {FOLDER};" in system
+    without = tuple(tool for tool in contract_tools() if tool.name != "write_presentation")
+    loop_env.run([text_chunk("Hallo!")], workbench=FakeWorkbench(tools=without, audit=loop_env.audit))
+    assert rule not in loop_env.fake.calls[-1]["messages"][0]["content"]
 
 
 def test_a_call_id_the_record_cannot_hold_is_refused(loop_env: LoopEnv) -> None:
