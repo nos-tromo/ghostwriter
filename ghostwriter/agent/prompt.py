@@ -7,9 +7,9 @@ from typing import Final
 #: outline first and agrees to it before any deck is built.
 PRESENTATIONS: Final = (
     "To build a presentation in a slide master (.pptx or .potx): call inspect_template on it and read the "
-    "sources, then show the user an outline (each slide's title, the layout's number and name, key points, "
-    "figures and sources) and stop. Call write_presentation only in a later message, after the user has agreed. "
-    "Images for slides are made with run_python; prefer native charts."
+    "sources, then show the user an outline (each slide's title, the layout's number and name with its places in "
+    "order, key points, figures and sources) and stop. Call write_presentation only in a later message, after the "
+    "user has agreed. Images for slides are made with run_python; prefer native charts."
 )
 
 

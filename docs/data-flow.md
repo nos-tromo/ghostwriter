@@ -36,7 +36,7 @@ Logs hold ids, counts, statuses and tokens only.
 
 | To | What | Under |
 |---|---|---|
-| The router, chat (`OPENAI_API_BASE`) | the system prompt (the date and, with tools, the chat's folder and the file period), the message with its attachments by name, path and size, the turn's tool calls and results, and earlier turns within the budget | `X-Cache-Scope` (an HMAC of the account under a key that never leaves the process, new at each start), `X-Request-ID` |
+| The router, chat (`OPENAI_API_BASE`) | the system prompt (the date and, with tools, the chat's folder and the file period; when workbench offers `write_presentation`, also a fixed rule on presentations, which holds no data), the message with its attachments by name, path and size, the turn's tool calls and results, and earlier turns within the budget | `X-Cache-Scope` (an HMAC of the account under a key that never leaves the process, new at each start), `X-Request-ID` |
 | The router, speech-to-text | the recording | the same |
 | workbench `/mcp` | tool arguments; results back | `X-User-Id` and `X-Session-Id`: HMAC-SHA256 of the account and of the chat id under `WORKBENCH_API_KEY`; the purpose (or `ghostwriter chat`), `X-Request-ID` |
 | workbench `/files/upload`, `/files/view` | an attachment's bytes, a download's bytes | the same |

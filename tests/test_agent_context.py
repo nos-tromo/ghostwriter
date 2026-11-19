@@ -22,7 +22,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import system_prompt
+from ghostwriter.agent.prompt import PRESENTATIONS, system_prompt
 from ghostwriter.agent.tools import (
     REFUSALS,
     Refusal,
@@ -435,11 +435,18 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
 
 
 def test_the_presentation_sentence_comes_with_the_tool() -> None:
-    """The outline-first rule is in the prompt only when write_presentation is offered and tools are."""
-    rule = "write_presentation only in a later message"
+    """The outline-first rule is in the prompt only when write_presentation is offered and tools are.
+
+    The outline names each layout's places in order, which the deck is then built in.
+    """
+    assert PRESENTATIONS == (
+        "To build a presentation in a slide master (.pptx or .potx): call inspect_template on it and read the "
+        "sources, then show the user an outline (each slide's title, the layout's number and name with its places "
+        "in order, key points, figures and sources) and stop. Call write_presentation only in a later message, "
+        "after the user has agreed. Images for slides are made with run_python; prefer native charts."
+    )
     with_tool = system_prompt(today=date(2026, 11, 16), folder=FOLDER, file_days=7, expired=False, presentations=True)
-    assert rule in with_tool and "call inspect_template on it and read the sources" in with_tool
-    assert rule not in SYSTEM
-    assert with_tool.startswith(SYSTEM)
+    assert with_tool == f"{SYSTEM} {PRESENTATIONS}"
+    assert PRESENTATIONS not in SYSTEM
     bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False, presentations=True)
-    assert "write_presentation" not in bare
+    assert bare == system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
