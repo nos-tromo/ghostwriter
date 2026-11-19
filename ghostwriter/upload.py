@@ -32,6 +32,8 @@ ATTACHMENT_TYPES: Final[dict[str, str]] = {
     ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     ".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    ".potx": "application/vnd.openxmlformats-officedocument.presentationml.template",
+    ".dotx": "application/vnd.openxmlformats-officedocument.wordprocessingml.template",
     ".csv": "text/csv",
     ".json": "application/json",
     ".jsonl": "application/x-ndjson",

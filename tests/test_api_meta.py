@@ -21,6 +21,7 @@ def test_config_reports_what_the_spa_needs(client: TestClient) -> None:
         "attachment_types": [
             ".csv",
             ".docx",
+            ".dotx",
             ".eml",
             ".htm",
             ".html",
@@ -31,6 +32,7 @@ def test_config_reports_what_the_spa_needs(client: TestClient) -> None:
             ".ods",
             ".odt",
             ".pdf",
+            ".potx",
             ".pptx",
             ".txt",
             ".xlsx",
