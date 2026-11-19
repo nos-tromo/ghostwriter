@@ -7,8 +7,12 @@ arrives, a blank line between two rounds' texts, and the answer stored is exactl
 out. A round that asks for calls runs them in order, at most ``MAX_CALLS_PER_ROUND``: a call
 to a tool not offered, with arguments that are not an object or an id the record cannot hold
 (:data:`CALL_ID`), or without its full timeout left of the message's wall is refused to the
-model and never sent; the last also withdraws the tools for the rest of the message. A call
-workbench answers busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
+model and never sent; the last also withdraws the tools for the rest of the message. A round
+at its cap (its finish reason ``length``, or its output tokens at its ``max_tokens``: vLLM says
+``tool_calls`` once a call's name streamed, at the cap too) may have cut its last call: that
+call, its arguments not an object or empty, is refused as cut, and the model reads to make them
+shorter. Without a usage count, only the finish reason tells the cap. A call workbench answers
+busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
 Every call is disclosed before it is sent, and every round recorded after it ends.
 
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
@@ -36,11 +40,13 @@ from loguru import logger
 from ghostwriter.agent.context import fit
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
+    MAX_ANSWER_TOKENS,
     MAX_CALLS_PER_ROUND,
     MAX_RESULTS_PER_MESSAGE,
     MAX_TOOL_ROUNDS,
     MESSAGE_WALL_S,
     PROMPT_TOKENS,
+    REASONING_ANSWER_TOKENS,
     REASONING_PROMPT_TOKENS,
     TOOL_CUTOFF_S,
 )
@@ -328,6 +334,7 @@ class AgentLoop:
             presentations="write_presentation" in names,
         )
         budget = REASONING_PROMPT_TOKENS if turn.reasoning else PROMPT_TOKENS
+        cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
         current: list[dict[str, Any]] = [{"role": "user", "content": text}]
         round_no = 0
@@ -373,12 +380,14 @@ class AgentLoop:
             audit.model_called(round=round_no, done=done, outcome="ok")
             if done.stopped or not done.calls or not tools or workbench is None:
                 return
+            # vLLM ends a round in which a call's name streamed with "tool_calls", at the cap too: the usage tells.
+            at_cap = done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
             calls: list[dict[str, Any]] = []
             answers: list[dict[str, Any]] = []
             for index, call in enumerate(done.calls):
                 if turn.cancel.is_set():
                     return
-                cut = done.finish_reason == "length" and index == len(done.calls) - 1
+                cut = at_cap and index == len(done.calls) - 1
                 outcome = yield from self._call(turn, audit, message, workbench, call, index, round_no, names, cut)
                 call_id = call.id if CALL_ID.fullmatch(call.id) else f"call_{uuid4().hex}"
                 calls.append(
@@ -402,8 +411,8 @@ class AgentLoop:
             call: The call.
             index: Its place in the round.
             names: The tools offered.
-            cut: Whether the round ended at the answer's length limit with this call the last, so its
-                arguments may be half written.
+            cut: Whether the round ended at its cap with this call the last, so its arguments may be half
+                written, or not begun when it was cut right after its name.
 
         Returns:
             The arguments to send, or why the call is not sent.
@@ -414,7 +423,7 @@ class AgentLoop:
             text = REFUSALS["unknown_tool"].format(name=call.name, names=", ".join(names) or "none")
             return Refusal("unknown_tool", text)
         arguments = parse_arguments(call.arguments)
-        if arguments is None and cut:
+        if cut and (arguments is None or not call.arguments.strip()):
             return Refusal("cut_arguments", CUT_ARGUMENTS.format(tool=call.name))
         if arguments is None or not CALL_ID.fullmatch(call.id):
             return Refusal("bad_arguments", REFUSALS["bad_arguments"].format(name=call.name))
