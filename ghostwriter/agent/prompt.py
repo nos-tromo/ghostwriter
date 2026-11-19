@@ -4,9 +4,11 @@ from datetime import date
 from typing import Final
 
 #: The rule for a presentation, given only when workbench offers ``write_presentation``: the user sees an
-#: outline first and agrees to it before any deck is built.
+#: outline first and agrees to it before any deck is built, in the user's slide master or, with none in the chat,
+#: in workbench's plain one.
 PRESENTATIONS: Final = (
-    "To build a presentation in a slide master (.pptx or .potx): call inspect_template on it and read the "
+    "To build a presentation, use the user's slide master (.pptx or .potx) if the chat has one, else the plain "
+    "16:9 master (leave path out of inspect_template and write_presentation). Call inspect_template and read the "
     "sources, then show the user an outline (each slide's title, the layout's number and name with its places in "
     "order, key points, figures and sources) and stop. Call write_presentation only in a later message, after the "
     "user has agreed. Images for slides are made with run_python; prefer native charts."
