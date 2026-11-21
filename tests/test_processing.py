@@ -12,6 +12,7 @@ from typing import Any, Literal
 import anyio
 import httpx
 import pytest
+from loguru import logger
 from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
@@ -259,3 +260,76 @@ async def test_a_chat_whose_delete_failed_is_prepared_again(env: Env, audit_stre
     assert len(_prepares(env.door)) == 2
     handed = [e for e in events(audit_stream) if e["operation"] == "chat.attachment"]
     assert [e["criteria"] for e in handed] == [{"kind": "image", "requeued": True}] * 2
+
+
+def _sized(env: Env, job: PrepareJob, width: int, height: int) -> None:
+    """Have the door report the job's picture at ``width`` x ``height``."""
+    manifest = stock_manifest(job.path)
+    env.door.manifests[job.path] = {
+        **manifest,
+        "renditions": [{**manifest["renditions"][0], "width": width, "height": height}],
+    }
+
+
+@pytest.mark.parametrize(
+    ("image_tokens", "width", "height", "strips"),
+    [
+        (280, 2048, 1536, [None, "2"]),
+        (280, 1536, 2048, [None, "2"]),
+        (280, 1024, 768, [None]),
+        (None, 2048, 1536, [None]),
+    ],
+)
+async def test_a_large_picture_at_a_fixed_cost_gets_its_strips_cut_before_it_is_ready(
+    env: Env,
+    audit_stream: CapturedAuditStream,
+    image_tokens: int | None,
+    width: int,
+    height: int,
+    strips: list[str | None],
+) -> None:
+    """With a fixed image cost, a picture whose long side is over 1024 is prepared once more with ``strips=2``."""
+    job = _job(env)
+    _sized(env, job, width, height)
+    workbench = WorkbenchClient(env.settings, transport=httpx.MockTransport(env.door))
+    processor = AttachmentProcessor(env.store, workbench, env.emitter, image_tokens=image_tokens)
+    try:
+        processor.submit(job)
+        await processor.wait(job.attachment_id, 5)
+    finally:
+        await processor.aclose()
+    assert [request.url.params.get("strips") for request in _prepares(env.door)] == strips
+    assert _status(env, job) == ("ready", None)
+    found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
+    assert found is not None and found.manifest is not None
+    assert (found.manifest["renditions"][0]["width"], found.manifest["renditions"][0]["height"]) == (width, height)
+    handed = [e for e in events(audit_stream) if e["operation"] == "chat.attachment"]
+    assert [(e["action"], e["outcome"]) for e in handed] == [("disclose", "ok")]
+
+
+async def test_a_failed_strips_prepare_leaves_the_picture_ready(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """The strips request answers 503: it is not tried again, the picture is ready, and the log names the token only."""
+    job = _job(env)
+    _sized(env, job, 2048, 1536)
+    asked: list[str] = []
+
+    def busy_on_strips(folder: str) -> httpx.Response | None:
+        asked.append(folder)
+        return None if len(asked) == 1 else httpx.Response(503, json={"detail": "busy"})
+
+    env.door.answers["/files/prepare"] = busy_on_strips
+    workbench = WorkbenchClient(env.settings, transport=httpx.MockTransport(env.door))
+    processor = AttachmentProcessor(env.store, workbench, env.emitter, image_tokens=280)
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)), level="DEBUG")
+    try:
+        processor.submit(job)
+        await processor.wait(job.attachment_id, 5)
+    finally:
+        logger.remove(sink)
+        await processor.aclose()
+    assert [request.url.params.get("strips") for request in _prepares(env.door)] == [None, "2"]
+    assert _status(env, job) == ("ready", None)
+    assert any("http:503" in line and job.attachment_id in line for line in lines)
+    assert not any("harbour-photo" in line or job.path in line for line in lines)
+    assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []

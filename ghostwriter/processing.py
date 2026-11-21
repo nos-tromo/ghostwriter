@@ -5,7 +5,11 @@ offered) is stored ``processing`` and handed to :class:`AttachmentProcessor`: as
 process, at most :data:`PREPARE_SLOTS` of them preparing at once. A job marks the chat's files, records
 the hand-over, has workbench prepare the file (``POST /files/prepare``, idempotent) and keeps its
 manifest: the attachment is then ``ready``. A busy or slow workbench (``http:503``, ``timeout``) is asked
-once more after :data:`PREPARE_RETRY_S`. A prepare that fails is recorded as an ``error`` child, and the
+once more after :data:`PREPARE_RETRY_S`. At a fixed image cost (``image_tokens``), a picture that goes to
+the model as two strips (:func:`~ghostwriter.agent.images.strips_for_image`) is prepared once more with
+``strips=2`` before it is ``ready``, so its first turn finds the strips cut. That request is not tried
+again; its failure is logged by its token and the picture is still ``ready``, for the turn has workbench
+cut the strips as it views them. A prepare that fails is recorded as an ``error`` child, and the
 attachment settles as its kind allows: a picture cannot be seen unprepared and goes ``failed`` with the
 token; a document still reads as text and goes ``ready`` without a manifest. So no attachment stays
 ``processing``, which would hold its message back (409), once its job has ended.
@@ -34,6 +38,7 @@ import anyio
 import anyio.to_thread
 from loguru import logger
 
+from ghostwriter.agent.images import strips_for_image
 from ghostwriter.audit import Operation, forward_headers, system_operation
 from ghostwriter.store import AttachmentRef, ChatNotFound, ChatStore
 from ghostwriter.utils.audit_event import AuditEmitter, Target
@@ -102,13 +107,18 @@ class AttachmentProcessor:
         store: The chats.
         workbench: The client.
         emitter: The process's audit chain, for the jobs requeued at start.
+        image_tokens: The fixed cost of an image (``Settings.image_tokens``), which sets a picture's
+            strips; ``None`` counts images by their pixels, and no strips are cut.
     """
 
-    def __init__(self, store: ChatStore, workbench: WorkbenchClient, emitter: AuditEmitter) -> None:
+    def __init__(
+        self, store: ChatStore, workbench: WorkbenchClient, emitter: AuditEmitter, *, image_tokens: int | None = None
+    ) -> None:
         """Start with no job."""
         self._store = store
         self._workbench = workbench
         self._emitter = emitter
+        self._image_tokens = image_tokens
         self._slots = asyncio.Semaphore(PREPARE_SLOTS)
         self._running: dict[str, _Running] = {}
         self._closed = False
@@ -363,6 +373,8 @@ class AttachmentProcessor:
                 "Attachment '{}' ({}): the prepare raised {}", job.attachment_id, job.kind, type(exc).__name__
             )
             return "error"
+        if job.kind == "image":
+            await self._cut_strips(call, job, manifest)
         try:
             settled = await anyio.to_thread.run_sync(
                 partial(
@@ -386,6 +398,34 @@ class AttachmentProcessor:
         else:
             logger.debug("Attachment '{}' ({}) was prepared; its row is gone or settled.", job.attachment_id, job.kind)
         return None
+
+    async def _cut_strips(self, call: CallFor, job: PrepareJob, manifest: Manifest) -> None:
+        """Have workbench cut a picture's strips now, when it goes to the model as more than one.
+
+        Asked once, never again: the prepare is idempotent, and a turn that finds no strips has them
+        cut as it views them. Never raises but a cancel.
+
+        Args:
+            call: The chat.
+            job: The picture.
+            manifest: What its prepare answered; its first rendition's size sets the strips.
+        """
+        size = next(((r.width, r.height) for r in manifest.renditions if r.n == 1), None)
+        strips = 1 if size is None else strips_for_image(size[0], size[1], fixed=self._image_tokens)
+        if strips == 1:
+            return
+        try:
+            await self._workbench.prepare(call=call, path=job.path, strips=strips)
+        except WorkbenchUnavailable as exc:
+            token = exc.token
+        except StorageFull:
+            token = "storage_full"
+        except Exception as exc:
+            token = type(exc).__name__
+        else:
+            logger.debug("Attachment '{}': its {} strips were cut.", job.attachment_id, strips)
+            return
+        logger.info("Attachment '{}': its strips were not cut ({}); the turn cuts them.", job.attachment_id, token)
 
     async def _ask(self, call: CallFor, path: str) -> Manifest:
         """Prepare the file, once more after :data:`PREPARE_RETRY_S` when workbench was busy or slow.

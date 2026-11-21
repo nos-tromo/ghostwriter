@@ -129,7 +129,7 @@ def create_app(
             store.apply_periods(settings.chat_days)
             workbench: WorkbenchClient | None = app.state.workbench
             if workbench is not None:
-                processor = AttachmentProcessor(store, workbench, emitter)
+                processor = AttachmentProcessor(store, workbench, emitter, image_tokens=settings.image_tokens)
                 processor.requeue()
             elif settled := store.settle_processing("unavailable"):
                 logger.info("{} attachments left processing were settled without workbench.", settled)
