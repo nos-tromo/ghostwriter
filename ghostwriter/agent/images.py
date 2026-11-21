@@ -305,6 +305,24 @@ def ref_places(messages: Sequence[dict[str, Any]], *, origin: str) -> list[tuple
     ]
 
 
+def newest_tool_images(messages: Sequence[dict[str, Any]]) -> dict[str, Any] | None:
+    """Return the message that carries the latest round's tool images, which the model has not seen yet.
+
+    A round's tool images follow its tool messages as the turn's last message, until the next
+    round. Once a round whose results hold no image follows, no tool image is the newest.
+
+    Args:
+        messages: The current turn's messages, in order (a system message before them changes nothing).
+
+    Returns:
+        The last message, when it holds a tool image's ref; else ``None``.
+    """
+    if not messages:
+        return None
+    last = messages[-1]
+    return last if any(is_ref(part) and part.get("origin") == "tool" for part in parts_of(last)) else None
+
+
 def siblings(message: Mapping[str, Any], index: int) -> list[int]:
     """Return the refs of a message that show the same picture as one of them: its strips.
 
@@ -401,9 +419,9 @@ def retire_tool_images(current: list[dict[str, Any]], bank: ImageBank, *, keep: 
     """Retire the current turn's tool images but the newest ``keep``, oldest first and whole pictures, in place.
 
     Each becomes a note in its message and leaves the bank: :data:`RETIRED` for an image the model
-    has been shown, and :data:`UNSEEN` for one of the newest tool images (those of the last message
-    that holds any), which it never was. A picture's strips go together, so a few more may go than
-    ``keep`` asks. Attached images stay.
+    has been shown, and :data:`UNSEEN` for one of the newest tool images (:func:`newest_tool_images`),
+    which it never was. A picture's strips go together, so a few more may go than ``keep`` asks.
+    Attached images stay.
 
     Args:
         current: The current turn's messages.
@@ -411,7 +429,7 @@ def retire_tool_images(current: list[dict[str, Any]], bank: ImageBank, *, keep: 
         keep: How many of the newest tool images stay.
     """
     places = ref_places(current, origin="tool")
-    newest = places[-1][0] if places else None
+    newest = newest_tool_images(current)
     over = len(places) - keep
     for message, index in places:
         if over <= 0:

@@ -664,6 +664,23 @@ def test_old_tool_results_are_cleared_before_the_newest_tool_images_give_way() -
     assert estimate_tokens(_labelled(fitted)) + 280 <= budget
 
 
+def test_a_seen_image_gives_way_to_a_later_rounds_text_result() -> None:
+    """After a round whose result has no image, no tool image is newest: the seen page retires, the text stays."""
+    images = ImageBudget(fixed=280, max_images=8)
+    call = {"id": "call_1", "type": "function", "function": {"name": "read_document", "arguments": "{}"}}
+    current: list[dict[str, Any]] = [
+        _user("Sieh dir Seite 2 an und lies dann den Bericht"),
+        *_viewed("call_0", [PAGE]),
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "1" * 3_000},
+    ]
+    budget = _text_tokens(current) + 280 - 1
+    fitted = fit(SYSTEM, [], [], current, budget=budget, images=images)
+    assert fitted[4]["content"][1] == note(current[3]["content"][1], RETIRED) and refs(fitted) == []
+    assert [m["content"] for m in fitted if m["role"] == "tool"] == ["0" * 100, "1" * 3_000]
+    assert estimate_tokens(fitted) <= budget
+
+
 def test_the_image_cap_holds_across_the_request() -> None:
     """At most three: an earlier round's image retires, the question's last gives way, the newest round's two stay."""
     photos = (_photo(1, "harbour-photo.jpg"), _photo(2, "quay-photo.jpg"))

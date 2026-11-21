@@ -18,6 +18,7 @@ from ghostwriter.agent.images import (
     attachment_parts,
     estimate_image_tokens,
     materialise,
+    newest_tool_images,
     refs,
     retire_tool_images,
     siblings,
@@ -186,6 +187,22 @@ def test_retire_tool_images_keeps_the_newest() -> None:
     )
     assert UNSEEN.format(label="x") == "[Image: x; not shown, there is no room for it in this request]"
     assert current[0] is question and len(refs([question])) == 1
+
+
+def test_tool_images_are_newest_only_while_their_message_ends_the_turn() -> None:
+    """The last message's tool images are the newest; once a round without images follows, none are."""
+    shown, bank = tool_image_message([("view_file", "call_0", [PAGE])])
+    current = [_question(PHOTO), shown]
+    assert newest_tool_images(current) is shown
+    assert newest_tool_images([_question(PHOTO)]) is None and newest_tool_images([]) is None
+    read = {"id": "call_1", "type": "function", "function": {"name": "read_document", "arguments": "{}"}}
+    current += [
+        {"role": "assistant", "content": "", "tool_calls": [read]},
+        {"role": "tool", "tool_call_id": "call_1", "content": "Umsatz 42"},
+    ]
+    assert newest_tool_images(current) is None
+    retire_tool_images(current, bank, keep=0)
+    assert shown["content"][1] == _text(RETIRED.format(label="quay-scan.pdf, page 2")) and bank == {}
 
 
 def test_a_tool_pages_strips_share_their_picture_and_retire_together() -> None:

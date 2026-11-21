@@ -13,14 +13,15 @@ With an :class:`~ghostwriter.agent.images.ImageBudget`, an image ref counts as i
 characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a request carries
 at most ``max_images``. While the current turn is over the budget or the cap, the tool images
 of its earlier rounds retire first, oldest first; past the cap, the question's own images give
-way, last first, so the newest tool images (the last message that holds any), which the model
-has not seen yet, stay within the cap. Then tool results are cleared and arguments cut, and only
-while still over do the newest tool images give way, oldest first: the images the model just
-asked for outrank text it has already read. Each image leaves a note in its place, and a
-picture's strips give way together. An earlier turn with images is replayed with them while the
-budget and the cap allow, else with a note per image that ``view_file`` shows it; a tool image
-is never replayed. Without an image budget, an earlier turn is replayed as its text, as before,
-and the current turn must hold no image ref.
+way, last first, so the newest tool images (the latest round's, while they end the turn: see
+:func:`~ghostwriter.agent.images.newest_tool_images`), which the model has not seen yet, stay
+within the cap; after a round without images, every tool image is an earlier round's. Then tool
+results are cleared and arguments cut, and only while still over do the newest tool images give
+way, oldest first: the images the model just asked for outrank text it has already read. Each
+image leaves a note in its place, and a picture's strips give way together. An earlier turn with
+images is replayed with them while the budget and the cap allow, else with a note per image that
+``view_file`` shows it; a tool image is never replayed. Without an image budget, an earlier turn
+is replayed as its text, as before, and the current turn must hold no image ref.
 """
 
 import math
@@ -41,6 +42,7 @@ from ghostwriter.agent.images import (
     attachment_parts,
     estimate_image_tokens,
     is_ref,
+    newest_tool_images,
     note,
     parts_of,
     ref_places,
@@ -405,7 +407,7 @@ def fit(
         return size.tokens() + fixed > budget or (images is not None and size.images > images.max_images)
 
     tool_places = ref_places(kept, origin="tool")
-    newest = tool_places[-1][0] if tool_places else None
+    newest = newest_tool_images(kept)
 
     def give_way(message: dict[str, Any], index: int, template: str, **values: Any) -> None:
         if is_ref(message["content"][index]):
