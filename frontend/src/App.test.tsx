@@ -66,12 +66,12 @@ describe('App', () => {
     expect(drop.defaultPrevented).toBe(true)
   })
 
-  it('presents the chat assistant first in the page title', async () => {
+  it('names the app alone in the page title, as its sibling apps do', async () => {
     // What the browser shows before the SPA has loaded.
-    expect(/<title>(.*)<\/title>/.exec(indexHtml)?.[1]).toBe('Ghostwriter · Chat assistant')
+    expect(/<title>(.*)<\/title>/.exec(indexHtml)?.[1]).toBe('Ghostwriter')
     render(<App />)
     await screen.findAllByRole('banner')
-    expect(document.title).toBe('Ghostwriter · Chat assistant')
+    expect(document.title).toBe('Ghostwriter')
   })
 
   it('shows no purpose bar where the deployment requires no purpose', async () => {
@@ -88,7 +88,7 @@ describe('App', () => {
     const [header] = await screen.findAllByRole('banner')
 
     expect(document.documentElement.lang).toBe('de')
-    expect(document.title).toBe('Ghostwriter · Chatassistent')
+    expect(document.title).toBe('Ghostwriter')
     expect(within(header).getByRole('button', { name: 'Zweck erforderlich' })).toBeInTheDocument()
     expect(within(header).getByText('v0.1.0')).toBeInTheDocument()
     expect(await within(header).findByRole('button', { name: /user-a/ })).toBeInTheDocument()

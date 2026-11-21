@@ -1,6 +1,6 @@
 export const en = {
   // the page
-  'app.title': 'Ghostwriter · Chat assistant',
+  'app.title': 'Ghostwriter',
 
   // appheader
   'appheader.home': 'Apps',
