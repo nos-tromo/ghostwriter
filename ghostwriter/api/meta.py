@@ -10,7 +10,8 @@ from ghostwriter.audit import required_endpoint_actions
 from ghostwriter.config import Settings
 from ghostwriter.identity import Principal, trusted_identity
 from ghostwriter.inference import MAX_RECORDING_BYTES, MAX_RECORDING_S
-from ghostwriter.upload import ATTACHMENT_TYPES
+from ghostwriter.upload import ATTACHMENT_TYPES, IMAGE_TYPES
+from ghostwriter.vision import Vision
 from ghostwriter.workbench import MAX_ATTACHMENT_BYTES
 
 router = APIRouter(prefix="/api", tags=["Metadata"])
@@ -51,7 +52,12 @@ class ConfigOut(BaseModel):
         require_purpose: The actions of these routes that need a stated purpose, sorted.
         speech_input: Whether dictation is offered.
         attachments: Whether files can be attached, that is whether workbench is configured.
-        attachment_types: The extensions an attachment may have, sorted.
+        attachment_types: The extensions an attachment may have, sorted; the picture types too while
+            pictures are offered.
+        image_types: The picture extensions, sorted; empty unless pictures are offered.
+        max_images: The most images one request carries.
+        vision: Whether pictures are offered: ``GHOSTWRITER_VISION`` is on, the chat model can see and
+            workbench lists ``view_file``.
         max_attachment_bytes: The largest attachment.
         max_recording_s: The longest recording; the recorder stops there.
         max_recording_bytes: The largest recording.
@@ -65,6 +71,9 @@ class ConfigOut(BaseModel):
     speech_input: bool
     attachments: bool
     attachment_types: list[str]
+    image_types: list[str]
+    max_images: int
+    vision: bool
     max_attachment_bytes: int
     max_recording_s: int
     max_recording_bytes: int
@@ -78,7 +87,9 @@ def config(request: Request) -> ConfigOut:
     """Return the deployment's switches, limits and periods.
 
     Unauthenticated and not audited, as translator's and docint's: it describes the deployment,
-    never a caller or their data, and the SPA reads it first.
+    never a caller or their data, and the SPA reads it first. Whether pictures are offered reads
+    workbench's cached discovery, so a request waits for one at most once per cache window; the route
+    runs on a pool thread for that.
 
     Args:
         request: The request.
@@ -87,12 +98,17 @@ def config(request: Request) -> ConfigOut:
         The configuration in force.
     """
     settings: Settings = request.app.state.settings
+    vision: Vision = request.app.state.vision
+    offered = vision.images_offered(request.app.state.workbench)
     return ConfigOut(
         ui_language=settings.ui_language,
         require_purpose=required_endpoint_actions(settings),
         speech_input=settings.speech_input,
         attachments=settings.workbench_enabled,
-        attachment_types=sorted(ATTACHMENT_TYPES),
+        attachment_types=sorted({**ATTACHMENT_TYPES, **IMAGE_TYPES} if offered else ATTACHMENT_TYPES),
+        image_types=sorted(IMAGE_TYPES) if offered else [],
+        max_images=settings.max_images,
+        vision=offered,
         max_attachment_bytes=MAX_ATTACHMENT_BYTES,
         max_recording_s=MAX_RECORDING_S,
         max_recording_bytes=MAX_RECORDING_BYTES,

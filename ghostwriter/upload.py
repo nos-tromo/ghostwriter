@@ -8,8 +8,11 @@ body that is no such form, or ends inside the part, is :class:`BadUpload`. The f
 as a browser writes it, its ``%22``, ``%0A`` and ``%0D`` undone.
 
 An attachment's type is decided by its extension alone, in any case, through
-:data:`ATTACHMENT_TYPES` to the MIME type sent on; its name is :func:`safe_filename`'s, and
-:func:`name_problem` refuses what workbench would.
+:data:`ATTACHMENT_TYPES` to the MIME type sent on, and through :data:`IMAGE_TYPES` for a picture
+while pictures are offered; its name is :func:`safe_filename`'s, and :func:`name_problem` refuses
+what workbench would. :func:`attachment_kind` says whether a name is a picture, and
+:func:`needs_prepare` whether workbench prepares it (renders its pages or its picture) once
+it is stored.
 """
 
 import re
@@ -17,7 +20,7 @@ import unicodedata
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator
 from dataclasses import dataclass, field
-from typing import Final
+from typing import Final, Literal
 
 from python_multipart import MultipartParser
 from python_multipart.exceptions import FormParserError
@@ -46,6 +49,22 @@ ATTACHMENT_TYPES: Final[dict[str, str]] = {
     ".html": "text/html",
     ".htm": "text/html",
 }
+#: The pictures an attachment may be while pictures are offered, by extension (never ``.svg``), and the MIME
+#: type each is sent on as.
+IMAGE_TYPES: Final[dict[str, str]] = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".bmp": "image/bmp",
+    ".tif": "image/tiff",
+    ".tiff": "image/tiff",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
+}
+#: The extensions workbench prepares once a file is stored: a pdf and every picture.
+PREPARED_SUFFIXES: Final = frozenset({".pdf", *IMAGE_TYPES})
 #: The most attachments a chat may hold before a message sends them.
 MAX_PENDING: Final = 10
 #: The longest file name, in characters and in UTF-8 bytes, as workbench takes it.
@@ -121,17 +140,56 @@ def safe_filename(raw: str) -> str | None:
     return stem + extension if stem else None
 
 
-def attachment_type(name: str) -> str | None:
-    """Return the MIME type an attachment of this name is sent on as, by its extension in any case.
+def _suffix(name: str) -> str:
+    """Return a name's extension in lower case with its dot, or ``""`` when it has none or no stem.
 
     Args:
         name: A name :func:`safe_filename` returned.
 
     Returns:
-        The type, or ``None`` when the extension is not in :data:`ATTACHMENT_TYPES`.
+        The extension, such as ``.pdf``.
     """
     stem, dot, extension = name.rpartition(".")
-    return ATTACHMENT_TYPES.get(f".{extension.lower()}") if dot and stem else None
+    return f".{extension.lower()}" if dot and stem else ""
+
+
+def attachment_type(name: str, *, images: bool = False) -> str | None:
+    """Return the MIME type an attachment of this name is sent on as, by its extension in any case.
+
+    Args:
+        name: A name :func:`safe_filename` returned.
+        images: Whether pictures are offered, so that :data:`IMAGE_TYPES` count too.
+
+    Returns:
+        The type, or ``None`` when the extension is not in :data:`ATTACHMENT_TYPES` or, while ``images``
+        is off, in :data:`IMAGE_TYPES`.
+    """
+    suffix = _suffix(name)
+    return ATTACHMENT_TYPES.get(suffix) or (IMAGE_TYPES.get(suffix) if images else None)
+
+
+def attachment_kind(name: str) -> Literal["document", "image"]:
+    """Say whether a name is a picture or a document, by its extension in any case.
+
+    Args:
+        name: A name :func:`safe_filename` returned.
+
+    Returns:
+        ``image`` for an extension of :data:`IMAGE_TYPES`, else ``document``.
+    """
+    return "image" if _suffix(name) in IMAGE_TYPES else "document"
+
+
+def needs_prepare(name: str) -> bool:
+    """Say whether workbench prepares a file of this name once it is stored.
+
+    Args:
+        name: A name :func:`safe_filename` returned.
+
+    Returns:
+        Whether the extension is in :data:`PREPARED_SUFFIXES`.
+    """
+    return _suffix(name) in PREPARED_SUFFIXES
 
 
 def name_problem(name: str) -> str | None:

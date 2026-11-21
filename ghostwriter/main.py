@@ -15,8 +15,10 @@ only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns; dictation
 runs on ``app.state.speech_threads``, a limiter of ``SPEECH_THREADS`` threads of
 its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retention`),
 which the lifespan runs a minute after start and then daily, and cancels at
-shutdown. Every request body is capped per route (:mod:`ghostwriter.body_limit`),
-as nginx caps it.
+shutdown. ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
+Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
+waits for, and cancels it at shutdown. Every request body is capped per route
+(:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
 import asyncio
@@ -51,6 +53,7 @@ from ghostwriter.retention_rule import run_retention_loop
 from ghostwriter.store import ChatStore
 from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditWriteError
+from ghostwriter.vision import Vision
 from ghostwriter.workbench import WorkbenchClient
 
 setup_logger()
@@ -65,6 +68,7 @@ def create_app(
     audit_stream: TextIO | None = None,
     workbench_transport: httpx.AsyncBaseTransport | None = None,
     model: ModelClient | None = None,
+    inference_transport: httpx.AsyncBaseTransport | None = None,
     now: Callable[[], datetime] = utcnow,
 ) -> FastAPI:
     """Build the application.
@@ -76,6 +80,8 @@ def create_app(
             ``None`` uses httpx's own.
         model: The chat model (tests pass one over a fake router); the router of the
             settings when omitted.
+        inference_transport: The transport of the Ollama probe (tests pass an ``httpx.MockTransport``);
+            ``None`` uses httpx's own.
         now: The store's clock (tests pass one set by hand).
 
     Returns:
@@ -94,7 +100,8 @@ def create_app(
 
         The store's schema is brought to this release's version and the
         configured periods are put in force before the first request; then
-        the retention sweep starts, and it is cancelled first at shutdown.
+        the retention sweep starts, and the Ollama probe where it applies (start-up
+        does not wait for it); both are cancelled first at shutdown.
 
         Args:
             app: The application being served.
@@ -105,6 +112,7 @@ def create_app(
         emitter = open_emitter(__version__, audit_stream)
         engine: Engine | None = None
         sweeps: asyncio.Task[None] | None = None
+        probe: asyncio.Task[None] | None = None
         try:
             start_chain(app, emitter)
             engine = make_engine(settings.db_path)
@@ -126,12 +134,15 @@ def create_app(
             sweeps = asyncio.create_task(
                 run_retention_loop(app.state.sweeper.sweep, first_delay=FIRST_SWEEP_DELAY_S, interval=SWEEP_INTERVAL_S)
             )
+            if settings.vision and settings.inference_provider == "ollama":
+                probe = asyncio.create_task(app.state.vision.probe(transport=inference_transport))
             yield
         finally:
-            if sweeps is not None:
-                sweeps.cancel()
-                with suppress(asyncio.CancelledError):
-                    await sweeps
+            for task in (probe, sweeps):
+                if task is not None:
+                    task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await task
             if engine is not None:
                 engine.dispose()
             emitter.close()
@@ -153,6 +164,7 @@ def create_app(
         WorkbenchClient(settings, transport=workbench_transport) if settings.workbench_enabled else None
     )
     app.state.turns = TurnRegistry()
+    app.state.vision = Vision(settings)
 
     @app.exception_handler(AuditWriteError)
     async def refuse_unrecorded(request: Request, exc: AuditWriteError) -> JSONResponse:
