@@ -1305,7 +1305,9 @@ class ChatStore:
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
         facts = {
-            attachment.id: attachment_facts(attachment.kind, _loaded_manifest(attachment.render), seen=seen)
+            attachment.id: attachment_facts(
+                attachment.kind, _loaded_manifest(attachment.render), seen=seen, name=attachment.name
+            )
             for attachment in attachments
         }
         return user_content(

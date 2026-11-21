@@ -51,12 +51,14 @@ from tests.fakes import (
     call_chunk,
     image_block,
     reasoning_chunk,
+    stock_manifest,
     text_chunk,
     usage_chunk,
     view_result,
 )
 
 ANSWER: Round = [text_chunk("Summe: 42"), usage_chunk(950, 5, "served-model")]
+PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 RUNNING = (409, {"detail": "An answer is still being written in this chat.", "code": "busy"})
 NOT_FOUND = (404, {"detail": "Chat not found."})
 THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
@@ -494,6 +496,49 @@ def test_a_message_waits_for_its_attachments(
     assert _send(client, cid, attachment_ids=[sheet.id, photo.id]).status_code == 200
     [question, _] = _detail(client, cid)["messages"]
     assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id])
+
+
+def _prompt_users(call: dict[str, Any]) -> list[str]:
+    """Return the text of each user message a model call carried, in order."""
+    texts: list[str] = []
+    for message in call["messages"]:
+        if message["role"] != "user":
+            continue
+        content = message["content"]
+        texts.append(
+            content
+            if isinstance(content, str)
+            else "\n".join(part["text"] for part in content if part.get("type") == "text")
+        )
+    return texts
+
+
+def test_a_message_sends_while_its_deck_is_prepared(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """A deck is ready at once: its message streams, its line has no facts until its manifest is kept, then slides."""
+    cid = _new(client)
+    store = _state(client).store
+    deck = store.add_attachment(
+        cid,
+        file_id=UPLOAD_ID,
+        path=f"{chat_folder(KEY, cid)}/harbour-deck.pptx",
+        name="harbour-deck.pptx",
+        size=48_213,
+        mime=PPTX,
+        kind="document",
+        status="ready",
+    )
+    assert deck.status == "ready"
+    line = f"[Attached: harbour-deck.pptx ({chat_folder(KEY, cid)}/harbour-deck.pptx, 48213 bytes)]"
+    fake_openai.script = [ANSWER, ANSWER]
+    response = _send(client, cid, content="Worum geht es?", attachment_ids=[deck.id])
+    assert response.status_code == 200
+    assert _frames(response)[-1].event == "final"
+    assert _prompt_users(fake_openai.calls[0]) == [f"Worum geht es?\n{line}"]
+
+    assert store.keep_manifest(deck.id, stock_manifest("harbour-deck.pptx"))
+    assert _send(client, cid, content="Und die Folien?").status_code == 200
+    facts = f"{line[:-2]}; PowerPoint, 3 slides; slide 2 has no text)]"
+    assert _prompt_users(fake_openai.calls[1]) == [f"Worum geht es?\n{facts}", "Und die Folien?"]
 
 
 @pytest.mark.parametrize(

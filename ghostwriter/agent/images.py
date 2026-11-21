@@ -28,7 +28,7 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any, Final, TypeAlias, TypeGuard
 
-from ghostwriter.upload import IMAGE_TYPES
+from ghostwriter.upload import IMAGE_TYPES, OFFICE_SUFFIXES
 from ghostwriter.workbench import ToolImage
 
 #: The long side, in pixels, above which a picture or page goes as two strips at a fixed cost.
@@ -155,14 +155,15 @@ def strips_for_path(path: str, *, fixed: int | None, known: Mapping[str, tuple[i
         known: The sizes of the pictures the chat has attached, by path.
 
     Returns:
-        ``None`` without a fixed cost, and for a file that is neither a PDF nor a picture: the
-        call then carries no ``strips``. 2 for a PDF, whose pages are rendered larger than
+        ``None`` without a fixed cost, and for a file that is neither a PDF, an Office file nor a
+        picture: the call then carries no ``strips``. 2 for a PDF or an Office file
+        (:data:`~ghostwriter.upload.OFFICE_SUFFIXES`), whose pages are rendered larger than
         :data:`STRIP_LONG_SIDE`; for a picture, :func:`strips_for_image` on its known size, or 1.
     """
     if fixed is None:
         return None
     suffix = PurePosixPath(path).suffix.lower()
-    if suffix == ".pdf":
+    if suffix == ".pdf" or suffix in OFFICE_SUFFIXES:
         return 2
     if suffix not in IMAGE_TYPES:
         return None
