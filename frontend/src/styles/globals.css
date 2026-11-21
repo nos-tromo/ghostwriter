@@ -6,12 +6,13 @@
 
 :root {
   /* ghostwriter's single design-system knob; primary derives from this.
-     Light default is darkened for WCAG AA as text on white (~4.5:1). */
-  --app-accent: hsl(217 91% 45%);
+     Rosé, the colour of the favicon tile. As text, ~6.2:1 on white here and
+     ~5.3:1 on the dark background for the dark value (WCAG AA 4.5:1). */
+  --app-accent: hsl(340 75% 42%);
   /* The user's own messages (@infra/ui's bubble): white text on the accent.
      Kept at the light accent in dark mode too, since white on the dark accent
-     (60%) is only ~3.6:1; this shade is ~6:1 (WCAG AA) in both themes. */
-  --app-bubble: hsl(217 91% 45%);
+     (62%) is only ~3.5:1; this shade is ~6.2:1 (WCAG AA) in both themes. */
+  --app-bubble: hsl(340 75% 42%);
 
   /* Code highlighting: rehype-highlight emits hljs-* classes only (no inline
      styles), coloured here. After highlight.js's GitHub themes, darkened
@@ -32,7 +33,7 @@
 }
 
 :root[data-theme='dark'] {
-  --app-accent: hsl(217 91% 60%);
+  --app-accent: hsl(340 75% 62%);
 
   --hljs-comment: #8b949e;
   --hljs-keyword: #ff7b72;
@@ -50,7 +51,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme]) {
-    --app-accent: hsl(217 91% 60%);
+    --app-accent: hsl(340 75% 62%);
 
     --hljs-comment: #8b949e;
     --hljs-keyword: #ff7b72;
