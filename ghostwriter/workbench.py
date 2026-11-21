@@ -1351,13 +1351,16 @@ class WorkbenchClient:
         logger.debug("workbench stored upload '{}': {} bytes", file_id, size)
         return UploadedFile(file_id, path, size)
 
-    async def prepare(self, *, call: CallFor, path: str, strips: int = 1) -> Manifest:
+    async def prepare(
+        self, *, call: CallFor, path: str, strips: int = 1, timeout_s: float = PREPARE_TIMEOUT_S
+    ) -> Manifest:
         """Have workbench make a file's renders, and say what they are. Idempotent.
 
         Args:
             call: The chat.
             path: The file's path in the chat's folder.
             strips: How many strips a picture is cut into on this prepare as well; sent only when more than 1.
+            timeout_s: The longest wait for each read of the answer; :data:`PREPARE_TIMEOUT_S` unless set.
 
         Returns:
             The file's manifest.
@@ -1376,7 +1379,7 @@ class WorkbenchClient:
             params: dict[str, str | int] = {"path": path, **({"strips": strips} if strips > 1 else {})}
             headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
             async with (
-                self._http(PREPARE_TIMEOUT_S) as client,
+                self._http(timeout_s) as client,
                 client.stream("POST", "/files/prepare", params=params, headers=headers) as response,
             ):
                 if response.status_code == 404:

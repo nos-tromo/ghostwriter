@@ -7,12 +7,13 @@ the hand-over, has workbench prepare the file (``POST /files/prepare``, idempote
 manifest: the attachment is then ``ready``. A busy or slow workbench (``http:503``, ``timeout``) is asked
 once more after :data:`PREPARE_RETRY_S`. At a fixed image cost (``image_tokens``), a picture that goes to
 the model as two strips (:func:`~ghostwriter.agent.images.strips_for_image`) is prepared once more with
-``strips=2`` before it is ``ready``, so its first turn finds the strips cut. That request is not tried
-again; its failure is logged by its token and the picture is still ``ready``, for the turn has workbench
-cut the strips as it views them. A prepare that fails is recorded as an ``error`` child, and the
-attachment settles as its kind allows: a picture cannot be seen unprepared and goes ``failed`` with the
-token; a document still reads as text and goes ``ready`` without a manifest. So no attachment stays
-``processing``, which would hold its message back (409), once its job has ended.
+``strips=2`` before it is ``ready``, so its first turn finds the strips cut. That request waits at most
+:data:`STRIPS_TIMEOUT_S` per read and is not tried again; its failure is logged by its token and the
+picture is still ``ready``, for the turn has workbench cut the strips as it views them. A prepare that
+fails is recorded as an ``error`` child, and the attachment settles as its kind allows: a picture cannot
+be seen unprepared and goes ``failed`` with the token; a document still reads as text and goes ``ready``
+without a manifest. So no attachment stays ``processing``, which would hold its message back (409), once
+its job has ended.
 
 The hand-over is ``disclose`` / ``chat.attachment`` (``workbench:prepare``), the upload's child, written
 before the prepare is sent; unrecorded, nothing is sent and the attachment settles with the token
@@ -54,6 +55,9 @@ PREPARE_RECIPIENT: Final = "workbench:prepare"
 ATTACHMENT: Final = "chat.attachment"
 #: The failures a second prepare may get past: a busy workbench and a slow one.
 RETRIED: Final = frozenset({"http:503", "timeout"})
+#: The longest wait, in seconds, for each read of the prepare that cuts a picture's strips: its
+#: renditions exist by then, so a workbench that hangs delays ``ready`` by about this, not a full prepare.
+STRIPS_TIMEOUT_S: Final = 60.0
 
 
 @dataclass(frozen=True)
@@ -402,8 +406,9 @@ class AttachmentProcessor:
     async def _cut_strips(self, call: CallFor, job: PrepareJob, manifest: Manifest) -> None:
         """Have workbench cut a picture's strips now, when it goes to the model as more than one.
 
-        Asked once, never again: the prepare is idempotent, and a turn that finds no strips has them
-        cut as it views them. Never raises but a cancel.
+        Asked once, never again, within :data:`STRIPS_TIMEOUT_S` per read: the prepare is idempotent,
+        and a turn that finds no strips has them cut as it views them. Never raises but a cancel; an
+        unexpected exception is logged as a warning, by its type.
 
         Args:
             call: The chat.
@@ -415,13 +420,18 @@ class AttachmentProcessor:
         if strips == 1:
             return
         try:
-            await self._workbench.prepare(call=call, path=job.path, strips=strips)
+            await self._workbench.prepare(call=call, path=job.path, strips=strips, timeout_s=STRIPS_TIMEOUT_S)
         except WorkbenchUnavailable as exc:
             token = exc.token
         except StorageFull:
             token = "storage_full"
         except Exception as exc:
-            token = type(exc).__name__
+            logger.warning(
+                "Attachment '{}': cutting its strips raised {}; the turn cuts them.",
+                job.attachment_id,
+                type(exc).__name__,
+            )
+            return
         else:
             logger.debug("Attachment '{}': its {} strips were cut.", job.attachment_id, strips)
             return

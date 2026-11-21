@@ -21,10 +21,10 @@ from ghostwriter.audit import open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment
-from ghostwriter.processing import PREPARE_SLOTS, AttachmentProcessor, PrepareJob
+from ghostwriter.processing import PREPARE_SLOTS, STRIPS_TIMEOUT_S, AttachmentProcessor, PrepareJob
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditEmitter
-from ghostwriter.workbench import WorkbenchClient, chat_folder
+from ghostwriter.workbench import PREPARE_TIMEOUT_S, WorkbenchClient, chat_folder
 from tests.conftest import KEY, CapturedAuditStream, events, make_settings
 from tests.fakes import TINY_JPEG, FakeDoor, stock_manifest
 
@@ -299,6 +299,8 @@ async def test_a_large_picture_at_a_fixed_cost_gets_its_strips_cut_before_it_is_
     finally:
         await processor.aclose()
     assert [request.url.params.get("strips") for request in _prepares(env.door)] == strips
+    waits = [request.extensions["timeout"]["read"] for request in _prepares(env.door)]
+    assert waits == [PREPARE_TIMEOUT_S, STRIPS_TIMEOUT_S][: len(strips)] and STRIPS_TIMEOUT_S == 60.0
     assert _status(env, job) == ("ready", None)
     found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
     assert found is not None and found.manifest is not None
@@ -333,3 +335,26 @@ async def test_a_failed_strips_prepare_leaves_the_picture_ready(env: Env, audit_
     assert any("http:503" in line and job.attachment_id in line for line in lines)
     assert not any("harbour-photo" in line or job.path in line for line in lines)
     assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+
+
+async def test_an_unexpected_strips_failure_is_a_warning(env: Env, loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """The strips request raises what the client does not map: a warning names its type, and the picture is ready."""
+    job = _job(env)
+    _sized(env, job, 2048, 1536)
+    asked: list[str] = []
+
+    def broken_on_strips(folder: str) -> Exception | None:
+        asked.append(folder)
+        return None if len(asked) == 1 else RuntimeError("synthetic transport failure")
+
+    env.door.answers["/files/prepare"] = broken_on_strips
+    workbench = WorkbenchClient(env.settings, transport=httpx.MockTransport(env.door))
+    processor = AttachmentProcessor(env.store, workbench, env.emitter, image_tokens=280)
+    try:
+        processor.submit(job)
+        await processor.wait(job.attachment_id, 5)
+    finally:
+        await processor.aclose()
+    assert len(_prepares(env.door)) == 2 and _status(env, job) == ("ready", None)
+    assert "RuntimeError" in loguru_caplog.text and job.attachment_id in loguru_caplog.text
+    assert "synthetic transport failure" not in loguru_caplog.text and "harbour-photo" not in loguru_caplog.text

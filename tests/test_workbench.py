@@ -821,6 +821,16 @@ async def test_prepare_answers_the_manifest() -> None:
     assert json.loads(json.dumps(stored)) == stored
 
 
+async def test_a_prepare_that_cuts_strips_may_wait_less() -> None:
+    """``strips`` goes as a query parameter only past 1, and ``timeout_s`` bounds each read instead of the default."""
+    door = FakeDoor()
+    door.files[PHOTO] = (b"\xff\xd8\xff", "image/jpeg")
+    got = await _client(door).prepare(call=CALL, path=PHOTO, strips=2, timeout_s=60.0)
+    req = door.last("/files/prepare")
+    assert dict(req.url.params) == {"path": PHOTO, "strips": "2"}
+    assert req.extensions["timeout"]["read"] == 60.0 and got.kind == "image"
+
+
 async def test_prepare_reads_a_picture_and_a_file_that_is_neither() -> None:
     """A picture is kind image with one rendition; any other file is kind none, with nothing to show."""
     door = FakeDoor()
