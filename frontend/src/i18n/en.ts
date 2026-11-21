@@ -35,6 +35,8 @@ export const en = {
   'chat.copy_code': 'Copy code',
   'chat.answer_busy': 'An answer is still being written in this chat.',
   'chat.no_answer': 'There is no answer to regenerate.',
+  'chat.images_dropped': 'The model did not take the pictures; it answered without them.',
+  'chat.attachment_processing': 'Wait until the attached files are ready.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',
@@ -55,8 +57,16 @@ export const en = {
     'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
   'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
   'composer.error_too_many_pending': 'Send the attached files before adding more.',
+  'composer.processing': 'Preparing {name}…',
+  'composer.processing_hint': 'Sending waits until the attached files are ready.',
+  'composer.unreadable': '{name} could not be read; the model will be told.',
+  'composer.images_cap':
+    'At most {max} images go to the model with one message; the others are only named.',
   'composer.send': 'Send',
   'composer.stop': 'Stop',
+
+  // a picture at full size
+  'lightbox.close': 'Close',
 
   // dictation
   'mic.start': 'Dictate',
@@ -72,6 +82,8 @@ export const en = {
   'trail.list_files': 'Listed the files',
   'trail.read_document': 'Read {detail}',
   'trail.read_document_unnamed': 'Read a document',
+  'trail.view_file': 'Looked at {detail}',
+  'trail.view_file_unnamed': 'Looked at a file',
   'trail.search_files': 'Searched for {detail}',
   'trail.search_files_unnamed': 'Searched the files',
   'trail.run_python': 'Ran Python',

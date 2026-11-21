@@ -2,17 +2,13 @@ import { useCallback, useEffect, useId, useState } from 'react'
 import { queryOptions, useQuery, useQueryClient } from '@tanstack/react-query'
 import { DownloadButton, Spinner, cn } from '@infra/ui'
 import { fileBlob } from '../api/chats'
-import { ApiError } from '../api/client'
+import { isGone } from '../api/client'
 import type { ResultOut } from '../api/types'
+import { saveBlob, useObjectUrl } from '../hooks/useObjectUrl'
 import { useLang, useT } from '../i18n/LanguageContext'
 import { formatSize } from '../lib/format'
 import { RequestError } from './RequestError'
 import { TablePreview } from './TablePreview'
-
-/** Whether a file is no longer there: expired (410), or not held by the chat any more (404). */
-function isGone(error: unknown): boolean {
-  return error instanceof ApiError && (error.status === 410 || error.status === 404)
-}
 
 /** A file's blob in the query cache, shared by every card that shows it. */
 const fileKey = (chatId: string, fileId: string) => ['file', chatId, fileId] as const
@@ -35,32 +31,6 @@ function fileQuery(chatId: string, fileId: string) {
     gcTime: FILE_GC_MS,
     retry: false,
   })
-}
-
-/** An object URL of this mount's own for a blob, revoked when the mount goes
- *  or the blob changes, so one card's unmount never breaks another's image. */
-function useObjectUrl(blob: Blob | undefined): string | null {
-  const [url, setUrl] = useState<string | null>(null)
-  useEffect(() => {
-    if (!blob) return
-    const created = URL.createObjectURL(blob)
-    setUrl(created)
-    return () => {
-      URL.revokeObjectURL(created)
-      setUrl(null)
-    }
-  }, [blob])
-  return url
-}
-
-/** Save a blob under its name through a transient object URL, revoked once the click has been dispatched. */
-function saveBlob(blob: Blob, name: string) {
-  const url = URL.createObjectURL(blob)
-  const anchor = document.createElement('a')
-  anchor.href = url
-  anchor.download = name
-  anchor.click()
-  setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
 /**

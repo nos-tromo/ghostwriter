@@ -9,6 +9,8 @@ and a turn's audit as the agent loop reaches them. Every name, id and value here
 invented.
 """
 
+import base64
+import dataclasses
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -31,6 +33,7 @@ from ghostwriter.workbench import (
     CallFor,
     Discovery,
     McpTool,
+    RenditionRequest,
     ToolFailure,
     ToolResult,
     WorkbenchClient,
@@ -44,24 +47,48 @@ OUTPUT_ID = "0" * 32
 #: The id the door gives every upload, unless a test sets another.
 UPLOAD_ID = "1" * 32
 NOT_FOUND = {"detail": "not found"}
+#: Bytes that pass the signature check of a jpeg and of a png, and no more.
+TINY_JPEG = b"\xff\xd8\xff\xe0" + bytes(60)
+TINY_PNG = b"\x89PNG\r\n\x1a\n" + bytes(56)
+#: The header workbench 0.7 lists ``view_file`` and attaches images for.
+ACCEPT_IMAGES_HEADER = "x-accept-images"
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
 
-#: The nine workspace tools of the contract: name, description and input properties.
+#: What workbench 0.7 tells a call that takes no images of ``read_document``: 0.6's text, which promises none.
+READ_DOCUMENT_TEXT = "Read a document as text, from its text layer only."
+#: The ten workspace tools of the contract: name, description (as a call that takes images is told) and input
+#: properties.
 CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
     "list_files": ("List the files in the chat's folder.", {"path": {"type": "string"}}),
-    "read_document": ("Read a document as text.", {"path": {"type": "string"}}),
+    "read_document": (
+        "Read a document as text; pages without text come back as images.",
+        {"path": {"type": "string"}, "strips": {"type": "integer"}},
+    ),
     "search_files": ("Search the chat's files for a text.", {"query": {"type": "string"}}),
     "run_python": ("Run Python on the chat's files.", {"code": {"type": "string"}}),
     "inspect_template": ("List a template's fields.", {"path": {"type": "string"}}),
     "fill_template": ("Fill a template's fields.", {"path": {"type": "string"}, "values": {"type": "object"}}),
     "write_table": ("Write a table as csv or xlsx.", {"name": {"type": "string"}, "rows": {"type": "array"}}),
     "write_document": ("Write a document.", {"name": {"type": "string"}, "text": {"type": "string"}}),
+    "view_file": (
+        "Show the pages or the picture of a file.",
+        {"path": {"type": "string"}, "part": {"type": "string"}, "strips": {"type": "integer"}},
+    ),
     "write_presentation": (
         "Build a presentation in a slide master.",
         {"path": {"type": "string"}, "name": {"type": "string"}, "slides": {"type": "array"}},
     ),
 }
 
-_ROUTES = frozenset({("POST", "/mcp"), ("POST", "/files/upload"), ("GET", "/files/view"), ("DELETE", "/files/chat")})
+_ROUTES = frozenset(
+    {
+        ("POST", "/mcp"),
+        ("POST", "/files/upload"),
+        ("POST", "/files/prepare"),
+        ("GET", "/files/view"),
+        ("DELETE", "/files/chat"),
+    }
+)
 _DISCOVERY = frozenset({"server/discover", "tools/list"})
 
 
@@ -115,7 +142,8 @@ def tools_result() -> dict[str, Any]:
     """Return workbench's ``tools/list`` result for the ghostwriter caller.
 
     Returns:
-        The result, the nine contract tools by name, as workbench lists them, cached for 300 s.
+        The result, the ten contract tools by name, as workbench lists them to a call that accepts
+        images (``view_file`` included), cached for 300 s.
     """
     tools = [
         {
@@ -190,6 +218,83 @@ def refusal(token: str) -> dict[str, Any]:
     }
 
 
+def image_block(data: bytes, mime: str = "image/jpeg") -> dict[str, Any]:
+    """Return one image block of a ``tools/call`` result, as workbench writes it.
+
+    Args:
+        data: The picture's bytes.
+        mime: Its media type.
+
+    Returns:
+        The block, its bytes as base64 and addressed to the assistant.
+    """
+    return {
+        "type": "image",
+        "data": base64.b64encode(data).decode("ascii"),
+        "mimeType": mime,
+        "annotations": {"audience": ["assistant"]},
+    }
+
+
+def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return a successful ``view_file`` result: the text, then one image block for each entry of ``shown``.
+
+    Args:
+        folder: The chat's folder.
+        shown: The entries of ``structuredContent.shown``, in the order of the blocks.
+        blocks: The image blocks, see :func:`image_block`.
+
+    Returns:
+        The result, with the contract's eight structured keys and no outputs.
+    """
+    structured = {
+        "path": f"{folder}/quay-scan.pdf",
+        "kind": "pdf",
+        "total": max(len(shown), 3),
+        "shown": shown,
+        "truncated": False,
+        "next_part": None,
+        "hint": None,
+        "outputs": list[Any](),
+    }
+    return {
+        "resultType": "complete",
+        "isError": False,
+        "content": [{"type": "text", "text": json.dumps(structured)}, *blocks],
+        "structuredContent": structured,
+        "_meta": SERVER_META,
+    }
+
+
+def stock_manifest(path: str) -> dict[str, Any]:
+    """Return the manifest the door gives a stored file, by its suffix.
+
+    Args:
+        path: The file's path.
+
+    Returns:
+        A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
+        text. Anything else: kind ``none``.
+    """
+    lower = path.lower()
+    manifest: dict[str, Any] = {
+        "path": path,
+        "kind": "none",
+        "total": 0,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "hint": None,
+    }
+    if lower.endswith(_IMAGE_SUFFIXES):
+        rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
+        return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
+    if lower.endswith(".pdf"):
+        pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
+        return {**manifest, "kind": "pdf", "total": 3, "pages_without_text": [2], "renditions": pages}
+    return manifest
+
+
 async def _parse_upload(request: httpx.Request) -> Upload | None:
     """Read the ``file`` part of an upload with Starlette's parser, which workbench's route uses.
 
@@ -224,9 +329,14 @@ class FakeDoor:
     no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
-    folder and returns one of those. ``None`` for ``/files/upload`` and ``/files/view``
-    is the default: an upload is parsed, stored in :attr:`files` and answered with
-    its path, size and :attr:`upload_id`; a view serves a stored file of the chat.
+    folder and returns one of those. ``None`` for ``/files/upload``, ``/files/prepare`` and
+    ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
+    with its path, size and :attr:`upload_id`; a prepare answers the file's manifest; a view
+    serves a stored file of the chat, or with ``rendition`` one of its renders.
+
+    As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
+    ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
+    :func:`listed_without_images`. Every request is kept with its headers in :attr:`requests`.
 
     Attributes:
         key: The key the door accepts.
@@ -234,6 +344,7 @@ class FakeDoor:
         answers: The scripted answers, by MCP method or REST path.
         delays: Seconds to wait before answering, by MCP method or REST path.
         files: The stored files, by path: their bytes and media type.
+        manifests: The manifest to answer for a path, instead of :func:`stock_manifest`'s.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
         on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
@@ -252,11 +363,13 @@ class FakeDoor:
             "tools/list": tools_result(),
             "tools/call": call_result,
             "/files/upload": None,
+            "/files/prepare": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
         }
         self.delays: dict[str, float] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.manifests: dict[str, dict[str, Any]] = {}
         self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
         self.on_delete: Callable[[], None] | None = None
@@ -307,9 +420,13 @@ class FakeDoor:
                 return _rpc_error(body, answer)
             if route == "tools/call" and isinstance(answer, dict):
                 self.last_call_answer = answer
+            if route == "tools/list" and isinstance(answer, dict) and not _accepts_images(request):
+                answer = listed_without_images(answer)
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": answer})
         if answer is None and path == "/files/upload":
             return self._store(request, body, folder)
+        if answer is None and path == "/files/prepare":
+            return self._prepare(request, folder)
         if answer is None and path == "/files/view":
             return self._serve(request, folder)
         return httpx.Response(200, json=answer)
@@ -344,6 +461,8 @@ class FakeDoor:
             The file; 404 for a path outside the chat or a missing file alike.
         """
         path = request.url.params.get("path", "")
+        if "rendition" in request.url.params:
+            return self._render(request, path, folder)
         stored = self.files.get(path) if path.startswith(f"{folder}/") else None
         if stored is None:
             return httpx.Response(404, json=NOT_FOUND)
@@ -351,6 +470,64 @@ class FakeDoor:
         name = quote(path.rsplit("/", 1)[-1], safe="")
         disposition = f"inline; filename*=UTF-8''{name}"
         return httpx.Response(200, content=data, headers={"Content-Type": mime, "Content-Disposition": disposition})
+
+    def _manifest_of(self, path: str, folder: str) -> dict[str, Any] | None:
+        """Return the manifest of a file of the chat.
+
+        Args:
+            path: The file's path.
+            folder: The chat's folder.
+
+        Returns:
+            The scripted manifest of the path, else the stock one of a stored file; ``None`` for
+            another chat's path and for an unknown one.
+        """
+        if not path.startswith(f"{folder}/"):
+            return None
+        if path in self.manifests:
+            return self.manifests[path]
+        return stock_manifest(path) if path in self.files else None
+
+    def _prepare(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Answer a prepare with the file's manifest.
+
+        Args:
+            request: The prepare.
+            folder: The chat's folder.
+
+        Returns:
+            The manifest; 404 for a path outside the chat or an unknown one.
+        """
+        manifest = self._manifest_of(request.url.params.get("path", ""), folder)
+        return httpx.Response(404, json=NOT_FOUND) if manifest is None else httpx.Response(200, json=manifest)
+
+    def _render(self, request: httpx.Request, path: str, folder: str) -> httpx.Response:
+        """Serve one render of a file of the chat: a page, a picture or one of its strips.
+
+        Args:
+            request: The view, with ``rendition`` and, for strips, ``strips`` and ``strip``.
+            path: The file's path.
+            folder: The chat's folder.
+
+        Returns:
+            The picture, as ``image/jpeg``: the same bytes for every page, and for strip ``i`` of
+            ``k > 1`` those bytes and ``i`` after them; 404 outside ``1..total``, 422 for a bad
+            ``strips`` and ``strip`` pair.
+        """
+        manifest = self._manifest_of(path, folder)
+        params = request.url.params
+        number, strips, strip = params["rendition"], params.get("strips", "1"), params.get("strip")
+        if manifest is None or not number.isdigit() or not 1 <= int(number) <= manifest["total"]:
+            return httpx.Response(404, json=NOT_FOUND)
+        cut = int(strips) if strips.isdigit() else 0
+        if (
+            not 1 <= cut <= 3
+            or (cut > 1) != (strip is not None)
+            or (strip is not None and strip not in tuple("123"[:cut]))
+        ):
+            return httpx.Response(422, json={"detail": "bad strips"})
+        data = TINY_JPEG if strip is None else TINY_JPEG + bytes([int(strip)])
+        return httpx.Response(200, content=data, headers={"Content-Type": "image/jpeg"})
 
     def methods(self) -> list[str]:
         """Return the MCP method of every ``/mcp`` request so far, in order.
@@ -381,6 +558,35 @@ class FakeDoor:
     def uploads(self) -> list[Upload]:
         """Every upload's parsed file part, in order."""
         return [body for _, body in self.requests if isinstance(body, Upload)]
+
+
+def _accepts_images(request: httpx.Request) -> bool:
+    """Tell whether a request asks for images, as workbench 0.7 reads ``X-Accept-Images``.
+
+    Args:
+        request: The request.
+
+    Returns:
+        ``True`` when the header is ``1``.
+    """
+    return request.headers.get(ACCEPT_IMAGES_HEADER) == "1"
+
+
+def listed_without_images(listing: dict[str, Any]) -> dict[str, Any]:
+    """Return a ``tools/list`` result as workbench 0.7 lists it to a call that takes no images.
+
+    Args:
+        listing: The result, as a call that takes images gets it.
+
+    Returns:
+        A copy without ``view_file``, and ``read_document`` told as 0.6 told it (:data:`READ_DOCUMENT_TEXT`).
+    """
+    tools = [
+        {**tool, "description": READ_DOCUMENT_TEXT} if tool.get("name") == "read_document" else tool
+        for tool in listing["tools"]
+        if tool.get("name") != "view_file"
+    ]
+    return {**listing, "tools": tools}
 
 
 def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
@@ -664,7 +870,7 @@ PLAIN_RESULT = ToolResult('{"text": "Umsatz 42"}', ())
 
 
 def contract_tools() -> tuple[McpTool, ...]:
-    """Return the nine contract tools as discovery hands them out.
+    """Return the ten contract tools as discovery hands them out.
 
     Returns:
         The tools, in workbench's order.
@@ -681,12 +887,14 @@ class SentCall:
         arguments: Its arguments.
         call: The chat it was made for.
         timeout_s: Its deadline.
+        images: Whether it asked workbench for images (``X-Accept-Images: 1``).
     """
 
     name: str
     arguments: dict[str, Any]
     call: CallFor
     timeout_s: float
+    images: bool = False
 
 
 class RecordingAudit:
@@ -695,6 +903,8 @@ class RecordingAudit:
     Attributes:
         log: ``disclose:<tool>:<round>:<attempt>`` and ``model:<round>:<outcome>``, in order.
         rounds: Each ``model_called``'s round, as the loop reported it.
+        images: Each ``model_called``'s count of the images the round sent.
+        call_ids: Each ``disclosed``'s call id, in order.
         failing: The writes that fail, ``disclose`` or ``model``.
         on_model: Called with the round after each ``model_called`` was written.
     """
@@ -703,6 +913,8 @@ class RecordingAudit:
         """Record nothing yet, and fail nothing."""
         self.log: list[str] = []
         self.rounds: list[RoundDone | None] = []
+        self.images: list[int] = []
+        self.call_ids: list[str] = []
         self.failing: set[str] = set()
         self.on_model: Callable[[int], None] | None = None
 
@@ -712,7 +924,7 @@ class RecordingAudit:
         Args:
             tool: The tool.
             round: The model round that asked for it.
-            call_id: The model's id for the call.
+            call_id: The call's id in the turn.
             attempt: 1, or 2 for the retry after a busy answer.
 
         Raises:
@@ -721,14 +933,16 @@ class RecordingAudit:
         if "disclose" in self.failing:
             raise AuditWriteError("synthetic audit failure")
         self.log.append(f"disclose:{tool}:{round}:{attempt}")
+        self.call_ids.append(call_id)
 
-    def model_called(self, *, round: int, done: RoundDone | None, outcome: str) -> None:
+    def model_called(self, *, round: int, done: RoundDone | None, outcome: str, images: int = 0) -> None:
         """Record a model round.
 
         Args:
             round: The round.
             done: How it ended; ``None`` when it failed.
             outcome: ``ok`` or ``error``.
+            images: How many images the round sent.
 
         Raises:
             AuditWriteError: While ``model`` is failing.
@@ -737,24 +951,29 @@ class RecordingAudit:
             raise AuditWriteError("synthetic audit failure")
         self.log.append(f"model:{round}:{outcome}")
         self.rounds.append(done)
+        self.images.append(images)
         if self.on_model is not None:
             self.on_model(round)
 
 
 class FakeWorkbench:
-    """``WorkbenchClient`` as the agent loop calls it: ``discover`` and ``call_tool``.
+    """``WorkbenchClient`` as the agent loop calls it: ``discover``, ``call_tool`` and ``fetch_renditions``.
 
-    Discovery answers :attr:`discovery`. Each call answers the next of :attr:`answers`, or
+    Discovery answers :attr:`discovery` to a call that takes images and, as workbench 0.7 does, the
+    same without ``view_file`` and with 0.6's ``read_document`` text to one that does not
+    (:data:`READ_DOCUMENT_TEXT`). Each call answers the next of :attr:`answers`, or
     :data:`PLAIN_RESULT` once they are used up, and is recorded with the audit line written
-    last before it went out.
+    last before it went out. A rendition is :data:`TINY_JPEG`, unless its path is in :attr:`missing`.
 
     Attributes:
-        discovery: What every discovery answers; ``None`` is a workbench that is not usable.
+        discovery: What every discovery that takes images answers; ``None`` is a workbench that is not usable.
         answers: The scripted answers, in order.
         calls: Every call, in order.
-        discoveries: The chat of every discovery, in order.
+        discoveries: The chat of every discovery, and whether it asked for images, in order.
         sent_after: For every call, the audit's last line when it was sent.
         audit: The audit whose log :attr:`sent_after` reads.
+        missing: The paths whose renditions are not there.
+        fetched: The renditions each ``fetch_renditions`` asked for, in order.
     """
 
     def __init__(
@@ -768,7 +987,7 @@ class FakeWorkbench:
 
         Args:
             answers: The calls' answers, in order.
-            tools: The tools discovery finds; the nine contract tools when omitted, none
+            tools: The tools discovery finds; the ten contract tools when omitted, none
                 at all (``()``) for a workbench that is not usable.
             audit: The audit whose log :attr:`sent_after` reads.
         """
@@ -776,9 +995,11 @@ class FakeWorkbench:
         self.discovery: Discovery | None = Discovery(tools=found, server_version="0.3.0") if found else None
         self.answers: list[Answer] = list(answers)
         self.calls: list[SentCall] = []
-        self.discoveries: list[CallFor] = []
+        self.discoveries: list[tuple[CallFor, bool]] = []
         self.sent_after: list[str | None] = []
         self.audit = audit
+        self.missing: set[str] = set()
+        self.fetched: list[tuple[RenditionRequest, ...]] = []
 
     def as_client(self) -> WorkbenchClient:
         """Return this fake typed as the client, for ``AgentLoop(workbench=...)``.
@@ -788,20 +1009,28 @@ class FakeWorkbench:
         """
         return cast(WorkbenchClient, self)
 
-    def discover(self, *, call: CallFor) -> Discovery | None:
+    def discover(self, *, call: CallFor, images: bool) -> Discovery | None:
         """Answer a discovery.
 
         Args:
             call: The asking turn's chat.
+            images: Whether it asks for the listing of a call that takes images.
 
         Returns:
-            :attr:`discovery`.
+            :attr:`discovery`, or without images its tools as workbench 0.7 lists them then.
         """
-        self.discoveries.append(call)
-        return self.discovery
+        self.discoveries.append((call, images))
+        if images or self.discovery is None:
+            return self.discovery
+        tools = tuple(
+            dataclasses.replace(tool, description=READ_DOCUMENT_TEXT) if tool.name == "read_document" else tool
+            for tool in self.discovery.tools
+            if tool.name != "view_file"
+        )
+        return dataclasses.replace(self.discovery, tools=tools)
 
     def call_tool(
-        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float
+        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float, images: bool = False
     ) -> ToolResult | ToolFailure:
         """Record a call and answer it from the script.
 
@@ -810,11 +1039,25 @@ class FakeWorkbench:
             arguments: Its arguments.
             call: The chat.
             timeout_s: Its deadline.
+            images: Whether it asks for images; the script answers the same either way.
 
         Returns:
             The next scripted answer.
         """
-        self.calls.append(SentCall(name, dict(arguments), call, timeout_s))
+        self.calls.append(SentCall(name, dict(arguments), call, timeout_s, images))
         self.sent_after.append(self.audit.log[-1] if self.audit is not None and self.audit.log else None)
         answer = self.answers.pop(0) if self.answers else PLAIN_RESULT
         return answer() if callable(answer) else answer
+
+    def fetch_renditions(self, wanted: Sequence[RenditionRequest], *, call: CallFor) -> list[tuple[str, bytes] | None]:
+        """Record a fetch and answer each rendition.
+
+        Args:
+            wanted: The renditions.
+            call: The chat.
+
+        Returns:
+            ``("image/jpeg", TINY_JPEG)`` for each, ``None`` for a path in :attr:`missing`.
+        """
+        self.fetched.append(tuple(wanted))
+        return [None if item.path in self.missing else ("image/jpeg", TINY_JPEG) for item in wanted]

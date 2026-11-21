@@ -37,6 +37,8 @@ export const de: Strings = {
   'chat.copy_code': 'Code kopieren',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
   'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
+  'chat.images_dropped': 'Das Modell hat die Bilder nicht angenommen und ohne sie geantwortet.',
+  'chat.attachment_processing': 'Warten Sie, bis die angehängten Dateien bereit sind.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',
@@ -58,8 +60,16 @@ export const de: Strings = {
   'composer.error_purpose':
     '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
   'composer.error_too_many_pending': 'Senden Sie zuerst die angehängten Dateien.',
+  'composer.processing': '{name} wird vorbereitet…',
+  'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
+  'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
+  'composer.images_cap':
+    'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',
   'composer.send': 'Senden',
   'composer.stop': 'Stopp',
+
+  // a picture at full size
+  'lightbox.close': 'Schließen',
 
   // dictation
   'mic.start': 'Diktieren',
@@ -75,6 +85,8 @@ export const de: Strings = {
   'trail.list_files': 'Dateien aufgelistet',
   'trail.read_document': '{detail} gelesen',
   'trail.read_document_unnamed': 'Ein Dokument gelesen',
+  'trail.view_file': '{detail} angesehen',
+  'trail.view_file_unnamed': 'Eine Datei angesehen',
   'trail.search_files': 'Nach {detail} gesucht',
   'trail.search_files_unnamed': 'Dateien durchsucht',
   'trail.run_python': 'Python ausgeführt',

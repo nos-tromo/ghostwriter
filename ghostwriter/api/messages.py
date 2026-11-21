@@ -4,8 +4,10 @@ A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most o
 (:class:`~ghostwriter.turns.TurnRegistry`), on a thread of the app's turn limiter
 (``TURN_THREADS``) rather than the shared pool; a turn beyond them waits for one. The frames
 are ``start`` (the stored question's and answer's ids), always first, then ``token``,
-``step``, ``result`` and ``error``, and ``final``, which is always last; a quiet
-stream carries a keep-alive comment every 15 s, which is no frame. A stop, or
+``step``, ``result``, ``notice`` and ``error``, and ``final``, which is always last; a quiet
+stream carries a keep-alive comment every 15 s, which is no frame. ``notice`` names by its
+``code`` what the user is told while the answer goes on: ``images_dropped``, the model refused
+a round's images and it went again without them. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
@@ -13,9 +15,10 @@ only frame, and when its response ends.
 
 A turn is recorded as one primary event, written before anything is stored (``collect`` /
 ``chat.message``, or ``modify`` / ``chat.regenerate``), with a child per model round
-(``ai_call`` / ``chat.answer``) and one per call sent to workbench (``disclose`` /
-``chat.tool``): references only. A record that cannot be written stops the answer with the
-``audit`` error frame; a step it left running is then ended by its own ``error`` frame.
+(``ai_call`` / ``chat.answer``, naming how many images it sent; a round sent again without its
+images has two) and one per call sent to workbench (``disclose`` / ``chat.tool``): references
+only. A record that cannot be written stops the answer with the ``audit`` error frame; a step
+it left running is then ended by its own ``error`` frame.
 """
 
 import threading
@@ -35,6 +38,7 @@ from ghostwriter.agent.loop import (
     INTERNAL_ERROR,
     AgentLoop,
     ErrorEvent,
+    NoticeEvent,
     ResultEvent,
     StepEvent,
     TokenEvent,
@@ -63,6 +67,8 @@ MAX_MESSAGE_ATTACHMENTS: Final = 10
 ANSWER_RUNNING: Final = "An answer is still being written in this chat."
 BUSY_CODE: Final = "busy"
 UNKNOWN_ATTACHMENT: Final = "Unknown attachment."
+PROCESSING: Final = "Wait until the attached files are ready."
+PROCESSING_CODE: Final = "attachment_processing"
 NO_ANSWER: Final = "There is no answer to regenerate."
 NO_ANSWER_CODE: Final = "no_answer"
 #: What the user is told when a record of the turn could not be written.
@@ -159,7 +165,7 @@ class OperationTurnAudit(TurnAudit):
         Args:
             tool: The tool.
             round: The model round that asked for it.
-            call_id: The model's id for the call.
+            call_id: The call's id in the turn.
             attempt: 1, or 2 for the retry after a busy answer.
         """
         self._op.child(
@@ -171,13 +177,16 @@ class OperationTurnAudit(TurnAudit):
         )
 
     @override
-    def model_called(self, *, round: int, done: RoundDone | None, outcome: Literal["ok", "error"]) -> None:
+    def model_called(
+        self, *, round: int, done: RoundDone | None, outcome: Literal["ok", "error"], images: int = 0
+    ) -> None:
         """Record a model round once it ended: ``ai_call`` / ``chat.answer``, the output by its hash only.
 
         Args:
             round: The round.
             done: How it ended; ``None`` when it failed.
             outcome: ``ok``, or ``error`` for a failed round.
+            images: How many images it sent.
         """
         if done is None:
             ai = AiCall(model_alias=self._text_model)
@@ -199,7 +208,7 @@ class OperationTurnAudit(TurnAudit):
         self._op.child(
             "ai_call",
             "chat.answer",
-            criteria={**criteria, "reasoning": self._reasoning},
+            criteria={**criteria, "images": images, "reasoning": self._reasoning},
             recipient="inference:chat",
             ai=ai,
             outcome=outcome,
@@ -221,6 +230,8 @@ def _frame(event: TurnEvent) -> str:
         return sse_frame("step", event.step.model_dump(mode="json"))
     if isinstance(event, ResultEvent):
         return sse_frame("result", event.result.model_dump(mode="json"))
+    if isinstance(event, NoticeEvent):
+        return sse_frame("notice", {"code": event.code})
     if isinstance(event, ErrorEvent):
         return sse_frame("error", {"code": event.code, "message": event.message})
     raise TypeError(f"not a turn event: {type(event).__name__}")
@@ -488,7 +499,8 @@ def send_message(
             and its length before it is stored; the turn's rounds and calls are its children.
 
     Returns:
-        The stream; or 409 ``busy`` while a turn runs in the chat.
+        The stream; or 409 ``busy`` while a turn runs in the chat, ``attachment_processing`` while
+        workbench still prepares one of its attachments, before anything is recorded or stored.
 
     Raises:
         HTTPException: 404 for another owner's chat or an unknown one; 400 when an attachment
@@ -500,8 +512,12 @@ def send_message(
         return _conflict(ANSWER_RUNNING, BUSY_CODE)
     try:
         owned_chat(store, user.name, chat_id)
-        if not set(body.attachment_ids) <= store.pending_ids(chat_id):
+        statuses = store.pending_statuses(chat_id)
+        if not set(body.attachment_ids) <= statuses.keys():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=UNKNOWN_ATTACHMENT)
+        if any(statuses[attachment_id] == "processing" for attachment_id in body.attachment_ids):
+            _turns(request).end(chat_id, claim)
+            return _conflict(PROCESSING, PROCESSING_CODE)
         question_id = str(uuid4())
         op.container = chat_id
         op.record(

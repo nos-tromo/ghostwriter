@@ -2,7 +2,9 @@
 
 A chat's rows go with it: every foreign key cascades, except an attachment's
 message, which is set to ``NULL``. Files are kept by reference only (workbench
-id, path, name, size, MIME type), never their bytes.
+id, path, name, size, MIME type), never their bytes; an attachment also keeps
+its manifest, the counts and sizes workbench reported of it, derived from the
+file and emptied with it.
 """
 
 from datetime import datetime
@@ -82,9 +84,18 @@ class ToolStep(Base):
 
 
 class Attachment(Base):
-    """A file the user attached, held in workbench; pending until a message binds it."""
+    """A file the user attached, held in workbench; pending until a message binds it.
+
+    A picture or a PDF is ``processing`` while workbench prepares it, then ``ready``
+    with its manifest in ``render``, or ``failed`` with a token in ``failure``. A
+    manifest is derived from the file, so it is emptied when the file's period passes.
+    """
 
     __tablename__ = "attachments"
+    __table_args__ = (
+        CheckConstraint("kind IN ('document', 'image', 'media')", name="ck_attachments_kind"),
+        CheckConstraint("status IN ('processing', 'ready', 'failed')", name="ck_attachments_status"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     chat_id: Mapped[str] = mapped_column(ForeignKey("chats.id", ondelete="CASCADE"), index=True)
@@ -94,6 +105,10 @@ class Attachment(Base):
     name: Mapped[str] = mapped_column(String(255))
     size: Mapped[int]
     mime: Mapped[str] = mapped_column(String(127))
+    kind: Mapped[str] = mapped_column(String(8), server_default="document")
+    status: Mapped[str] = mapped_column(String(10), server_default="ready", index=True)
+    render: Mapped[str | None] = mapped_column(Text)
+    failure: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
 
 

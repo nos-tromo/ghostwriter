@@ -5,6 +5,9 @@ also work with files: attach a document, workbench processes it with its tools,
 and the results come back in the chat as cards to download. A chat needs no
 file, and chats work with workbench off or unreachable.
 
+Pictures can be attached too: with a model that sees, they go to it with the
+message, and a tool can show it the pages of a document.
+
 A reasoning switch in the composer lets the model think before it answers; it
 is off by default, and the thinking is never shown or stored.
 

@@ -29,10 +29,17 @@ WORKBENCH_TIMEOUT_ENV: Final = "WORKBENCH_TIMEOUT"
 CHAT_DAYS_ENV: Final = "GHOSTWRITER_CHAT_RETENTION_DAYS"
 SPEECH_INPUT_ENV: Final = "GHOSTWRITER_SPEECH_INPUT"
 CONTEXT_TOKENS_ENV: Final = "GHOSTWRITER_CONTEXT_TOKENS"
+VISION_ENV: Final = "GHOSTWRITER_VISION"
+MAX_IMAGES_ENV: Final = "GHOSTWRITER_MAX_IMAGES"
+IMAGE_TOKENS_ENV: Final = "GHOSTWRITER_IMAGE_CONTEXT_TOKENS"
 REQUIRE_PURPOSE_ENV: Final = "AUDIT_REQUIRE_PURPOSE"
 
 MAX_DAYS: Final = 3650
 MAX_NOTICE_DAYS: Final = 365
+#: The most images ``GHOSTWRITER_MAX_IMAGES`` may allow one request.
+MAX_IMAGES_LIMIT: Final = 32
+#: The most tokens ``GHOSTWRITER_IMAGE_CONTEXT_TOKENS`` may charge for one image.
+IMAGE_TOKENS_LIMIT: Final = 10_000
 
 
 @dataclass(frozen=True)
@@ -50,6 +57,10 @@ class Settings:
             federation's router), ``ollama``, ``openai`` or another.
         text_model: The chat model.
         context_tokens: The chat model's context, in tokens; each round's prompt budget follows from it.
+        vision: Whether pictures are offered: attached images go to the chat model, and it is shown
+            the images workbench's tools return.
+        max_images: The most images one request carries.
+        image_tokens: The fixed cost of one image, in tokens; ``None`` counts it by its pixels.
         whisper_model: The speech-to-text model.
         workbench_api_base: workbench's base URL, without a trailing ``/``.
         workbench_api_key: Ghostwriter's key at workbench; ``None`` switches
@@ -71,6 +82,9 @@ class Settings:
     inference_provider: str
     text_model: str
     context_tokens: int
+    vision: bool
+    max_images: int
+    image_tokens: int | None
     whisper_model: str
     workbench_api_base: str
     workbench_api_key: str | None = field(repr=False)
@@ -232,6 +246,74 @@ def _context_tokens(environ: Mapping[str, str]) -> int:
     return tokens
 
 
+def _vision(environ: Mapping[str, str]) -> bool:
+    """Return whether pictures are on.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        ``True`` for ``on`` (the default), ``False`` for ``off``.
+
+    Raises:
+        ValueError: For any other value.
+    """
+    raw = (_get(environ, VISION_ENV) or "on").lower()
+    if raw not in ("on", "off"):
+        raise ValueError(f"{VISION_ENV} must be on or off.")
+    return raw == "on"
+
+
+def _max_images(environ: Mapping[str, str]) -> int:
+    """Return the most images one request carries.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        The cap; 8 while unset.
+
+    Raises:
+        ValueError: If it is not a whole number from 1 to :data:`MAX_IMAGES_LIMIT`.
+    """
+    raw = _get(environ, MAX_IMAGES_ENV)
+    if raw is None:
+        return 8
+    message = f"{MAX_IMAGES_ENV} must be a whole number from 1 to {MAX_IMAGES_LIMIT}."
+    try:
+        count = int(raw)
+    except ValueError:
+        raise ValueError(message) from None
+    if not 1 <= count <= MAX_IMAGES_LIMIT:
+        raise ValueError(message)
+    return count
+
+
+def _image_tokens(environ: Mapping[str, str]) -> int | None:
+    """Return the fixed cost of one image in tokens.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        The cost, or ``None`` while unset: the cost then follows the image's pixels.
+
+    Raises:
+        ValueError: If it is not a whole number from 1 to :data:`IMAGE_TOKENS_LIMIT`.
+    """
+    raw = _get(environ, IMAGE_TOKENS_ENV)
+    if raw is None:
+        return None
+    message = f"{IMAGE_TOKENS_ENV} must be a whole number of tokens from 1 to {IMAGE_TOKENS_LIMIT}, or unset."
+    try:
+        tokens = int(raw)
+    except ValueError:
+        raise ValueError(message) from None
+    if not 1 <= tokens <= IMAGE_TOKENS_LIMIT:
+        raise ValueError(message)
+    return tokens
+
+
 def _speech_input(environ: Mapping[str, str]) -> bool:
     """Return whether dictation is on.
 
@@ -326,6 +408,9 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         inference_provider=(_get(environ, "INFERENCE_PROVIDER") or "vllm").lower(),
         text_model=_get(environ, "TEXT_MODEL") or "Qwen/Qwen3.8-27B-FP8",
         context_tokens=_context_tokens(environ),
+        vision=_vision(environ),
+        max_images=_max_images(environ),
+        image_tokens=_image_tokens(environ),
         whisper_model=_get(environ, "WHISPER_MODEL") or "openai/whisper-large-v3",
         workbench_api_base=_base(environ, "WORKBENCH_API_BASE", "http://workbench-api:8000"),
         workbench_api_key=_secret(environ, WORKBENCH_KEY_ENV),

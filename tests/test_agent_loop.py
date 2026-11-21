@@ -4,15 +4,18 @@ A hand clock stands for the monotonic clock; the stop's waits pass on it. Every 
 here is invented.
 """
 
+import base64
 import dataclasses
+import itertools
 import json
 import re
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import httpx2
 import openai
@@ -20,6 +23,7 @@ import pytest
 from typing_extensions import override
 
 from ghostwriter.agent.context import estimate_tokens
+from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
     MAX_ANSWER_TOKENS,
@@ -28,16 +32,38 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     prompt_tokens,
 )
-from ghostwriter.agent.loop import AgentLoop, ErrorEvent, ResultEvent, StepEvent, TokenEvent, Turn, TurnEvent
-from ghostwriter.agent.prompt import PRESENTATIONS
+from ghostwriter.agent.loop import (
+    AgentLoop,
+    ErrorEvent,
+    NoticeEvent,
+    ResultEvent,
+    StepEvent,
+    TokenEvent,
+    Turn,
+    TurnEvent,
+)
+from ghostwriter.agent.prompt import PRESENTATIONS, VISION
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
-from ghostwriter.workbench import CallFor, OutputFile, TablePreview, ToolFailure, ToolResult, chat_folder
+from ghostwriter.vision import Vision
+from ghostwriter.workbench import (
+    CallFor,
+    OutputFile,
+    RenditionRequest,
+    TablePreview,
+    ToolFailure,
+    ToolImage,
+    ToolResult,
+    chat_folder,
+)
 from tests.conftest import KEY, make_settings
 from tests.fakes import (
+    CONTRACT_TOOLS,
+    READ_DOCUMENT_TEXT,
+    TINY_JPEG,
     Chunk,
     FakeOpenAI,
     FakeWorkbench,
@@ -46,6 +72,7 @@ from tests.fakes import (
     call_chunk,
     contract_tools,
     finish_chunk,
+    stock_manifest,
     text_chunk,
     usage_chunk,
 )
@@ -69,6 +96,32 @@ AT_THE_CAP = {
     "length": [finish_chunk("length")],
     "vllm": [finish_chunk("tool_calls"), usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")],
 }
+PHOTO = "harbour-photo.jpg"
+PHOTO_PATH = f"{FOLDER}/{PHOTO}"
+SCAN_PATH = f"{FOLDER}/quay-scan.pdf"
+VIEW_SCAN = json.dumps({"path": SCAN_PATH})
+TIMES = "\N{MULTIPLICATION SIGN}"
+JPEG_URL = "data:image/jpeg;base64," + base64.b64encode(TINY_JPEG).decode("ascii")
+
+
+class StoreClock:
+    """The store's time of day, set by hand.
+
+    Attributes:
+        now: The time it reads.
+    """
+
+    def __init__(self) -> None:
+        """Start at ``T0``."""
+        self.now = T0
+
+    def __call__(self) -> datetime:
+        """Read the clock.
+
+        Returns:
+            The time it is set to.
+        """
+        return self.now
 
 
 class HandClock:
@@ -130,6 +183,7 @@ class LoopEnv:
         audit: The turn's audit.
         clock: The monotonic clock.
         cancel: The turn's stop.
+        today: The store's time of day.
         answer_id: The answer the last run wrote.
     """
 
@@ -140,6 +194,7 @@ class LoopEnv:
     audit: RecordingAudit
     clock: HandClock
     cancel: HandStop
+    today: StoreClock
     answer_id: str = ""
 
     def run(
@@ -148,6 +203,8 @@ class LoopEnv:
         content: str = "Summe der Spalte B",
         workbench: FakeWorkbench | None | str = "default",
         reasoning: bool = False,
+        vision: bool = False,
+        attach: Sequence[tuple[str, dict[str, Any]]] = (),
     ) -> list[TurnEvent]:
         """Send a message and run its turn to the end.
 
@@ -156,13 +213,31 @@ class LoopEnv:
             content: The user's message.
             workbench: workbench, the env's own by default; ``None`` for none at all.
             reasoning: The message's reasoning switch.
+            vision: Whether the model sees images.
+            attach: The files the message sends, by name and manifest, each settled ``ready`` first:
+                a manifest of kind ``image`` makes a picture, any other a document.
 
         Returns:
             The turn's events.
         """
         self.fake.script = list(rounds)
         chosen = self.workbench if workbench == "default" else workbench
-        user = self.store.add_user_message("user-a", CHAT, content, [])
+        ids: list[str] = []
+        for name, manifest in attach:
+            picture = manifest.get("kind") == "image"
+            attachment = self.store.add_attachment(
+                CHAT,
+                file_id=uuid4().hex,
+                path=f"{FOLDER}/{name}",
+                name=name,
+                size=4_096,
+                mime="image/jpeg" if picture else "application/pdf",
+                kind="image" if picture else "document",
+                status="processing",
+            )
+            self.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
+            ids.append(attachment.id)
+        user = self.store.add_user_message("user-a", CHAT, content, ids)
         self.answer_id = self.store.start_assistant_message(CHAT)
         loop = AgentLoop(
             model=ModelClient(self.settings, client=self.fake.as_client()),
@@ -171,6 +246,7 @@ class LoopEnv:
             settings=self.settings,
             clock=self.clock,
             now=lambda: T0,
+            vision=Vision(dataclasses.replace(self.settings, vision=True)) if vision else None,
         )
         headers = {"X-Request-ID": "req-0001"}
         turn = Turn(
@@ -200,11 +276,12 @@ def loop_env(tmp_path: Path) -> Iterator[LoopEnv]:
     settings = make_settings(tmp_path, text_model="chat-model")
     engine = make_engine(settings.db_path)
     init_db(engine)
-    store = ChatStore(engine, file_days=settings.file_days, notice_days=30, now=lambda: T0)
+    today = StoreClock()
+    store = ChatStore(engine, file_days=settings.file_days, notice_days=30, now=today)
     store.create_chat("user-a", id=CHAT)
     audit = RecordingAudit()
     clock = HandClock()
-    yield LoopEnv(settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock))
+    yield LoopEnv(settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock), today)
     engine.dispose()
 
 
@@ -627,7 +704,7 @@ def test_with_workbench_the_prompt_names_the_chats_folder(loop_env: LoopEnv) -> 
     """The system prompt names this chat's folder, and discovery asks for this chat."""
     loop_env.run([text_chunk("Hallo!")])
     assert f"This chat's files are in {FOLDER};" in loop_env.sent(1)[0]["content"]
-    assert loop_env.workbench.discoveries == [CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"})]
+    assert loop_env.workbench.discoveries == [(CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"}), False)]
 
 
 @pytest.mark.parametrize(
@@ -812,3 +889,495 @@ def test_a_smaller_context_fits_every_round_to_what_it_leaves(loop_env: LoopEnv,
     for call in loop_env.fake.calls:
         assert estimate_tokens(call["messages"]) + estimate_tokens(call["tools"]) <= budget
     assert len(loop_env.sent(1)) > 3
+
+
+# --- images: attached pictures, tool images, strips, the cap and a refusal -----
+
+
+def _page(n: int, *, width: int = 1131, height: int = 1600, data: bytes = TINY_JPEG) -> ToolImage:
+    """Return page ``n`` of the scan, as a tool shows it."""
+    return ToolImage(f"quay-scan.pdf, page {n}", width, height, "image/jpeg", data)
+
+
+def _shown(*pages: ToolImage) -> ToolResult:
+    """Return a tool's answer that shows ``pages``."""
+    return ToolResult(json.dumps({"path": SCAN_PATH, "shown": len(pages)}), (), pages)
+
+
+def _url(data: bytes) -> str:
+    return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
+
+
+def _photo(width: int = 64, height: int = 48, *, name: str = PHOTO) -> tuple[str, dict[str, Any]]:
+    """Return a photo as it is attached: its name, and its manifest of one rendition of that size."""
+    manifest = stock_manifest(f"{FOLDER}/{name}")
+    return name, {**manifest, "renditions": [{**manifest["renditions"][0], "width": width, "height": height}]}
+
+
+def _content(message: dict[str, Any]) -> list[dict[str, Any]]:
+    content = message["content"]
+    return content if isinstance(content, list) else []
+
+
+def _image_urls(messages: list[dict[str, Any]]) -> list[str]:
+    """Return the data URLs of messages, in order."""
+    return [p["image_url"]["url"] for m in messages for p in _content(m) if p.get("type") == "image_url"]
+
+
+def _labelled(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
+    """Return each image's label text and its data URL, in order."""
+    parts = [part for message in messages for part in _content(message)]
+    return [(a["text"], b["image_url"]["url"]) for a, b in itertools.pairwise(parts) if b.get("type") == "image_url"]
+
+
+def _tool_names(call: dict[str, Any]) -> list[str]:
+    """Return the names of the tools a model call offered."""
+    return [tool["function"]["name"] for tool in call.get("tools", [])]
+
+
+def _read_document_told(call: dict[str, Any]) -> str:
+    """Return what a model call was told of ``read_document``."""
+    return next(t["function"]["description"] for t in call["tools"] if t["function"]["name"] == "read_document")
+
+
+#: What a call that takes images is told of ``read_document``: its pages without text come back as images.
+READ_DOCUMENT_IMAGES = CONTRACT_TOOLS["read_document"][0]
+
+
+def _refused() -> openai.BadRequestError:
+    """Return the router's refusal of a request with images."""
+    request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
+    return openai.BadRequestError("image refused", response=httpx2.Response(400, request=request), body=None)
+
+
+def _failed_otherwise() -> dict[str, Callable[[], Round]]:
+    request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
+    return {
+        "server-error": lambda: openai.InternalServerError(
+            "router down", response=httpx2.Response(500, request=request), body=None
+        ),
+        "after-text": lambda: [text_chunk("Ich sehe"), _refused()],
+        "unreachable": _router_error,
+    }
+
+
+def test_an_attached_image_goes_into_the_users_message(loop_env: LoopEnv) -> None:
+    """The question carries its text, then the picture's label and its data URL; its rendition is fetched once.
+
+    view_file is offered, and no tool's schema shows ``strips``; the cached discovery keeps it.
+    """
+    events = loop_env.run([text_chunk("Ein Hafen.")], content="Was zeigt das Bild?", vision=True, attach=[_photo()])
+    assert events == [TokenEvent("Ein Hafen.")]
+    text, label, image = loop_env.sent(1)[-1]["content"]
+    assert text["type"] == "text" and text["text"].startswith("Was zeigt das Bild?\n")
+    assert f"[Attached: {PHOTO} ({PHOTO_PATH}, 4096 bytes; image 64{TIMES}48)]" in text["text"]
+    assert label == {"type": "text", "text": f"[Image: {PHOTO}]"}
+    assert image == {"type": "image_url", "image_url": {"url": JPEG_URL}}
+    assert loop_env.workbench.fetched == [(RenditionRequest(PHOTO_PATH, n=1, strips=1, strip=1),)]
+    assert loop_env.audit.images == [1]
+    schemas = {tool["function"]["name"]: tool["function"]["parameters"] for tool in loop_env.fake.calls[0]["tools"]}
+    assert "view_file" in schemas
+    for name in ("view_file", "read_document"):
+        assert "strips" not in schemas[name]["properties"] and "strips" not in schemas[name]["required"]
+    discovery = loop_env.workbench.discovery
+    assert discovery is not None
+    cached = {tool.name: tool.input_schema for tool in discovery.tools}
+    assert "strips" in cached["read_document"]["properties"] and "strips" in cached["read_document"]["required"]
+
+
+def test_a_fixed_image_cost_sends_two_strips_of_a_large_image(loop_env: LoopEnv) -> None:
+    """At a fixed cost, a picture longer than 1024 pixels goes as two strips, each labelled and fetched."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo(2048, 1536)])
+    assert loop_env.sent(1)[-1]["content"][1:] == [
+        {"type": "text", "text": f"[Image: {PHOTO}, strip 1 of 2]"},
+        {"type": "image_url", "image_url": {"url": JPEG_URL}},
+        {"type": "text", "text": f"[Image: {PHOTO}, strip 2 of 2]"},
+        {"type": "image_url", "image_url": {"url": JPEG_URL}},
+    ]
+    assert loop_env.workbench.fetched == [
+        (RenditionRequest(PHOTO_PATH, n=1, strips=2, strip=1), RenditionRequest(PHOTO_PATH, n=1, strips=2, strip=2))
+    ]
+    assert loop_env.audit.images == [2]
+
+
+def test_tool_images_follow_the_tool_messages_in_one_user_message(loop_env: LoopEnv) -> None:
+    """A round's images go in one user message after its tool messages: per call its legend, then its images.
+
+    Each tool message names how many images were returned; the stored steps hold that same text, never the bytes.
+    """
+    loop_env.workbench.answers = [_shown(_page(1), _page(2)), _shown(_page(3))]
+    first = [call_chunk(0, "call_0", "view_file", VIEW_SCAN), call_chunk(1, "call_1", "read_document", VIEW_SCAN)]
+    loop_env.run(first, [text_chunk("Drei Seiten.")], vision=True)
+    sent = loop_env.sent(2)
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "tool", "user"]
+    image = {"type": "image_url", "image_url": {"url": JPEG_URL}}
+
+    def label(n: int) -> dict[str, str]:
+        return {"type": "text", "text": f"[Image: quay-scan.pdf, page {n}]"}
+
+    both = "quay-scan.pdf, page 1; quay-scan.pdf, page 2"
+    assert sent[-1]["content"] == [
+        {"type": "text", "text": LEGEND.format(tool="view_file", call_id="call_0", labels=both)},
+        label(1),
+        image,
+        label(2),
+        image,
+        {"type": "text", "text": LEGEND.format(tool="read_document", call_id="call_1", labels="quay-scan.pdf, page 3")},
+        label(3),
+        image,
+    ]
+    view, read = sent[3]["content"], sent[4]["content"]
+    assert view == json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were returned]"
+    assert read == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were returned]"
+    steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert [step.result for step in steps] == [view, read]
+    stored = json.dumps([step.model_dump(mode="json") for step in steps])
+    assert base64.b64encode(TINY_JPEG).decode("ascii") not in stored and "data:image" not in stored
+    assert [call.images for call in loop_env.workbench.calls] == [True, True]
+    assert loop_env.audit.images == [0, 3]
+
+
+def test_ghostwriter_sets_strips_and_the_model_cannot(loop_env: LoopEnv) -> None:
+    """At a fixed cost a PDF is viewed in 2 strips and an attached picture by its size; the model's strips go.
+
+    A file that is neither gets none, and without a fixed cost no call carries strips.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    sheet = f"{FOLDER}/sales.xlsx"
+    calls = [
+        call_chunk(0, "call_0", "view_file", json.dumps({"path": SCAN_PATH, "strips": 3})),
+        call_chunk(1, "call_1", "view_file", json.dumps({"path": PHOTO_PATH, "strips": 3})),
+        call_chunk(2, "call_2", "read_document", json.dumps({"path": sheet, "strips": 2})),
+    ]
+    loop_env.run(calls, [text_chunk("Ok.")], vision=True, attach=[_photo(2048, 1536)])
+    assert [call.arguments for call in loop_env.workbench.calls] == [
+        {"path": SCAN_PATH, "strips": 2},
+        {"path": PHOTO_PATH, "strips": 2},
+        {"path": sheet},
+    ]
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=None)
+    loop_env.run(calls, [text_chunk("Ok.")], vision=True)
+    assert [call.arguments for call in loop_env.workbench.calls[3:]] == [
+        {"path": SCAN_PATH},
+        {"path": PHOTO_PATH},
+        {"path": sheet},
+    ]
+
+
+def test_a_follow_up_replays_tool_steps_as_text_and_attached_images_again(loop_env: LoopEnv) -> None:
+    """The next message sends the earlier question with its picture again, fetched anew, and its tool step as text.
+
+    The earlier turn's tool images are not sent again: its legend message is gone.
+    """
+    loop_env.workbench.answers = [_shown(_page(1))]
+    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
+    loop_env.run(view, [text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    loop_env.run([text_chunk("Ja.")], content="Und das Wasser?", vision=True)
+    sent = loop_env.sent(3)
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "assistant", "user"]
+    assert sent[1]["content"][1:] == [
+        {"type": "text", "text": f"[Image: {PHOTO}]"},
+        {"type": "image_url", "image_url": {"url": JPEG_URL}},
+    ]
+    assert sent[3]["content"] == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were returned]"
+    assert "Images returned by" not in json.dumps(sent) and _image_urls(sent) == [JPEG_URL]
+    assert len(loop_env.workbench.fetched) == 2
+
+
+def test_without_vision_view_file_is_not_offered_and_tool_images_are_named(loop_env: LoopEnv) -> None:
+    """A model that does not see gets no image anywhere: no view_file, no strips, a tool's images named as not shown.
+
+    Its calls do not ask workbench for images, and an attached picture is named in the text alone, never fetched.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.workbench.answers = [_shown(_page(1))]
+    read = [call_chunk(0, "call_0", "read_document", json.dumps({"path": SCAN_PATH, "strips": 2}))]
+    loop_env.run(read, [text_chunk("Seite 1 hat keinen Text.")], attach=[_photo()])
+    assert _image_urls([m for call in loop_env.fake.calls for m in call["messages"]]) == []
+    assert "image_url" not in json.dumps([call["messages"] for call in loop_env.fake.calls])
+    assert loop_env.sent(2)[-1] == {
+        "role": "tool",
+        "tool_call_id": "call_0",
+        "content": json.dumps({"path": SCAN_PATH, "shown": 1})
+        + "\n[1 images could not be shown: this model does not take images]",
+    }
+    assert "view_file" not in [tool["function"]["name"] for tool in loop_env.fake.calls[0]["tools"]]
+    [sent] = loop_env.workbench.calls
+    assert (sent.arguments, sent.images) == ({"path": SCAN_PATH}, False)
+    assert loop_env.workbench.fetched == [] and loop_env.audit.images == [0, 0]
+    question = loop_env.sent(1)[-1]["content"]
+    assert isinstance(question, str) and f"image 64{TIMES}48; not shown to the model)]" in question
+    assert VISION not in loop_env.sent(1)[0]["content"]
+
+
+def test_an_expired_or_missing_image_is_noted_and_the_turn_goes_on(loop_env: LoopEnv) -> None:
+    """A follow-up whose picture's rendition is gone sends a note that it could not be loaded, and answers.
+
+    Once the picture has expired, its line says so, and nothing is fetched.
+    """
+    loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    loop_env.workbench.missing = {PHOTO_PATH}
+    assert loop_env.run([text_chunk("Ein Kran.")], content="Und links?", vision=True) == [TokenEvent("Ein Kran.")]
+    assert loop_env.sent(2)[1]["content"][1:] == [{"type": "text", "text": NOT_LOADED.format(label=PHOTO)}]
+    assert len(loop_env.workbench.fetched) == 2 and loop_env.audit.images == [1, 0]
+    loop_env.today.now = T0 + timedelta(days=loop_env.settings.file_days, seconds=1)
+    assert loop_env.run([text_chunk("Nicht mehr.")], content="Und rechts?", vision=True) == [TokenEvent("Nicht mehr.")]
+    assert loop_env.sent(3)[1]["content"] == f"Summe der Spalte B\n[Attached: {PHOTO}; expired]"
+    assert len(loop_env.workbench.fetched) == 2 and loop_env.audit.images == [1, 0, 0]
+
+
+def test_a_refused_image_round_is_tried_once_without_images(loop_env: LoopEnv) -> None:
+    """A round refused with its images goes once more with a note in each image's place, after one notice.
+
+    The rest of the turn goes without sight: view_file is no longer offered and the prompt no longer says how
+    to look; the calls ask workbench for no images and carry no strips, and a tool's images are named as not
+    shown, none sent.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.workbench.answers = [_shown(_page(1))]
+    read = [call_chunk(0, "call_0", "read_document", json.dumps({"path": SCAN_PATH, "strips": 2}))]
+    events = loop_env.run(_refused(), read, [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert [e for e in events if isinstance(e, NoticeEvent)] == [NoticeEvent("images_dropped")]
+    assert (events[0], events[-1]) == (NoticeEvent("images_dropped"), TokenEvent("Ohne Bild."))
+    first, second = loop_env.fake.calls[:2]
+    assert VISION in first["messages"][0]["content"] and "view_file" in _tool_names(first)
+    assert VISION not in second["messages"][0]["content"] and "view_file" not in _tool_names(second)
+    assert second["messages"][1]["content"][1:] == [{"type": "text", "text": LEFT_OUT.format(label=PHOTO)}]
+    assert "image_url" not in json.dumps(second["messages"])
+    assert loop_env.audit.log[:2] == ["model:1:error", "model:1:ok"] and loop_env.audit.images[:2] == [1, 0]
+    [sent] = loop_env.workbench.calls
+    assert (sent.arguments, sent.images) == ({"path": SCAN_PATH}, False)
+    third = loop_env.sent(3)
+    assert "image_url" not in json.dumps(third) and third[1]["content"] == second["messages"][1]["content"]
+    assert VISION not in third[0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[2])
+    assert third[-1]["role"] == "tool"
+    assert third[-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
+    assert loop_env.audit.images == [1, 0, 0]
+
+
+def test_a_turn_is_offered_the_listing_its_sight_takes(loop_env: LoopEnv) -> None:
+    """A seeing turn is offered workbench's listing for images; a turn without vision 0.6's, without view_file.
+
+    So a model that is shown no image is never told that pages come back as images.
+    """
+    loop_env.run([text_chunk("Hallo!")], vision=True)
+    loop_env.run([text_chunk("Hallo!")])
+    seeing, blind = loop_env.fake.calls
+    assert "view_file" in _tool_names(seeing) and _read_document_told(seeing) == READ_DOCUMENT_IMAGES
+    assert "view_file" not in _tool_names(blind) and _read_document_told(blind) == READ_DOCUMENT_TEXT
+    call = CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"})
+    assert loop_env.workbench.discoveries == [(call, True), (call, False)]
+
+
+def test_after_a_refusal_the_turn_is_offered_the_listing_without_images(loop_env: LoopEnv) -> None:
+    """The round sent again without images, and every round after it, get the listing of a call without images."""
+    read = [call_chunk(0, "call_0", "read_document", VIEW_SCAN)]
+    loop_env.run(_refused(), read, [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    first, again, last = loop_env.fake.calls
+    assert _read_document_told(first) == READ_DOCUMENT_IMAGES
+    for call in (again, last):
+        assert "view_file" not in _tool_names(call) and _read_document_told(call) == READ_DOCUMENT_TEXT
+    assert [images for _, images in loop_env.workbench.discoveries] == [True, False]
+    assert [sent.images for sent in loop_env.workbench.calls] == [False]
+
+
+def test_vision_with_a_workbench_that_shows_no_images_has_no_sight(loop_env: LoopEnv) -> None:
+    """With vision on and no view_file listed, the turn goes as without vision: no picture, and no note of one.
+
+    A follow-up's earlier picture is not sent, and no note says view_file shows it: there is none.
+    """
+    loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    older = FakeWorkbench(tools=[t for t in contract_tools() if t.name != "view_file"], audit=loop_env.audit)
+    older.answers = [_shown(_page(1))]
+    read = [call_chunk(0, "call_0", "read_document", VIEW_SCAN)]
+    events = loop_env.run(read, [text_chunk("Ein Kran.")], content="Und links?", vision=True, workbench=older)
+    assert events[-1] == TokenEvent("Ein Kran.")
+    sent = [loop_env.sent(n) for n in (2, 3)]
+    assert "image_url" not in json.dumps(sent) and "view_file" not in json.dumps(sent)
+    assert NOT_LOADED.format(label=PHOTO) not in json.dumps(sent)
+    assert VISION not in sent[0][0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[1])
+    assert _read_document_told(loop_env.fake.calls[1]) == READ_DOCUMENT_TEXT
+    assert older.fetched == [] and [call.images for call in older.calls] == [False]
+    assert (
+        f"[Attached: {PHOTO} ({PHOTO_PATH}, 4096 bytes; image 64{TIMES}48; not shown to the model)]"
+        in sent[0][1]["content"]
+    )
+    assert sent[1][-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
+    assert loop_env.audit.images == [1, 0, 0]
+
+
+def _promises_view_file(messages: list[dict[str, Any]]) -> list[str]:
+    """Return the texts of messages that send the model to view_file."""
+    texts = [m["content"] for m in messages if isinstance(m["content"], str)]
+    texts += [p["text"] for m in messages for p in _content(m) if p.get("type") == "text"]
+    return [t for t in texts if "view_file shows it" in t or "view it again with view_file" in t]
+
+
+def test_after_a_refusal_an_earlier_turn_replayed_as_notes_names_no_view_file(loop_env: LoopEnv) -> None:
+    """An earlier turn's pictures replayed as notes say they are not shown again, and nothing of view_file."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, max_images=1)
+    loop_env.run([text_chunk("Zwei Bilder.")], vision=True, attach=[_photo(), _photo(name="quay-photo.jpg")])
+    events = loop_env.run(
+        _refused(), [text_chunk("Ohne Bild.")], content="Und das?", vision=True, attach=[_photo(name="pier.jpg")]
+    )
+    assert events[0] == NoticeEvent("images_dropped")
+    first, again = loop_env.sent(2), loop_env.sent(3)
+    assert NOT_RESENT.format(label=PHOTO) in json.dumps(first)
+    assert _promises_view_file(again) == [] and "view_file" not in json.dumps(again)
+    for name in (PHOTO, "quay-photo.jpg"):
+        assert f"[Image: {name}; not shown again]" in again[1]["content"]
+
+
+def test_after_a_refusal_a_retired_tool_image_names_no_view_file(loop_env: LoopEnv) -> None:
+    """A tool image retired before the refusal is named in the rounds after it without a word of view_file."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, max_images=1)
+    loop_env.workbench.answers = [_shown(_page(1)), _shown(_page(2))]
+    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
+    again = [call_chunk(0, "call_1", "view_file", VIEW_SCAN)]
+    loop_env.run(view, again, _refused(), [text_chunk("Zwei Seiten.")], vision=True)
+    refused, retried = loop_env.sent(3), loop_env.sent(4)
+    assert RETIRED.format(label="quay-scan.pdf, page 1") in json.dumps(refused)
+    assert _promises_view_file(retried) == []
+    assert "[Image: quay-scan.pdf, page 1; not shown again to make room]" in json.dumps(retried)
+
+
+def test_a_second_refusal_is_the_model_error(loop_env: LoopEnv) -> None:
+    """The round sent again without images and refused again ends the turn with the model error."""
+    events = loop_env.run(_refused(), _refused(), vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), ErrorEvent("model", "The model did not answer.")]
+    assert loop_env.audit.log == ["model:1:error", "model:1:error"] and loop_env.audit.images == [1, 0]
+
+
+def test_a_refusal_without_images_is_not_retried(loop_env: LoopEnv) -> None:
+    """A refused round that carried no image is the model error at once: one call, no notice."""
+    events = loop_env.run(_refused(), vision=True)
+    assert events == [ErrorEvent("model", "The model did not answer.")]
+    assert len(loop_env.fake.calls) == 1 and loop_env.audit.log == ["model:1:error"]
+
+
+@pytest.mark.parametrize("failed", _failed_otherwise().values(), ids=_failed_otherwise().keys())
+def test_a_round_with_images_that_failed_otherwise_is_not_retried(
+    loop_env: LoopEnv, failed: Callable[[], Round]
+) -> None:
+    """A failure that is no refusal before any text, a server error or none from the router, is the model error."""
+    events = loop_env.run(failed(), vision=True, attach=[_photo()])
+    assert events[-1] == ErrorEvent("model", "The model did not answer.")
+    assert not any(isinstance(e, NoticeEvent) for e in events) and len(loop_env.fake.calls) == 1
+
+
+def test_the_prompt_tells_the_model_how_to_look_only_with_vision(loop_env: LoopEnv) -> None:
+    """How to look at files is told right after the chat's folder while the model sees and has the tools; else not."""
+    loop_env.run([text_chunk("Hallo!")], vision=True)
+    loop_env.run([text_chunk("Hallo!")])
+    loop_env.run([text_chunk("Hallo!")], vision=True, workbench=None)
+    seeing, plain, toolless = (call["messages"][0]["content"] for call in loop_env.fake.calls)
+    assert VISION in seeing and seeing.index("days after they were made.") < seeing.index(VISION)
+    assert seeing.index(VISION) < seeing.index(PRESENTATIONS)
+    assert VISION not in plain and VISION not in toolless
+    assert VISION.endswith(
+        "Images tools showed earlier are not sent again, and attached pictures only while there is room: "
+        "use view_file to see one again."
+    )
+
+
+def test_tool_images_past_the_cap_are_retired(loop_env: LoopEnv) -> None:
+    """With at most 2 images a request, three rounds of one image each leave the oldest as a note."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, max_images=2)
+    loop_env.workbench.answers = [_shown(_page(n)) for n in (1, 2, 3)]
+    views: list[Round] = [[call_chunk(0, f"call_{n}", "view_file", VIEW_SCAN)] for n in range(3)]
+    loop_env.run(*views, [text_chunk("Drei Seiten.")], vision=True)
+    fourth = loop_env.sent(4)
+    assert [label for label, _ in _labelled(fourth)] == [f"[Image: quay-scan.pdf, page {n}]" for n in (2, 3)]
+    assert json.dumps(fourth).count(RETIRED.format(label="quay-scan.pdf, page 1")) == 1
+    assert loop_env.audit.images == [0, 1, 2, 2]
+
+
+def test_a_reused_call_id_keeps_each_image_its_own(loop_env: LoopEnv) -> None:
+    """A model that names a call ``call_0`` in two rounds gets two ids: each image keeps its own label and bytes.
+
+    The id is the same in the call, its tool message, the legend and the stored step.
+    """
+    one, two = TINY_JPEG + b"\x01", TINY_JPEG + b"\x02"
+    loop_env.workbench.answers = [_shown(_page(1, data=one)), _shown(_page(2, data=two))]
+    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
+    loop_env.run(view, view, [text_chunk("Zwei Seiten.")], vision=True)
+    third = loop_env.sent(3)
+    ids = [m["tool_calls"][0]["id"] for m in third if m.get("tool_calls")]
+    assert ids[0] == "call_0" and len(set(ids)) == 2 and re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", ids[1])
+    assert [m["tool_call_id"] for m in third if m["role"] == "tool"] == ids
+    assert _labelled(third) == [
+        ("[Image: quay-scan.pdf, page 1]", _url(one)),
+        ("[Image: quay-scan.pdf, page 2]", _url(two)),
+    ]
+    legends = [p["text"] for m in third for p in _content(m) if p.get("text", "").startswith("[Images returned by")]
+    assert legends == [
+        LEGEND.format(tool="view_file", call_id=ids[0], labels="quay-scan.pdf, page 1"),
+        LEGEND.format(tool="view_file", call_id=ids[1], labels="quay-scan.pdf, page 2"),
+    ]
+    [turn], _ = loop_env.store.past_turns(CHAT, before_position=99)
+    assert [call.call_id for calls in turn.rounds for call in calls] == ids
+    assert loop_env.audit.call_ids == ids
+
+
+def test_an_image_never_shown_is_never_said_to_be_shown_before(loop_env: LoopEnv) -> None:
+    """A tool image the request had no room for stays named as never shown in later rounds, never as retired."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, context_tokens=24_576)
+    loop_env.workbench.answers = [_shown(_page(1, width=4096, height=3072), _page(2, width=4096, height=3072)), RESULT]
+    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
+    listing = [call_chunk(0, "call_1", "list_files", "{}")]
+    loop_env.run(view, listing, [text_chunk("Seite 2.")], vision=True)
+    unseen = UNSEEN.format(label="quay-scan.pdf, page 1")
+    retired = RETIRED.format(label="quay-scan.pdf, page 1")
+    for n in (2, 3):
+        sent = loop_env.sent(n)
+        assert unseen in json.dumps(sent) and retired not in json.dumps(sent)
+        assert [label for label, _ in _labelled(sent)] == ["[Image: quay-scan.pdf, page 2]"]
+    steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert [step.result for step in steps if step.tool == "view_file"] == [
+        json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were returned]"
+    ]
+
+
+def test_a_picture_without_room_is_never_said_to_be_shown_before(loop_env: LoopEnv) -> None:
+    """A question's picture the request has no room for is named so in every round, and never fetched.
+
+    It stays the question's own: no round calls it retired or not shown again, and the round's result is kept.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, context_tokens=22_000)
+    quay = "quay-photo.jpg"
+    loop_env.workbench.answers = [RESULT]
+    attach = [_photo(4096, 3072), _photo(4096, 3072, name=quay)]
+    loop_env.run(_calls(READ_SALES), [text_chunk("Zwei Bilder.")], vision=True, attach=attach)
+    # Both were attached at one instant, so which of them is the question's last is the store's choice.
+    [went] = [name for name in (PHOTO, quay) if f"[Image: {name}]" in json.dumps(loop_env.sent(1))]
+    left = quay if went == PHOTO else PHOTO
+    for n in (1, 2):
+        sent = json.dumps(loop_env.sent(n))
+        assert NO_ROOM.format(label=left) in sent
+        assert RETIRED.format(label=left) not in sent and NOT_RESENT.format(label=left) not in sent
+        assert [label for label, _ in _labelled(loop_env.sent(n))] == [f"[Image: {went}]"]
+    assert loop_env.sent(2)[-1]["content"] == RESULT.text
+    assert loop_env.workbench.fetched == [(RenditionRequest(f"{FOLDER}/{went}", n=1, strips=1, strip=1),)]
+    assert loop_env.audit.images == [1, 1]
+
+
+def test_images_past_the_cap_in_one_round_are_returned_and_named_unseen(loop_env: LoopEnv) -> None:
+    """Two calls of 8 images in one round, at most 8 a request: the tool messages say 16 were returned, never shown.
+
+    The first call's 8 go as notes that they were never shown, the second's as images; the stored steps say
+    the same as the tool messages.
+    """
+    first, second = (tuple(_page(n) for n in pages) for pages in (range(1, 9), range(9, 17)))
+    loop_env.workbench.answers = [_shown(*first), _shown(*second)]
+    views = [call_chunk(0, "call_0", "view_file", VIEW_SCAN), call_chunk(1, "call_1", "view_file", VIEW_SCAN)]
+    loop_env.run(views, [text_chunk("Sechzehn Seiten.")], vision=True)
+    sent = loop_env.sent(2)
+    returned = json.dumps({"path": SCAN_PATH, "shown": 8}) + "\n[8 images were returned]"
+    assert [m["content"] for m in sent if m["role"] == "tool"] == [returned, returned]
+    steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert [step.result for step in steps] == [returned, returned]
+    assert [label for label, _ in _labelled(sent)] == [f"[Image: quay-scan.pdf, page {n}]" for n in range(9, 17)]
+    text = json.dumps(sent)
+    assert all(UNSEEN.format(label=f"quay-scan.pdf, page {n}") in text for n in range(1, 9))
+    assert "were shown" not in text

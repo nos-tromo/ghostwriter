@@ -3,6 +3,7 @@
 Every name, id and value here is invented.
 """
 
+import base64
 import json
 import threading
 import time
@@ -19,6 +20,7 @@ import pytest
 from anyio import CapacityLimiter
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from loguru import logger
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
@@ -37,6 +39,9 @@ from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import CallFor, chat_folder
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings
 from tests.fakes import (
+    CONTRACT_TOOLS,
+    READ_DOCUMENT_TEXT,
+    TINY_JPEG,
     UPLOAD_ID,
     XLSX,
     Chunk,
@@ -44,9 +49,11 @@ from tests.fakes import (
     FakeOpenAI,
     Round,
     call_chunk,
+    image_block,
     reasoning_chunk,
     text_chunk,
     usage_chunk,
+    view_result,
 )
 
 ANSWER: Round = [text_chunk("Summe: 42"), usage_chunk(950, 5, "served-model")]
@@ -455,6 +462,40 @@ def test_a_message_names_only_its_chats_pending_attachments(
     assert not _state(client).turns.running(cid)
 
 
+def test_a_message_waits_for_its_attachments(
+    client: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """An attachment still being prepared holds the message back unrecorded and unstored; a failed one is taken."""
+    cid = _new(client)
+    store = _state(client).store
+    photo = store.add_attachment(
+        cid,
+        file_id=UPLOAD_ID,
+        path=f"{chat_folder(KEY, cid)}/harbour-photo.jpg",
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    sheet = _attach(client, cid, file_id="2" * 32)
+    before = len(events(audit_stream))
+    r = _send(client, cid, attachment_ids=[sheet.id, photo.id])
+    assert (r.status_code, r.json()) == (
+        409,
+        {"detail": "Wait until the attached files are ready.", "code": "attachment_processing"},
+    )
+    assert events(audit_stream)[before:] == [] and fake_openai.calls == []
+    assert not _state(client).turns.running(cid)
+    assert _detail(client, cid)["messages"] == []
+
+    assert store.settle_attachment(photo.id, status="failed", manifest=None, failure="unreadable_file")
+    fake_openai.script = [ANSWER]
+    assert _send(client, cid, attachment_ids=[sheet.id, photo.id]).status_code == 200
+    [question, _] = _detail(client, cid)["messages"]
+    assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id])
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -538,6 +579,7 @@ def test_the_turn_is_recorded_with_its_children(
         "tool_calls": 1,
         "finish_reason": None,
         "stopped": False,
+        "images": 0,
         "reasoning": False,
     }
     assert second["ai"]["output_sha256"] == sha256_text("Summe: 42")
@@ -878,3 +920,142 @@ def test_a_fresh_table_keeps_its_preview_in_a_chat_older_than_the_file_period(
     [result] = [f.data for f in _frames(_send(client, cid)) if f.event == "result"]
     assert (result["kind"], result["expired"]) == ("table", False)
     assert result["preview"] is not None
+
+
+# --- images: a refused image round, which calls ask for images, where data URLs never go ---
+
+PHOTO = "harbour-photo.jpg"
+
+
+@pytest.fixture
+def seeing(
+    tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor, fake_openai: FakeOpenAI
+) -> Iterator[TestClient]:
+    """Serve the app with pictures offered: vision on, and a workbench that lists ``view_file``."""
+    with TestClient(_app(tmp_path, audit_stream, door, fake_openai, vision=True)) as test_client:
+        yield test_client
+
+
+def _refused() -> openai.BadRequestError:
+    """Return the router's refusal of a request with images."""
+    request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
+    return openai.BadRequestError("image refused", response=httpx2.Response(400, request=request), body=None)
+
+
+def _attach_photo(client: TestClient, cid: str) -> str:
+    """Attach the harbour photo through the route, wait until it is prepared, and return its id."""
+    files = {"file": (PHOTO, TINY_JPEG, "application/octet-stream")}
+    r = client.post(f"/api/chats/{cid}/attachments", files=files, headers=as_user())
+    assert r.status_code == 201, r.text
+    attachment_id = str(r.json()["id"])
+    r = client.get(f"/api/chats/{cid}/attachments/{attachment_id}", params={"wait": 20}, headers=as_user())
+    assert (r.status_code, r.json()["status"]) == (200, "ready")
+    return attachment_id
+
+
+def _tool_calls(door: FakeDoor) -> list[httpx.Request]:
+    return [request for request, body in door.requests if request.url.path == "/mcp" and body["method"] == "tools/call"]
+
+
+def _view_page(folder: str) -> dict[str, Any]:
+    """Return workbench's answer to a view of the scan's first page."""
+    shown = [{"n": 1, "label": "quay-scan.pdf, page 1", "width": 1131, "height": 1600}]
+    return view_result(folder, shown, [image_block(TINY_JPEG)])
+
+
+def test_a_refused_image_round_streams_a_notice(
+    seeing: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """A model that refuses the picture gets the round again without it; the stream says so before any text.
+
+    Each try is its own ``chat.answer`` record, naming how many images it sent.
+    """
+    cid = _new(seeing)
+    photo = _attach_photo(seeing, cid)
+    fake_openai.script = [_refused(), ANSWER]
+    frames = _frames(_send(seeing, cid, "Was zeigt das Bild?", attachment_ids=[photo]))
+    assert [frame.event for frame in frames] == ["notice", "token", "final"]
+    assert frames[0].data == {"code": "images_dropped"}
+    answers = [e for e in events(audit_stream) if e["operation"] == "chat.answer"]
+    assert [(e["outcome"], e["criteria"]["round"], e["criteria"]["images"]) for e in answers] == [
+        ("error", 1, 1),
+        ("ok", 1, 0),
+    ]
+
+
+def _listings(door: FakeDoor) -> list[httpx.Request]:
+    return [request for request, body in door.requests if request.url.path == "/mcp" and body["method"] == "tools/list"]
+
+
+def _read_document_told(call: dict[str, Any]) -> str:
+    return next(t["function"]["description"] for t in call["tools"] if t["function"]["name"] == "read_document")
+
+
+def test_a_turn_asks_workbench_for_images_only_while_the_model_sees(
+    client: TestClient, door: FakeDoor, fake_openai: FakeOpenAI
+) -> None:
+    """With vision off, neither the turn's discovery nor its calls carry ``X-Accept-Images``.
+
+    The model is offered workbench's listing for a call without images: no view_file, 0.6's read_document text.
+    """
+    cid = _new(client)
+    fake_openai.script = [_read_call(cid), ANSWER]
+    _frames(_send(client, cid))
+    [call] = _tool_calls(door)
+    assert "x-accept-images" not in call.headers
+    listings = _listings(door)
+    assert listings and all("x-accept-images" not in request.headers for request in listings)
+    offered = fake_openai.calls[0]
+    assert "view_file" not in [tool["function"]["name"] for tool in offered["tools"]]
+    assert _read_document_told(offered) == READ_DOCUMENT_TEXT
+
+
+def test_a_seeing_turn_is_offered_the_listing_for_images(
+    seeing: TestClient, door: FakeDoor, fake_openai: FakeOpenAI
+) -> None:
+    """With pictures offered, the turn's discovery asks for images, and the model is told read_document's image text."""
+    cid = _new(seeing)
+    fake_openai.script = [ANSWER]
+    _frames(_send(seeing, cid))
+    listings = _listings(door)
+    assert listings and all(request.headers["x-accept-images"] == "1" for request in listings)
+    offered = fake_openai.calls[0]
+    assert "view_file" in [tool["function"]["name"] for tool in offered["tools"]]
+    assert _read_document_told(offered) == CONTRACT_TOOLS["read_document"][0]
+
+
+def test_no_data_url_reaches_the_log_the_store_or_the_audit(
+    seeing: TestClient, door: FakeDoor, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """An attached picture and a tool's page go to the model as data URLs, and nowhere else.
+
+    Not into a log line at DEBUG, the audit chain, or the database file and its write-ahead log. The turn's
+    call asks workbench for images.
+    """
+    lines: list[str] = []
+    sink = logger.add(lines.append, level="DEBUG", format="{message} {extra}")
+    try:
+        cid = _new(seeing)
+        photo = _attach_photo(seeing, cid)
+        door.answers["tools/call"] = _view_page
+        view = json.dumps({"path": f"{chat_folder(KEY, cid)}/quay-scan.pdf"})
+        fake_openai.script = [
+            [call_chunk(0, "call_0", "view_file", view), usage_chunk(900, 20, "served-model")],
+            ANSWER,
+        ]
+        frames = _frames(_send(seeing, cid, "Was zeigt das Bild?", attachment_ids=[photo]))
+    finally:
+        logger.remove(sink)
+    assert [frame.event for frame in frames] == ["step", "step", "token", "final"]
+    [call] = _tool_calls(door)
+    assert call.headers["x-accept-images"] == "1"
+    encoded = base64.b64encode(TINY_JPEG).decode("ascii")
+    url = f"data:image/jpeg;base64,{encoded}"
+    sent = [json.dumps(call["messages"]) for call in fake_openai.calls]
+    assert [text.count(url) for text in sent] == [1, 2]
+    db = Path(_state(seeing).settings.db_path)
+    wal = db.with_name(db.name + "-wal")
+    assert db.exists() and wal.exists()
+    stored = (db.read_bytes() + wal.read_bytes()).decode("latin-1")
+    for where in ("\n".join(lines), audit_stream.getvalue(), stored):
+        assert "data:image" not in where and encoded not in where

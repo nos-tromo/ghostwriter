@@ -17,9 +17,31 @@ from sqlalchemy.types import TypeDecorator
 from typing_extensions import override
 
 #: The schema this release writes.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+def _to_2(conn: Connection) -> None:
+    """Give attachments a kind, a status, a manifest and a failure token.
+
+    Every attachment written before is a document, and ready.
+
+    Args:
+        conn: The connection of the migration's transaction.
+    """
+    for statement in (
+        "ALTER TABLE attachments ADD COLUMN kind VARCHAR(8) NOT NULL DEFAULT 'document'"
+        " CHECK (kind IN ('document', 'image', 'media'))",
+        "ALTER TABLE attachments ADD COLUMN status VARCHAR(10) NOT NULL DEFAULT 'ready'"
+        " CHECK (status IN ('processing', 'ready', 'failed'))",
+        "ALTER TABLE attachments ADD COLUMN render TEXT",
+        "ALTER TABLE attachments ADD COLUMN failure VARCHAR(40)",
+        "CREATE INDEX ix_attachments_status ON attachments (status)",
+    ):
+        conn.exec_driver_sql(statement)
+
+
 #: Version ``n`` to ``n + 1``, each run in a transaction of its own.
-MIGRATIONS: dict[int, Callable[[Connection], None]] = {}
+MIGRATIONS: dict[int, Callable[[Connection], None]] = {1: _to_2}
 
 _PRAGMAS: Final = ("busy_timeout=5000", "foreign_keys=ON", "secure_delete=ON", "journal_mode=WAL")
 

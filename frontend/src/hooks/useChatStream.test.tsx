@@ -47,6 +47,7 @@ const TABLE = result({
   size: 120,
   preview: { columns: ['Monat', 'Betrag'], rows: [['Jan', '42']], row_count: 1, truncated: false },
 })
+const IMAGES_DROPPED = 'The model did not take the pictures; it answered without them.'
 const FINAL = { message_id: 'm2', user_message_id: 'm1', chat: CHAT, stopped: false }
 const SALES: AttachmentOut = {
   id: 'a1',
@@ -56,6 +57,8 @@ const SALES: AttachmentOut = {
   mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
   created_at: '2026-11-02T09:00:00Z',
   expired: false,
+  kind: 'document',
+  status: 'ready',
 }
 
 /** A stand-in for Task 14's composer: buttons over the conversation's stream. */
@@ -390,6 +393,52 @@ function serveTwoChats() {
   }
   return { calls, streams, finish }
 }
+
+describe('a notice frame', () => {
+  it('keeps an images_dropped notice with its answer until the next one starts', async () => {
+    const { sse, finish } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    expect(screen.queryByText(IMAGES_DROPPED)).not.toBeInTheDocument()
+
+    // Sent twice, said once; a code this app does not know is ignored.
+    sse.push('notice', { code: 'images_dropped' })
+    sse.push('notice', { code: 'images_dropped' })
+    sse.push('notice', { code: 'something_new' })
+    sse.push('token', { text: 'Ohne Bilder' })
+    await screen.findByText('Ohne Bilder')
+    expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+
+    finish()
+    // The stored answer replaces the draft; the notice stays with it.
+    expect(await screen.findByText('Summe: 42')).toBeInTheDocument()
+    expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
+    expect(screen.getByText(IMAGES_DROPPED)).toHaveAttribute('role', 'status')
+
+    // The next message clears it.
+    serveChat(detail([QUESTION, ANSWER]), detail([QUESTION, ANSWER]), 'messages')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    await waitFor(() => expect(screen.queryByText(IMAGES_DROPPED)).not.toBeInTheDocument())
+  })
+
+  it('names the notice in the language of the app', async () => {
+    const { sse } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />
+      </LanguageContext>,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('notice', { code: 'images_dropped' })
+    const line = await screen.findByText('Das Modell hat die Bilder nicht angenommen und ohne sie geantwortet.')
+    expect(line).toHaveAttribute('role', 'status')
+  })
+})
 
 describe('answers in chats the user has left', () => {
   it('shows each message once on return, as the server lists the chat while its answer runs', async () => {

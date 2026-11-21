@@ -13,6 +13,7 @@ type Translate = ReturnType<typeof useT>
 const TOOL_LABELS = new Map<string, { named: Key; unnamed: Key }>([
   ['list_files', { named: 'trail.list_files', unnamed: 'trail.list_files' }],
   ['read_document', { named: 'trail.read_document', unnamed: 'trail.read_document_unnamed' }],
+  ['view_file', { named: 'trail.view_file', unnamed: 'trail.view_file_unnamed' }],
   ['search_files', { named: 'trail.search_files', unnamed: 'trail.search_files_unnamed' }],
   ['run_python', { named: 'trail.run_python', unnamed: 'trail.run_python' }],
   ['inspect_template', { named: 'trail.inspect_template', unnamed: 'trail.inspect_template_unnamed' }],

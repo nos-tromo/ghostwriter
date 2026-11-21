@@ -11,11 +11,12 @@ import {
 } from '@infra/ui'
 import { transcribe } from '../api/chats'
 import type { AppConfig } from '../api/types'
-import { isAttachable, type Attachments } from '../hooks/useAttachments'
+import { isAttachable, isImageName, type Attachments } from '../hooks/useAttachments'
 import type { ChatStream } from '../hooks/useChatStream'
 import { useRecorder } from '../hooks/useRecorder'
 import { useT } from '../i18n/LanguageContext'
-import { AttachmentChips } from './AttachmentChips'
+import { screenshotName } from '../lib/format'
+import { AttachmentTiles } from './AttachmentTiles'
 import { RequestError } from './RequestError'
 
 /**
@@ -65,7 +66,7 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  * text; the reasoning switch; send, or stop while an answer streams.
  *
  * Enter sends and Shift+Enter starts a new line. Send waits while a file
- * uploads, and needs text or an attached file. A transcript goes in at the
+ * uploads or a picture is prepared, and needs text or an attached file. A transcript goes in at the
  * cursor and is never sent by itself; one still running when the composer
  * goes is aborted. A message the server refuses comes back into the composer
  * with its files, as it was.
@@ -74,12 +75,14 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  * `ChatPane`'s, so the conversation above shows the same answer this sends.
  */
 export function Composer({
+  chatId,
   config,
   stream,
   attachments,
   reasoning,
   onReasoningChange,
 }: {
+  chatId: string
   config: AppConfig
   stream: ChatStream
   attachments: Attachments
@@ -138,9 +141,10 @@ export function Composer({
   })
 
   const done = attachments.pending.filter((f) => f.status === 'done' && f.attachment)
-  const uploading = attachments.pending.some((f) => f.status === 'uploading')
+  const processing = attachments.pending.some((f) => f.status === 'processing')
+  const busy = processing || attachments.pending.some((f) => f.status === 'uploading')
   const content = text.trim()
-  const canSend = !stream.streaming && !uploading && (content !== '' || done.length > 0)
+  const canSend = !stream.streaming && !busy && (content !== '' || done.length > 0)
 
   const submit = async () => {
     if (!canSend) return
@@ -164,20 +168,31 @@ export function Composer({
   }
 
   // A paste of files attaches them. Text is pasted as ever; what comes with
-  // it is a picture of that text (an office program's copy) unless it is of
-  // a type that can be attached. Text that is just a pasted file's name (a
-  // file manager's copy) is that file, not text to paste.
+  // it is a picture of that text (an office program's copy), never attached,
+  // and any other file of a type that can be attached is. Text that is just
+  // a pasted file's name (a file manager's copy) is that file, not text to
+  // paste. A lone PNG with no text that the browser calls `image.png` is a
+  // screenshot, named by the moment it was taken; any other keeps its name.
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     if (!config.attachments) return
     const files = Array.from(event.clipboardData.files)
     if (files.length === 0) return
     const pasted = event.clipboardData.getData('text/plain')
     if (pasted && !files.some((f) => f.name === pasted)) {
-      const attachable = files.filter((f) => isAttachable(f.name, config))
+      const attachable = files.filter((f) => isAttachable(f.name, config) && !isImageName(f.name, config))
       if (attachable.length > 0) attachments.add(attachable)
       return
     }
     event.preventDefault()
+    const [only] = files
+    if (!pasted && files.length === 1 && only.type === 'image/png' && only.name === 'image.png') {
+      const name = screenshotName(new Date(), new Set(attachments.pending.map((f) => f.name)))
+      // Where pictures cannot be attached, it stays as it came, and is refused as ever.
+      if (isAttachable(name, config)) {
+        attachments.add([new File([only], name, { type: only.type })])
+        return
+      }
+    }
     attachments.add(files)
   }
 
@@ -192,7 +207,13 @@ export function Composer({
     >
       {/* As wide as the message column (Conversation), whose padding is inside its max width too. */}
       <div className="mx-auto w-full max-w-3xl space-y-2 px-4">
-        <AttachmentChips pending={attachments.pending} onDismiss={attachments.dismiss} />
+        <AttachmentTiles
+          chatId={chatId}
+          pending={attachments.pending}
+          maxImages={config.max_images}
+          onDismiss={attachments.dismiss}
+        />
+        {processing && <p className="text-xs text-muted-foreground">{t('composer.processing_hint')}</p>}
         {attachments.pending.some((f) => f.status !== 'error') && (
           <p className="text-xs text-muted-foreground">
             {t('composer.files_stay', { days: config.file_retention_days })}

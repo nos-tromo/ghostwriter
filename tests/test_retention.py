@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import anyio
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -28,11 +29,13 @@ from ghostwriter.audit import open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
-from ghostwriter.models import Chat, Result, ToolStep
+from ghostwriter.models import Attachment, Chat, Result, ToolStep
+from ghostwriter.processing import AttachmentProcessor, PrepareJob
 from ghostwriter.retention import (
     FIRST_SWEEP_DELAY_S,
     SWEEP_BATCH,
     SWEEP_INTERVAL_S,
+    WORKBENCH_DELETE,
     Sweeper,
     SweepReport,
     dry_run,
@@ -44,8 +47,8 @@ from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError
 from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import WorkbenchClient, chat_folder, session_pseudonym, user_pseudonym
-from tests.conftest import KEY, CapturedAuditStream, events, make_settings
-from tests.fakes import FakeDoor
+from tests.conftest import KEY, CapturedAuditStream, events, make_settings, unrecorded_child
+from tests.fakes import FakeDoor, stock_manifest
 
 DAY = timedelta(days=1)
 SECOND = timedelta(seconds=1)
@@ -227,6 +230,41 @@ def _raw_result(engine: Engine, result_id: str) -> tuple[Any, ...]:
         return tuple(row)
 
 
+def _scan(env: Env, made: datetime) -> str:
+    """Start a chat at ``made`` and give it a scanned PDF whose manifest was kept then.
+
+    Args:
+        env: The test's env.
+        made: When the chat and the attachment were made.
+
+    Returns:
+        The attachment's id.
+    """
+    chat_id = env.chat(made)
+    env.clock.now = made
+    attachment = env.store.add_attachment(
+        chat_id,
+        file_id="b" * 32,
+        path="/workspace/s/quay-scan.pdf",
+        name="quay-scan.pdf",
+        size=2048,
+        mime="application/pdf",
+        status="processing",
+    )
+    manifest = {"kind": "pdf", "total": 2, "pages_without_text": [2], "renditions": [{"n": 1, "width": 8, "height": 9}]}
+    assert env.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
+    env.clock.now = NOW
+    return attachment.id
+
+
+def _raw_attachment(engine: Engine, attachment_id: str) -> tuple[Any, ...]:
+    with Session(engine) as s:
+        row = s.execute(
+            select(Attachment.name, Attachment.status, Attachment.render).where(Attachment.id == attachment_id)
+        ).one()
+        return tuple(row)
+
+
 def _of(stream: CapturedAuditStream, operation: str) -> list[dict[str, Any]]:
     return [e for e in events(stream) if e["operation"] == operation]
 
@@ -344,6 +382,97 @@ async def test_a_workbench_timeout_ends_the_sweeps_calls_to_it(
     env.clock.now = NOW + DAY
     assert await env.sweeper.sweep() == SweepReport(chats=1)
     assert _deletes(env.door)[-1].headers["x-session-id"] == session_pseudonym(KEY, later)
+
+
+async def test_a_due_chats_attachment_jobs_are_cancelled_before_its_folder_goes(
+    settled: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """A picture of a due chat still being prepared: the sweep cancels its job first, then deletes the folder."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    path = f"{chat_folder(KEY, cid)}/harbour-photo.jpg"
+    env.door.manifests[path] = stock_manifest(path)
+    env.door.delays["/files/prepare"] = 2.0
+    photo = env.store.add_attachment(
+        cid,
+        file_id="b" * 32,
+        path=path,
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    sweeper = Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+    left: list[int] = []
+    env.door.on_delete = lambda: left.append(processor.cancel_chat(cid))
+    try:
+        processor.submit(PrepareJob(photo.id, cid, "user-a", path, "image", None))
+        with anyio.fail_after(5):
+            while not [r for r, _ in env.door.requests if r.url.path == "/files/prepare"]:
+                await anyio.sleep(0.01)
+        with anyio.fail_after(1.5):
+            assert await sweeper.sweep() == SweepReport(chats=1)
+        await processor.wait(photo.id, 5)
+        assert (left, processor.running(photo.id), env.has_rows(cid)) == ([0], False, False)
+        assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+    finally:
+        await processor.aclose()
+
+
+async def test_a_failed_sweep_batch_prepares_its_chats_pictures_again(
+    settled: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch cancelled the picture's job, then its record failed and the chat stayed: it is prepared again."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    path = f"{chat_folder(KEY, cid)}/harbour-photo.jpg"
+    env.door.manifests[path] = stock_manifest(path)
+    env.door.delays["/files/prepare"] = 1.0
+    photo = env.store.add_attachment(
+        cid,
+        file_id="b" * 32,
+        path=path,
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    sweeper = Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+    unrecorded_child(monkeypatch, WORKBENCH_DELETE)
+    try:
+        processor.submit(PrepareJob(photo.id, cid, "user-a", path, "image", None))
+        with anyio.fail_after(5):
+            while not [r for r, _ in env.door.requests if r.url.path == "/files/prepare"]:
+                await anyio.sleep(0.01)
+        with pytest.raises(AuditWriteError):
+            await sweeper.sweep()
+        assert env.has_rows(cid) and processor.running(photo.id)
+        await processor.wait(photo.id, 5)
+        found = env.store.find_attachment("user-a", cid, photo.id)
+        assert found is not None and found.status == "ready"
+        assert len([r for r, _ in env.door.requests if r.url.path == "/files/prepare"]) == 2
+    finally:
+        await processor.aclose()
 
 
 async def test_the_sweep_names_the_chat_and_the_system_reason_to_workbench(
@@ -517,6 +646,40 @@ async def test_tool_contents_and_previews_are_emptied_after_the_file_period(
     assert "Umsatz 42" not in audit_stream.getvalue() and "sums.xlsx" not in audit_stream.getvalue()
 
 
+async def test_expired_manifests_are_recorded_then_emptied(settled: Env, audit_stream: CapturedAuditStream) -> None:
+    """A manifest goes with its file's period: recorded first, then emptied; the attachment itself stays."""
+    env = settled
+    old = _scan(env, NOW - 7 * DAY - SECOND)
+    live = _scan(env, NOW - DAY)
+    before = len(events(audit_stream))
+    assert await env.sweeper.sweep() == SweepReport(manifests=1)
+    emptied = _of(audit_stream, "retention.tool_content")
+    assert [(e["action"], e["actor"], e["target"], e["criteria"]) for e in emptied] == [
+        ("delete", SYSTEM, {"kind": "attachment", "ids": [old], "count": 1}, {"file_days": 7}),
+    ]
+    assert len(events(audit_stream)) == before + 1
+    assert _raw_attachment(env.engine, old) == ("quay-scan.pdf", "ready", None)
+    assert _raw_attachment(env.engine, live)[2] is not None
+    assert "pages_without_text" not in audit_stream.getvalue()
+    assert await env.sweeper.sweep() == SweepReport()
+    assert len(events(audit_stream)) == before + 1
+
+
+async def test_a_manifest_is_not_emptied_when_its_record_cannot_be_written(
+    settled: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """The record comes first: an event that cannot be written leaves the manifest where it is."""
+    env = settled
+    old = _scan(env, NOW - 8 * DAY)
+    audit_stream.writes_left = 0
+    with pytest.raises(AuditWriteError):
+        await env.sweeper.sweep()
+    audit_stream.writes_left = None
+    assert _raw_attachment(env.engine, old)[2] is not None
+    assert await env.sweeper.sweep() == SweepReport(manifests=1)
+    assert _raw_attachment(env.engine, old)[2] is None
+
+
 def _spin_guard(monkeypatch: pytest.MonkeyPatch, store: ChatStore, name: str) -> None:
     """Fail a sweep that reads what is due more than ten times, instead of letting it spin."""
     read = getattr(store, name)
@@ -554,7 +717,7 @@ async def test_a_content_batch_with_nothing_new_ends_the_sweep(
     """Contents that were not emptied come back: the sweep stops with one warning, each recorded once."""
     env = settled
     step, result = _contents(env, NOW - 8 * DAY)
-    monkeypatch.setattr(env.store, "empty_contents", lambda steps, results: None)
+    monkeypatch.setattr(env.store, "empty_contents", lambda steps, results, attachments=(): None)
     _spin_guard(monkeypatch, env.store, "due_contents")
     assert await env.sweeper.sweep() == SweepReport(steps=1, previews=1)
     assert [e["target"]["ids"] for e in _of(audit_stream, "retention.tool_content")] == [[step], [result]]
@@ -672,7 +835,7 @@ def test_the_dry_run_counts_and_changes_nothing(settled: Env, audit_stream: Capt
     out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
     assert out == (
         "chats due now: 2 (started 95 to 120 days ago; period 90 days, in force since 2026-11-16)\n"
-        "tool contents due now: 2 steps, 1 preview (made 8 to 30 days ago; period 7 days)\n"
+        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)\n"
         "This run deletes nothing."
     )
     assert "chats due now: 2" in out
@@ -681,6 +844,33 @@ def test_the_dry_run_counts_and_changes_nothing(settled: Env, audit_stream: Capt
     for secret in (*chat_ids, "user-a", "Q3 Zahlen", "Umsatz 42", "sums.xlsx"):
         assert secret not in out
     assert _files(env) == files and len(events(audit_stream)) == before
+
+
+async def test_the_dry_run_counts_the_manifests_a_sweep_would_empty(settled: Env) -> None:
+    """A due manifest of a kept chat counts, a live one and a due chat's do not; the sweep then empties as many."""
+    env = settled
+    _scan(env, NOW - 8 * DAY)
+    _scan(env, NOW - DAY)
+    _scan(env, NOW - 100 * DAY)
+    files = _files(env)
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert (
+        out.splitlines()[1] == "tool contents due now: 0 steps, 0 previews, 1 manifest (made 8 days ago; period 7 days)"
+    )
+    assert _files(env) == files
+    assert (await env.sweeper.sweep()).manifests == 1
+
+
+def test_the_dry_run_reads_a_file_from_before_manifests(settled: Env) -> None:
+    """A file of schema 1 has no ``render`` column: the run still reports, with no manifests."""
+    env = settled
+    _scenario(env)
+    with env.engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE attachments DROP COLUMN render")
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert out.splitlines()[1] == (
+        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)"
+    )
 
 
 def test_the_dry_run_previews_another_period(settled: Env) -> None:
@@ -697,7 +887,7 @@ def test_the_dry_run_previews_another_period(settled: Env) -> None:
     out = dry_run(env.settings.db_path, chat_days=None, file_days=7, notice_days=30, now=NOW)
     assert out.splitlines()[:2] == [
         "chats due now: 0 (chat retention is off)",
-        "tool contents due now: 3 steps, 2 previews (made 8 to 120 days ago; period 7 days)",
+        "tool contents due now: 3 steps, 2 previews, 0 manifests (made 8 to 120 days ago; period 7 days)",
     ]
 
 

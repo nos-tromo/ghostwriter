@@ -1,7 +1,7 @@
 import { useState, type DragEvent, type ReactNode } from 'react'
 import { EmptyState, Spinner } from '@infra/ui'
 import { ApiError } from '../api/client'
-import type { AppConfig, ErrorFrame } from '../api/types'
+import type { AppConfig, ErrorFrame, NoticeCode } from '../api/types'
 import type { ChatStream, StreamFailure } from '../hooks/useChatStream'
 import { useChat } from '../hooks/useChats'
 import { useStickToBottom } from '../hooks/useStickToBottom'
@@ -20,11 +20,13 @@ const ERROR_KEYS: Record<ErrorFrame['code'], keyof Strings> = {
 const REFUSAL_KEYS: Partial<Record<string, keyof Strings>> = {
   busy: 'chat.answer_busy',
   no_answer: 'chat.no_answer',
+  attachment_processing: 'chat.attachment_processing',
 }
 
 /** Why the last answer ended early, or never started: a refusal says what it
  *  is by its code (`busy`, an answer still being written, which a chat left
- *  and reopened can meet; `no_answer`), anything else is the generic line. */
+ *  and reopened can meet; `no_answer`; `attachment_processing`, files not yet
+ *  ready), anything else is the generic line. */
 function FailureLine({ failure }: { failure: StreamFailure }) {
   const t = useT()
   let key: keyof Strings | undefined
@@ -36,6 +38,19 @@ function FailureLine({ failure }: { failure: StreamFailure }) {
   return (
     <p role="alert" className="text-sm text-danger">
       {t(key)}
+    </p>
+  )
+}
+
+/** What the server said about the answer besides its text, quietly: the model
+ *  answered without the pictures. Announced politely, and only for a notice this
+ *  app knows. */
+function NoticeLine({ notices }: { notices: readonly NoticeCode[] }) {
+  const t = useT()
+  if (!notices.includes('images_dropped')) return null
+  return (
+    <p role="status" className="text-sm text-muted-foreground">
+      {t('chat.images_dropped')}
     </p>
   )
 }
@@ -91,6 +106,8 @@ export function Conversation({
   const failure: StreamFailure | null = stream.draft?.error
     ? { kind: 'answer', code: stream.draft.error }
     : stream.failure
+  // The draft's own while the answer is written, then the stream's: kept with the answer.
+  const notices = stream.draft?.notices ?? stream.notices
   const empty = chat.isSuccess && messages.length === 0 && !stream.streaming
 
   const drops = onDropFiles && {
@@ -132,8 +149,9 @@ export function Conversation({
               onRegenerate={message.id === lastAnswer ? () => void stream.regenerate(reasoning) : undefined}
             />
           ))}
-          {stream.pendingUser !== null && <PendingUser message={stream.pendingUser} />}
+          {stream.pendingUser !== null && <PendingUser chatId={chatId} message={stream.pendingUser} />}
           {stream.draft && <DraftView chatId={chatId} draft={stream.draft} fileDays={fileDays} />}
+          <NoticeLine notices={notices} />
           {failure && <FailureLine failure={failure} />}
         </div>
       </div>

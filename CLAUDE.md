@@ -28,7 +28,10 @@ back as cards; no file is stored here. A FastAPI backend keeps the chats in
 SQLite; a React SPA (`@infra/ui`, nginx) is reached only through the edge
 gateway. Reasoning is a per-message switch in the composer, off by default; on
 vllm it sets `chat_template_kwargs.enable_thinking`, and the thinking is
-dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
+dropped (never shown, stored, replayed or recorded). A picture attached to a
+message, or a page or picture a tool shows, goes to the chat model as an image
+while it sees (`GHOSTWRITER_VISION`); the bytes live in memory for that one
+message. Reference: `docs/`.
 
 ## Where it fits
 
@@ -45,6 +48,17 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
   `base` is `/ghostwriter/`.
 - **obs-plane** collects the audit chain from stdout and scrapes
   `ghostwriter-backend:8000/metrics`.
+- **The workbench seam and pictures.** workbench 0.7.0 lists `view_file`, tells
+  `read_document` in its image words and attaches images only to a call that
+  carries `X-Accept-Images: 1` (`workbench.ACCEPT_IMAGES`); without it, it
+  answers as 0.6.0 did. Discovery is cached per listing (`discover(images=…)`).
+  A turn sees when the model sees and the image listing holds `view_file`: it is
+  offered that listing, and its calls carry the header. A turn without sight,
+  and every round after the router refused a round's images, is offered the
+  header-less listing and sends no header. Pictures are offered
+  (`Vision.images_offered`) on the same condition. On Ollama, one
+  `POST /api/show` to the router's host at start turns pictures off for a model
+  without `vision`; on vLLM, a text-only model needs `GHOSTWRITER_VISION=off`.
 
 ## Module map
 
@@ -61,9 +75,11 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
 | `ghostwriter/turns.py` | `TurnRegistry`: at most one answer per chat |
 | `ghostwriter/sse.py` | SSE frames; docint's sync-generator bridge |
 | `ghostwriter/body_limit.py` | per-route body caps, as nginx's |
-| `ghostwriter/upload.py` | streaming multipart reader; attachment types and safe names |
+| `ghostwriter/upload.py` | streaming multipart reader; attachment types, kinds and safe names |
 | `ghostwriter/inference.py` | `ModelClient`: chat rounds and transcriptions through the router |
-| `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, chat delete; the pseudonyms |
+| `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, prepare, renditions, chat delete; the pseudonyms |
+| `ghostwriter/vision.py` | `Vision.images_offered` (setting, model, `view_file` listed); the Ollama probe; `system_call` |
+| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), with the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete |
 | `ghostwriter/retention_rule.py` | the period rule (docint's, verbatim) and the sweep loop |
 | `ghostwriter/retention.py` | the daily sweep and the dry run |
 | `ghostwriter/log_cfg.py` | the stderr sink; quiet HTTP and SDK loggers |
@@ -71,6 +87,7 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
 | `ghostwriter/agent/loop.py` | `AgentLoop`: rounds and tool calls within the caps |
 | `ghostwriter/agent/stream.py`, `reasoning.py` | one streamed round; reasoning stripped (docint's) |
 | `ghostwriter/agent/context.py` | the prompt fitted to the budget; follow-ups replayed |
+| `ghostwriter/agent/images.py` | image refs, their token estimate, the notes where one gives way, the `ImageBank` and `materialise` (refs to data URLs, as a round goes out) |
 | `ghostwriter/agent/tools.py` | tools as OpenAI functions; arguments read; what the model reads back |
 | `ghostwriter/agent/prompt.py` | the system prompt |
 | `ghostwriter/api/chats.py` | list, create, read, rename, delete |
@@ -80,7 +97,10 @@ dropped (never shown, stored, replayed or recorded). Reference: `docs/`.
 | `ghostwriter/api/meta.py` | `/api/whoami`, `/api/config` |
 | `frontend/src/api/` | `apiFetch` (the purpose on every request), routes, SSE reader |
 | `frontend/src/hooks/` | chats, the chat streams (one per chat, held above the open chat), attachments, the recorder, the stray-drop guard |
+| `frontend/src/hooks/usePreview.ts` | a picture's render as an object URL, fetched once with the purpose; says when it is gone |
 | `frontend/src/components/` | chat list, conversation, trail, result cards, composer, retention note |
+| `frontend/src/components/AttachmentTiles.tsx` | the composer's tiles: uploading, processing, ready, failed; preview and lightbox |
+| `frontend/src/components/AttachmentImage.tsx` | a sent picture in the user's bubble, opening full size in a lightbox |
 | `frontend/src/i18n/` | en and de with key parity; German uses "Sie" |
 | `frontend/nginx/` | sub-path, the stream, body caps, security headers |
 
@@ -120,10 +140,21 @@ the sweep. Never add workers or replicas.
    through `ModelClient` and strips the reasoning. Each tool call is disclosed
    (`disclose` / `chat.tool`) before it goes to `WorkbenchClient.call_tool`
    over MCP, which never raises. Each round is then recorded (`ai_call` /
-   `chat.answer`). With workbench off, `app.state.workbench` is `None` and no
-   tool is offered.
-5. The frames are `start` (always first), then `token`, `step`, `result` and
-   `error`, then `final` (always last), with a keep-alive comment every 15 s.
+   `chat.answer`, with how many images it sent). With workbench off,
+   `app.state.workbench` is `None` and no tool is offered. While the turn sees,
+   the question carries its attached pictures and a follow-up those of earlier
+   questions that fit, as image parts: refs, never bytes. `fit` counts a ref by
+   `estimate_image_tokens` and puts a note in its place where it gives way: the
+   question's pictures, then the newest tool images, before the latest round's
+   own results (`agent/context.py` docstring). A tool's images follow its tool
+   messages in one user message. The renditions
+   are fetched into the message's `ImageBank` (memory, for one message), and
+   only `materialise`, just before the model call, swaps each ref for its label
+   and a data URL, in a new list. A round the router refuses with images before
+   any text goes once more without them, and the turn goes on as without sight.
+5. The frames are `start` (always first), then `token`, `step`, `result`,
+   `notice` (what the user is told while the answer goes on: `images_dropped`)
+   and `error`, then `final` (always last), with a keep-alive comment every 15 s.
    A stop or a disconnect sets the turn's event: the call in flight finishes
    and is stored, and no further round starts.
 6. Every `ChatStore` method is one short transaction that returns schema
@@ -174,13 +205,17 @@ strict; lines are 120 characters.
 
 - A body cap: `ghostwriter/body_limit.py` and `client_max_body_size` in
   `frontend/nginx/default.conf`.
+- An image cap (`GHOSTWRITER_MAX_IMAGES`, `agent/images.py`, `vision.py`):
+  vllm-service's `CHAT_LIMIT_MM_PER_PROMPT` must stay at or above it.
 - `tests/test_scaffold.py` checks the text of `docker/compose.yaml`, the
   `Makefile`, nginx, Vite's `base` and `.env.example` (its tag comments,
   lines under 80 characters).
 - A setting: `load_settings` in `config.py`, `.env.example`, `docs/configuration.md`.
-- The schema: raise `SCHEMA_VERSION` in `db.py` and add
+- The schema (now version 2: attachments carry `kind`, `status`, `render`,
+  `failure`): raise `SCHEMA_VERSION` in `db.py` and add
   `MIGRATIONS[<previous version>]`, one step per version. A file from a newer
-  version is refused.
+  version is refused. `retention.py`'s dry run reads the file directly, so it
+  needs the same care for a column it selects.
 - A new audit action goes into `ENDPOINT_ACTIONS` in `audit.py` first, or
   `audited()` raises. `docs/audit.md` lists what each route records.
 - UI strings go into both `frontend/src/i18n/en.ts` and `de.ts`;

@@ -4,7 +4,8 @@
 |---|---|---|
 | A chat: its messages, steps, attachments and results | `GHOSTWRITER_CHAT_RETENTION_DAYS` (90) after it started | the daily sweep deletes it |
 | Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
-| The files | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download answers 410 |
+| An attachment's manifest (its page count, the pages without text, the sizes of its renders) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
+| The files, and the renders workbench made of them | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
 after start, then daily (`ghostwriter/retention.py`). A line under the composer
@@ -34,13 +35,26 @@ day 6 goes on day 7, a step on day 10 on day 17. Emptied, a step reads "Details
 deleted after 7 days". A changed file period applies at the next start to what
 has not expired yet, without a notice; nothing expired comes back.
 
+## Manifests and renders
+
+An attachment's manifest is derived from its file, so it goes with the file's
+period: the sweep records it, then empties it, and the attachment stays. The
+renders themselves (the pages and pictures the model sees) are workbench's
+derived files and are deleted with their source there. Ghostwriter keeps none:
+the processing and preview routes hold nothing (the preview streams a render
+through), and a picture's bytes live in memory for the one message that sends it.
+After the period an earlier picture is read as expired: the follow-up's line says
+so and nothing is fetched.
+
 ## The delete order
 
 1. Hold the chat's turn: while an answer runs, the owner's delete gets 409 and
    the sweep leaves the chat to its next run.
 2. Record the `delete` event.
-3. Delete the chat's folder in workbench (`DELETE /files/chat`), then record what
-   went. A chat that never used workbench is not sent.
+3. Cancel the jobs that prepare the chat's attachments, then delete the chat's
+   folder in workbench (`DELETE /files/chat`), and record what went. A chat that
+   never used workbench is not sent. A delete that fails after the cancel keeps the
+   chat, and its `processing` attachments are prepared again.
 4. Delete the chat's rows. The owner's delete stops when workbench fails (502,
    the chat is kept); the sweep goes on, as the chat is due and workbench's own
    period takes its files.
@@ -54,5 +68,6 @@ this caller no single-file delete. Otherwise it goes after its 7 days.
 ## The dry run
 
 `make retention-dry-run` asks the running backend what a sweep would delete
-now, in counts, ages and dates only; `CHAT_DAYS=n` previews another chat
+now, in counts, ages and dates only: the chats, and the tool steps, previews
+and manifests whose period has passed; `CHAT_DAYS=n` previews another chat
 period, with the notice it would get. It records and changes nothing.

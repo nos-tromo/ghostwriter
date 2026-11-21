@@ -12,7 +12,18 @@ from starlette.requests import Request
 from starlette.types import Message
 from typing_extensions import override
 
-from ghostwriter.upload import BadUpload, TooLarge, name_problem, read_file_part, safe_filename
+from ghostwriter.upload import (
+    IMAGE_TYPES,
+    PREPARED_SUFFIXES,
+    BadUpload,
+    TooLarge,
+    attachment_kind,
+    attachment_type,
+    name_problem,
+    needs_prepare,
+    read_file_part,
+    safe_filename,
+)
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 BOUNDARY = "gwtest"
@@ -196,3 +207,48 @@ def test_a_name_over_255_bytes_or_ending_in_part_is_a_problem(name: str) -> None
     """Workbench refuses these names, so none is sent to it; a long name with umlauts and spaces is fine."""
     assert isinstance(name_problem(name), str)
     assert name_problem("Übersicht März #1.xlsx") is None
+
+
+def test_images_are_attachable_only_when_offered() -> None:
+    """A picture's type is known only while images are offered, in any case; ``.svg`` is never one."""
+    assert attachment_type("photo.HEIC") is None
+    assert attachment_type("photo.HEIC", images=True) == "image/heic"
+    assert attachment_type("quay-scan.PDF") == "application/pdf"
+    assert attachment_type("quay-scan.pdf", images=True) == "application/pdf"
+    assert attachment_type("drawing.svg") is None
+    assert attachment_type("drawing.svg", images=True) is None
+    assert attachment_type(".png", images=True) is None
+    assert attachment_type("png", images=True) is None
+
+
+def test_the_image_types_are_the_spec_s() -> None:
+    """Ten suffixes, each on its MIME type; ``.jpg`` and ``.jpeg``, ``.tif`` and ``.tiff`` share one."""
+    assert IMAGE_TYPES == {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".gif": "image/gif",
+        ".bmp": "image/bmp",
+        ".tif": "image/tiff",
+        ".tiff": "image/tiff",
+        ".heic": "image/heic",
+        ".heif": "image/heif",
+    }
+    assert PREPARED_SUFFIXES == frozenset({".pdf", *IMAGE_TYPES})
+
+
+@pytest.mark.parametrize(
+    ("name", "kind", "prepared"),
+    [
+        ("quay-scan.pdf", "document", True),
+        ("deck.pptx", "document", False),
+        ("harbour-photo.jpg", "image", True),
+        ("Harbour-Photo.JPEG", "image", True),
+        ("notes.txt", "document", False),
+    ],
+)
+def test_kinds_and_preparation_follow_the_extension(name: str, kind: str, prepared: bool) -> None:
+    """A picture or a pdf is prepared when it is stored; a picture is the one image kind."""
+    assert attachment_kind(name) == kind
+    assert needs_prepare(name) is prepared

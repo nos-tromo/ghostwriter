@@ -3,6 +3,7 @@ import type { AttachmentOut, MessageOut } from '../api/types'
 import type { DraftAnswer, PendingMessage } from '../hooks/useChatStream'
 import { useLang, useT } from '../i18n/LanguageContext'
 import { formatSize } from '../lib/format'
+import { AttachmentImage } from './AttachmentImage'
 import { MarkdownProse } from './MarkdownProse'
 import { ResultCard } from './ResultCard'
 import { Trail } from './Trail'
@@ -22,14 +23,26 @@ function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
   )
 }
 
-/** What the user wrote, as written (never Markdown), and the files it bound. */
-function UserMessage({ message }: { message: Pick<MessageOut, 'content' | 'attachments'> }) {
+/** What the user wrote, as written (never Markdown), and the files it bound: pictures as a
+ *  grid of tiles that open full size, every other file as a chip. */
+function UserMessage({ chatId, message }: { chatId: string; message: Pick<MessageOut, 'content' | 'attachments'> }) {
+  const pictures = message.attachments.filter((attachment) => attachment.kind === 'image')
+  const files = message.attachments.filter((attachment) => attachment.kind !== 'image')
   return (
     <UserBubble data-role="user">
       {message.content && <p className="whitespace-pre-wrap break-words">{message.content}</p>}
-      {message.attachments.length > 0 && (
+      {pictures.length > 0 && (
+        <ul className="flex flex-wrap gap-2">
+          {pictures.map((attachment) => (
+            <li key={attachment.id} className="max-w-full">
+              <AttachmentImage chatId={chatId} attachment={attachment} />
+            </li>
+          ))}
+        </ul>
+      )}
+      {files.length > 0 && (
         <ul className="flex flex-wrap gap-1">
-          {message.attachments.map((attachment) => (
+          {files.map((attachment) => (
             <li key={attachment.id} className="max-w-full">
               <AttachmentChip attachment={attachment} />
             </li>
@@ -71,7 +84,7 @@ export function MessageView({
   onRegenerate?: () => void
 }) {
   const t = useT()
-  if (message.role === 'user') return <UserMessage message={message} />
+  if (message.role === 'user') return <UserMessage chatId={chatId} message={message} />
   return (
     <div data-role="assistant" className="space-y-2">
       <Trail steps={message.steps} fileDays={fileDays} />
@@ -104,7 +117,8 @@ export function DraftView({ chatId, draft, fileDays }: { chatId: string; draft: 
   )
 }
 
-/** The message being sent, with the files it binds, shown until the chat is read again. */
-export function PendingUser({ message }: { message: PendingMessage }) {
-  return <UserMessage message={message} />
+/** The message being sent, with the files it binds (its pictures from the server's renditions,
+ *  as the stored message's are), shown until the chat is read again. */
+export function PendingUser({ chatId, message }: { chatId: string; message: PendingMessage }) {
+  return <UserMessage chatId={chatId} message={message} />
 }

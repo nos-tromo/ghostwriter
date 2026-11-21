@@ -33,6 +33,11 @@ export function isPurposeRefusal(error: unknown): boolean {
   return error instanceof ApiError && error.status === PURPOSE_REQUIRED_STATUS
 }
 
+/** Whether a file is no longer there: expired (410), or not held by the chat any more (404). */
+export function isGone(error: unknown): boolean {
+  return error instanceof ApiError && (error.status === 410 || error.status === 404)
+}
+
 /** The `ApiError` a non-2xx response stands for. The body is read once, then
  *  parsed, so a non-JSON error page keeps its status. */
 export async function apiErrorOf(res: Response): Promise<ApiError> {

@@ -13,8 +13,10 @@ Each batch of chats:
    by an answer or by its owner's delete, is left to the next sweep. Holding the turns, the sweep
    reads again what is due, so a chat deleted meanwhile is not named;
 2. records ``delete`` / ``retention.chat``: the chats, the period and the cutoff, the sweep's time;
-3. deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
+3. cancels the jobs that prepare the chats' attachments (:mod:`ghostwriter.processing`), then
+   deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
    under the batch's request id; a chat that never used workbench (no file mark) is not sent.
+   A batch that fails after the cancel keeps its chats, and their attachments are prepared again.
    After one timeout, workbench is not called again in this sweep, so a hung workbench holds
    it up once, not once per chat;
 4. records the child ``delete`` / ``retention.chat.workbench``: the files workbench deleted, the
@@ -24,7 +26,9 @@ Each batch of chats:
    retention (``WORKBENCH_RETENTION_DAYS``) removes its files.
 
 Then the contents: ``delete`` / ``retention.tool_content`` names the steps, and again the
-results, before their arguments, results and previews are emptied. Last, the write-ahead log is
+results and the attachments, before their arguments, results, previews and manifests are
+emptied (a manifest is derived from its file, so it goes when the file's period passes; the
+attachment stays). Last, the write-ahead log is
 checkpointed, so no earlier version of what went stays in it.
 
 ``python -m ghostwriter.retention --dry-run [--chat-days N]`` (``make retention-dry-run``) prints
@@ -47,9 +51,10 @@ from typing import Final
 import anyio.to_thread
 from loguru import logger
 
-from ghostwriter.audit import forward_headers, system_operation
+from ghostwriter.audit import Operation, forward_headers, system_operation
 from ghostwriter.config import MAX_DAYS, Settings, load_settings
 from ghostwriter.db import utcnow
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, is_due, next_period_state
 from ghostwriter.store import CHATS_STORE, ChatStore
 from ghostwriter.turns import TurnRegistry
@@ -78,12 +83,14 @@ class SweepReport:
         chats: Chats deleted.
         steps: Tool steps emptied.
         previews: Table previews emptied.
+        manifests: Attachment manifests emptied.
         workbench_failed: Chats whose folder workbench could not delete; their rows went all the same.
     """
 
     chats: int = 0
     steps: int = 0
     previews: int = 0
+    manifests: int = 0
     workbench_failed: int = 0
 
 
@@ -101,6 +108,8 @@ class Sweeper:
         settings: The chat and file periods, for the records.
         turns: The process's turn registry, whose turns the sweep holds while it deletes.
         now: The clock.
+        processor: The attachment processor, whose jobs of a due chat are cancelled before its
+            folder goes; ``None`` while workbench is off.
     """
 
     def __init__(
@@ -112,6 +121,7 @@ class Sweeper:
         settings: Settings,
         turns: TurnRegistry,
         now: Callable[[], datetime] = utcnow,
+        processor: AttachmentProcessor | None = None,
     ) -> None:
         """Keep what the sweep works with."""
         self._store = store
@@ -120,6 +130,7 @@ class Sweeper:
         self._settings = settings
         self._turns = turns
         self._now = now
+        self._processor = processor
         self._workbench_timed_out = False
 
     async def sweep(self) -> SweepReport:
@@ -138,12 +149,13 @@ class Sweeper:
         await self._sweep_contents(now, report)
         await anyio.to_thread.run_sync(self._store.checkpoint)
         logger.info(
-            "Retention sweep: {} chats deleted, {} left while busy; {} tool steps and {} previews emptied; "
-            "workbench failed {}.",
+            "Retention sweep: {} chats deleted, {} left while busy; {} tool steps, {} previews and {} manifests "
+            "emptied; workbench failed {}.",
             report.chats,
             busy,
             report.steps,
             report.previews,
+            report.manifests,
             report.workbench_failed,
         )
         return report
@@ -192,7 +204,7 @@ class Sweeper:
                     self._turns.end(chat_id, claim)
 
     async def _delete_chats(self, batch: Sequence[tuple[str, str]], now: datetime, report: SweepReport) -> None:
-        """Record a batch of due chats, delete their folders in workbench, then their rows.
+        """Record a batch of due chats, cancel their attachment jobs, delete their workbench folders, then their rows.
 
         Args:
             batch: Each chat's id and owner, its turn held.
@@ -208,6 +220,26 @@ class Sweeper:
                 criteria={"period_days": self._settings.chat_days, "cutoff": _iso(now)},
             )
         )
+        cancelled = [] if self._processor is None else [c for c in ids if self._processor.cancel_chat(c)]
+        try:
+            await self._delete_folders_then_rows(op, batch, report)
+        except Exception:
+            if self._processor is not None:
+                for chat_id in cancelled:
+                    await self._processor.requeue_chat(chat_id)
+            raise
+
+    async def _delete_folders_then_rows(
+        self, op: Operation, batch: Sequence[tuple[str, str]], report: SweepReport
+    ) -> None:
+        """Delete a recorded batch's folders in workbench, record how that went, then delete its rows.
+
+        Args:
+            op: The batch's ``retention.chat`` operation, its primary written.
+            batch: Each chat's id and owner, its turn held.
+            report: What the sweep did, counted on.
+        """
+        ids = tuple(chat_id for chat_id, _ in batch)
         used = set() if self._workbench is None else await anyio.to_thread.run_sync(self._store.workbench_chats, ids)
         if self._workbench is None:
             child = partial(op.child, "delete", WORKBENCH_DELETE, criteria={"workbench": "not_configured"})
@@ -246,10 +278,10 @@ class Sweeper:
             self._store.delete_chat_rows(chat_id)
 
     async def _sweep_contents(self, now: datetime, report: SweepReport) -> None:
-        """Record, then empty, the expired tool contents and previews, batch by batch.
+        """Record, then empty, the expired tool contents, previews and manifests, batch by batch.
 
-        A batch that brings no step or result this sweep has not handled yet ends it with a
-        warning, so contents that were not emptied cannot keep it turning.
+        A batch that brings no step, result or attachment this sweep has not handled yet ends it
+        with a warning, so contents that were not emptied cannot keep it turning.
 
         Args:
             now: The time of the sweep.
@@ -258,21 +290,22 @@ class Sweeper:
         criteria = {"file_days": self._settings.file_days}
         handled: set[str] = set()
         while True:
-            steps, results = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
-            if not steps and not results:
+            steps, results, attachments = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
+            if not steps and not results and not attachments:
                 return
-            if handled.issuperset(steps) and handled.issuperset(results):
+            if handled.issuperset(steps) and handled.issuperset(results) and handled.issuperset(attachments):
                 logger.warning("The retention sweep found no tool content it had not handled; it stops here.")
                 return
-            handled.update(steps, results)
-            for kind, ids in (("tool_step", steps), ("result", results)):
+            handled.update(steps, results, attachments)
+            for kind, ids in (("tool_step", steps), ("result", results), ("attachment", attachments)):
                 if ids:
                     op = system_operation(self._emitter, "delete", CONTENT_DELETE)
                     target = Target(kind=kind, ids=tuple(ids), count=len(ids))
                     await anyio.to_thread.run_sync(partial(op.record, target=target, criteria=criteria))
-            await anyio.to_thread.run_sync(self._store.empty_contents, steps, results)
+            await anyio.to_thread.run_sync(self._store.empty_contents, steps, results, attachments)
             report.steps += len(steps)
             report.previews += len(results)
+            report.manifests += len(attachments)
 
 
 # --- the dry run --------------------------------------------------------------
@@ -353,7 +386,9 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
 
     The chats are counted under ``chat_days`` as a start with it would put it in force: the
     period recorded, or another one previewed, with the notice a new or shorter period gives.
-    The contents are counted by the deadlines the store holds, leaving out those of due chats.
+    The contents are counted by the deadlines the store holds, leaving out those of due chats:
+    the steps, the previews and the attachments' manifests, which go at the file period. A file
+    of the schema before 2 has no manifests, and counts none.
 
     Args:
         db_path: The SQLite file, opened read-only.
@@ -380,6 +415,9 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
             "SELECT m.chat_id, r.created_at, r.preview_expires_at FROM results AS r"
             " JOIN messages AS m ON m.id = r.message_id WHERE r.preview IS NOT NULL"
         ).fetchall()
+        manifests: list[tuple[str, str]] = []
+        if any(column[1] == "render" for column in conn.execute("PRAGMA table_info(attachments)")):
+            manifests = conn.execute("SELECT chat_id, created_at FROM attachments WHERE render IS NOT NULL").fetchall()
     if chat_days is None:
         lines, due = ["chats due now: 0 (chat retention is off)"], set()
     else:
@@ -388,9 +426,16 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
     def expired(rows: list[tuple[str, str, str]]) -> list[datetime]:
         return [_aware(made) for chat_id, made, deadline in rows if chat_id not in due and _aware(deadline) <= now]
 
+    file_period = file_days * DAY
     made_steps, made_previews = expired(steps), expired(previews)
-    counts = f"{_counted(len(made_steps), 'step')}, {_counted(len(made_previews), 'preview')}"
-    ages = _ages("made", made_steps + made_previews, now)
+    made_manifests = [
+        made for chat_id, stored in manifests if chat_id not in due and (made := _aware(stored)) + file_period <= now
+    ]
+    counts = (
+        f"{_counted(len(made_steps), 'step')}, {_counted(len(made_previews), 'preview')}, "
+        f"{_counted(len(made_manifests), 'manifest')}"
+    )
+    ages = _ages("made", made_steps + made_previews + made_manifests, now)
     lines.append(f"tool contents due now: {counts} ({ages}period {_counted(file_days, 'day')})")
     lines.append("This run deletes nothing.")
     return "\n".join(lines)

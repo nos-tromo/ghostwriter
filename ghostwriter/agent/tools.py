@@ -4,7 +4,12 @@ The model is offered workbench's MCP tools as OpenAI functions. Its arguments ar
 smaller models write them: nothing is no arguments, a JSON string holding an object is decoded
 once, anything else is refused to the model. What it reads back is bounded: a result's text
 (which workbench writes without the table previews) cut to ``TOOL_RESULT_CHARS``, or a small
-JSON object naming why there is none. The texts here are the model-facing protocol.
+JSON object naming why there is none. A result that showed images says how many it returned,
+or that they could not be shown; which of them went to the model, the note in each one's place
+says. The texts here are the model-facing protocol.
+
+Ghostwriter sets the arguments of :data:`HIDDEN_ARGUMENTS` itself: their schemas are left out of
+what the model is offered, and whatever it sends for them is dropped.
 """
 
 import json
@@ -40,6 +45,14 @@ MAX_ARGUMENT_DEPTH: Final = 32
 DETAIL_CHARS: Final = 120
 #: The most of a failure's text the model reads.
 FAILURE_CHARS: Final = 500
+#: Arguments Ghostwriter sets itself, never offered to the model.
+HIDDEN_ARGUMENTS: Final = frozenset({"strips"})
+#: The tools whose ``strips`` Ghostwriter sets, by the file a call reads.
+STRIPPED_TOOLS: Final = frozenset({"view_file", "read_document"})
+#: What ends a result whose images go to the model, as far as the request has room (the note of each says).
+SHOWN: Final = "[{n} images were returned]"
+#: What ends a result whose images could not go to the model.
+NOT_SHOWN: Final = "[{n} images could not be shown: this model does not take images]"
 
 
 @dataclass(frozen=True)
@@ -80,19 +93,44 @@ def cut(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(0, limit - len(CUT_MARK))] + CUT_MARK
 
 
-def function_tools(tools: Sequence[McpTool]) -> list[dict[str, Any]]:
+def _without(schema: Mapping[str, Any], hidden: frozenset[str]) -> dict[str, Any]:
+    """Return a copy of an input schema without some of its arguments.
+
+    Args:
+        schema: The schema; never changed, as discovery caches it.
+        hidden: The arguments to leave out.
+
+    Returns:
+        The copy, without them in ``properties`` or in ``required``.
+    """
+    copy = dict(schema)
+    properties = schema.get("properties")
+    if isinstance(properties, Mapping):
+        copy["properties"] = {key: value for key, value in properties.items() if key not in hidden}
+    required = schema.get("required")
+    if isinstance(required, list):
+        copy["required"] = [name for name in required if not (isinstance(name, str) and name in hidden)]
+    return copy
+
+
+def function_tools(tools: Sequence[McpTool], *, hidden: frozenset[str] = HIDDEN_ARGUMENTS) -> list[dict[str, Any]]:
     """Offer workbench's tools as OpenAI functions.
 
     Args:
         tools: The tools discovery found.
+        hidden: The arguments Ghostwriter sets itself, left out of every schema.
 
     Returns:
-        One function per tool, in order, its input schema as the parameters.
+        One function per tool, in order, a copy of its input schema without ``hidden`` as the parameters.
     """
     return [
         {
             "type": "function",
-            "function": {"name": tool.name, "description": tool.description, "parameters": tool.input_schema},
+            "function": {
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": _without(tool.input_schema, hidden),
+            },
         }
         for tool in tools
     ]
@@ -199,19 +237,24 @@ def step_detail(tool: str, arguments: Mapping[str, Any]) -> str | None:
     return None
 
 
-def tool_message(outcome: ToolResult | ToolFailure | Refusal) -> str:
-    """Return what the model reads back for a call.
+def tool_message(outcome: ToolResult | ToolFailure | Refusal, *, images_seen: bool = True) -> str:
+    """Return what the model reads back for a call; the store keeps exactly this text.
 
     Args:
         outcome: What the call returned, why it failed, or why it was not run.
+        images_seen: Whether a result's images go to the model.
 
     Returns:
-        A result's text, cut to :data:`TOOL_RESULT_CHARS`; otherwise ``{"error", "detail"}``
+        A result's text, cut to :data:`TOOL_RESULT_CHARS`, and after a newline :data:`SHOWN`, or
+        :data:`NOT_SHOWN` when not ``images_seen``, if it showed images; otherwise ``{"error", "detail"}``
         as compact JSON: a busy workbench's detail says to try later, a failure's is cut to
         :data:`FAILURE_CHARS`.
     """
     if isinstance(outcome, ToolResult):
-        return cut(outcome.text, TOOL_RESULT_CHARS)
+        text = cut(outcome.text, TOOL_RESULT_CHARS)
+        if not outcome.images:
+            return text
+        return f"{text}\n{(SHOWN if images_seen else NOT_SHOWN).format(n=len(outcome.images))}"
     if isinstance(outcome, Refusal):
         detail = outcome.text
     elif outcome.token in BUSY_TOKENS:
