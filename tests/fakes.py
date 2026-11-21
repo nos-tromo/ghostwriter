@@ -9,6 +9,7 @@ and a turn's audit as the agent loop reaches them. Every name, id and value here
 invented.
 """
 
+import base64
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -44,24 +45,42 @@ OUTPUT_ID = "0" * 32
 #: The id the door gives every upload, unless a test sets another.
 UPLOAD_ID = "1" * 32
 NOT_FOUND = {"detail": "not found"}
+#: Bytes that pass the signature check of a jpeg and of a png, and no more.
+TINY_JPEG = b"\xff\xd8\xff\xe0" + bytes(60)
+TINY_PNG = b"\x89PNG\r\n\x1a\n" + bytes(56)
+#: The header workbench 0.7 lists ``view_file`` and attaches images for.
+ACCEPT_IMAGES_HEADER = "x-accept-images"
+_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
 
-#: The nine workspace tools of the contract: name, description and input properties.
+#: The ten workspace tools of the contract: name, description and input properties.
 CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
     "list_files": ("List the files in the chat's folder.", {"path": {"type": "string"}}),
-    "read_document": ("Read a document as text.", {"path": {"type": "string"}}),
+    "read_document": ("Read a document as text.", {"path": {"type": "string"}, "strips": {"type": "integer"}}),
     "search_files": ("Search the chat's files for a text.", {"query": {"type": "string"}}),
     "run_python": ("Run Python on the chat's files.", {"code": {"type": "string"}}),
     "inspect_template": ("List a template's fields.", {"path": {"type": "string"}}),
     "fill_template": ("Fill a template's fields.", {"path": {"type": "string"}, "values": {"type": "object"}}),
     "write_table": ("Write a table as csv or xlsx.", {"name": {"type": "string"}, "rows": {"type": "array"}}),
     "write_document": ("Write a document.", {"name": {"type": "string"}, "text": {"type": "string"}}),
+    "view_file": (
+        "Show the pages or the picture of a file.",
+        {"path": {"type": "string"}, "part": {"type": "string"}, "strips": {"type": "integer"}},
+    ),
     "write_presentation": (
         "Build a presentation in a slide master.",
         {"path": {"type": "string"}, "name": {"type": "string"}, "slides": {"type": "array"}},
     ),
 }
 
-_ROUTES = frozenset({("POST", "/mcp"), ("POST", "/files/upload"), ("GET", "/files/view"), ("DELETE", "/files/chat")})
+_ROUTES = frozenset(
+    {
+        ("POST", "/mcp"),
+        ("POST", "/files/upload"),
+        ("POST", "/files/prepare"),
+        ("GET", "/files/view"),
+        ("DELETE", "/files/chat"),
+    }
+)
 _DISCOVERY = frozenset({"server/discover", "tools/list"})
 
 
@@ -115,7 +134,8 @@ def tools_result() -> dict[str, Any]:
     """Return workbench's ``tools/list`` result for the ghostwriter caller.
 
     Returns:
-        The result, the nine contract tools by name, as workbench lists them, cached for 300 s.
+        The result, the ten contract tools by name, as workbench lists them to a call that accepts
+        images (``view_file`` included), cached for 300 s.
     """
     tools = [
         {
@@ -190,6 +210,83 @@ def refusal(token: str) -> dict[str, Any]:
     }
 
 
+def image_block(data: bytes, mime: str = "image/jpeg") -> dict[str, Any]:
+    """Return one image block of a ``tools/call`` result, as workbench writes it.
+
+    Args:
+        data: The picture's bytes.
+        mime: Its media type.
+
+    Returns:
+        The block, its bytes as base64 and addressed to the assistant.
+    """
+    return {
+        "type": "image",
+        "data": base64.b64encode(data).decode("ascii"),
+        "mimeType": mime,
+        "annotations": {"audience": ["assistant"]},
+    }
+
+
+def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return a successful ``view_file`` result: the text, then one image block for each entry of ``shown``.
+
+    Args:
+        folder: The chat's folder.
+        shown: The entries of ``structuredContent.shown``, in the order of the blocks.
+        blocks: The image blocks, see :func:`image_block`.
+
+    Returns:
+        The result, with the contract's eight structured keys and no outputs.
+    """
+    structured = {
+        "path": f"{folder}/quay-scan.pdf",
+        "kind": "pdf",
+        "total": max(len(shown), 3),
+        "shown": shown,
+        "truncated": False,
+        "next_part": None,
+        "hint": None,
+        "outputs": list[Any](),
+    }
+    return {
+        "resultType": "complete",
+        "isError": False,
+        "content": [{"type": "text", "text": json.dumps(structured)}, *blocks],
+        "structuredContent": structured,
+        "_meta": SERVER_META,
+    }
+
+
+def stock_manifest(path: str) -> dict[str, Any]:
+    """Return the manifest the door gives a stored file, by its suffix.
+
+    Args:
+        path: The file's path.
+
+    Returns:
+        A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
+        text. Anything else: kind ``none``.
+    """
+    lower = path.lower()
+    manifest: dict[str, Any] = {
+        "path": path,
+        "kind": "none",
+        "total": 0,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "hint": None,
+    }
+    if lower.endswith(_IMAGE_SUFFIXES):
+        rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
+        return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
+    if lower.endswith(".pdf"):
+        pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
+        return {**manifest, "kind": "pdf", "total": 3, "pages_without_text": [2], "renditions": pages}
+    return manifest
+
+
 async def _parse_upload(request: httpx.Request) -> Upload | None:
     """Read the ``file`` part of an upload with Starlette's parser, which workbench's route uses.
 
@@ -224,9 +321,13 @@ class FakeDoor:
     no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
-    folder and returns one of those. ``None`` for ``/files/upload`` and ``/files/view``
-    is the default: an upload is parsed, stored in :attr:`files` and answered with
-    its path, size and :attr:`upload_id`; a view serves a stored file of the chat.
+    folder and returns one of those. ``None`` for ``/files/upload``, ``/files/prepare`` and
+    ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
+    with its path, size and :attr:`upload_id`; a prepare answers the file's manifest; a view
+    serves a stored file of the chat, or with ``rendition`` one of its renders.
+
+    As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` only for a request that
+    carries ``X-Accept-Images: 1``; every request is kept with its headers in :attr:`requests`.
 
     Attributes:
         key: The key the door accepts.
@@ -234,6 +335,7 @@ class FakeDoor:
         answers: The scripted answers, by MCP method or REST path.
         delays: Seconds to wait before answering, by MCP method or REST path.
         files: The stored files, by path: their bytes and media type.
+        manifests: The manifest to answer for a path, instead of :func:`stock_manifest`'s.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
         on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
@@ -252,11 +354,13 @@ class FakeDoor:
             "tools/list": tools_result(),
             "tools/call": call_result,
             "/files/upload": None,
+            "/files/prepare": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
         }
         self.delays: dict[str, float] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.manifests: dict[str, dict[str, Any]] = {}
         self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
         self.on_delete: Callable[[], None] | None = None
@@ -307,9 +411,13 @@ class FakeDoor:
                 return _rpc_error(body, answer)
             if route == "tools/call" and isinstance(answer, dict):
                 self.last_call_answer = answer
+            if route == "tools/list" and isinstance(answer, dict) and not _accepts_images(request):
+                answer = _without_view_file(answer)
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": answer})
         if answer is None and path == "/files/upload":
             return self._store(request, body, folder)
+        if answer is None and path == "/files/prepare":
+            return self._prepare(request, folder)
         if answer is None and path == "/files/view":
             return self._serve(request, folder)
         return httpx.Response(200, json=answer)
@@ -344,6 +452,8 @@ class FakeDoor:
             The file; 404 for a path outside the chat or a missing file alike.
         """
         path = request.url.params.get("path", "")
+        if "rendition" in request.url.params:
+            return self._render(request, path, folder)
         stored = self.files.get(path) if path.startswith(f"{folder}/") else None
         if stored is None:
             return httpx.Response(404, json=NOT_FOUND)
@@ -351,6 +461,64 @@ class FakeDoor:
         name = quote(path.rsplit("/", 1)[-1], safe="")
         disposition = f"inline; filename*=UTF-8''{name}"
         return httpx.Response(200, content=data, headers={"Content-Type": mime, "Content-Disposition": disposition})
+
+    def _manifest_of(self, path: str, folder: str) -> dict[str, Any] | None:
+        """Return the manifest of a file of the chat.
+
+        Args:
+            path: The file's path.
+            folder: The chat's folder.
+
+        Returns:
+            The scripted manifest of the path, else the stock one of a stored file; ``None`` for
+            another chat's path and for an unknown one.
+        """
+        if not path.startswith(f"{folder}/"):
+            return None
+        if path in self.manifests:
+            return self.manifests[path]
+        return stock_manifest(path) if path in self.files else None
+
+    def _prepare(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Answer a prepare with the file's manifest.
+
+        Args:
+            request: The prepare.
+            folder: The chat's folder.
+
+        Returns:
+            The manifest; 404 for a path outside the chat or an unknown one.
+        """
+        manifest = self._manifest_of(request.url.params.get("path", ""), folder)
+        return httpx.Response(404, json=NOT_FOUND) if manifest is None else httpx.Response(200, json=manifest)
+
+    def _render(self, request: httpx.Request, path: str, folder: str) -> httpx.Response:
+        """Serve one render of a file of the chat: a page, a picture or one of its strips.
+
+        Args:
+            request: The view, with ``rendition`` and, for strips, ``strips`` and ``strip``.
+            path: The file's path.
+            folder: The chat's folder.
+
+        Returns:
+            The picture, as ``image/jpeg``: the same bytes for every page, and for strip ``i`` of
+            ``k > 1`` those bytes and ``i`` after them; 404 outside ``1..total``, 422 for a bad
+            ``strips`` and ``strip`` pair.
+        """
+        manifest = self._manifest_of(path, folder)
+        params = request.url.params
+        number, strips, strip = params["rendition"], params.get("strips", "1"), params.get("strip")
+        if manifest is None or not number.isdigit() or not 1 <= int(number) <= manifest["total"]:
+            return httpx.Response(404, json=NOT_FOUND)
+        cut = int(strips) if strips.isdigit() else 0
+        if (
+            not 1 <= cut <= 3
+            or (cut > 1) != (strip is not None)
+            or (strip is not None and strip not in tuple("123"[:cut]))
+        ):
+            return httpx.Response(422, json={"detail": "bad strips"})
+        data = TINY_JPEG if strip is None else TINY_JPEG + bytes([int(strip)])
+        return httpx.Response(200, content=data, headers={"Content-Type": "image/jpeg"})
 
     def methods(self) -> list[str]:
         """Return the MCP method of every ``/mcp`` request so far, in order.
@@ -381,6 +549,30 @@ class FakeDoor:
     def uploads(self) -> list[Upload]:
         """Every upload's parsed file part, in order."""
         return [body for _, body in self.requests if isinstance(body, Upload)]
+
+
+def _accepts_images(request: httpx.Request) -> bool:
+    """Tell whether a request asks for images, as workbench 0.7 reads ``X-Accept-Images``.
+
+    Args:
+        request: The request.
+
+    Returns:
+        ``True`` when the header is ``1``.
+    """
+    return request.headers.get(ACCEPT_IMAGES_HEADER) == "1"
+
+
+def _without_view_file(listing: dict[str, Any]) -> dict[str, Any]:
+    """Return a ``tools/list`` result without ``view_file``, as workbench lists it to a call that takes no images.
+
+    Args:
+        listing: The result.
+
+    Returns:
+        A copy without the tool.
+    """
+    return {**listing, "tools": [tool for tool in listing["tools"] if tool.get("name") != "view_file"]}
 
 
 def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
@@ -664,7 +856,7 @@ PLAIN_RESULT = ToolResult('{"text": "Umsatz 42"}', ())
 
 
 def contract_tools() -> tuple[McpTool, ...]:
-    """Return the nine contract tools as discovery hands them out.
+    """Return the ten contract tools as discovery hands them out.
 
     Returns:
         The tools, in workbench's order.
@@ -768,7 +960,7 @@ class FakeWorkbench:
 
         Args:
             answers: The calls' answers, in order.
-            tools: The tools discovery finds; the nine contract tools when omitted, none
+            tools: The tools discovery finds; the ten contract tools when omitted, none
                 at all (``()``) for a workbench that is not usable.
             audit: The audit whose log :attr:`sent_after` reads.
         """

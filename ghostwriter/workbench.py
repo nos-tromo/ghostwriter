@@ -21,17 +21,28 @@ previews; the cards come from ``structuredContent.outputs``, kept only inside th
 folder, each preview clamped. A refusal is read by its ``structuredContent.reason`` token.
 :meth:`WorkbenchClient.call_tool` never raises.
 
+Images. workbench 0.7 lists ``view_file`` and attaches images to an answer only for a request
+that carries ``X-Accept-Images: 1`` (:data:`ACCEPT_IMAGES`). Discovery always sends it, so the
+one cached listing is the full one; a call sends it only when asked (``images=True``). The
+image blocks of an answer, ``content[1:]``, are kept paired by position with
+``structuredContent.shown``: a block that is no jpeg or png of its type, is too large, or has no
+valid entry is dropped, and so is whatever passes the caps on one answer.
+
 Files. Uploads stream into the chat's folder as multipart, cut off past
-:data:`MAX_ATTACHMENT_BYTES`; views stream back; a chat's folder is deleted whole. These
-run on the caller's event loop, each over a fresh client that takes no proxy either.
+:data:`MAX_ATTACHMENT_BYTES`; views stream back; a chat's folder is deleted whole. A file is
+prepared (:meth:`WorkbenchClient.prepare`: its manifest, and its renders made) and its renders
+are viewed one by one (``view(rendition=...)``) or several at once
+(:meth:`WorkbenchClient.fetch_renditions`, from a thread). The REST routes run on the caller's
+event loop, each over a fresh client that takes no proxy either.
 
 Every request carries the key, the user and the chat as keyed pseudonyms (HMAC-SHA256
 under ``WORKBENCH_API_KEY`` over a label, a NUL byte and the owner or the chat id, as 64
 hex digits), the purpose and the request id; the chat's pseudonym names its folder. The
 log holds tool names, ids, counts, statuses and tokens, never a file name, an argument,
-an output or the key.
+an output, a picture's label or bytes, or the key.
 """
 
+import base64
 import concurrent.futures
 import contextlib
 import hashlib
@@ -44,9 +55,9 @@ import re
 import secrets
 import threading
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping
-from dataclasses import dataclass
-from typing import Any, TypeGuard, TypeVar
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Final, Literal, TypeGuard, TypeVar
 
 import anyio
 import httpx
@@ -75,12 +86,34 @@ MAX_ANSWER_BYTES = 4 * 1024 * 1024
 MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
 #: A workbench file id.
 FILE_ID = re.compile(r"[0-9a-f]{32}")
+#: The header workbench 0.7 lists ``view_file`` and attaches images for.
+ACCEPT_IMAGES: Final = {"X-Accept-Images": "1"}
+#: What a picture's bytes start with, by its media type: a jpeg and a png are the only ones shown.
+IMAGE_SIGNATURES: Final = {"image/jpeg": b"\xff\xd8\xff", "image/png": b"\x89PNG\r\n\x1a\n"}
+#: The largest picture kept from a tool's answer, and the most pictures and bytes kept from one answer.
+MAX_IMAGE_BYTES: Final = 1024 * 1024
+MAX_IMAGES_BYTES: Final = 3 * 1024 * 1024
+MAX_TOOL_IMAGES: Final = 8
+#: The largest rendition fetched.
+MAX_RENDITION_BYTES: Final = 768 * 1024
+#: Seconds a prepare is waited for: workbench's 120 s of queue, its 120 s wall and 30 s.
+PREPARE_TIMEOUT_S: Final = 270.0
+#: Seconds the renditions of one fetch get together.
+RENDITION_TIMEOUT_S: Final = 30.0
 #: A table preview's most columns, rows and characters a cell, as workbench's executor cuts them.
 PREVIEW_COLUMNS = 20
 PREVIEW_ROWS = 5
 PREVIEW_CELL_CHARS = 100
 
 _PATH = "/mcp"
+# A picture's label, as workbench's ``shown`` writes it, and the largest side it names.
+_LABEL_CHARS = 100
+_MAX_SIDE = 4096
+# The base64 of a picture at the cap, so a longer string is not decoded.
+_MAX_IMAGE_BASE64 = (MAX_IMAGE_BYTES + 2) // 3 * 4
+# The most of a refusal's body read for its token.
+_MAX_REFUSAL_BYTES = 16 * 1024
+_KINDS: Final[dict[str, Literal["image", "pdf", "none"]]] = {"image": "image", "pdf": "pdf", "none": "none"}
 _ACCEPT = "application/json, text/event-stream"
 _USER_LABEL = b"workbench-user/v1"
 _SESSION_LABEL = b"workbench-session/v1"
@@ -180,16 +213,38 @@ class OutputFile:
 
 
 @dataclass(frozen=True)
+class ToolImage:
+    """A picture a tool showed: a page, or a whole picture, or one of its strips.
+
+    Attributes:
+        label: What workbench calls it, at most 100 characters; for the model, never for a log.
+        width: Its width in pixels, 1 to 4096.
+        height: Its height in pixels, 1 to 4096.
+        mime: ``image/jpeg`` or ``image/png``.
+        data: Its bytes, at most :data:`MAX_IMAGE_BYTES`; not in the repr.
+    """
+
+    label: str
+    width: int
+    height: int
+    mime: str
+    data: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
 class ToolResult:
     """A call that completed.
 
     Attributes:
         text: What the model reads, without the previews.
         outputs: The files the call wrote, for the cards.
+        images: The pictures the call showed, at most :data:`MAX_TOOL_IMAGES` and
+            :data:`MAX_IMAGES_BYTES`, in workbench's order.
     """
 
     text: str
     outputs: tuple[OutputFile, ...]
+    images: tuple[ToolImage, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +290,75 @@ class UploadedFile:
     id: str
     path: str
     size: int
+
+
+@dataclass(frozen=True)
+class Rendition:
+    """One render of a file that workbench keeps: a page of a PDF, or a picture.
+
+    Attributes:
+        n: Its place, counted from 1.
+        width: Its width in pixels.
+        height: Its height in pixels.
+        mime: ``image/jpeg`` or ``image/png``.
+    """
+
+    n: int
+    width: int
+    height: int
+    mime: str
+
+
+@dataclass(frozen=True)
+class Manifest:
+    """What workbench says a file is to the tools that show it, as :meth:`WorkbenchClient.prepare` reads it.
+
+    Attributes:
+        kind: ``image``, ``pdf``, or ``none`` for a file that is not shown as pictures.
+        total: The pages of a PDF; 1 for a picture; 0 for ``none``.
+        pages_without_text: The pages of a PDF with no text of their own, counted from 1.
+        renditions: The renders that exist now.
+        frames: The frames of a picture that has several, of which only the first is shown; else ``None``.
+    """
+
+    kind: Literal["image", "pdf", "none"]
+    total: int
+    pages_without_text: tuple[int, ...]
+    renditions: tuple[Rendition, ...]
+    frames: int | None
+
+    def as_stored(self) -> dict[str, Any]:
+        """Return what a chat keeps of the manifest: its five counts and kinds, never a path or a hint.
+
+        Returns:
+            The keys of ``STORED_MANIFEST_KEYS`` as plain JSON values.
+        """
+        return {
+            "kind": self.kind,
+            "total": self.total,
+            "pages_without_text": list(self.pages_without_text),
+            "renditions": [
+                {"n": item.n, "width": item.width, "height": item.height, "mime": item.mime} for item in self.renditions
+            ],
+            "frames": self.frames,
+        }
+
+
+@dataclass(frozen=True)
+class RenditionRequest:
+    """One rendition to fetch.
+
+    Attributes:
+        path: The file's path in the chat's folder.
+        n: The page or picture, counted from 1.
+        strips: Into how many strips the render is cut: 1 for the whole render, up to 3.
+        strip: Which strip, counted from 1; read only when ``strips`` is more than 1.
+    """
+
+    path: str
+    n: int = 1
+    strips: int = 1
+    strip: int = 1
 
 
 class WorkbenchUnavailable(Exception):
@@ -484,6 +608,14 @@ def _strings(value: object) -> TypeGuard[list[str]]:
     return isinstance(value, list) and all(isinstance(item, str) for item in value)
 
 
+def _side(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and 1 <= value <= _MAX_SIDE
+
+
+def _positive(value: object) -> TypeGuard[int]:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
 def _cells(values: list[str]) -> tuple[str, ...]:
     return tuple(value[:PREVIEW_CELL_CHARS] for value in values[:PREVIEW_COLUMNS])
 
@@ -557,7 +689,7 @@ def _decode(message: Mapping[str, Any], folder: str) -> ToolResult | ToolFailure
         folder: The chat's folder, which every output must be in.
 
     Returns:
-        The text and the outputs, or the failure the answer names.
+        The text, the outputs and the pictures, or the failure the answer names.
     """
     try:
         result = _result(message)
@@ -585,7 +717,72 @@ def _decode(message: Mapping[str, Any], folder: str) -> ToolResult | ToolFailure
         logger.warning(
             "workbench listed {} outputs that are not files of the chat; they are dropped", len(entries) - len(outputs)
         )
-    return ToolResult(text, outputs)
+    return ToolResult(text, outputs, _images(content, structured))
+
+
+def _image(block: object, entry: object) -> ToolImage | None:
+    """Read one image block with the entry of ``shown`` at its position.
+
+    Args:
+        block: An element of ``content[1:]``.
+        entry: ``shown[i]`` for the block's position ``i``, or ``None`` when there is none.
+
+    Returns:
+        The picture; ``None`` when the block is no jpeg or png of its type with valid base64 of at most
+        :data:`MAX_IMAGE_BYTES`, or the entry has no label of at most 100 characters and no sides of 1 to 4096.
+    """
+    if not isinstance(block, dict) or block.get("type") != "image" or not isinstance(entry, dict):
+        return None
+    mime, encoded = block.get("mimeType"), block.get("data")
+    label, width, height = entry.get("label"), entry.get("width"), entry.get("height")
+    if not isinstance(mime, str) or mime not in IMAGE_SIGNATURES or not isinstance(encoded, str):
+        return None
+    if not isinstance(label, str) or len(label) > _LABEL_CHARS or not _side(width) or not _side(height):
+        return None
+    if len(encoded) > _MAX_IMAGE_BASE64:
+        return None
+    try:
+        data = base64.b64decode(encoded, validate=True)
+    except ValueError:
+        return None
+    if len(data) > MAX_IMAGE_BYTES or not data.startswith(IMAGE_SIGNATURES[mime]):
+        return None
+    return ToolImage(label, width, height, mime, data)
+
+
+def _images(content: object, structured: Mapping[str, Any] | None) -> tuple[ToolImage, ...]:
+    """Keep the pictures of an answer, block ``i`` of ``content[1:]`` paired with ``shown[i]``.
+
+    Keeping stops at :data:`MAX_TOOL_IMAGES` pictures, or before the one that would take the answer past
+    :data:`MAX_IMAGES_BYTES`. The blocks that are not kept give one warning with their count.
+
+    Args:
+        content: The result's ``content``.
+        structured: Its ``structuredContent``.
+
+    Returns:
+        The pictures, in order.
+    """
+    blocks: list[Any] = content[1:] if isinstance(content, list) else []
+    if not blocks:
+        return ()
+    listed = structured.get("shown") if structured is not None else None
+    shown: list[Any] = listed if isinstance(listed, list) else []
+    kept: list[ToolImage] = []
+    size = 0
+    for index, block in enumerate(blocks):
+        if len(kept) >= MAX_TOOL_IMAGES:
+            break
+        image = _image(block, shown[index] if index < len(shown) else None)
+        if image is None:
+            continue
+        if size + len(image.data) > MAX_IMAGES_BYTES:
+            break
+        kept.append(image)
+        size += len(image.data)
+    if len(kept) < len(blocks):
+        logger.warning("workbench sent {} image blocks that are not kept", len(blocks) - len(kept))
+    return tuple(kept)
 
 
 def _failure(token: str, *, answered: bool = False) -> ToolFailure:
@@ -649,6 +846,121 @@ async def _json_answer(response: httpx.Response) -> object:
         return json.loads(raw)
     except (ValueError, RecursionError):
         raise WorkbenchUnavailable("not_json") from None
+
+
+async def _refusal_token(response: httpx.Response) -> str:
+    """Read the token of a ``422``: the text of its ``detail`` before the first ``:``, when that is a token.
+
+    Args:
+        response: The streamed answer.
+
+    Returns:
+        The token, such as ``unreadable_file``; ``http:<status>`` when the body is no JSON object
+        with a ``detail`` text that starts with one, or is longer than :data:`_MAX_REFUSAL_BYTES`.
+    """
+    fallback = f"http:{response.status_code}"
+    raw = bytearray()
+    async for chunk in response.aiter_bytes():
+        raw += chunk
+        if len(raw) > _MAX_REFUSAL_BYTES:
+            return fallback
+    try:
+        body = json.loads(raw)
+    except (ValueError, RecursionError):
+        return fallback
+    detail = body.get("detail") if isinstance(body, dict) else None
+    head = detail.split(":", 1)[0] if isinstance(detail, str) else ""
+    return head if _TOKEN.fullmatch(head) else fallback
+
+
+def _rendition(entry: object) -> Rendition | None:
+    if not isinstance(entry, dict):
+        return None
+    n, width, height, mime = entry.get("n"), entry.get("width"), entry.get("height"), entry.get("mime")
+    if not (_positive(n) and _positive(width) and _positive(height)):
+        return None
+    return Rendition(n, width, height, mime) if isinstance(mime, str) and mime in IMAGE_SIGNATURES else None
+
+
+def _manifest(answer: object) -> Manifest | None:
+    """Read a prepare's answer.
+
+    Args:
+        answer: The JSON document.
+
+    Returns:
+        The manifest; ``None`` when it is not an object with a known ``kind``, a count for ``total``,
+        pages counted from 1, renditions of a jpeg or png and a frame count or ``null``. Its ``path``
+        and ``hint`` are not read.
+    """
+    if not isinstance(answer, dict):
+        return None
+    kind, total, frames = answer.get("kind"), _count(answer.get("total")), answer.get("frames")
+    pages, listed = answer.get("pages_without_text"), answer.get("renditions")
+    if not isinstance(kind, str) or kind not in _KINDS or total is None:
+        return None
+    if (
+        not isinstance(pages, list)
+        or not isinstance(listed, list)
+        or not (frames is None or _count(frames) is not None)
+    ):
+        return None
+    numbers = tuple(page for page in pages if _positive(page))
+    renditions = tuple(item for item in (_rendition(entry) for entry in listed) if item is not None)
+    if len(numbers) < len(pages) or len(renditions) < len(listed):
+        return None
+    return Manifest(_KINDS[kind], total, numbers, renditions, frames)
+
+
+def _view_params(path: str, rendition: int | None, strips: int, strip: int | None) -> dict[str, str | int]:
+    """Return the query of a view.
+
+    Args:
+        path: The file's path.
+        rendition: The render asked for; ``None`` for the file itself.
+        strips: Into how many strips the render is cut; read with ``rendition`` only.
+        strip: Which strip; read when ``strips`` is more than 1.
+
+    Returns:
+        ``path``, and with a rendition its number and, past one strip, ``strips`` and ``strip``.
+
+    Raises:
+        ValueError: When ``strips`` is more than 1 and ``strip`` is ``None``.
+    """
+    params: dict[str, str | int] = {"path": path}
+    if rendition is None:
+        return params
+    params["rendition"] = rendition
+    if strips > 1:
+        if strip is None:
+            raise ValueError("strip is required when strips is more than 1")
+        params["strips"] = strips
+        params["strip"] = strip
+    return params
+
+
+async def _picture(response: httpx.Response) -> tuple[str, bytes] | None:
+    """Read a rendition's answer as a stream.
+
+    Args:
+        response: The streamed answer.
+
+    Returns:
+        Its media type and bytes when it is ``200``, a jpeg or png of at most :data:`MAX_RENDITION_BYTES` that starts
+        as its type does; else ``None``. The stream is cut at the cap.
+    """
+    if response.status_code != 200:
+        return None
+    mime = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    signature = IMAGE_SIGNATURES.get(mime)
+    if signature is None:
+        return None
+    raw = bytearray()
+    async for chunk in response.aiter_bytes():
+        raw += chunk
+        if len(raw) > MAX_RENDITION_BYTES:
+            return None
+    return (mime, bytes(raw)) if raw.startswith(signature) else None
 
 
 @contextlib.contextmanager
@@ -806,6 +1118,9 @@ class WorkbenchClient:
         Concurrent callers wait for the one discovery in progress, never longer than its limit
         plus half a second; a caller that would is offered no tool on this turn.
 
+        Both requests carry ``X-Accept-Images: 1`` whatever the asking call is, so the one cached
+        listing is the full one, ``view_file`` included.
+
         Args:
             call: The asking turn's chat. Its headers go with the requests, as with every request
                 to workbench; workbench's discovery reads no principal from them.
@@ -819,7 +1134,7 @@ class WorkbenchClient:
         if not self._flight.acquire(timeout=DISCOVERY_TIMEOUT_S + _GRACE_S):
             return None
         try:
-            return self._discover_held(self._headers(key, call))
+            return self._discover_held({**self._headers(key, call), **ACCEPT_IMAGES})
         finally:
             self._flight.release()
 
@@ -906,7 +1221,7 @@ class WorkbenchClient:
     # --- tools -------------------------------------------------------------
 
     def call_tool(
-        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float
+        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float, images: bool = False
     ) -> ToolResult | ToolFailure:
         """Call a tool for a chat, within one deadline. Never raises.
 
@@ -916,6 +1231,8 @@ class WorkbenchClient:
             call: The chat.
             timeout_s: The deadline for the whole call, name lookup to last byte. The caller
                 is answered within it plus half a second.
+            images: Whether to send ``X-Accept-Images: 1``, so that workbench may attach pictures to
+                the answer. Without it the request is the one workbench 0.6 knew.
 
         Returns:
             What the call returned, or why there is nothing.
@@ -928,7 +1245,7 @@ class WorkbenchClient:
             elif shown == "?":
                 outcome = _failure("unknown_tool")
             else:
-                headers = {**self._headers(key, call), "Mcp-Name": name}
+                headers = {**self._headers(key, call), "Mcp-Name": name, **(ACCEPT_IMAGES if images else {})}
                 params = {"name": name, "arguments": dict(arguments)}
                 folder = chat_folder(key, call.chat_id)
                 outcome = _detached(lambda: self._call(params, headers, timeout_s, folder), timeout_s + _GRACE_S)
@@ -1034,21 +1351,74 @@ class WorkbenchClient:
         logger.debug("workbench stored upload '{}': {} bytes", file_id, size)
         return UploadedFile(file_id, path, size)
 
-    @contextlib.asynccontextmanager
-    async def view(self, *, call: CallFor, path: str) -> AsyncIterator[httpx.Response]:
-        """Stream a file of the chat back.
+    async def prepare(self, *, call: CallFor, path: str, strips: int = 1) -> Manifest:
+        """Have workbench make a file's renders, and say what they are. Idempotent.
 
         Args:
             call: The chat.
             path: The file's path in the chat's folder.
+            strips: How many strips a picture is cut into on this prepare as well; sent only when more than 1.
+
+        Returns:
+            The file's manifest.
+
+        Raises:
+            WorkbenchNotFound: When the chat has no such file; a path outside its folder is not asked for.
+            StorageFull: On workbench's ``507``.
+            WorkbenchUnavailable: On any other failure. Its token is the one a ``422`` names
+                (``unreadable_file``, ``unsupported_format``, ``read_timeout``), ``http:<status>``,
+                ``bad_answer`` for a manifest that cannot be read, or ``timeout`` and ``unreachable``.
+        """
+        with _rest_errors("prepare"):
+            key = self._required_key()
+            if _inside(chat_folder(key, call.chat_id), path) is None:
+                raise WorkbenchNotFound("not_found")
+            params: dict[str, str | int] = {"path": path, **({"strips": strips} if strips > 1 else {})}
+            headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
+            async with (
+                self._http(PREPARE_TIMEOUT_S) as client,
+                client.stream("POST", "/files/prepare", params=params, headers=headers) as response,
+            ):
+                if response.status_code == 404:
+                    raise WorkbenchNotFound("not_found")
+                if response.status_code == 507:
+                    raise StorageFull
+                if response.status_code == 422:
+                    raise WorkbenchUnavailable(await _refusal_token(response))
+                answer = await _json_answer(response)
+            manifest = _manifest(answer)
+            if manifest is None:
+                raise WorkbenchUnavailable("bad_answer")
+        logger.debug(
+            "workbench prepared a file: kind {}, {} pages, {} renditions",
+            manifest.kind,
+            manifest.total,
+            len(manifest.renditions),
+        )
+        return manifest
+
+    @contextlib.asynccontextmanager
+    async def view(
+        self, *, call: CallFor, path: str, rendition: int | None = None, strips: int = 1, strip: int | None = None
+    ) -> AsyncIterator[httpx.Response]:
+        """Stream a file of the chat back, or one of its renders.
+
+        Args:
+            call: The chat.
+            path: The file's path in the chat's folder.
+            rendition: The page or picture to show as an image, counted from 1; ``None`` for the file itself.
+            strips: Into how many strips the render is cut; sent with ``rendition`` only, and only when more than 1.
+            strip: Which strip; sent when ``strips`` is more than 1.
 
         Yields:
             workbench's answer, its body not read yet.
 
         Raises:
-            WorkbenchNotFound: When the chat has no such file; a path outside its folder is not asked for.
+            ValueError: If ``strips`` is more than 1 with a ``rendition`` and ``strip`` is ``None``; nothing is sent.
+            WorkbenchNotFound: When the chat has no such file or render; a path outside its folder is not asked for.
             WorkbenchUnavailable: On any other failure.
         """
+        params = _view_params(path, rendition, strips, strip)
         with _rest_errors("view"):
             key = self._required_key()
             if _inside(chat_folder(key, call.chat_id), path) is None:
@@ -1056,13 +1426,84 @@ class WorkbenchClient:
             headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
             async with (
                 self._http(self._settings.workbench_timeout_s) as client,
-                client.stream("GET", "/files/view", params={"path": path}, headers=headers) as response,
+                client.stream("GET", "/files/view", params=params, headers=headers) as response,
             ):
                 if response.status_code == 404:
                     raise WorkbenchNotFound("not_found")
                 if response.status_code != 200:
                     raise WorkbenchUnavailable(f"http:{response.status_code}")
                 yield response
+
+    def fetch_renditions(self, wanted: Sequence[RenditionRequest], *, call: CallFor) -> list[tuple[str, bytes] | None]:
+        """Fetch several renditions at once, for a turn's thread. Never raises.
+
+        One exchange within :data:`RENDITION_TIMEOUT_S`, over one client, all the requests together.
+        A picture counts only when workbench answered ``200`` with a jpeg or png of at most
+        :data:`MAX_RENDITION_BYTES` that starts as its type does.
+
+        Args:
+            wanted: The renditions, of the chat's own files.
+            call: The chat.
+
+        Returns:
+            One entry for each of ``wanted``, in order: the media type and bytes, or ``None`` for a
+            picture outside the chat's folder, not there, not whole, or not in time.
+        """
+        found: list[tuple[str, bytes] | None] = [None] * len(wanted)
+        key = self._key()
+        if key is not None and wanted:
+            try:
+                folder = chat_folder(key, call.chat_id)
+                headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
+                asked = [(i, item) for i, item in enumerate(wanted) if _inside(folder, item.path) is not None]
+                _detached(lambda: self._fetch_renditions(found, asked, headers), RENDITION_TIMEOUT_S + _GRACE_S)
+            except Exception as exc:
+                logger.warning("workbench renditions raised {}", type(exc).__name__)
+        got = sum(item is not None for item in found)
+        (logger.debug if got == len(wanted) else logger.info)("workbench fetched {} of {} renditions", got, len(wanted))
+        return list(found)
+
+    async def _fetch_renditions(
+        self,
+        found: list[tuple[str, bytes] | None],
+        asked: Sequence[tuple[int, RenditionRequest]],
+        headers: Mapping[str, str],
+    ) -> None:
+        """Fetch the renditions together, each into its place of ``found``; what is not in time stays ``None``.
+
+        Args:
+            found: The answers, by the position of the request.
+            asked: The requests to send, with their positions.
+            headers: The chat's headers.
+        """
+        with contextlib.suppress(TimeoutError), anyio.fail_after(RENDITION_TIMEOUT_S):
+            async with self._http(RENDITION_TIMEOUT_S) as client, anyio.create_task_group() as group:
+                for index, item in asked:
+                    group.start_soon(self._fetch_one, client, found, index, item, headers)
+
+    async def _fetch_one(
+        self,
+        client: httpx.AsyncClient,
+        found: list[tuple[str, bytes] | None],
+        index: int,
+        item: RenditionRequest,
+        headers: Mapping[str, str],
+    ) -> None:
+        """Fetch one rendition into ``found[index]``; a failure leaves ``None`` and never reaches the task group.
+
+        Args:
+            client: The exchange's client.
+            found: The answers.
+            index: The request's position.
+            item: The request.
+            headers: The chat's headers.
+        """
+        params = _view_params(item.path, item.n, item.strips, item.strip)
+        try:
+            async with client.stream("GET", "/files/view", params=params, headers=headers) as response:
+                found[index] = await _picture(response)
+        except Exception:
+            found[index] = None
 
     async def delete_chat(self, *, call: CallFor) -> int:
         """Delete the chat's folder in workbench, with its files and jobs.

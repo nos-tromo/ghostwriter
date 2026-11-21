@@ -379,7 +379,7 @@ def test_unknown_tools_and_bad_arguments_never_reach_workbench(loop_env: LoopEnv
     assert loop_env.workbench.calls == [] and _steps(events) == []
     assistant, unknown, bad = loop_env.sent(2)[-3:]
     names = "fill_template, inspect_template, list_files, read_document, run_python, search_files, "
-    names += "write_document, write_presentation, write_table"
+    names += "view_file, write_document, write_presentation, write_table"
     assert json.loads(unknown["content"]) == {
         "error": "unknown_tool",
         "detail": f"there is no tool named 'delete_everything'; the tools you can call are {names}.",
