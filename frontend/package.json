@@ -16,7 +16,7 @@
   },
   "dependencies": {
     "@fontsource/inter": "^5.3.0",
-    "@infra/ui": "https://codeload.github.com/nos-tromo/infra-ui/tar.gz/7a6c73d7c6d1574a5a9a735f7c7c846e8a40a0e8",
+    "@infra/ui": "https://codeload.github.com/nos-tromo/infra-ui/tar.gz/182e5d93996971e675186dab6bd87ec05659b70f",
     "@tanstack/react-query": "^5.105.1",
     "highlight.js": "~11.12.0",
     "react": "^19.3.1",
