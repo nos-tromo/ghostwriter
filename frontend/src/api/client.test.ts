@@ -7,7 +7,9 @@ import { ApiError, PURPOSE_SCOPE, apiBase } from './client'
 import {
   createChat,
   deleteChat,
+  attachmentPreview,
   fileBlob,
+  getAttachment,
   getChat,
   getConfig,
   getWhoami,
@@ -84,6 +86,8 @@ describe('the API client', () => {
             mime: 'text/csv',
             created_at: '2026-11-02T09:00:00Z',
             expired: false,
+            kind: 'document',
+            status: 'ready',
           },
           201,
         ),
@@ -122,6 +126,30 @@ describe('the API client', () => {
     ])
     for (const call of calls) expect(call.headers[PURPOSE_HEADER]).toBe('reason=review')
     expect(calls[3].body).toBe(JSON.stringify({ title: 'Q3 Zahlen' }))
+  })
+
+  it('reads one attachment after a wait, and its picture as a blob of a page', async () => {
+    setPurpose('ghostwriter', { reason: 'review' })
+    const fetchFn = serve({
+      'GET /ghostwriter/api/chats/c1/attachments/a%201?wait=20': () =>
+        json({ id: 'a 1', kind: 'image', status: 'ready', expired: false }),
+      'GET /ghostwriter/api/chats/c1/attachments/a1/preview?page=1': () =>
+        new Response('png', { status: 200, headers: { 'content-type': 'image/png' } }),
+      'GET /ghostwriter/api/chats/c1/attachments/a1/preview?page=3': () =>
+        json({ detail: 'This file has expired.' }, 410),
+    })
+    const controller = new AbortController()
+    expect(await getAttachment('c1', 'a 1', 20, controller.signal)).toMatchObject({ kind: 'image', status: 'ready' })
+    expect(await (await attachmentPreview('c1', 'a1')).text()).toBe('png')
+    await expect(attachmentPreview('c1', 'a1', 3)).rejects.toMatchObject({ name: 'ApiError', status: 410 })
+
+    const calls = sent(fetchFn)
+    expect(calls.map((c) => `${c.method} ${c.url}`)).toEqual([
+      'GET /ghostwriter/api/chats/c1/attachments/a%201?wait=20',
+      'GET /ghostwriter/api/chats/c1/attachments/a1/preview?page=1',
+      'GET /ghostwriter/api/chats/c1/attachments/a1/preview?page=3',
+    ])
+    for (const call of calls) expect(call.headers[PURPOSE_HEADER]).toBe('reason=review')
   })
 
   it('sends a file as the multipart field "file", under its own name and type', async () => {

@@ -35,7 +35,17 @@ const QUESTION = message({ id: 'm1', role: 'user', content: 'Summe der Spalte B?
 const ANSWER = message({ id: 'm2', role: 'assistant', content: 'Summe: 42' })
 
 function attachment(id: string, name: string, size = 3): AttachmentOut {
-  return { id, file_id: `F-${id}`, name, size, mime: 'text/csv', created_at: '2026-11-02T09:00:00Z', expired: false }
+  return {
+    id,
+    file_id: `F-${id}`,
+    name,
+    size,
+    mime: 'text/csv',
+    created_at: '2026-11-02T09:00:00Z',
+    expired: false,
+    kind: 'document',
+    status: 'ready',
+  }
 }
 
 /** A file of `size` bytes as the browser reports it, without allocating them. */

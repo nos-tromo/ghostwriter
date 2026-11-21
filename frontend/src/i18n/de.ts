@@ -37,6 +37,8 @@ export const de: Strings = {
   'chat.copy_code': 'Code kopieren',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
   'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
+  'chat.images_dropped': 'Das Modell hat die Bilder nicht angenommen und ohne sie geantwortet.',
+  'chat.attachment_processing': 'Warten Sie, bis die angehängten Dateien bereit sind.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',

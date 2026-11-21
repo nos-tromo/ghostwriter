@@ -3,7 +3,16 @@ import { useQueryClient, type QueryClient } from '@tanstack/react-query'
 import { stopChat } from '../api/chats'
 import { ApiError } from '../api/client'
 import { SseIdle, streamSse } from '../api/sse'
-import type { ErrorFrame, MessageIn, MessageOut, RegenerateIn, ResultOut, StartFrame, StepOut } from '../api/types'
+import type {
+  ErrorFrame,
+  MessageIn,
+  MessageOut,
+  NoticeCode,
+  RegenerateIn,
+  ResultOut,
+  StartFrame,
+  StepOut,
+} from '../api/types'
 import { chatKey, chatsKey } from './useChats'
 
 /** The answer being written, as its frames have built it so far. */
@@ -12,6 +21,8 @@ export interface DraftAnswer {
   steps: StepOut[]
   results: ResultOut[]
   error: ErrorFrame['code'] | null
+  /** What the server said about the answer besides its text, each code once. */
+  notices: NoticeCode[]
   /** The answer's reasoning switch: until its first token, the model is thinking. */
   reasoning: boolean
 }
@@ -40,18 +51,28 @@ export interface StreamState {
    *  shows the draft and `pendingUser` in their place. Null until `start` has come. */
   stored: StoredTurn | null
   failure: StreamFailure | null
+  /** The notices of the last answer, kept in view with it until the next one starts. */
+  notices: NoticeCode[]
 }
 
-export const IDLE: StreamState = { streaming: false, draft: null, pendingUser: null, stored: null, failure: null }
+export const IDLE: StreamState = {
+  streaming: false,
+  draft: null,
+  pendingUser: null,
+  stored: null,
+  failure: null,
+  notices: [],
+}
 
 /** How long a stream may go without a byte (the server sends a keep-alive every 15 s) before it is given up. */
 export const STREAM_IDLE_MS = 60_000
 
 const ERROR_CODES: ReadonlySet<string> = new Set<ErrorFrame['code']>(['model', 'audit', 'internal'])
+const NOTICE_CODES: ReadonlySet<string> = new Set<NoticeCode>(['images_dropped'])
 
 /** The draft with one frame applied: a token appends, a step is upserted by
- *  its id (`running`, then `ok` or `error`), a result appends, an error sets
- *  its code. */
+ *  its id (`running`, then `ok` or `error`), a result appends, a notice is
+ *  added once, an error sets its code. */
 function applyFrame(draft: DraftAnswer, event: string, data: unknown): DraftAnswer {
   switch (event) {
     case 'token': {
@@ -65,6 +86,12 @@ function applyFrame(draft: DraftAnswer, event: string, data: unknown): DraftAnsw
     }
     case 'result':
       return { ...draft, results: [...draft.results, data as ResultOut] }
+    case 'notice': {
+      // A code this app does not know is not this app's to say.
+      const code = (data as { code?: unknown } | null)?.code
+      if (typeof code !== 'string' || !NOTICE_CODES.has(code) || draft.notices.includes(code as NoticeCode)) return draft
+      return { ...draft, notices: [...draft.notices, code as NoticeCode] }
+    }
     case 'error': {
       const code = (data as { code?: unknown } | null)?.code
       return { ...draft, error: typeof code === 'string' && ERROR_CODES.has(code) ? (code as ErrorFrame['code']) : 'internal' }
@@ -87,10 +114,11 @@ interface Live {
  *
  * Once `final` has come, the chat and the list are read again (the answer is
  * stored, the chat has moved up the list), then the stream drops out and the
- * stored messages take the draft's place. Why an answer ended early stays
- * with its chat until the next one starts. The stop asks the server; a stream
- * ends without one when the app goes away (a closed tab), which the server
- * takes as a stop, or when it stays silent for `STREAM_IDLE_MS`.
+ * stored messages take the draft's place. Why an answer ended early, and what
+ * the server said about an answer (its notices), stay with its chat until the
+ * next one starts. The stop asks the server; a stream ends without one when
+ * the app goes away (a closed tab), which the server takes as a stop, or when
+ * it stays silent for `STREAM_IDLE_MS`.
  */
 export class ChatStreams {
   private readonly live = new Map<string, Live>()
@@ -142,7 +170,7 @@ export class ChatStreams {
   ): Promise<boolean | null> {
     if (this.live.has(chatId)) return null
     const controller = new AbortController()
-    let draft: DraftAnswer = { text: '', steps: [], results: [], error: null, reasoning: body.reasoning }
+    let draft: DraftAnswer = { text: '', steps: [], results: [], error: null, notices: [], reasoning: body.reasoning }
     const entry: Live = { controller, state: { ...IDLE, streaming: true, draft, pendingUser } }
     this.live.set(chatId, entry)
     this.ended.delete(chatId)
@@ -189,7 +217,7 @@ export class ChatStreams {
       this.qc.invalidateQueries({ queryKey: chatsKey }),
     ])
     this.live.delete(chatId)
-    if (failure) this.ended.set(chatId, { ...IDLE, failure })
+    if (failure || draft.notices.length > 0) this.ended.set(chatId, { ...IDLE, failure, notices: draft.notices })
     this.emit(chatId)
     return taken
   }

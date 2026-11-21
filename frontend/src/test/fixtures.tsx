@@ -15,12 +15,23 @@ export const CONFIG: AppConfig = {
   speech_input: true,
   attachments: true,
   attachment_types: ['.csv', '.pdf', '.xlsx'],
+  image_types: [],
+  max_images: 8,
+  vision: false,
   max_attachment_bytes: 50 * 1024 * 1024,
   max_recording_s: 120,
   max_recording_bytes: 10 * 1024 * 1024,
   chat_retention_days: 90,
   file_retention_days: 7,
   version: '0.1.0',
+}
+
+/** A deployment whose model sees pictures: `.png`, `.jpg` and `.heic` can be attached. */
+export const VISION_CONFIG: AppConfig = {
+  ...CONFIG,
+  attachment_types: [...CONFIG.attachment_types, '.png', '.jpg', '.heic'],
+  image_types: ['.png', '.jpg', '.heic'],
+  vision: true,
 }
 
 export const CHAT: ChatOut = {

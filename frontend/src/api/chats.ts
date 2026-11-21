@@ -28,6 +28,31 @@ export async function uploadAttachment(chatId: string, file: File, signal?: Abor
   return apiResult<AttachmentOut>(await apiFetch(`${chatPath(chatId)}/attachments`, { method: 'POST', body, signal }))
 }
 
+/** One attachment, read as it is now. A `processing` one is waited for on the server for
+ *  up to `waitS` seconds (at most 20) and answers as soon as its preparation ends. */
+export const getAttachment = (
+  chatId: string,
+  attachmentId: string,
+  waitS: number,
+  signal?: AbortSignal,
+): Promise<AttachmentOut> =>
+  apiGet<AttachmentOut>(`${chatPath(chatId)}/attachments/${encodeURIComponent(attachmentId)}?wait=${waitS}`, { signal })
+
+/** The picture of an attachment, or its page, as a blob: a small rendition the server
+ *  made, never the original. Errors as {@link fileBlob}'s. */
+export async function attachmentPreview(
+  chatId: string,
+  attachmentId: string,
+  page = 1,
+  signal?: AbortSignal,
+): Promise<Blob> {
+  const res = await apiFetch(`${chatPath(chatId)}/attachments/${encodeURIComponent(attachmentId)}/preview?page=${page}`, {
+    signal,
+  })
+  if (!res.ok) throw await apiErrorOf(res)
+  return res.blob()
+}
+
 /** A file of the chat, an attachment or a tool's output, as a blob. 410 once
  *  it has expired, also when workbench no longer holds it; 404 for one this
  *  chat does not hold. */

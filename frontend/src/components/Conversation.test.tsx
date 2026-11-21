@@ -1,14 +1,18 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
+import type { ChatStream } from '../hooks/useChatStream'
 import { LanguageContext } from '../i18n/LanguageContext'
 import {
+  CHAT,
   CONFIG,
   StreamedConversation,
+  VISION_CONFIG,
   detail,
   message,
   renderWithClient,
   result,
   serve,
+  sseStream,
   step,
   stubClipboard,
 } from '../test/fixtures'
@@ -59,6 +63,8 @@ describe('Conversation', () => {
               mime: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
               created_at: '2026-11-02T09:00:00Z',
               expired: false,
+              kind: 'document',
+              status: 'ready',
             },
           ],
         }),
@@ -87,6 +93,68 @@ describe('Conversation', () => {
     const last = screen.getByText('Spalte C ist leer.').closest('[data-role="assistant"]') as HTMLElement
     expect(within(last).getByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
     expect(screen.getAllByRole('button', { name: 'Regenerate' })).toHaveLength(1)
+  })
+
+  it('says when the model answered without the pictures', async () => {
+    const sse = sseStream()
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages': () => sse.response(),
+    })
+    renderWithClient(
+      <StreamedConversation
+        chatId="c1"
+        config={VISION_CONFIG}
+        reasoning={false}
+        composer={(stream) => (
+          <button type="button" onClick={() => void stream.send('Was zeigt das Bild?', [], false)}>
+            Ask
+          </button>
+        )}
+      />,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('notice', { code: 'images_dropped' })
+    sse.push('token', { text: 'Ich sehe nichts.' })
+
+    const line = await screen.findByText('The model did not take the pictures; it answered without them.')
+    // Not an error: a quiet status line, muted, below the answer being written.
+    expect(line).toHaveAttribute('role', 'status')
+    expect(line).toHaveClass('text-sm', 'text-muted-foreground')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByText('Ich sehe nichts.').compareDocumentPosition(line)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
+  it('names a refusal while files are prepared', async () => {
+    const refused = () =>
+      new Response(
+        JSON.stringify({ detail: 'An attached file is still being prepared.', code: 'attachment_processing' }),
+        { status: 409 },
+      )
+    serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'POST /ghostwriter/api/chats/c1/messages': refused })
+    const send = (stream: ChatStream) => (
+      <button type="button" onClick={() => void stream.send('Was zeigt das Bild?', [], false)}>
+        Ask
+      </button>
+    )
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={VISION_CONFIG} reasoning={false} composer={send} />)
+    await screen.findByText('Ask anything, or attach a document.')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Wait until the attached files are ready.')
+    // The refusal stored nothing: no bubble for the message.
+    expect(screen.queryByText('Was zeigt das Bild?')).not.toBeInTheDocument()
+    first.unmount()
+
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={VISION_CONFIG} reasoning={false} composer={send} />
+      </LanguageContext>,
+    )
+    await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Warten Sie, bis die angehängten Dateien bereit sind.')
   })
 
   it('copies a finished answer as its Markdown; a question has no copy button', async () => {

@@ -16,7 +16,12 @@ export interface ChatOut {
   expires_at: string | null
 }
 
-/** A file the user attached. */
+export type AttachmentKind = 'document' | 'image' | 'media'
+export type AttachmentStatus = 'processing' | 'ready' | 'failed'
+
+/** A file the user attached. `kind` says what it is (a picture is shown, and
+ *  seen by a model that can); `status` how far its preparation has come: only
+ *  a `ready` file can be sent with a message. */
 export interface AttachmentOut {
   id: string
   file_id: string
@@ -25,6 +30,8 @@ export interface AttachmentOut {
   mime: string
   created_at: string
   expired: boolean
+  kind: AttachmentKind
+  status: AttachmentStatus
 }
 
 /** A tool step of an answer; `detail`, `arguments` and `result` are null once expired. */
@@ -86,6 +93,12 @@ export interface AppConfig {
   /** Whether files can be attached, that is whether workbench is configured. */
   attachments: boolean
   attachment_types: string[]
+  /** The picture types among `attachment_types`; empty while none can be attached. */
+  image_types: string[]
+  /** The most pictures one message may carry. */
+  max_images: number
+  /** Whether the model can see pictures. */
+  vision: boolean
   max_attachment_bytes: number
   max_recording_s: number
   max_recording_bytes: number
@@ -142,4 +155,12 @@ export interface FinalFrame {
 export interface ErrorFrame {
   code: 'model' | 'audit' | 'internal'
   message: string
+}
+
+/** What the answer should say about itself: `images_dropped`, the model took no
+ *  pictures and answered without them. A code this app does not know is ignored. */
+export type NoticeCode = 'images_dropped'
+
+export interface NoticeFrame {
+  code: NoticeCode
 }

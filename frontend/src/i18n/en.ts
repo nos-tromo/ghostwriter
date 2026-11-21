@@ -35,6 +35,8 @@ export const en = {
   'chat.copy_code': 'Copy code',
   'chat.answer_busy': 'An answer is still being written in this chat.',
   'chat.no_answer': 'There is no answer to regenerate.',
+  'chat.images_dropped': 'The model did not take the pictures; it answered without them.',
+  'chat.attachment_processing': 'Wait until the attached files are ready.',
 
   // the reasoning switch
   'chat.reasoning_state': 'Reasoning: {mode}',
