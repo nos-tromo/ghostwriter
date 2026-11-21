@@ -11,12 +11,15 @@ result is cut to ``HISTORY_RESULT_CHARS``.
 
 With an :class:`~ghostwriter.agent.images.ImageBudget`, an image ref counts as its label's
 characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a request carries
-at most ``max_images``. While the current turn is over the budget or the cap, its tool images
-retire first, oldest first, each leaving a note; past the cap, the question's own images give
-way, last first; only then are tool results cleared and arguments cut. An earlier turn with
-images is replayed with them while the budget and the cap allow, else with a note per image
-that ``view_file`` shows it; a tool image is never replayed. Without an image budget, an
-earlier turn is replayed as its text, as before.
+at most ``max_images``. While the current turn is over the budget or the cap, the tool images
+of its earlier rounds retire first, oldest first; past the cap, the question's own images give
+way, last first, so the newest tool images (the last message that holds any), which the model
+has not seen yet, stay within the cap; only while still over do those give way, oldest first.
+Each leaves a note in its place, and a picture's strips give way together. Only then are tool
+results cleared and arguments cut. An earlier turn with images is replayed with them while the
+budget and the cap allow, else with a note per image that ``view_file`` shows it; a tool image
+is never replayed. Without an image budget, an earlier turn is replayed as its text, as before,
+and the current turn must hold no image ref.
 """
 
 import math
@@ -31,6 +34,7 @@ from ghostwriter.agent.images import (
     NOT_RESENT,
     OVER_CAP,
     RETIRED,
+    UNSEEN,
     AttachedImage,
     ImageBudget,
     attachment_parts,
@@ -38,7 +42,10 @@ from ghostwriter.agent.images import (
     is_ref,
     note,
     parts_of,
+    ref_places,
+    refs,
     rendition_size,
+    siblings,
 )
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, HISTORY_ARGUMENT_CHARS, HISTORY_RESULT_CHARS, PROMPT_TOKENS
 from ghostwriter.agent.tools import CUT_MARK, compact, cut, echoed_arguments, parse_arguments
@@ -48,6 +55,8 @@ from ghostwriter.schemas import AttachmentOut
 CLEARED: Final = "[cleared to make room; call the tool again if you need it]"
 #: How an earlier turn is replayed: with its images, with a note per image, or as its text alone.
 ReplayMode = Literal["images", "notes", "none"]
+#: The most pages without text an attachment's line lists.
+LISTED_PAGES: Final = 10
 
 
 @dataclass(frozen=True)
@@ -142,7 +151,9 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
 
     Returns:
         For a picture ``image`` and its first rendition's size, followed by that the model does
-        not see it when not ``seen``; for a PDF its pages, and those without text; else ``None``.
+        not see it when not ``seen``; for a PDF its pages, and those without text: at most
+        :data:`LISTED_PAGES` of them and how many more, or that no page has text when that holds
+        for more than one page; else ``None``.
     """
     if kind == "image":
         size = rendition_size(manifest)
@@ -156,11 +167,15 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
     facts = "PDF, 1 page" if total == 1 else f"PDF, {total} pages"
     listed = manifest.get("pages_without_text")
     blank: list[int] = [page for page in listed if isinstance(page, int)] if isinstance(listed, list) else []
+    if total > 1 and set(blank) >= set(range(1, total + 1)):
+        return f"{facts}; no page has text"
     if len(blank) == 1:
         return f"{facts}; page {blank[0]} has no text"
-    if blank:
-        return f"{facts}; pages {', '.join(str(page) for page in blank)} have no text"
-    return facts
+    if not blank:
+        return facts
+    pages = ", ".join(str(page) for page in blank[:LISTED_PAGES])
+    more = f", and {len(blank) - LISTED_PAGES} more" if len(blank) > LISTED_PAGES else ""
+    return f"{facts}; pages {pages}{more} have no text"
 
 
 def _cut_arguments(raw: str, limit: int) -> str:
@@ -279,24 +294,6 @@ def _copied(message: Mapping[str, Any]) -> dict[str, Any]:
     return {**message, "content": list(content)} if isinstance(content, list) else dict(message)
 
 
-def _refs_of(messages: Sequence[dict[str, Any]], *, origin: str) -> list[tuple[dict[str, Any], int]]:
-    """Return where the image refs of one origin are, in order.
-
-    Args:
-        messages: The messages.
-        origin: ``attachment`` or ``tool``.
-
-    Returns:
-        Each ref's message and its index in the message's content.
-    """
-    return [
-        (message, index)
-        for message in messages
-        for index, part in enumerate(parts_of(message))
-        if is_ref(part) and part.get("origin") == origin
-    ]
-
-
 class _Size:
     """The tokens of a message list: its compact JSON's characters, and its images' estimates.
 
@@ -392,7 +389,12 @@ def fit(
     Returns:
         The system message, the earlier turns that fit, and the current turn, in order; their
         image refs still refs (:func:`~ghostwriter.agent.images.materialise` makes them images).
+
+    Raises:
+        ValueError: If ``current`` holds an image ref while ``images`` is ``None``.
     """
+    if images is None and refs(current):
+        raise ValueError("the current turn holds images, but fit was given no image budget")
     fixed = estimate_tokens(tools) if tools else 0
     kept: list[dict[str, Any]] = [{"role": "system", "content": system}, *(_copied(m) for m in current)]
     size = _Size(kept, images)
@@ -400,15 +402,28 @@ def fit(
     def over() -> bool:
         return size.tokens() + fixed > budget or (images is not None and size.images > images.max_images)
 
+    def give_way(message: dict[str, Any], index: int, template: str, **values: Any) -> None:
+        if is_ref(message["content"][index]):
+            for sibling in siblings(message, index):
+                size.replace(message, sibling, note(message["content"][sibling], template, **values))
+
     if images is not None:
-        for message, index in _refs_of(kept, origin="tool"):
-            if not over():
+        tool_places = ref_places(kept, origin="tool")
+        newest = tool_places[-1][0] if tool_places else None
+        for message, index in tool_places:
+            if message is newest or not over():
                 break
-            size.replace(message, index, note(message["content"][index], RETIRED))
-        for message, index in reversed(_refs_of(kept[1:2], origin="attachment")):
+            give_way(message, index, RETIRED)
+        for message, index in reversed(ref_places(kept[1:2], origin="attachment")):
             if size.images <= images.max_images:
                 break
-            size.replace(message, index, note(message["content"][index], OVER_CAP, max=images.max_images))
+            give_way(message, index, OVER_CAP, max=images.max_images)
+        for message, index in tool_places:
+            if message is not newest:
+                continue
+            if not over():
+                break
+            give_way(message, index, UNSEEN)
     for message in kept[1:]:
         if size.tokens() + fixed <= budget:
             break

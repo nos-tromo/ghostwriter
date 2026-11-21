@@ -29,6 +29,7 @@ from ghostwriter.agent.images import (
     NOT_RESENT,
     OVER_CAP,
     RETIRED,
+    UNSEEN,
     AttachedImage,
     ImageBudget,
     attachment_parts,
@@ -589,57 +590,71 @@ def test_the_attachment_line_carries_facts() -> None:
     )
 
 
+def _viewed(call_id: str, images: list[ToolImage], *, chars: int = 100) -> list[dict[str, Any]]:
+    """Return one round of the current turn: a ``view_file`` call, its result, and the message with its images."""
+    call = {"id": call_id, "type": "function", "function": {"name": "view_file", "arguments": "{}"}}
+    shown, _ = tool_image_message([("view_file", call_id, images)])
+    return [
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": call_id, "content": call_id[-1] * chars},
+        shown,
+    ]
+
+
 def test_an_image_counts_its_estimate_against_the_budget() -> None:
-    """At 280 tokens an image, room for one of two tool images retires the older; room for both retires none."""
+    """At 280 tokens an image, room for one of two rounds' images retires the older; room for both retires none."""
     images = ImageBudget(fixed=280, max_images=8)
-    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
-    current = [_user("Was zeigen die Seiten?"), *_round_with_results(1, chars=100), shown]
+    current = [_user("Was zeigen die Seiten?"), *_viewed("call_0", [PAGE]), *_viewed("call_1", [CHART])]
     before = copy.deepcopy(current)
     text = _text_tokens(current)
     both = fit(SYSTEM, [], [], current, budget=text + 560, images=images)
     assert refs(both) == refs(current) and both[1:] == current
     one = fit(SYSTEM, [], [], current, budget=text + 559, images=images)
-    assert one[-1]["content"][1] == note(shown["content"][1], RETIRED)
-    assert one[-1]["content"][1]["text"] == (
+    assert one[4]["content"][1] == note(current[3]["content"][1], RETIRED)
+    assert one[4]["content"][1]["text"] == (
         "[Image: quay-scan.pdf, page 2; not shown again to make room, view it again with view_file]"
     )
-    assert one[-1]["content"][2] == shown["content"][2] and len(refs(one)) == 1
+    assert one[-1] == current[-1] and len(refs(one)) == 1
     assert estimate_tokens(_labelled(one)) + 280 <= text + 559
-    assert [m["content"] for m in one if m["role"] == "tool"] == ["0" * 100]
+    assert [m["content"] for m in one if m["role"] == "tool"] == ["0" * 100, "1" * 100]
     assert current == before
 
 
 def test_tool_images_retire_oldest_first_before_results_are_cleared() -> None:
-    """Short by one image, the older image retires and no result is cleared; short by more, all images, then results."""
+    """Short by one image, the earlier round's image retires; short by more, the newest is unseen, then results go."""
     images = ImageBudget(fixed=280, max_images=8)
-    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
-    current = [_user("Was zeigen die Seiten?"), *_round_with_results(2, chars=3_000), shown]
+    current = [
+        _user("Was zeigen die Seiten?"),
+        *_viewed("call_0", [PAGE], chars=3_000),
+        *_viewed("call_1", [CHART], chars=3_000),
+    ]
     text = _text_tokens(current)
     short_by_one = fit(SYSTEM, [], [], current, budget=text + 560 - 1, images=images)
-    assert short_by_one[-1]["content"][1:] == [note(shown["content"][1], RETIRED), shown["content"][2]]
+    assert short_by_one[4]["content"][1] == note(current[3]["content"][1], RETIRED)
+    assert short_by_one[-1] == current[-1]
     assert [m["content"] for m in short_by_one if m["role"] == "tool"] == ["0" * 3_000, "1" * 3_000]
     short_by_more = fit(SYSTEM, [], [], current, budget=text - 100, images=images)
     assert refs(short_by_more) == []
-    assert short_by_more[-1]["content"][1:] == [note(part, RETIRED) for part in shown["content"][1:]]
+    assert short_by_more[4]["content"][1] == note(current[3]["content"][1], RETIRED)
+    assert short_by_more[-1]["content"][1] == note(current[-1]["content"][1], UNSEEN)
+    assert short_by_more[-1]["content"][1]["text"] == (
+        "[Image: plot.png; not shown, there is no room for it in this request]"
+    )
     assert [m["content"] for m in short_by_more if m["role"] == "tool"] == [CLEARED, "1" * 3_000]
     assert estimate_tokens(short_by_more) <= text - 100
 
 
 def test_the_image_cap_holds_across_the_request() -> None:
-    """At most three images go: the question's two and the newest tool image; an earlier turn's image is a note."""
+    """At most three: an earlier round's image retires, the question's last gives way, the newest round's two stay."""
     photos = (_photo(1, "harbour-photo.jpg"), _photo(2, "quay-photo.jpg"))
     question = {"role": "user", "content": [_text("Vergleiche die Bilder"), *attachment_parts(photos, fixed=None)]}
-    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
-    current = [question, *_round_with_results(1, chars=50), shown]
+    current: list[dict[str, Any]] = [question, *_viewed("call_0", [PAGE]), *_viewed("call_1", [CHART, PAGE])]
     pier = _photo(3, "pier-photo.jpg")
     past = [PastTurn("Zeig das Foto", (), "Ein Hafen.", False, (pier,))]
     messages = fit(SYSTEM, [], past, current, images=ImageBudget(fixed=None, max_images=3))
-    assert [p["key"] for p in refs(messages)] == [
-        "att:" + "1" * 32 + ":1/1",
-        "att:" + "2" * 32 + ":1/1",
-        "tool:call_0:2",
-    ]
-    assert messages[-1]["content"][1] == note(shown["content"][1], RETIRED)
+    assert [p["key"] for p in refs(messages)] == ["att:" + "1" * 32 + ":1/1", "tool:call_1:1", "tool:call_1:2"]
+    assert messages[-4]["content"][1] == note(current[3]["content"][1], RETIRED)
+    assert messages[3]["content"][2] == note(question["content"][2], OVER_CAP, max=3)
     assert messages[1] == {"role": "user", "content": "Zeig das Foto\n" + NOT_RESENT.format(label="pier-photo.jpg")}
     assert NOT_RESENT.format(label="pier-photo.jpg") == "[Image: pier-photo.jpg; not shown again, view_file shows it]"
     crowded = {"role": "user", "content": [_text("Vergleiche"), *attachment_parts((*photos, pier), fixed=None)]}
@@ -649,6 +664,77 @@ def test_the_image_cap_holds_across_the_request() -> None:
         "[Image: pier-photo.jpg; not shown, at most 2 images go to the model at once; view_file shows it]"
     )
     assert len(crowded["content"]) == 4 and len(refs([crowded])) == 3
+
+
+def test_the_newest_tool_images_stay_when_the_question_fills_the_cap() -> None:
+    """Four large pictures at 280 fill the cap of 8 with strips: a view_file image stays, the last picture gives way.
+
+    Short of tokens after that, the newest tool image gives way as unseen, before any result is cleared.
+    """
+    images = ImageBudget(fixed=280, max_images=8)
+    photos = tuple(_photo(n, f"pier-{n}.jpg", width=1600, height=1200) for n in range(1, 5))
+    question = {"role": "user", "content": [_text("Vergleiche die Fotos"), *attachment_parts(photos, fixed=280)]}
+    current: list[dict[str, Any]] = [question, *_viewed("call_0", [PAGE])]
+    assert len(refs(current)) == 9
+    capped = fit(SYSTEM, [], [], current, images=images)
+    assert [p["key"] for p in refs(capped)] == [
+        *(f"att:{n}{n * 31}:{strip}/2" for n in "123" for strip in (1, 2)),
+        "tool:call_0:1",
+    ]
+    assert capped[1]["content"][7:] == [note(part, OVER_CAP, max=8) for part in question["content"][7:]]
+    assert capped[1]["content"][8]["text"] == (
+        "[Image: pier-4.jpg, strip 2 of 2; not shown, at most 8 images go to the model at once; view_file shows it]"
+    )
+    budget = estimate_tokens(_labelled(capped)) + 7 * 280 - 1
+    short = fit(SYSTEM, [], [], current, budget=budget, images=images)
+    assert short[-1]["content"][1] == note(current[-1]["content"][1], UNSEEN)
+    assert short[1] == capped[1] and len(refs(short)) == 6
+    assert [m["content"] for m in short if m["role"] == "tool"] == ["0" * 100]
+    assert estimate_tokens(_labelled(short)) + 6 * 280 <= budget
+
+
+def test_a_picture_gives_way_whole() -> None:
+    """A two-strip attachment past the cap gives way with both strips; so does an earlier round's page in strips."""
+    small, large = _photo(1, "harbour-photo.jpg"), _photo(2, "site-plan.png", width=2048, height=1536)
+    question = {"role": "user", "content": [_text("Vergleiche"), *attachment_parts((small, large), fixed=280)]}
+    capped = fit(SYSTEM, [], [], [question], images=ImageBudget(fixed=280, max_images=2))
+    assert capped[1]["content"] == [
+        *question["content"][:2],
+        *(note(part, OVER_CAP, max=2) for part in question["content"][2:]),
+    ]
+    assert [p["key"] for p in refs(capped)] == ["att:" + "1" * 32 + ":1/1"]
+    top = ToolImage("page 3, strip 1 of 2", 1131, 820, "image/jpeg", TINY_JPEG)
+    bottom = ToolImage("page 3, strip 2 of 2", 1131, 820, "image/jpeg", TINY_JPEG)
+    current = [_user("Und Seite 3?"), *_viewed("call_0", [top, bottom]), *_viewed("call_1", [CHART])]
+    fitted = fit(SYSTEM, [], [], current, images=ImageBudget(fixed=280, max_images=2))
+    assert fitted[4]["content"][1:] == [note(part, RETIRED) for part in current[3]["content"][1:]]
+    assert [p["key"] for p in refs(fitted)] == ["tool:call_1:1"]
+
+
+def test_fit_refuses_images_without_an_image_budget() -> None:
+    """Refs in the current turn need an image budget: without one they would neither count nor give way."""
+    question = {
+        "role": "user",
+        "content": [_text("Was zeigt das?"), *attachment_parts([_photo(1, "a.jpg")], fixed=None)],
+    }
+    with pytest.raises(ValueError, match="no image budget"):
+        fit(SYSTEM, [], [], [question])
+    assert len(refs(fit(SYSTEM, [], [], [question], images=ImageBudget(None, max_images=8)))) == 1
+
+
+def test_a_long_list_of_pages_without_text_is_cut() -> None:
+    """At most ten pages are named, then how many more; a scan whose pages all lack text says so."""
+    assert attachment_facts("document", _pdf_manifest(40, list(range(3, 18))), seen=True) == (
+        "PDF, 40 pages; pages 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, and 5 more have no text"
+    )
+    assert attachment_facts("document", _pdf_manifest(12, list(range(1, 11))), seen=True) == (
+        "PDF, 12 pages; pages 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 have no text"
+    )
+    assert attachment_facts("document", _pdf_manifest(300, list(range(1, 301))), seen=True) == (
+        "PDF, 300 pages; no page has text"
+    )
+    assert attachment_facts("document", _pdf_manifest(2, [1, 2]), seen=True) == "PDF, 2 pages; no page has text"
+    assert attachment_facts("document", _pdf_manifest(1, [1]), seen=True) == "PDF, 1 page; page 1 has no text"
 
 
 def test_earlier_turns_replay_with_their_images_while_budget_and_cap_allow() -> None:

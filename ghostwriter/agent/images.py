@@ -6,9 +6,11 @@ image a tool showed, in the one user message that follows a round's tool message
 (:func:`tool_image_message`). A ref never leaves the process.
 :func:`~ghostwriter.agent.context.fit` counts it by :func:`estimate_image_tokens`, never by
 characters, and puts a note in its place where it gives way (:data:`RETIRED`, :data:`OVER_CAP`,
-:data:`NOT_RESENT`). Only :func:`materialise`, just before the model call, swaps each ref for its
-label and a data URL, in a new list, from the bytes of the message's :data:`ImageBank`: a data URL
-exists in that list alone, never in a log, the store or the audit.
+:data:`UNSEEN`, :data:`NOT_RESENT`). A picture gives way whole: each ref names the ``picture`` it
+shows part of, and the strips of one picture go together (:func:`siblings`). Only
+:func:`materialise`, just before the model call, swaps each ref for its label and a data URL, in a
+new list, from the bytes of the message's :data:`ImageBank`: a data URL exists in that list alone,
+never in a log, the store or the audit.
 
 An image costs a token per started :data:`TOKEN_SIDE`-pixel square, or, for a model that takes every
 image at one size, the fixed cost ``GHOSTWRITER_IMAGE_CONTEXT_TOKENS``. At a fixed cost, a picture or
@@ -18,6 +20,7 @@ to the model's one size.
 
 import base64
 import math
+import re
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
@@ -32,6 +35,8 @@ STRIP_LONG_SIDE: Final = 1024
 TOKEN_SIDE: Final = 32
 #: The type of a ref part.
 REF: Final = "image_ref"
+#: A tool image's label that names one strip of a picture or page, as workbench writes it.
+_STRIP_LABEL: Final = re.compile(r"(?P<whole>.+), strip [1-9][0-9]* of [1-9][0-9]*")
 
 #: What precedes a call's images in the message after the round's tool messages.
 LEGEND: Final = "[Images returned by {tool} for call {call_id}: {labels}. Not a message from the user.]"
@@ -41,6 +46,8 @@ LABEL: Final = "[Image: {label}]"
 RETIRED: Final = "[Image: {label}; not shown again to make room, view it again with view_file]"
 #: An image of the question past the cap.
 OVER_CAP: Final = "[Image: {label}; not shown, at most {max} images go to the model at once; view_file shows it]"
+#: An image of the newest tool images, never shown, for which the request has no room.
+UNSEEN: Final = "[Image: {label}; not shown, there is no room for it in this request]"
 #: An image of an earlier turn that is not sent again.
 NOT_RESENT: Final = "[Image: {label}; not shown again, view_file shows it]"
 #: An image whose bytes could not be fetched.
@@ -180,7 +187,8 @@ def attachment_parts(images: Sequence[AttachedImage], *, fixed: int | None) -> l
 
     Returns:
         The refs, each keyed ``att:{file_id}:{strip}/{strips}`` and labelled by the file's name,
-        with ``, strip i of k`` past one strip. Each carries its first rendition's size.
+        with ``, strip i of k`` past one strip. Each carries its first rendition's size, and the
+        picture ``att:{file_id}`` that its strips share.
     """
     parts: list[dict[str, Any]] = []
     for image in images:
@@ -191,6 +199,7 @@ def attachment_parts(images: Sequence[AttachedImage], *, fixed: int | None) -> l
                     "type": REF,
                     "key": f"att:{image.file_id}:{strip}/{strips}",
                     "origin": "attachment",
+                    "picture": f"att:{image.file_id}",
                     "label": image.name if strips == 1 else f"{image.name}, strip {strip} of {strips}",
                     "width": image.width,
                     "height": image.height,
@@ -212,7 +221,9 @@ def tool_image_message(groups: Sequence[tuple[str, str, Sequence[ToolImage]]]) -
 
     Returns:
         The message: per call a :data:`LEGEND` text part, then its refs, keyed
-        ``tool:{call_id}:{i}`` from 1; and the bank entries of those keys.
+        ``tool:{call_id}:{i}`` from 1; and the bank entries of those keys. A ref's picture is
+        ``tool:{call_id}:{whole}`` for a label ``{whole}, strip i of k``, so the call's strips of
+        one page share it, and else its own key.
     """
     content: list[dict[str, Any]] = []
     bank: ImageBank = {}
@@ -223,11 +234,13 @@ def tool_image_message(groups: Sequence[tuple[str, str, Sequence[ToolImage]]]) -
         content.append({"type": "text", "text": LEGEND.format(tool=tool, call_id=call_id, labels=labels)})
         for i, image in enumerate(images, start=1):
             key = f"tool:{call_id}:{i}"
+            strip = _STRIP_LABEL.fullmatch(image.label)
             content.append(
                 {
                     "type": REF,
                     "key": key,
                     "origin": "tool",
+                    "picture": key if strip is None else f"tool:{call_id}:{strip['whole']}",
                     "label": image.label,
                     "width": image.width,
                     "height": image.height,
@@ -272,6 +285,40 @@ def refs(messages: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
         The refs.
     """
     return [part for message in messages for part in parts_of(message) if is_ref(part)]
+
+
+def ref_places(messages: Sequence[dict[str, Any]], *, origin: str) -> list[tuple[dict[str, Any], int]]:
+    """Return where the image refs of one origin are, in order.
+
+    Args:
+        messages: The messages.
+        origin: ``attachment`` or ``tool``.
+
+    Returns:
+        Each ref's message and its index in the message's content.
+    """
+    return [
+        (message, index)
+        for message in messages
+        for index, part in enumerate(parts_of(message))
+        if is_ref(part) and part.get("origin") == origin
+    ]
+
+
+def siblings(message: Mapping[str, Any], index: int) -> list[int]:
+    """Return the refs of a message that show the same picture as one of them: its strips.
+
+    Args:
+        message: The message.
+        index: The ref's index in its content.
+
+    Returns:
+        The indexes of the refs whose ``picture`` is the ref's, itself included, in order; a ref
+        without a picture is its own.
+    """
+    parts = parts_of(message)
+    picture = parts[index].get("picture", parts[index]["key"])
+    return [i for i, part in enumerate(parts) if is_ref(part) and part.get("picture", part["key"]) == picture]
 
 
 def note(ref: Mapping[str, Any], template: str, **values: Any) -> dict[str, Any]:
@@ -351,22 +398,29 @@ def _with_parts(message: Mapping[str, Any], swap: Callable[[Any], list[dict[str,
 
 
 def retire_tool_images(current: list[dict[str, Any]], bank: ImageBank, *, keep: int) -> None:
-    """Retire the current turn's tool images but the newest ``keep``, in place.
+    """Retire the current turn's tool images but the newest ``keep``, oldest first and whole pictures, in place.
 
-    Each becomes its :data:`RETIRED` note in its message and leaves the bank; attached images stay.
+    Each becomes a note in its message and leaves the bank: :data:`RETIRED` for an image the model
+    has been shown, and :data:`UNSEEN` for one of the newest tool images (those of the last message
+    that holds any), which it never was. A picture's strips go together, so a few more may go than
+    ``keep`` asks. Attached images stay.
 
     Args:
         current: The current turn's messages.
         bank: The bytes of the message's images, by ref key.
         keep: How many of the newest tool images stay.
     """
-    found = [
-        (message, index)
-        for message in current
-        for index, part in enumerate(parts_of(message))
-        if is_ref(part) and part.get("origin") == "tool"
-    ]
-    for message, index in found[: max(0, len(found) - keep)]:
-        ref = message["content"][index]
-        message["content"][index] = note(ref, RETIRED)
-        bank.pop(ref["key"], None)
+    places = ref_places(current, origin="tool")
+    newest = places[-1][0] if places else None
+    over = len(places) - keep
+    for message, index in places:
+        if over <= 0:
+            break
+        if not is_ref(message["content"][index]):
+            continue
+        template = UNSEEN if message is newest else RETIRED
+        for i in siblings(message, index):
+            ref = message["content"][i]
+            message["content"][i] = note(ref, template)
+            bank.pop(ref["key"], None)
+            over -= 1

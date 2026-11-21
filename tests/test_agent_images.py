@@ -12,6 +12,7 @@ from ghostwriter.agent.images import (
     LEFT_OUT,
     NOT_LOADED,
     RETIRED,
+    UNSEEN,
     AttachedImage,
     ImageBank,
     attachment_parts,
@@ -19,6 +20,7 @@ from ghostwriter.agent.images import (
     materialise,
     refs,
     retire_tool_images,
+    siblings,
     strips_for_image,
     strips_for_path,
     tool_image_message,
@@ -80,8 +82,8 @@ def test_attachment_parts_label_each_strip() -> None:
         ("att:F:2/2", "harbour-photo.jpg, strip 2 of 2", 2, 2),
     ]
     assert all(
-        (p["type"], p["origin"], p["path"], p["n"], p["width"], p["height"])
-        == ("image_ref", "attachment", PHOTO.path, 1, 2048, 1536)
+        (p["type"], p["origin"], p["picture"], p["path"], p["n"], p["width"], p["height"])
+        == ("image_ref", "attachment", "att:F", PHOTO.path, 1, 2048, 1536)
         for p in parts
     )
     assert attachment_parts([PHOTO], fixed=None) == [
@@ -89,6 +91,7 @@ def test_attachment_parts_label_each_strip() -> None:
             "type": "image_ref",
             "key": "att:F:1/1",
             "origin": "attachment",
+            "picture": "att:F",
             "label": "harbour-photo.jpg",
             "width": 2048,
             "height": 1536,
@@ -163,7 +166,7 @@ def test_without_images_leaves_only_notes() -> None:
 
 
 def test_retire_tool_images_keeps_the_newest() -> None:
-    """Tool images older than the newest ``keep`` become notes in place and leave the bank; attached ones stay."""
+    """Older tool images retire first and the newest ones, never shown, are unseen; attached ones stay."""
     first, first_bank = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
     second, second_bank = tool_image_message([("view_file", "call_1", [PAGE])])
     question = _question(PHOTO)
@@ -177,5 +180,25 @@ def test_retire_tool_images_keeps_the_newest() -> None:
     assert set(bank) == {"att:F:1/1", "tool:call_0:2", "tool:call_1:1"}
     retire_tool_images(current, bank, keep=0)
     assert [p["key"] for p in refs(current)] == ["att:F:1/1"] and set(bank) == {"att:F:1/1"}
-    assert second["content"][1] == _text(RETIRED.format(label="quay-scan.pdf, page 2"))
+    assert first["content"][2] == _text(RETIRED.format(label="plot.png"))
+    assert second["content"][1] == _text(
+        "[Image: quay-scan.pdf, page 2; not shown, there is no room for it in this request]"
+    )
+    assert UNSEEN.format(label="x") == "[Image: x; not shown, there is no room for it in this request]"
     assert current[0] is question and len(refs([question])) == 1
+
+
+def test_a_tool_pages_strips_share_their_picture_and_retire_together() -> None:
+    """Strips of one page in a call's answer are one picture: they retire together, even past ``keep``."""
+    top = ToolImage("page 3, strip 1 of 2", 1131, 820, "image/jpeg", TINY_JPEG)
+    bottom = ToolImage("page 3, strip 2 of 2", 1131, 820, "image/jpeg", TINY_JPEG)
+    shown, bank = tool_image_message([("view_file", "call_0", [top, bottom, PAGE])])
+    assert [p["picture"] for p in refs([shown])] == ["tool:call_0:page 3", "tool:call_0:page 3", "tool:call_0:3"]
+    assert siblings(shown, 2) == [1, 2] and siblings(shown, 3) == [3]
+    later, later_bank = tool_image_message([("view_file", "call_1", [CHART])])
+    current = [_question(PHOTO), shown, later]
+    bank.update(later_bank)
+    retire_tool_images(current, bank, keep=3)
+    assert shown["content"][1:3] == [_text(RETIRED.format(label=image.label)) for image in (top, bottom)]
+    assert [p["key"] for p in refs(current)] == ["att:F:1/1", "tool:call_0:3", "tool:call_1:1"]
+    assert set(bank) == {"tool:call_0:3", "tool:call_1:1"}
