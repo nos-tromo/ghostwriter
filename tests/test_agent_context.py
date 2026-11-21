@@ -6,6 +6,7 @@ Every name, id and value here is invented.
 import copy
 import dataclasses
 import json
+import time
 from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -756,6 +757,17 @@ def test_a_long_list_of_pages_without_text_is_cut() -> None:
     )
     assert attachment_facts("document", _pdf_manifest(2, [1, 2]), seen=True) == "PDF, 2 pages; no page has text"
     assert attachment_facts("document", _pdf_manifest(1, [1]), seen=True) == "PDF, 1 page; page 1 has no text"
+
+
+def test_a_huge_page_count_is_read_from_the_short_list() -> None:
+    """A manifest's total is workbench's word: a billion pages with three blank ones answers at once, as three."""
+    started = time.monotonic()
+    facts = attachment_facts("document", _pdf_manifest(10**9, [2, 5, 9]), seen=True)
+    assert facts == "PDF, 1000000000 pages; pages 2, 5, 9 have no text"
+    assert attachment_facts("document", _pdf_manifest(3, [1, 2, 2, 3, 7]), seen=True) == (
+        "PDF, 3 pages; no page has text"
+    )
+    assert time.monotonic() - started < 1.0
 
 
 def test_earlier_turns_replay_with_their_images_while_budget_and_cap_allow() -> None:

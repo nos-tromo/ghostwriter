@@ -168,7 +168,8 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
     facts = "PDF, 1 page" if total == 1 else f"PDF, {total} pages"
     listed = manifest.get("pages_without_text")
     blank: list[int] = [page for page in listed if isinstance(page, int)] if isinstance(listed, list) else []
-    if total > 1 and set(blank) >= set(range(1, total + 1)):
+    distinct = {page for page in blank if 1 <= page <= total}
+    if total > 1 and len(distinct) == total:
         return f"{facts}; no page has text"
     if len(blank) == 1:
         return f"{facts}; page {blank[0]} has no text"
