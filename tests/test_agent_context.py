@@ -621,7 +621,7 @@ def test_an_image_counts_its_estimate_against_the_budget() -> None:
 
 
 def test_tool_images_retire_oldest_first_before_results_are_cleared() -> None:
-    """Short by one image, the earlier round's image retires; short by more, the newest is unseen, then results go."""
+    """Short by one image, the earlier round's image retires; short by more, results go, then the newest is unseen."""
     images = ImageBudget(fixed=280, max_images=8)
     current = [
         _user("Was zeigen die Seiten?"),
@@ -633,15 +633,34 @@ def test_tool_images_retire_oldest_first_before_results_are_cleared() -> None:
     assert short_by_one[4]["content"][1] == note(current[3]["content"][1], RETIRED)
     assert short_by_one[-1] == current[-1]
     assert [m["content"] for m in short_by_one if m["role"] == "tool"] == ["0" * 3_000, "1" * 3_000]
-    short_by_more = fit(SYSTEM, [], [], current, budget=text - 100, images=images)
+    cleared = copy.deepcopy(current)
+    cleared[2]["content"] = cleared[5]["content"] = CLEARED
+    cleared[3]["content"][1] = note(current[3]["content"][1], RETIRED)
+    budget = _text_tokens(cleared) + 280 - 1
+    short_by_more = fit(SYSTEM, [], [], current, budget=budget, images=images)
     assert refs(short_by_more) == []
     assert short_by_more[4]["content"][1] == note(current[3]["content"][1], RETIRED)
     assert short_by_more[-1]["content"][1] == note(current[-1]["content"][1], UNSEEN)
     assert short_by_more[-1]["content"][1]["text"] == (
         "[Image: plot.png; not shown, there is no room for it in this request]"
     )
-    assert [m["content"] for m in short_by_more if m["role"] == "tool"] == [CLEARED, "1" * 3_000]
-    assert estimate_tokens(short_by_more) <= text - 100
+    assert [m["content"] for m in short_by_more if m["role"] == "tool"] == [CLEARED, CLEARED]
+    assert estimate_tokens(short_by_more) <= budget
+
+
+def test_old_tool_results_are_cleared_before_the_newest_tool_images_give_way() -> None:
+    """Short by one image's cost, earlier text results are cleared and the images the model just asked for stay."""
+    images = ImageBudget(fixed=280, max_images=8)
+    current: list[dict[str, Any]] = [
+        _user("Was steht im Bericht, und was zeigt die Grafik?"),
+        *_round_with_results(2, chars=3_000),
+        *_viewed("call_9", [CHART]),
+    ]
+    budget = _text_tokens(current) + 280 - 280
+    fitted = fit(SYSTEM, [], [], current, budget=budget, images=images)
+    assert fitted[-1] == current[-1] and [p["key"] for p in refs(fitted)] == ["tool:call_9:1"]
+    assert [m["content"] for m in fitted if m["role"] == "tool"] == [CLEARED, "1" * 3_000, "9" * 100]
+    assert estimate_tokens(_labelled(fitted)) + 280 <= budget
 
 
 def test_the_image_cap_holds_across_the_request() -> None:
@@ -669,7 +688,7 @@ def test_the_image_cap_holds_across_the_request() -> None:
 def test_the_newest_tool_images_stay_when_the_question_fills_the_cap() -> None:
     """Four large pictures at 280 fill the cap of 8 with strips: a view_file image stays, the last picture gives way.
 
-    Short of tokens after that, the newest tool image gives way as unseen, before any result is cleared.
+    Short of tokens after that, the tool result is cleared first, and only then does the newest tool image give way.
     """
     images = ImageBudget(fixed=280, max_images=8)
     photos = tuple(_photo(n, f"pier-{n}.jpg", width=1600, height=1200) for n in range(1, 5))
@@ -685,11 +704,13 @@ def test_the_newest_tool_images_stay_when_the_question_fills_the_cap() -> None:
     assert capped[1]["content"][8]["text"] == (
         "[Image: pier-4.jpg, strip 2 of 2; not shown, at most 8 images go to the model at once; view_file shows it]"
     )
-    budget = estimate_tokens(_labelled(capped)) + 7 * 280 - 1
+    cleared = copy.deepcopy(capped)
+    cleared[3]["content"] = CLEARED
+    budget = estimate_tokens(_labelled(cleared)) + 7 * 280 - 1
     short = fit(SYSTEM, [], [], current, budget=budget, images=images)
     assert short[-1]["content"][1] == note(current[-1]["content"][1], UNSEEN)
     assert short[1] == capped[1] and len(refs(short)) == 6
-    assert [m["content"] for m in short if m["role"] == "tool"] == ["0" * 100]
+    assert [m["content"] for m in short if m["role"] == "tool"] == [CLEARED]
     assert estimate_tokens(_labelled(short)) + 6 * 280 <= budget
 
 

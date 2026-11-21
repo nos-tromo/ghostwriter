@@ -14,9 +14,10 @@ characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a r
 at most ``max_images``. While the current turn is over the budget or the cap, the tool images
 of its earlier rounds retire first, oldest first; past the cap, the question's own images give
 way, last first, so the newest tool images (the last message that holds any), which the model
-has not seen yet, stay within the cap; only while still over do those give way, oldest first.
-Each leaves a note in its place, and a picture's strips give way together. Only then are tool
-results cleared and arguments cut. An earlier turn with images is replayed with them while the
+has not seen yet, stay within the cap. Then tool results are cleared and arguments cut, and only
+while still over do the newest tool images give way, oldest first: the images the model just
+asked for outrank text it has already read. Each image leaves a note in its place, and a
+picture's strips give way together. An earlier turn with images is replayed with them while the
 budget and the cap allow, else with a note per image that ``view_file`` shows it; a tool image
 is never replayed. Without an image budget, an earlier turn is replayed as its text, as before,
 and the current turn must hold no image ref.
@@ -402,14 +403,15 @@ def fit(
     def over() -> bool:
         return size.tokens() + fixed > budget or (images is not None and size.images > images.max_images)
 
+    tool_places = ref_places(kept, origin="tool")
+    newest = tool_places[-1][0] if tool_places else None
+
     def give_way(message: dict[str, Any], index: int, template: str, **values: Any) -> None:
         if is_ref(message["content"][index]):
             for sibling in siblings(message, index):
                 size.replace(message, sibling, note(message["content"][sibling], template, **values))
 
     if images is not None:
-        tool_places = ref_places(kept, origin="tool")
-        newest = tool_places[-1][0] if tool_places else None
         for message, index in tool_places:
             if message is newest or not over():
                 break
@@ -418,12 +420,6 @@ def fit(
             if size.images <= images.max_images:
                 break
             give_way(message, index, OVER_CAP, max=images.max_images)
-        for message, index in tool_places:
-            if message is not newest:
-                continue
-            if not over():
-                break
-            give_way(message, index, UNSEEN)
     for message in kept[1:]:
         if size.tokens() + fixed <= budget:
             break
@@ -438,6 +434,13 @@ def fit(
         shortened = {**message, "tool_calls": [_with_cut_arguments(call) for call in message["tool_calls"]]}
         size.chars += len(compact(shortened)) - len(compact(message))
         kept[index] = shortened
+    if images is not None:
+        for message, index in tool_places:
+            if message is not newest:
+                continue
+            if not over():
+                break
+            give_way(message, index, UNSEEN)
     if size.tokens() + fixed > budget:
         logger.warning("The current turn alone is over the prompt budget: about {} tokens", size.tokens() + fixed)
     replayed: list[dict[str, Any]] = []
