@@ -1107,7 +1107,7 @@ def test_without_vision_view_file_is_not_offered_and_tool_images_are_named(loop_
     assert (sent.arguments, sent.images) == ({"path": SCAN_PATH}, False)
     assert loop_env.workbench.fetched == [] and loop_env.audit.images == [0, 0]
     question = loop_env.sent(1)[-1]["content"]
-    assert isinstance(question, str) and f"image 64{TIMES}48; not shown: this model does not take images" in question
+    assert isinstance(question, str) and f"image 64{TIMES}48; not shown to the model)]" in question
     assert VISION not in loop_env.sent(1)[0]["content"]
 
 
@@ -1199,6 +1199,10 @@ def test_vision_with_a_workbench_that_shows_no_images_has_no_sight(loop_env: Loo
     assert VISION not in sent[0][0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[1])
     assert _read_document_told(loop_env.fake.calls[1]) == READ_DOCUMENT_TEXT
     assert older.fetched == [] and [call.images for call in older.calls] == [False]
+    assert (
+        f"[Attached: {PHOTO} ({PHOTO_PATH}, 4096 bytes; image 64{TIMES}48; not shown to the model)]"
+        in sent[0][1]["content"]
+    )
     assert sent[1][-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
     assert loop_env.audit.images == [1, 0, 0]
 

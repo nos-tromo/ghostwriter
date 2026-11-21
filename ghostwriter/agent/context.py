@@ -76,6 +76,9 @@ CLEARED: Final = "[cleared to make room; call the tool again if you need it]"
 ReplayMode = Literal["images", "notes", "none"]
 #: The most pages without text an attachment's line lists.
 LISTED_PAGES: Final = 10
+#: What a picture's line says while the turn does not see, whatever the cause: vision off, a model
+#: that takes no images, or a workbench that shows none.
+UNSEEN_PICTURE: Final = "not shown to the model"
 
 
 @dataclass(frozen=True)
@@ -166,18 +169,18 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
     Args:
         kind: The attachment's kind: ``document``, ``image`` or ``media``.
         manifest: Its manifest as the chat keeps it, or ``None``.
-        seen: Whether the model sees images.
+        seen: Whether the turn sees images.
 
     Returns:
-        For a picture ``image`` and its first rendition's size, followed by that the model does
-        not see it when not ``seen``; for a PDF its pages, and those without text: at most
+        For a picture ``image`` and its first rendition's size, followed by :data:`UNSEEN_PICTURE`
+        when not ``seen``; for a PDF its pages, and those without text: at most
         :data:`LISTED_PAGES` of them and how many more, or that no page has text when that holds
         for more than one page; else ``None``.
     """
     if kind == "image":
         size = rendition_size(manifest)
         facts = "image" if size is None else f"image {size[0]}\N{MULTIPLICATION SIGN}{size[1]}"
-        return facts if seen else f"{facts}; not shown: this model does not take images"
+        return facts if seen else f"{facts}; {UNSEEN_PICTURE}"
     if manifest is None or manifest.get("kind") != "pdf":
         return None
     total = manifest.get("total")

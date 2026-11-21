@@ -1273,7 +1273,7 @@ class ChatStore:
             message: The message.
             attachments: The files it sent.
             now: The time of the read.
-            seen: Whether the model sees images, which a picture's line says.
+            seen: Whether the turn sees images, which a picture's line says.
 
         Returns:
             The text, then each attachment with its path, size and facts
@@ -1319,7 +1319,7 @@ class ChatStore:
         Args:
             chat_id: The chat.
             message_id: The user's message.
-            seen: Whether the model sees images, which a picture's line says.
+            seen: Whether the turn sees images, which a picture's line says.
 
         Returns:
             The text with its attachments named (:func:`~ghostwriter.agent.context.user_content`),
@@ -1354,7 +1354,7 @@ class ChatStore:
         Args:
             chat_id: The chat.
             before_position: The position of the message being answered.
-            seen: Whether the model sees images, which a picture's line says.
+            seen: Whether the turn sees images, which a picture's line says.
 
         Returns:
             The turns, oldest first, and whether any of their files or tool contents have expired.

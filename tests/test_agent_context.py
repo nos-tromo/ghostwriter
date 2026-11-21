@@ -533,7 +533,7 @@ def test_the_attachment_line_carries_facts() -> None:
     times = "\N{MULTIPLICATION SIGN}"
     assert attachment_facts("image", _image_manifest(2048, 1536), seen=True) == f"image 2048{times}1536"
     assert attachment_facts("image", _image_manifest(2048, 1536), seen=False) == (
-        f"image 2048{times}1536; not shown: this model does not take images"
+        f"image 2048{times}1536; not shown to the model"
     )
     assert (
         attachment_facts("document", _pdf_manifest(12, [3, 7]), seen=True) == "PDF, 12 pages; pages 3, 7 have no text"
@@ -592,7 +592,7 @@ def test_the_attachment_line_carries_facts() -> None:
     )
     assert unseen == (
         f"[Attached: harbour-photo.jpg ({FOLDER}/harbour-photo.jpg, 48000 bytes; "
-        f"image 2048{times}1536; not shown: this model does not take images)]"
+        f"image 2048{times}1536; not shown to the model)]"
     )
 
 
@@ -1021,7 +1021,7 @@ def test_the_store_lists_ready_images_of_a_turn(store: ChatStore, clock: Clock) 
         0,
     )
     unseen = store.user_turn(chat.id, first.id)
-    assert unseen.images == (photo,) and f"image 64{times}48; not shown: this model does not take images" in unseen.text
+    assert unseen.images == (photo,) and f"image 64{times}48; not shown to the model" in unseen.text
     store.finish_assistant_message(store.start_assistant_message(chat.id), "Einen Hafen.")
     store.add_user_message("user-a", chat.id, "Und weiter?", [])
     [turn], expired = store.past_turns(chat.id, before_position=2, seen=True)
