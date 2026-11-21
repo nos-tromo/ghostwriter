@@ -341,7 +341,15 @@ def test_an_earlier_call_with_bad_arguments_is_replayed_as_an_empty_object() -> 
 def test_attachments_are_named_with_their_paths_until_they_expire() -> None:
     """The model reads an attachment's path and size, or that it has expired; never its content."""
     live = AttachmentOut(
-        id="att-1", file_id="1" * 32, name="sales.xlsx", size=14, mime=XLSX, created_at=T0, expired=False
+        id="att-1",
+        file_id="1" * 32,
+        name="sales.xlsx",
+        size=14,
+        mime=XLSX,
+        kind="document",
+        status="ready",
+        created_at=T0,
+        expired=False,
     )
     gone = live.model_copy(update={"id": "att-2", "name": "alt.pdf", "expired": True})
     text = user_content("Summe der Spalte B", [live, gone], path_of=lambda a: f"{FOLDER}/{a.name}")

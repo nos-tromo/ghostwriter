@@ -28,7 +28,7 @@ from ghostwriter.audit import open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
-from ghostwriter.models import Chat, Result, ToolStep
+from ghostwriter.models import Attachment, Chat, Result, ToolStep
 from ghostwriter.retention import (
     FIRST_SWEEP_DELAY_S,
     SWEEP_BATCH,
@@ -223,6 +223,41 @@ def _raw_result(engine: Engine, result_id: str) -> tuple[Any, ...]:
     with Session(engine) as s:
         row = s.execute(
             select(Result.kind, Result.name, Result.mime, Result.size, Result.preview).where(Result.id == result_id)
+        ).one()
+        return tuple(row)
+
+
+def _scan(env: Env, made: datetime) -> str:
+    """Start a chat at ``made`` and give it a scanned PDF whose manifest was kept then.
+
+    Args:
+        env: The test's env.
+        made: When the chat and the attachment were made.
+
+    Returns:
+        The attachment's id.
+    """
+    chat_id = env.chat(made)
+    env.clock.now = made
+    attachment = env.store.add_attachment(
+        chat_id,
+        file_id="b" * 32,
+        path="/workspace/s/quay-scan.pdf",
+        name="quay-scan.pdf",
+        size=2048,
+        mime="application/pdf",
+        status="processing",
+    )
+    manifest = {"kind": "pdf", "total": 2, "pages_without_text": [2], "renditions": [{"n": 1, "width": 8, "height": 9}]}
+    assert env.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
+    env.clock.now = NOW
+    return attachment.id
+
+
+def _raw_attachment(engine: Engine, attachment_id: str) -> tuple[Any, ...]:
+    with Session(engine) as s:
+        row = s.execute(
+            select(Attachment.name, Attachment.status, Attachment.render).where(Attachment.id == attachment_id)
         ).one()
         return tuple(row)
 
@@ -517,6 +552,40 @@ async def test_tool_contents_and_previews_are_emptied_after_the_file_period(
     assert "Umsatz 42" not in audit_stream.getvalue() and "sums.xlsx" not in audit_stream.getvalue()
 
 
+async def test_expired_manifests_are_recorded_then_emptied(settled: Env, audit_stream: CapturedAuditStream) -> None:
+    """A manifest goes with its file's period: recorded first, then emptied; the attachment itself stays."""
+    env = settled
+    old = _scan(env, NOW - 7 * DAY - SECOND)
+    live = _scan(env, NOW - DAY)
+    before = len(events(audit_stream))
+    assert await env.sweeper.sweep() == SweepReport(manifests=1)
+    emptied = _of(audit_stream, "retention.tool_content")
+    assert [(e["action"], e["actor"], e["target"], e["criteria"]) for e in emptied] == [
+        ("delete", SYSTEM, {"kind": "attachment", "ids": [old], "count": 1}, {"file_days": 7}),
+    ]
+    assert len(events(audit_stream)) == before + 1
+    assert _raw_attachment(env.engine, old) == ("quay-scan.pdf", "ready", None)
+    assert _raw_attachment(env.engine, live)[2] is not None
+    assert "pages_without_text" not in audit_stream.getvalue()
+    assert await env.sweeper.sweep() == SweepReport()
+    assert len(events(audit_stream)) == before + 1
+
+
+async def test_a_manifest_is_not_emptied_when_its_record_cannot_be_written(
+    settled: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """The record comes first: an event that cannot be written leaves the manifest where it is."""
+    env = settled
+    old = _scan(env, NOW - 8 * DAY)
+    audit_stream.writes_left = 0
+    with pytest.raises(AuditWriteError):
+        await env.sweeper.sweep()
+    audit_stream.writes_left = None
+    assert _raw_attachment(env.engine, old)[2] is not None
+    assert await env.sweeper.sweep() == SweepReport(manifests=1)
+    assert _raw_attachment(env.engine, old)[2] is None
+
+
 def _spin_guard(monkeypatch: pytest.MonkeyPatch, store: ChatStore, name: str) -> None:
     """Fail a sweep that reads what is due more than ten times, instead of letting it spin."""
     read = getattr(store, name)
@@ -554,7 +623,7 @@ async def test_a_content_batch_with_nothing_new_ends_the_sweep(
     """Contents that were not emptied come back: the sweep stops with one warning, each recorded once."""
     env = settled
     step, result = _contents(env, NOW - 8 * DAY)
-    monkeypatch.setattr(env.store, "empty_contents", lambda steps, results: None)
+    monkeypatch.setattr(env.store, "empty_contents", lambda steps, results, attachments=(): None)
     _spin_guard(monkeypatch, env.store, "due_contents")
     assert await env.sweeper.sweep() == SweepReport(steps=1, previews=1)
     assert [e["target"]["ids"] for e in _of(audit_stream, "retention.tool_content")] == [[step], [result]]

@@ -24,7 +24,9 @@ Each batch of chats:
    retention (``WORKBENCH_RETENTION_DAYS``) removes its files.
 
 Then the contents: ``delete`` / ``retention.tool_content`` names the steps, and again the
-results, before their arguments, results and previews are emptied. Last, the write-ahead log is
+results and the attachments, before their arguments, results, previews and manifests are
+emptied (a manifest is derived from its file, so it goes when the file's period passes; the
+attachment stays). Last, the write-ahead log is
 checkpointed, so no earlier version of what went stays in it.
 
 ``python -m ghostwriter.retention --dry-run [--chat-days N]`` (``make retention-dry-run``) prints
@@ -78,12 +80,14 @@ class SweepReport:
         chats: Chats deleted.
         steps: Tool steps emptied.
         previews: Table previews emptied.
+        manifests: Attachment manifests emptied.
         workbench_failed: Chats whose folder workbench could not delete; their rows went all the same.
     """
 
     chats: int = 0
     steps: int = 0
     previews: int = 0
+    manifests: int = 0
     workbench_failed: int = 0
 
 
@@ -138,12 +142,13 @@ class Sweeper:
         await self._sweep_contents(now, report)
         await anyio.to_thread.run_sync(self._store.checkpoint)
         logger.info(
-            "Retention sweep: {} chats deleted, {} left while busy; {} tool steps and {} previews emptied; "
-            "workbench failed {}.",
+            "Retention sweep: {} chats deleted, {} left while busy; {} tool steps, {} previews and {} manifests "
+            "emptied; workbench failed {}.",
             report.chats,
             busy,
             report.steps,
             report.previews,
+            report.manifests,
             report.workbench_failed,
         )
         return report
@@ -246,10 +251,10 @@ class Sweeper:
             self._store.delete_chat_rows(chat_id)
 
     async def _sweep_contents(self, now: datetime, report: SweepReport) -> None:
-        """Record, then empty, the expired tool contents and previews, batch by batch.
+        """Record, then empty, the expired tool contents, previews and manifests, batch by batch.
 
-        A batch that brings no step or result this sweep has not handled yet ends it with a
-        warning, so contents that were not emptied cannot keep it turning.
+        A batch that brings no step, result or attachment this sweep has not handled yet ends it
+        with a warning, so contents that were not emptied cannot keep it turning.
 
         Args:
             now: The time of the sweep.
@@ -258,21 +263,22 @@ class Sweeper:
         criteria = {"file_days": self._settings.file_days}
         handled: set[str] = set()
         while True:
-            steps, results = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
-            if not steps and not results:
+            steps, results, attachments = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
+            if not steps and not results and not attachments:
                 return
-            if handled.issuperset(steps) and handled.issuperset(results):
+            if handled.issuperset(steps) and handled.issuperset(results) and handled.issuperset(attachments):
                 logger.warning("The retention sweep found no tool content it had not handled; it stops here.")
                 return
-            handled.update(steps, results)
-            for kind, ids in (("tool_step", steps), ("result", results)):
+            handled.update(steps, results, attachments)
+            for kind, ids in (("tool_step", steps), ("result", results), ("attachment", attachments)):
                 if ids:
                     op = system_operation(self._emitter, "delete", CONTENT_DELETE)
                     target = Target(kind=kind, ids=tuple(ids), count=len(ids))
                     await anyio.to_thread.run_sync(partial(op.record, target=target, criteria=criteria))
-            await anyio.to_thread.run_sync(self._store.empty_contents, steps, results)
+            await anyio.to_thread.run_sync(self._store.empty_contents, steps, results, attachments)
             report.steps += len(steps)
             report.previews += len(results)
+            report.manifests += len(attachments)
 
 
 # --- the dry run --------------------------------------------------------------

@@ -3,7 +3,7 @@
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,7 +15,14 @@ from sqlalchemy.orm import InstrumentedAttribute, Session
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, ToolStep
 from ghostwriter.schemas import AttachmentOut, ResultOut, StepOut, TablePreviewOut
-from ghostwriter.store import AttachmentNotPending, ChatNotFound, ChatStore, FileRef, TooManyPending
+from ghostwriter.store import (
+    STORED_MANIFEST_KEYS,
+    AttachmentNotPending,
+    ChatNotFound,
+    ChatStore,
+    FileRef,
+    TooManyPending,
+)
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -70,6 +77,30 @@ def _attach(store: ChatStore, chat_id: str) -> AttachmentOut:
     return store.add_attachment(
         chat_id, file_id=file_id, path=f"/workspace/s/{file_id}.xlsx", name="sales.xlsx", size=14, mime=XLSX
     )
+
+
+def _picture(store: ChatStore, chat_id: str, *, kind: str = "image", status: str = "processing") -> AttachmentOut:
+    """Add a pending picture, by default one still being prepared."""
+    file_id = uuid4().hex
+    return store.add_attachment(
+        chat_id,
+        file_id=file_id,
+        path=f"/workspace/s/{file_id}.jpg",
+        name="harbour-photo.jpg",
+        size=900,
+        mime="image/jpeg",
+        kind=kind,
+        status=status,
+    )
+
+
+def _raw_attachment(engine: Engine, attachment_id: str) -> tuple[str, str | None, str | None]:
+    """Read an attachment's status, manifest column and failure as stored."""
+    with Session(engine) as s:
+        row = s.execute(
+            select(Attachment.status, Attachment.render, Attachment.failure).where(Attachment.id == attachment_id)
+        ).one()
+        return row[0], row[1], row[2]
 
 
 def _step(store: ChatStore, message_id: str, position: int = 0) -> StepOut:
@@ -546,6 +577,197 @@ def test_a_file_expires_by_the_rule_its_card_reads(store: ChatStore, clock: Cloc
     clock.now = T0 + 7 * DAY
     assert store.file_expired(ref)
     assert store.chat_detail("user-a", chat.id).pending_attachments[0].expired is True
+
+
+#: What workbench's preparation reports of a three-page scan: more than the chat keeps.
+MANIFEST: dict[str, Any] = {
+    "path": "/workspace/s/quay-scan.pdf",
+    "kind": "pdf",
+    "total": 3,
+    "pages_without_text": [2, 3],
+    "renditions": [
+        {"n": 1, "width": 800, "height": 1000, "mime": "image/jpeg", "bytes": 4096, "path": "/workspace/s/p1.jpg"},
+        {"n": 2, "width": 800, "height": 1000, "mime": "image/jpeg", "bytes": 5120, "hint": "scan"},
+    ],
+    "frames": [],
+    "hint": "two pages carry no text",
+}
+
+
+def test_an_attachment_carries_its_kind_and_status(store: ChatStore) -> None:
+    """A picture still being prepared says so, and a file added without either is a ready document."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    document = _attach(store, chat.id)
+    assert (picture.kind, picture.status) == ("image", "processing")
+    assert (document.kind, document.status) == ("document", "ready")
+    pending = store.chat_detail("user-a", chat.id).pending_attachments
+    assert {a.id: (a.kind, a.status) for a in pending} == {
+        picture.id: ("image", "processing"),
+        document.id: ("document", "ready"),
+    }
+    sent = store.add_user_message("user-a", chat.id, "Was zeigt das Foto?", [picture.id]).attachments
+    assert [(a.kind, a.status) for a in sent] == [("image", "processing")]
+    message = store.chat_detail("user-a", chat.id).messages[0]
+    assert [(a.kind, a.status) for a in message.attachments] == [("image", "processing")]
+
+
+def test_an_attachment_is_served_through_its_owners_chat(store: ChatStore) -> None:
+    """The served attachment is the one the detail serves, for the owner's chat only."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    assert store.attachment_out("user-a", chat.id, picture.id) == picture
+    assert store.attachment_out("user-b", chat.id, picture.id) is None
+    assert store.attachment_out("user-a", store.create_chat("user-a").id, picture.id) is None
+    assert store.attachment_out("user-a", chat.id, str(uuid4())) is None
+
+
+def test_a_settled_manifest_keeps_metadata_only(store: ChatStore, engine: Engine) -> None:
+    """Of what workbench reports, only the counts and sizes are kept: never a path, a hint or a byte count."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id, kind="document")
+    assert store.settle_attachment(picture.id, status="ready", manifest=MANIFEST, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, picture.id)
+    assert ref is not None and ref.manifest is not None and ref.status == "ready"
+    assert list(ref.manifest) == list(STORED_MANIFEST_KEYS)
+    assert ref.manifest["renditions"] == [
+        {"n": 1, "width": 800, "height": 1000, "mime": "image/jpeg"},
+        {"n": 2, "width": 800, "height": 1000, "mime": "image/jpeg"},
+    ]
+    assert (ref.manifest["total"], ref.manifest["pages_without_text"], ref.manifest["kind"]) == (3, [2, 3], "pdf")
+    _, render, failure = _raw_attachment(engine, picture.id)
+    assert failure is None and render is not None
+    assert all(word not in render for word in ("/workspace", "hint", "bytes", "scan"))
+
+
+def test_a_manifest_without_some_keys_keeps_those_it_has(store: ChatStore) -> None:
+    """A picture has no pages: only what its manifest reports is kept."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    manifest = {"kind": "image", "total": 1, "renditions": [{"n": 1, "width": 64, "height": 48, "mime": "image/png"}]}
+    assert store.settle_attachment(picture.id, status="ready", manifest=manifest, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, picture.id)
+    assert ref is not None and ref.manifest == manifest
+
+
+def test_a_failed_attachment_keeps_its_token_and_no_manifest(store: ChatStore, engine: Engine) -> None:
+    """A picture that could not be prepared is ``failed``, with the reason as a token, and has no manifest."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    assert store.settle_attachment(picture.id, status="failed", manifest=None, failure="unreadable") is True
+    assert _raw_attachment(engine, picture.id) == ("failed", None, "unreadable")
+    ref = store.find_attachment("user-a", chat.id, picture.id)
+    assert ref is not None and (ref.status, ref.manifest) == ("failed", None)
+
+
+def test_settling_is_once_and_only_from_processing(store: ChatStore, engine: Engine) -> None:
+    """Only a row still being prepared settles; a later settle, a ready row and a gone row change nothing."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    assert store.settle_attachment(picture.id, status="ready", manifest={"total": 1}, failure=None) is True
+    assert store.settle_attachment(picture.id, status="failed", manifest=None, failure="late") is False
+    assert _raw_attachment(engine, picture.id)[0] == "ready"
+    document = _attach(store, chat.id)
+    assert store.settle_attachment(document.id, status="failed", manifest=None, failure="late") is False
+    assert _raw_attachment(engine, document.id) == ("ready", None, None)
+    assert store.settle_attachment(str(uuid4()), status="ready", manifest=None, failure=None) is False
+
+
+def test_an_attachment_is_found_only_through_its_owners_chat(store: ChatStore) -> None:
+    """Owner, chat and attachment id together: another owner's or another chat's lookup finds nothing."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    ref = store.find_attachment("user-a", chat.id, picture.id)
+    assert ref is not None
+    assert (ref.id, ref.chat_id, ref.owner, ref.file_id) == (picture.id, chat.id, "user-a", picture.file_id)
+    assert (ref.path, ref.name, ref.kind, ref.status) == (
+        f"/workspace/s/{picture.file_id}.jpg",
+        "harbour-photo.jpg",
+        "image",
+        "processing",
+    )
+    assert (ref.manifest, ref.created_at, ref.expired) == (None, T0, False)
+    assert store.find_attachment("user-b", chat.id, picture.id) is None
+    assert store.find_attachment("user-a", store.create_chat("user-a").id, picture.id) is None
+    assert store.find_attachment("user-a", chat.id, str(uuid4())) is None
+
+
+def test_pending_statuses_name_each_waiting_attachment(store: ChatStore) -> None:
+    """The waiting attachments of a chat, by id, with their status; a sent one and another chat's are not named."""
+    chat = store.create_chat("user-a")
+    preparing = _picture(store, chat.id)
+    ready = _attach(store, chat.id)
+    sent = _picture(store, chat.id, status="ready")
+    store.add_user_message("user-a", chat.id, "Hallo", [sent.id])
+    _picture(store, store.create_chat("user-a").id)
+    assert store.pending_statuses(chat.id) == {preparing.id: "processing", ready.id: "ready"}
+    assert store.pending_statuses(store.create_chat("user-a").id) == {}
+
+
+def test_processing_attachments_are_listed_across_chats_with_their_owner(store: ChatStore, clock: Clock) -> None:
+    """Every picture still being prepared, oldest first, each with the owner of its chat."""
+    first, second = store.create_chat("user-a"), store.create_chat("user-b")
+    late = _picture(store, second.id)
+    clock.now = T0 - DAY
+    early = _picture(store, first.id)
+    _attach(store, first.id)
+    settled = _picture(store, second.id)
+    store.settle_attachment(settled.id, status="failed", manifest=None, failure="unreadable")
+    refs = store.processing_attachments()
+    assert [(r.id, r.chat_id, r.owner, r.kind, r.status) for r in refs] == [
+        (early.id, first.id, "user-a", "image", "processing"),
+        (late.id, second.id, "user-b", "image", "processing"),
+    ]
+
+
+def test_stranded_processing_rows_settle(store: ChatStore, engine: Engine) -> None:
+    """A restart finds rows nothing will settle: a picture fails with the token, a document is taken as ready."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    pdf = _picture(store, chat.id, kind="document")
+    ready = _attach(store, chat.id)
+    failed = _picture(store, chat.id)
+    store.settle_attachment(failed.id, status="failed", manifest=None, failure="unreadable")
+    assert store.settle_processing("interrupted") == 2
+    assert _raw_attachment(engine, picture.id) == ("failed", None, "interrupted")
+    assert _raw_attachment(engine, pdf.id) == ("ready", None, None)
+    assert _raw_attachment(engine, ready.id) == ("ready", None, None)
+    assert _raw_attachment(engine, failed.id) == ("failed", None, "unreadable")
+    assert store.processing_attachments() == []
+    assert store.settle_processing("interrupted") == 0
+
+
+def test_a_manifest_expires_with_its_file(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """Past its file's period a manifest is not served, is due for emptying, and is emptied; the row stays."""
+    chat = store.create_chat("user-a")
+    scan = _picture(store, chat.id, kind="document")
+    store.settle_attachment(scan.id, status="ready", manifest=MANIFEST, failure=None)
+    _attach(store, chat.id)
+    clock.now = T0 + 7 * DAY - timedelta(microseconds=1)
+    live = store.find_attachment("user-a", chat.id, scan.id)
+    assert live is not None and live.manifest is not None and not live.expired
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+    clock.now = T0 + 7 * DAY
+    gone = store.find_attachment("user-a", chat.id, scan.id)
+    assert gone is not None and gone.manifest is None and gone.expired
+    assert store.due_contents(clock.now, 10) == ([], [], [scan.id])
+    store.empty_contents([], [], [scan.id])
+    assert _raw_attachment(engine, scan.id) == ("ready", None, None)
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+
+
+def test_emptying_a_manifest_leaves_steps_and_results_alone(store: ChatStore, engine: Engine) -> None:
+    """The three kinds of content are emptied by their own ids."""
+    chat = store.create_chat("user-a")
+    answer = store.start_assistant_message(chat.id)
+    step, result = _step(store, answer), _result(store, answer)
+    scan = _picture(store, chat.id, kind="document")
+    store.settle_attachment(scan.id, status="ready", manifest=MANIFEST, failure=None)
+    store.empty_contents([], [], [scan.id])
+    assert _raw_attachment(engine, scan.id)[1] is None
+    with Session(engine) as s:
+        assert s.execute(select(ToolStep.result).where(ToolStep.id == step.id)).scalar_one() == "Umsatz 42"
+        assert s.execute(select(Result.preview).where(Result.id == result.id)).scalar_one() is not None
 
 
 def test_an_attachment_for_a_chat_deleted_meanwhile_is_refused(store: ChatStore) -> None:

@@ -9,6 +9,7 @@ from sqlalchemy.exc import IntegrityError, StatementError
 
 from ghostwriter import db
 from ghostwriter.db import UtcDateTime, init_db, make_engine, utcnow
+from ghostwriter.models import Base
 
 TABLES = {"chats", "messages", "tool_steps", "attachments", "results", "retention_periods", "file_marks"}
 
@@ -28,13 +29,13 @@ def _pragma(engine: Engine, name: str) -> object:
 
 
 def test_a_fresh_database_gets_the_schema_and_its_version(tmp_path: Path) -> None:
-    """An empty file gets every table and version 1; a second start changes nothing."""
+    """An empty file gets every table and version 2; a second start changes nothing."""
     engine = make_engine(str(tmp_path / "a.sqlite3"))
     init_db(engine)
     assert set(inspect(engine).get_table_names()) == TABLES
-    assert _pragma(engine, "user_version") == 1
+    assert _pragma(engine, "user_version") == 2
     init_db(engine)
-    assert _pragma(engine, "user_version") == 1
+    assert _pragma(engine, "user_version") == 2
 
 
 def test_the_lookups_by_message_and_chat_are_indexed(tmp_path: Path) -> None:
@@ -52,7 +53,7 @@ def test_a_newer_database_stops_startup(tmp_path: Path) -> None:
     """A file from a later release is never opened by an older one."""
     engine = make_engine(str(tmp_path / "a.sqlite3"))
     with engine.begin() as conn:
-        conn.exec_driver_sql("PRAGMA user_version = 2")
+        conn.exec_driver_sql("PRAGMA user_version = 3")
     with pytest.raises(RuntimeError, match="newer"):
         init_db(engine)
 
@@ -72,23 +73,79 @@ def test_migrations_run_in_order_one_transaction_each(tmp_path: Path, monkeypatc
     init_db(engine)
     ran: list[int] = []
 
-    def to_2(conn: Connection) -> None:
-        conn.exec_driver_sql("CREATE TABLE extra_2 (id INTEGER)")
-        ran.append(2)
-
     def to_3(conn: Connection) -> None:
         conn.exec_driver_sql("CREATE TABLE extra_3 (id INTEGER)")
         ran.append(3)
+
+    def to_4(conn: Connection) -> None:
+        conn.exec_driver_sql("CREATE TABLE extra_4 (id INTEGER)")
+        ran.append(4)
         raise RuntimeError("synthetic migration failure")
 
-    monkeypatch.setattr(db, "SCHEMA_VERSION", 3)
-    monkeypatch.setattr(db, "MIGRATIONS", {1: to_2, 2: to_3})
+    monkeypatch.setattr(db, "SCHEMA_VERSION", 4)
+    monkeypatch.setattr(db, "MIGRATIONS", {2: to_3, 3: to_4})
     with pytest.raises(RuntimeError, match="synthetic"):
         init_db(engine)
-    assert ran == [2, 3]
-    assert _pragma(engine, "user_version") == 2
+    assert ran == [3, 4]
+    assert _pragma(engine, "user_version") == 3
     tables = set(inspect(engine).get_table_names())
-    assert "extra_2" in tables and "extra_3" not in tables
+    assert "extra_3" in tables and "extra_4" not in tables
+
+
+#: Version 1's attachments, as the first release wrote them.
+_V1_ATTACHMENTS = """CREATE TABLE attachments (id VARCHAR(36) NOT NULL PRIMARY KEY,
+  chat_id VARCHAR(36) NOT NULL REFERENCES chats (id) ON DELETE CASCADE,
+  message_id VARCHAR(36), workbench_file_id VARCHAR(32) NOT NULL, path VARCHAR(1024) NOT NULL,
+  name VARCHAR(255) NOT NULL, size INTEGER NOT NULL, mime VARCHAR(127) NOT NULL, created_at DATETIME NOT NULL)"""
+_ADD_ATTACHMENT = (
+    "INSERT INTO attachments (id, chat_id, workbench_file_id, path, name, size, mime, created_at{extra})"
+    " VALUES ('att-{n}', 'chat-1', '{f}', '/workspace/s/quay-scan.pdf', 'quay-scan.pdf', 14,"
+    " 'application/pdf', '2026-11-16 00:00:00.000000'{values})"
+)
+
+
+def test_a_version_1_file_gets_kinds_and_statuses(tmp_path: Path) -> None:
+    """A file written before pictures has its attachments read as ready documents, and checks what comes after."""
+    engine = make_engine(str(tmp_path / "a.sqlite3"))
+    with engine.begin() as conn:
+        Base.metadata.tables["chats"].create(conn)
+        conn.exec_driver_sql(_V1_ATTACHMENTS)
+        conn.exec_driver_sql(
+            "INSERT INTO chats (id, owner, title, created_at, updated_at)"
+            " VALUES ('chat-1', 'user-a', NULL, '2026-11-16 00:00:00.000000', '2026-11-16 00:00:00.000000')"
+        )
+        conn.exec_driver_sql(_ADD_ATTACHMENT.format(n=1, f="f" * 32, extra="", values=""))
+        conn.exec_driver_sql("PRAGMA user_version = 1")
+    init_db(engine)
+    assert _pragma(engine, "user_version") == 2
+    with engine.connect() as conn:
+        row = conn.exec_driver_sql("SELECT kind, status, render, failure FROM attachments").one()
+    assert tuple(row) == ("document", "ready", None, None)
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.exec_driver_sql(_ADD_ATTACHMENT.format(n=2, f="e" * 32, extra=", kind", values=", 'video'"))
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.exec_driver_sql(_ADD_ATTACHMENT.format(n=3, f="d" * 32, extra=", status", values=", 'lost'"))
+    assert ["status"] in [index["column_names"] for index in inspect(engine).get_indexes("attachments")]
+    assert "ix_attachments_status" in {index["name"] for index in inspect(engine).get_indexes("attachments")}
+    init_db(engine)
+    assert _pragma(engine, "user_version") == 2
+
+
+def test_a_fresh_file_has_the_same_columns_and_checks_as_a_migrated_one(tmp_path: Path) -> None:
+    """The model's schema and version 1's migration agree on what an attachment holds and refuses."""
+    engine = make_engine(str(tmp_path / "a.sqlite3"))
+    init_db(engine)
+    columns = {column["name"] for column in inspect(engine).get_columns("attachments")}
+    assert {"kind", "status", "render", "failure"} <= columns
+    with engine.begin() as conn:
+        conn.exec_driver_sql(
+            "INSERT INTO chats (id, owner, title, created_at, updated_at)"
+            " VALUES ('chat-1', 'user-a', NULL, '2026-11-16 00:00:00.000000', '2026-11-16 00:00:00.000000')"
+        )
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.exec_driver_sql(_ADD_ATTACHMENT.format(n=1, f="f" * 32, extra=", kind", values=", 'video'"))
+    with engine.begin() as conn, pytest.raises(IntegrityError):
+        conn.exec_driver_sql(_ADD_ATTACHMENT.format(n=2, f="e" * 32, extra=", status", values=", 'lost'"))
 
 
 def test_every_connection_has_the_pragmas(tmp_path: Path) -> None:

@@ -116,6 +116,8 @@ def test_an_attachment_streams_to_workbench_and_is_kept_by_reference(
         "name": "sales.xlsx",
         "size": 14,
         "mime": XLSX,
+        "kind": "document",
+        "status": "ready",
         "created_at": None,
         "expired": False,
     }

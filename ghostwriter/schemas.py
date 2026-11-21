@@ -8,6 +8,8 @@ from pydantic import BaseModel
 Role = Literal["user", "assistant"]
 StepStatus = Literal["running", "ok", "error"]
 ResultKind = Literal["image", "table", "file"]
+AttachmentKind = Literal["document", "image", "media"]
+AttachmentStatus = Literal["processing", "ready", "failed"]
 
 
 class ChatOut(BaseModel):
@@ -37,6 +39,8 @@ class AttachmentOut(BaseModel):
         name: The file name.
         size: Its size in bytes.
         mime: Its MIME type.
+        kind: ``document``, ``image`` or ``media`` (reserved).
+        status: ``processing`` while workbench prepares it, then ``ready`` or ``failed``.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.
     """
@@ -46,6 +50,8 @@ class AttachmentOut(BaseModel):
     name: str
     size: int
     mime: str
+    kind: AttachmentKind
+    status: AttachmentStatus
     created_at: datetime
     expired: bool
 
