@@ -138,11 +138,11 @@ def test_max_images_is_a_whole_number_from_1_to_32() -> None:
 def test_image_tokens_is_unset_or_a_fixed_cost() -> None:
     """Unset, the cost follows the pixels (``None``); a number from 1 to 10 000 is a fixed cost per image."""
     assert load_settings(ENV).image_tokens is None
-    assert load_settings({**ENV, "GHOSTWRITER_IMAGE_TOKENS": "280"}).image_tokens == 280
-    message = r"GHOSTWRITER_IMAGE_TOKENS must be a whole number of tokens from 1 to 10000, or unset\."
+    assert load_settings({**ENV, "GHOSTWRITER_IMAGE_CONTEXT_TOKENS": "280"}).image_tokens == 280
+    message = r"GHOSTWRITER_IMAGE_CONTEXT_TOKENS must be a whole number of tokens from 1 to 10000, or unset\."
     for raw in ("0", "10001", "many"):
         with pytest.raises(ValueError, match=message):
-            load_settings({**ENV, "GHOSTWRITER_IMAGE_TOKENS": raw})
+            load_settings({**ENV, "GHOSTWRITER_IMAGE_CONTEXT_TOKENS": raw})
 
 
 @pytest.mark.parametrize("raw", ["0", "-5", "nan", "inf", "soon"])

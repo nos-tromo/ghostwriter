@@ -67,7 +67,7 @@ def test_compose_matches_the_contract() -> None:
     assert "WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}" in backend
     assert "GHOSTWRITER_VISION: ${GHOSTWRITER_VISION:-on}" in backend
     assert "GHOSTWRITER_MAX_IMAGES: ${GHOSTWRITER_MAX_IMAGES:-8}" in backend
-    assert "GHOSTWRITER_IMAGE_TOKENS: ${GHOSTWRITER_IMAGE_TOKENS:-}" in backend
+    assert "GHOSTWRITER_IMAGE_CONTEXT_TOKENS: ${GHOSTWRITER_IMAGE_CONTEXT_TOKENS:-}" in backend
     assert "  workbench-net:\n    external: true\n    name: ${WORKBENCH_NET:-workbench-net}" in compose
     assert '"--factory", "ghostwriter.main:create_app"' in (ROOT / "docker" / "Dockerfile.backend").read_text()
 
@@ -184,5 +184,5 @@ def test_env_example_tags_follow_the_contract_amendment() -> None:
 def test_env_example_documents_vision() -> None:
     """The three vision settings are in the Inference section, commented out at their defaults."""
     lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
-    for line in ("# GHOSTWRITER_VISION=on", "# GHOSTWRITER_MAX_IMAGES=8", "# GHOSTWRITER_IMAGE_TOKENS="):
+    for line in ("# GHOSTWRITER_VISION=on", "# GHOSTWRITER_MAX_IMAGES=8", "# GHOSTWRITER_IMAGE_CONTEXT_TOKENS="):
         assert line in lines
