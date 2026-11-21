@@ -28,15 +28,19 @@ from ghostwriter.agent.context import (
 from ghostwriter.agent.images import (
     LABEL,
     NO_ROOM,
+    NOT_LOADED,
     NOT_RESENT,
     OVER_CAP,
     RETIRED,
     UNSEEN,
+    WITHOUT_VIEW,
     AttachedImage,
     ImageBudget,
     attachment_parts,
+    materialise,
     note,
     refs,
+    told,
     tool_image_message,
 )
 from ghostwriter.agent.limits import (
@@ -839,6 +843,60 @@ def test_a_picture_gives_way_whole() -> None:
     fitted = fit(SYSTEM, [], [], current, images=ImageBudget(fixed=280, max_images=2))
     assert fitted[4]["content"][1:] == [note(part, RETIRED) for part in current[3]["content"][1:]]
     assert [p["key"] for p in refs(fitted)] == ["tool:call_1:1"]
+
+
+def test_each_note_that_sends_to_view_file_has_a_form_without_it() -> None:
+    """For a round that does not offer view_file, each note keeps what happened and drops where to look."""
+    assert set(WITHOUT_VIEW) == {RETIRED, OVER_CAP, NO_ROOM, NOT_RESENT, NOT_LOADED}
+    assert [WITHOUT_VIEW[t].format(label="pier.jpg", max=8) for t in (RETIRED, OVER_CAP, NO_ROOM, NOT_RESENT)] == [
+        "[Image: pier.jpg; not shown again to make room]",
+        "[Image: pier.jpg; not shown, at most 8 images go to the model at once]",
+        "[Image: pier.jpg; not shown, there is no room for it in this request]",
+        "[Image: pier.jpg; not shown again]",
+    ]
+    assert WITHOUT_VIEW[NOT_LOADED].format(label="pier.jpg") == "[Image: pier.jpg; could not be loaded]"
+    for template, blind in WITHOUT_VIEW.items():
+        assert "view_file" in template and "view_file" not in blind
+        assert told(template, view=True) == template and told(template, view=False) == blind
+    assert told(UNSEEN, view=False) == UNSEEN and told(LABEL, view=False) == LABEL
+
+
+def test_without_view_file_fit_and_materialise_promise_it_nowhere() -> None:
+    """With view=False, the notes fit and materialise put in an image's place say nothing of view_file.
+
+    The same fit with view_file offered names the tool in each of them.
+    """
+
+    def promising(messages: list[dict[str, Any]]) -> bool:
+        text = json.dumps(messages)
+        return "view_file shows it" in text or "view it again with view_file" in text
+
+    images = ImageBudget(fixed=280, max_images=2)
+    photos = tuple(_photo(n, f"pier-{n}.jpg") for n in range(1, 4))
+    question = {"role": "user", "content": [_text("Vergleiche"), *attachment_parts(photos, fixed=280)]}
+    current: list[dict[str, Any]] = [question, *_viewed("call_0", [PAGE]), *_viewed("call_1", [CHART])]
+    past = [PastTurn("Und das?", (), "Ein Kai.", False, (_photo(4, "old-photo.jpg"), _photo(5, "kai.jpg")))]
+    assert promising(fit(SYSTEM, [], past, current, images=images))
+    capped = fit(SYSTEM, [], past, current, images=images, view=False)
+    assert not promising(capped)
+    assert (
+        capped[1]["content"] == "Und das?\n[Image: old-photo.jpg; not shown again]\n[Image: kai.jpg; not shown again]"
+    )
+    assert capped[3]["content"][2:] == [
+        _text(f"[Image: pier-{n}.jpg; not shown, at most 2 images go to the model at once]") for n in (2, 3)
+    ]
+    assert _text("[Image: quay-scan.pdf, page 2; not shown again to make room]") in capped[6]["content"]
+
+    alone = [{"role": "user", "content": [_text("Und das?"), *attachment_parts(photos[:1], fixed=280)]}]
+    short = _text_tokens(alone) + 280 - 1
+    assert promising(fit(SYSTEM, [], [], alone, budget=short, images=images))
+    no_room = fit(SYSTEM, [], [], alone, budget=short, images=images, view=False)
+    assert no_room[1]["content"][1] == _text("[Image: pier-1.jpg; not shown, there is no room for it in this request]")
+
+    unloaded = fit(SYSTEM, [], [], alone, images=images, view=False)
+    assert promising(materialise(unloaded, {})[0])
+    wire, count = materialise(unloaded, {}, view=False)
+    assert count == 0 and wire[1]["content"][1] == _text("[Image: pier-1.jpg; could not be loaded]")
 
 
 def test_fit_refuses_images_without_an_image_budget() -> None:

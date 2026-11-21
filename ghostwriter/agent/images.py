@@ -6,7 +6,9 @@ image a tool showed, in the one user message that follows a round's tool message
 (:func:`tool_image_message`). A ref never leaves the process.
 :func:`~ghostwriter.agent.context.fit` counts it by :func:`estimate_image_tokens`, never by
 characters, and puts a note in its place where it gives way (:data:`RETIRED`, :data:`OVER_CAP`,
-:data:`UNSEEN`, :data:`NO_ROOM`, :data:`NOT_RESENT`). A picture gives way whole: each ref names the ``picture`` it
+:data:`UNSEEN`, :data:`NO_ROOM`, :data:`NOT_RESENT`). In a round that does not offer ``view_file``, a
+note never sends the model to it: each note that would has a form without that clause
+(:data:`WITHOUT_VIEW`, :func:`told`). A picture gives way whole: each ref names the ``picture`` it
 shows part of, and the strips of one picture go together (:func:`siblings`). Only
 :func:`materialise`, just before the model call, swaps each ref for its label and a data URL, in a
 new list, from the bytes of the message's :data:`ImageBank`: a data URL exists in that list alone,
@@ -56,6 +58,27 @@ NOT_RESENT: Final = "[Image: {label}; not shown again, view_file shows it]"
 NOT_LOADED: Final = "[Image: {label}; could not be loaded, view_file shows it]"
 #: An image of a round the model refused with images, sent again without them.
 LEFT_OUT: Final = "[Image: {label}; left out, the model did not take images]"
+#: Each note that sends the model to ``view_file``, and its form for a round that does not offer the tool.
+WITHOUT_VIEW: Final[Mapping[str, str]] = {
+    RETIRED: "[Image: {label}; not shown again to make room]",
+    OVER_CAP: "[Image: {label}; not shown, at most {max} images go to the model at once]",
+    NO_ROOM: "[Image: {label}; not shown, there is no room for it in this request]",
+    NOT_RESENT: "[Image: {label}; not shown again]",
+    NOT_LOADED: "[Image: {label}; could not be loaded]",
+}
+#: Each of those notes as it reads once written, with its label and count as groups.
+_VIEW_NOTES: Final = tuple(
+    (
+        re.compile(
+            re.escape(template)
+            .replace(re.escape("{label}"), "(?P<label>.*)")
+            .replace(re.escape("{max}"), "(?P<max>[0-9]+)"),
+            re.DOTALL,
+        ),
+        blind,
+    )
+    for template, blind in WITHOUT_VIEW.items()
+)
 
 #: The bytes of a message's images, by ref key: their media type and bytes. It lives for one message.
 ImageBank: TypeAlias = dict[str, tuple[str, bytes]]
@@ -252,6 +275,63 @@ def tool_image_message(groups: Sequence[tuple[str, str, Sequence[ToolImage]]]) -
     return {"role": "user", "content": content}, bank
 
 
+def told(template: str, *, view: bool) -> str:
+    """Return a note's template as a round tells it.
+
+    Args:
+        template: One of the texts of this module.
+        view: Whether the round offers ``view_file``.
+
+    Returns:
+        ``template``; without ``view``, its form that names no ``view_file`` (:data:`WITHOUT_VIEW`), when it has one.
+    """
+    return template if view else WITHOUT_VIEW.get(template, template)
+
+
+def _blind_note(part: object) -> dict[str, Any] | None:
+    """Return a written note that sends the model to ``view_file`` in its form without the tool.
+
+    Args:
+        part: A content part.
+
+    Returns:
+        The text part :data:`WITHOUT_VIEW` has for it, with its label and count; ``None`` for any other part.
+    """
+    text = part.get("text") if isinstance(part, Mapping) and part.get("type") == "text" else None
+    if not isinstance(text, str):
+        return None
+    for pattern, form in _VIEW_NOTES:
+        found = pattern.fullmatch(text)
+        if found is not None:
+            return {"type": "text", "text": form.format(**found.groupdict())}
+    return None
+
+
+def forget_view_file(messages: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Return messages whose written notes no longer send the model to ``view_file``.
+
+    For a turn that goes on without the tool, as after a refusal: the notes a round wrote into its messages
+    (a retired tool image above all) are told again as :data:`WITHOUT_VIEW` has them. Pass only messages whose
+    text parts are this module's own, never the user's question.
+
+    Args:
+        messages: The messages; never changed.
+
+    Returns:
+        A new list; a message with such a note gets a new content list.
+    """
+    copied: list[dict[str, Any]] = []
+    for message in messages:
+        parts = parts_of(message)
+        blinded = [_blind_note(part) for part in parts]
+        if all(blind is None for blind in blinded):
+            copied.append(dict(message))
+        else:
+            content = [dict(part) if blind is None else blind for part, blind in zip(parts, blinded, strict=True)]
+            copied.append({**message, "content": content})
+    return copied
+
+
 def is_ref(part: object) -> bool:
     """Tell whether a content part is an image ref.
 
@@ -356,17 +436,18 @@ def note(ref: Mapping[str, Any], template: str, **values: Any) -> dict[str, Any]
 
 
 def materialise(
-    messages: Sequence[Mapping[str, Any]], bank: Mapping[str, tuple[str, bytes]]
+    messages: Sequence[Mapping[str, Any]], bank: Mapping[str, tuple[str, bytes]], *, view: bool = True
 ) -> tuple[list[dict[str, Any]], int]:
     """Return the messages as the model is sent them: each ref as its label and a data URL.
 
     Args:
         messages: The fitted messages; never changed.
         bank: The bytes of the message's images, by ref key.
+        view: Whether the round offers ``view_file``, which the :data:`NOT_LOADED` note names.
 
     Returns:
         A new list, in which each ref is its :data:`LABEL` and an ``image_url`` part, or its
-        :data:`NOT_LOADED` note when its key is not in the bank; and how many images it carries.
+        :data:`NOT_LOADED` note (:func:`told`) when its key is not in the bank; and how many images it carries.
     """
     count = 0
 
@@ -376,7 +457,7 @@ def materialise(
             return [dict(part)]
         found = bank.get(part["key"])
         if found is None:
-            return [note(part, NOT_LOADED)]
+            return [note(part, told(NOT_LOADED, view=view))]
         mime, data = found
         count += 1
         url = f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"

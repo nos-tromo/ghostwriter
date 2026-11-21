@@ -1203,6 +1203,41 @@ def test_vision_with_a_workbench_that_shows_no_images_has_no_sight(loop_env: Loo
     assert loop_env.audit.images == [1, 0, 0]
 
 
+def _promises_view_file(messages: list[dict[str, Any]]) -> list[str]:
+    """Return the texts of messages that send the model to view_file."""
+    texts = [m["content"] for m in messages if isinstance(m["content"], str)]
+    texts += [p["text"] for m in messages for p in _content(m) if p.get("type") == "text"]
+    return [t for t in texts if "view_file shows it" in t or "view it again with view_file" in t]
+
+
+def test_after_a_refusal_an_earlier_turn_replayed_as_notes_names_no_view_file(loop_env: LoopEnv) -> None:
+    """An earlier turn's pictures replayed as notes say they are not shown again, and nothing of view_file."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, max_images=1)
+    loop_env.run([text_chunk("Zwei Bilder.")], vision=True, attach=[_photo(), _photo(name="quay-photo.jpg")])
+    events = loop_env.run(
+        _refused(), [text_chunk("Ohne Bild.")], content="Und das?", vision=True, attach=[_photo(name="pier.jpg")]
+    )
+    assert events[0] == NoticeEvent("images_dropped")
+    first, again = loop_env.sent(2), loop_env.sent(3)
+    assert NOT_RESENT.format(label=PHOTO) in json.dumps(first)
+    assert _promises_view_file(again) == [] and "view_file" not in json.dumps(again)
+    for name in (PHOTO, "quay-photo.jpg"):
+        assert f"[Image: {name}; not shown again]" in again[1]["content"]
+
+
+def test_after_a_refusal_a_retired_tool_image_names_no_view_file(loop_env: LoopEnv) -> None:
+    """A tool image retired before the refusal is named in the rounds after it without a word of view_file."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, max_images=1)
+    loop_env.workbench.answers = [_shown(_page(1)), _shown(_page(2))]
+    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
+    again = [call_chunk(0, "call_1", "view_file", VIEW_SCAN)]
+    loop_env.run(view, again, _refused(), [text_chunk("Zwei Seiten.")], vision=True)
+    refused, retried = loop_env.sent(3), loop_env.sent(4)
+    assert RETIRED.format(label="quay-scan.pdf, page 1") in json.dumps(refused)
+    assert _promises_view_file(retried) == []
+    assert "[Image: quay-scan.pdf, page 1; not shown again to make room]" in json.dumps(retried)
+
+
 def test_a_second_refusal_is_the_model_error(loop_env: LoopEnv) -> None:
     """The round sent again without images and refused again ends the turn with the model error."""
     events = loop_env.run(_refused(), _refused(), vision=True, attach=[_photo()])

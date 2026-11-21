@@ -32,6 +32,8 @@ leaves a note in its place, and a picture's strips give way together. A question
 gives way stays a ref in the turn: a later round sends it when there is room, and never says it
 was shown before. An earlier turn with images is replayed with them while the budget and the cap
 allow, else with a note per image that ``view_file`` shows it; a tool image is never replayed.
+In a round that does not offer ``view_file`` (``view=False``), every note keeps what happened and
+leaves the tool out (:data:`~ghostwriter.agent.images.WITHOUT_VIEW`).
 Without an image budget, the current turn's results are cleared oldest first and then arguments
 cut, as before; an earlier turn is replayed as its text, and the current turn must hold no image ref.
 """
@@ -62,6 +64,7 @@ from ghostwriter.agent.images import (
     refs,
     rendition_size,
     siblings,
+    told,
 )
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, HISTORY_ARGUMENT_CHARS, HISTORY_RESULT_CHARS, PROMPT_TOKENS
 from ghostwriter.agent.tools import CUT_MARK, compact, cut, echoed_arguments, parse_arguments
@@ -238,7 +241,7 @@ def _with_cut_arguments(call: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
-def _question(turn: PastTurn, mode: ReplayMode, images: ImageBudget | None) -> dict[str, Any]:
+def _question(turn: PastTurn, mode: ReplayMode, images: ImageBudget | None, *, view: bool = True) -> dict[str, Any]:
     """Return an earlier turn's question as it is replayed.
 
     Args:
@@ -246,6 +249,7 @@ def _question(turn: PastTurn, mode: ReplayMode, images: ImageBudget | None) -> d
         mode: ``images``: the text and its images' refs; ``notes``: the text and a
             :data:`~ghostwriter.agent.images.NOT_RESENT` line per image; ``none``: the text.
         images: What images cost; read in ``images`` mode, for the strips.
+        view: Whether the round offers ``view_file``, which a ``notes`` line names.
 
     Returns:
         The user's message.
@@ -255,23 +259,26 @@ def _question(turn: PastTurn, mode: ReplayMode, images: ImageBudget | None) -> d
         parts = attachment_parts(turn.images, fixed=fixed)
         return {"role": "user", "content": [{"type": "text", "text": turn.user}, *parts]}
     if mode == "notes":
-        lines = [turn.user, *(NOT_RESENT.format(label=image.name) for image in turn.images)]
+        lines = [turn.user, *(told(NOT_RESENT, view=view).format(label=image.name) for image in turn.images)]
         return {"role": "user", "content": "\n".join(line for line in lines if line)}
     return {"role": "user", "content": turn.user}
 
 
-def _replayed(turn: PastTurn, *, mode: ReplayMode = "none", images: ImageBudget | None = None) -> list[dict[str, Any]]:
+def _replayed(
+    turn: PastTurn, *, mode: ReplayMode = "none", images: ImageBudget | None = None, view: bool = True
+) -> list[dict[str, Any]]:
     """Return an earlier turn as the messages that replay it.
 
     Args:
         turn: The turn.
         mode: How its question's images are replayed (:func:`_question`).
         images: What images cost.
+        view: Whether the round offers ``view_file``.
 
     Returns:
         Its question, each round's calls and results, and its answer.
     """
-    messages: list[dict[str, Any]] = [_question(turn, mode, images)]
+    messages: list[dict[str, Any]] = [_question(turn, mode, images, view=view)]
     for calls in turn.rounds:
         messages.append(
             {
@@ -407,6 +414,7 @@ def fit(
     *,
     budget: int = PROMPT_TOKENS,
     images: ImageBudget | None = None,
+    view: bool = True,
 ) -> list[dict[str, Any]]:
     """Return the messages of a round, within the budget as far as the current turn allows.
 
@@ -419,6 +427,7 @@ def fit(
         budget: The tokens the messages and the tool schemas may take.
         images: What an image costs and how many a request carries; ``None`` when the model is
             sent no images, and earlier turns are replayed as their text.
+        view: Whether the round offers ``view_file``; without it no note names the tool.
 
     Returns:
         The system message, the earlier turns that fit, and the current turn, in order; their
@@ -459,11 +468,11 @@ def fit(
         for message, index in tool_places:
             if message is newest or not over():
                 break
-            give_way(message, index, RETIRED)
+            give_way(message, index, told(RETIRED, view=view))
         for message, index in reversed(ref_places(kept[1:2], origin="attachment")):
             if size.images <= images.max_images:
                 break
-            give_way(message, index, OVER_CAP, max=images.max_images)
+            give_way(message, index, told(OVER_CAP, view=view), max=images.max_images)
     clear([place for place in range(1, len(kept)) if place not in latest])
     for index, message in enumerate(kept):
         if size.tokens() + fixed <= budget:
@@ -477,7 +486,7 @@ def fit(
         for message, index in reversed(ref_places(kept[1:2], origin="attachment")):
             if not over():
                 break
-            give_way(message, index, NO_ROOM)
+            give_way(message, index, told(NO_ROOM, view=view))
         for message, index in tool_places:
             if message is not newest:
                 continue
@@ -491,7 +500,7 @@ def fit(
     for turn in reversed(past):
         modes: tuple[ReplayMode, ...] = ("none",) if images is None or not turn.images else ("images", "notes")
         for mode in modes:
-            messages = _replayed(turn, mode=mode, images=images)
+            messages = _replayed(turn, mode=mode, images=images, view=view)
             chars, image_tokens, count = size.total(messages)
             if size.tokens(more=len(messages), chars=chars, image_tokens=image_tokens) + fixed > budget:
                 continue

@@ -40,8 +40,9 @@ its answer ends, and a data URL exists only in the list a round is streamed with
 router refuses with images before any text
 (:data:`REFUSED_IMAGE_STATUSES`) is sent once more without them, after a :class:`NoticeEvent`, and
 the rest of the turn goes as for a model that does not see: no ``view_file``, no word on how to look,
-no images asked for, no ``strips``, and a tool's images named as not shown. Each round is recorded
-with how many images it sent.
+no images asked for, no ``strips``, and a tool's images named as not shown; no note, those the turn
+wrote before included, sends the model to ``view_file`` any more. Each round is recorded with how many
+images it sent.
 
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
 a label or an image.
@@ -66,6 +67,7 @@ from ghostwriter.agent.images import (
     ImageBank,
     ImageBudget,
     attachment_parts,
+    forget_view_file,
     is_ref,
     materialise,
     newest_tool_images,
@@ -395,7 +397,10 @@ class _Request:
         """
         offer = self.offer(sight)
         tools = offer.tools if tooled else []
-        return fit(offer.system, tools, self.past, current, budget=self.budget, images=sight.budget), tools
+        fitted = fit(
+            offer.system, tools, self.past, current, budget=self.budget, images=sight.budget, view=sight.showing
+        )
+        return fitted, tools
 
 
 def _preview(output: OutputFile) -> dict[str, Any] | None:
@@ -485,14 +490,16 @@ def _drop_images(current: list[dict[str, Any]], sight: _Sight) -> None:
     """Go without images for the rest of the turn, the model having refused them.
 
     Every image of the current turn becomes its :data:`~ghostwriter.agent.images.LEFT_OUT` note in place,
-    and the bank is emptied.
+    the notes earlier rounds wrote (a retired tool image) no longer name ``view_file``, which the rest of
+    the turn does not offer, and the bank is emptied. The question's own text is left as the user wrote it.
 
     Args:
         current: The current turn's messages.
         sight: The turn's images.
     """
     sight.dropped = True
-    current[:] = without_images(current)
+    unseen = without_images(current)
+    current[:] = [*unseen[:1], *forget_view_file(unseen[1:])]
     sight.bank.clear()
 
 
@@ -738,7 +745,9 @@ class AgentLoop:
             self._fetch(turn, sight, fitted)
             _keep_unseen(current, fitted, sight.bank)
         while True:
-            wire, count = materialise(without_images(fitted) if sight.dropped else fitted, sight.bank)
+            wire, count = materialise(
+                without_images(fitted) if sight.dropped else fitted, sight.bank, view=sight.showing
+            )
             said = False
             done: RoundDone | None = None
             try:
