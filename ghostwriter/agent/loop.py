@@ -462,6 +462,9 @@ def _keep_unseen(current: list[dict[str, Any]], fitted: Sequence[Mapping[str, An
     refs still, which a later round, for which they are older images, would retire as "not shown
     again". So each becomes its note in ``current`` and leaves the bank.
 
+    A picture of the question that ``fit`` leaves out (:data:`~ghostwriter.agent.images.NO_ROOM`) stays a
+    ref: only tool images ever retire, so no later round calls it shown before, and one with room sends it.
+
     Args:
         current: The current turn's messages.
         fitted: The messages the round sends, as ``fit`` returned them.
@@ -662,9 +665,7 @@ class AgentLoop:
             current.extend(answers)
             self._tool_images(current, sight, shown)
 
-    def _offer(
-        self, discovery: Discovery | None, *, seeing: bool, chat_id: str, expired: bool, today: date
-    ) -> _Offer:
+    def _offer(self, discovery: Discovery | None, *, seeing: bool, chat_id: str, expired: bool, today: date) -> _Offer:
         """Return what a round offers, with sight or without it.
 
         Args:

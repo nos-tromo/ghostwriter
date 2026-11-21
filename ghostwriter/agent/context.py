@@ -11,17 +11,29 @@ result is cut to ``HISTORY_RESULT_CHARS``.
 
 With an :class:`~ghostwriter.agent.images.ImageBudget`, an image ref counts as its label's
 characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a request carries
-at most ``max_images``. While the current turn is over the budget or the cap, the tool images
-of its earlier rounds retire first, oldest first; past the cap, the question's own images give
-way, last first, so the newest tool images (the latest round's, while they end the turn: see
-:func:`~ghostwriter.agent.images.newest_tool_images`), which the model has not seen yet, stay
-within the cap; after a round without images, every tool image is an earlier round's. Then tool
-results are cleared and arguments cut, and only while still over do the newest tool images give
-way, oldest first: the images the model just asked for outrank text it has already read. Each
-image leaves a note in its place, and a picture's strips give way together. An earlier turn with
-images is replayed with them while the budget and the cap allow, else with a note per image that
-``view_file`` shows it; a tool image is never replayed. Without an image budget, an earlier turn
-is replayed as its text, as before, and the current turn must hold no image ref.
+at most ``max_images``. While the current turn is over the budget or the cap, it gives way in
+this order:
+
+1. the tool images of its earlier rounds retire, oldest first;
+2. past the cap, the question's own pictures give way, last first, so the newest tool images (the
+   latest round's, while they end the turn: see :func:`~ghostwriter.agent.images.newest_tool_images`),
+   which the model has not seen yet, stay within the cap; after a round without images, every tool
+   image is an earlier round's;
+3. tool results are cleared, oldest first, except the latest round's (the tool messages after the
+   turn's last assistant message with calls);
+4. arguments are cut;
+5. the question's pictures give way, last first, each with a note that ``view_file`` shows it;
+6. the newest tool images give way, oldest first;
+7. the latest round's own results are cleared, oldest first.
+
+So the document the model just asked for outlasts the pictures of the question, which it has seen
+or can look at, and the images it just asked for outrank text it has already read. Each image
+leaves a note in its place, and a picture's strips give way together. A question's picture that
+gives way stays a ref in the turn: a later round sends it when there is room, and never says it
+was shown before. An earlier turn with images is replayed with them while the budget and the cap
+allow, else with a note per image that ``view_file`` shows it; a tool image is never replayed.
+Without an image budget, the current turn's results are cleared oldest first and then arguments
+cut, as before; an earlier turn is replayed as its text, and the current turn must hold no image ref.
 """
 
 import math
@@ -33,6 +45,7 @@ from loguru import logger
 
 from ghostwriter.agent.images import (
     LABEL,
+    NO_ROOM,
     NOT_RESENT,
     OVER_CAP,
     RETIRED,
@@ -285,6 +298,23 @@ def _replayed(turn: PastTurn, *, mode: ReplayMode = "none", images: ImageBudget 
     return messages
 
 
+def _latest_round(messages: Sequence[Mapping[str, Any]]) -> list[int]:
+    """Return where the latest round's results are: the tool messages after the last assistant message with calls.
+
+    Args:
+        messages: The messages.
+
+    Returns:
+        Their places, in order; none before a round has called a tool.
+    """
+    asked = [
+        place for place, message in enumerate(messages) if message["role"] == "assistant" and message.get("tool_calls")
+    ]
+    if not asked:
+        return []
+    return [place for place in range(asked[-1] + 1, len(messages)) if messages[place]["role"] == "tool"]
+
+
 def _copied(message: Mapping[str, Any]) -> dict[str, Any]:
     """Return a copy of a message of the current turn that ``fit`` may change.
 
@@ -414,6 +444,17 @@ def fit(
             for sibling in siblings(message, index):
                 size.replace(message, sibling, note(message["content"][sibling], template, **values))
 
+    def clear(places: Sequence[int]) -> None:
+        for place in places:
+            if size.tokens() + fixed <= budget:
+                break
+            message = kept[place]
+            if message["role"] == "tool" and message.get("content") != CLEARED:
+                size.chars += len(compact({**message, "content": CLEARED})) - len(compact(message))
+                message["content"] = CLEARED
+
+    # With images, the latest round's results are cleared last of all (step 7); without, as any other.
+    latest: list[int] = _latest_round(kept) if images is not None else []
     if images is not None:
         for message, index in tool_places:
             if message is newest or not over():
@@ -423,12 +464,7 @@ def fit(
             if size.images <= images.max_images:
                 break
             give_way(message, index, OVER_CAP, max=images.max_images)
-    for message in kept[1:]:
-        if size.tokens() + fixed <= budget:
-            break
-        if message["role"] == "tool" and message.get("content") != CLEARED:
-            size.chars += len(compact({**message, "content": CLEARED})) - len(compact(message))
-            message["content"] = CLEARED
+    clear([place for place in range(1, len(kept)) if place not in latest])
     for index, message in enumerate(kept):
         if size.tokens() + fixed <= budget:
             break
@@ -438,12 +474,17 @@ def fit(
         size.chars += len(compact(shortened)) - len(compact(message))
         kept[index] = shortened
     if images is not None:
+        for message, index in reversed(ref_places(kept[1:2], origin="attachment")):
+            if not over():
+                break
+            give_way(message, index, NO_ROOM)
         for message, index in tool_places:
             if message is not newest:
                 continue
             if not over():
                 break
             give_way(message, index, UNSEEN)
+        clear(latest)
     if size.tokens() + fixed > budget:
         logger.warning("The current turn alone is over the prompt budget: about {} tokens", size.tokens() + fixed)
     replayed: list[dict[str, Any]] = []

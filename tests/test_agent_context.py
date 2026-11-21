@@ -27,6 +27,7 @@ from ghostwriter.agent.context import (
 )
 from ghostwriter.agent.images import (
     LABEL,
+    NO_ROOM,
     NOT_RESENT,
     OVER_CAP,
     RETIRED,
@@ -706,7 +707,8 @@ def test_the_image_cap_holds_across_the_request() -> None:
 def test_the_newest_tool_images_stay_when_the_question_fills_the_cap() -> None:
     """Four large pictures at 280 fill the cap of 8 with strips: a view_file image stays, the last picture gives way.
 
-    Short of tokens after that, the tool result is cleared first, and only then does the newest tool image give way.
+    Short of tokens after that, the question's last picture left gives way, whole, before the page the model just
+    asked for and its result.
     """
     images = ImageBudget(fixed=280, max_images=8)
     photos = tuple(_photo(n, f"pier-{n}.jpg", width=1600, height=1200) for n in range(1, 5))
@@ -722,14 +724,103 @@ def test_the_newest_tool_images_stay_when_the_question_fills_the_cap() -> None:
     assert capped[1]["content"][8]["text"] == (
         "[Image: pier-4.jpg, strip 2 of 2; not shown, at most 8 images go to the model at once; view_file shows it]"
     )
-    cleared = copy.deepcopy(capped)
-    cleared[3]["content"] = CLEARED
-    budget = estimate_tokens(_labelled(cleared)) + 7 * 280 - 1
+    budget = estimate_tokens(_labelled(capped)) + 7 * 280 - 1
     short = fit(SYSTEM, [], [], current, budget=budget, images=images)
-    assert short[-1]["content"][1] == note(current[-1]["content"][1], UNSEEN)
-    assert short[1] == capped[1] and len(refs(short)) == 6
-    assert [m["content"] for m in short if m["role"] == "tool"] == [CLEARED]
-    assert estimate_tokens(_labelled(short)) + 6 * 280 <= budget
+    assert short[1]["content"][5:7] == [note(part, NO_ROOM) for part in question["content"][5:7]]
+    assert short[1]["content"][:5] == capped[1]["content"][:5] and short[1]["content"][7:] == capped[1]["content"][7:]
+    assert short[-1] == current[-1] and [m["content"] for m in short if m["role"] == "tool"] == ["0" * 100]
+    assert len(refs(short)) == 5
+    assert estimate_tokens(_labelled(short)) + 5 * 280 <= budget
+
+
+def _screenshots(count: int) -> tuple[AttachedImage, ...]:
+    return tuple(_photo(n, f"screenshot-{n}.png", width=2048, height=1152) for n in range(1, count + 1))
+
+
+#: About 26,800 characters of tool schemas, as workbench's ten tools take.
+BIG_TOOLS = function_tools([McpTool("read_document", "Lies ein Dokument. " * 1_400, SCHEMA)])
+
+
+def test_the_document_just_read_stays_while_the_questions_pictures_give_way() -> None:
+    """Reasoning on: large schemas, six screenshots at their pixel cost, and the 9,000 characters the round read.
+
+    The round's own result stays; the question's last picture gives way, with a note that there is no room for
+    it and view_file shows it, so the model need not call the tool again.
+    """
+    shots = _screenshots(6)
+    question = {
+        "role": "user",
+        "content": [_text("Was zeigen die Bildschirmfotos?"), *attachment_parts(shots, fixed=None)],
+    }
+    arguments = json.dumps({"path": f"{FOLDER}/bericht.pdf"})
+    call = {"id": "call_0", "type": "function", "function": {"name": "read_document", "arguments": arguments}}
+    current: list[dict[str, Any]] = [
+        question,
+        {"role": "assistant", "content": "", "tool_calls": [call]},
+        {"role": "tool", "tool_call_id": "call_0", "content": "B" * 9_000},
+    ]
+    pixels = 6 * 64 * 36
+    assert 26_000 < len(json.dumps(BIG_TOOLS)) < 28_000
+    assert _text_tokens(current) + estimate_tokens(BIG_TOOLS) + pixels > REASONING_PROMPT_TOKENS
+    images = ImageBudget(fixed=None, max_images=8)
+    fitted = fit(SYSTEM, BIG_TOOLS, [], current, budget=REASONING_PROMPT_TOKENS, images=images)
+    assert fitted[-1] == current[-1] and CLEARED not in json.dumps(fitted)
+    assert fitted[1]["content"][:6] == question["content"][:6]
+    assert fitted[1]["content"][6] == note(question["content"][6], NO_ROOM)
+    assert fitted[1]["content"][6]["text"] == (
+        "[Image: screenshot-6.png; not shown, there is no room for it in this request; view_file shows it]"
+    )
+    assert estimate_tokens(_labelled(fitted)) + estimate_tokens(BIG_TOOLS) + 5 * 64 * 36 <= REASONING_PROMPT_TOKENS
+
+
+def test_a_first_rounds_question_too_large_for_the_budget_gives_way_last_first() -> None:
+    """Eight screenshots and the schemas are over the reasoning budget before any round: the last picture gives way."""
+    shots = _screenshots(8)
+    question = {"role": "user", "content": [_text("Vergleiche die Fotos"), *attachment_parts(shots, fixed=None)]}
+    assert _text_tokens([question]) + estimate_tokens(BIG_TOOLS) + 8 * 64 * 36 > REASONING_PROMPT_TOKENS
+    images = ImageBudget(fixed=None, max_images=8)
+    fitted = fit(SYSTEM, BIG_TOOLS, [], [question], budget=REASONING_PROMPT_TOKENS, images=images)
+    assert fitted[1]["content"] == [*question["content"][:8], note(question["content"][8], NO_ROOM)]
+    assert len(refs(fitted)) == 7
+
+
+def test_the_question_gives_way_after_older_results_and_before_the_newest_round() -> None:
+    """With images, older results go first, then the question's pictures, the newest tool image, the latest result.
+
+    The question's pictures give way last first, and the latest round's own result is cleared only after all else.
+    """
+    images = ImageBudget(fixed=280, max_images=8)
+    photos = (_photo(1, "harbour-photo.jpg"), _photo(2, "quay-photo.jpg"))
+    question = {"role": "user", "content": [_text("Vergleiche mit der Grafik"), *attachment_parts(photos, fixed=280)]}
+    current: list[dict[str, Any]] = [
+        question,
+        *_round_with_results(1, chars=3_000),
+        *_viewed("call_9", [CHART], chars=3_000),
+    ]
+    older, latest = 2, 4
+    last_photo, first_photo, chart = question["content"][2], question["content"][1], current[-1]["content"][1]
+
+    def expected(*, cleared: tuple[int, ...] = (), no_room: tuple[int, ...] = (), unseen: bool = False) -> list[Any]:
+        messages = copy.deepcopy(current)
+        for place in cleared:
+            messages[place]["content"] = CLEARED
+        for index in no_room:
+            messages[0]["content"][index] = note(question["content"][index], NO_ROOM)
+        if unseen:
+            messages[-1]["content"][1] = note(chart, UNSEEN)
+        return messages
+
+    def fitted(budget: int) -> list[dict[str, Any]]:
+        return fit(SYSTEM, [], [], current, budget=budget, images=images)[1:]
+
+    room = _text_tokens(expected(cleared=(older,))) + 3 * 280
+    assert fitted(room) == expected(cleared=(older,))
+    assert fitted(room - 1) == expected(cleared=(older,), no_room=(2,))
+    assert note(last_photo, NO_ROOM) in fitted(room - 1)[0]["content"] and first_photo in fitted(room - 1)[0]["content"]
+    none_shown = expected(cleared=(older,), no_room=(1, 2), unseen=True)
+    floor = estimate_tokens([{"role": "system", "content": SYSTEM}, *none_shown])
+    assert fitted(floor) == none_shown
+    assert fitted(floor - 1) == expected(cleared=(older, latest), no_room=(1, 2), unseen=True)
 
 
 def test_a_picture_gives_way_whole() -> None:

@@ -23,7 +23,7 @@ import pytest
 from typing_extensions import override
 
 from ghostwriter.agent.context import estimate_tokens
-from ghostwriter.agent.images import LEFT_OUT, LEGEND, NOT_LOADED, RETIRED, UNSEEN
+from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
     MAX_ANSWER_TOKENS,
@@ -908,10 +908,10 @@ def _url(data: bytes) -> str:
     return "data:image/jpeg;base64," + base64.b64encode(data).decode("ascii")
 
 
-def _photo(width: int = 64, height: int = 48) -> tuple[str, dict[str, Any]]:
-    """Return the harbour photo as it is attached: its name, and its manifest of one rendition of that size."""
-    manifest = stock_manifest(PHOTO_PATH)
-    return PHOTO, {**manifest, "renditions": [{**manifest["renditions"][0], "width": width, "height": height}]}
+def _photo(width: int = 64, height: int = 48, *, name: str = PHOTO) -> tuple[str, dict[str, Any]]:
+    """Return a photo as it is attached: its name, and its manifest of one rendition of that size."""
+    manifest = stock_manifest(f"{FOLDER}/{name}")
+    return name, {**manifest, "renditions": [{**manifest["renditions"][0], "width": width, "height": height}]}
 
 
 def _content(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1298,6 +1298,26 @@ def test_an_image_never_shown_is_never_said_to_be_shown_before(loop_env: LoopEnv
     assert [step.result for step in steps if step.tool == "view_file"] == [
         json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were returned]"
     ]
+
+
+def test_a_picture_without_room_is_never_said_to_be_shown_before(loop_env: LoopEnv) -> None:
+    """A question's picture the request has no room for is named so in every round, and never fetched.
+
+    It stays the question's own: no round calls it retired or not shown again, and the round's result is kept.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, context_tokens=22_000)
+    quay = "quay-photo.jpg"
+    loop_env.workbench.answers = [RESULT]
+    attach = [_photo(4096, 3072), _photo(4096, 3072, name=quay)]
+    loop_env.run(_calls(READ_SALES), [text_chunk("Zwei Bilder.")], vision=True, attach=attach)
+    for n in (1, 2):
+        sent = json.dumps(loop_env.sent(n))
+        assert NO_ROOM.format(label=quay) in sent
+        assert RETIRED.format(label=quay) not in sent and NOT_RESENT.format(label=quay) not in sent
+        assert [label for label, _ in _labelled(loop_env.sent(n))] == [f"[Image: {PHOTO}]"]
+    assert loop_env.sent(2)[-1]["content"] == RESULT.text
+    assert loop_env.workbench.fetched == [(RenditionRequest(PHOTO_PATH, n=1, strips=1, strip=1),)]
+    assert loop_env.audit.images == [1, 1]
 
 
 def test_images_past_the_cap_in_one_round_are_returned_and_named_unseen(loop_env: LoopEnv) -> None:

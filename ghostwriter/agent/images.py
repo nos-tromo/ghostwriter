@@ -6,7 +6,7 @@ image a tool showed, in the one user message that follows a round's tool message
 (:func:`tool_image_message`). A ref never leaves the process.
 :func:`~ghostwriter.agent.context.fit` counts it by :func:`estimate_image_tokens`, never by
 characters, and puts a note in its place where it gives way (:data:`RETIRED`, :data:`OVER_CAP`,
-:data:`UNSEEN`, :data:`NOT_RESENT`). A picture gives way whole: each ref names the ``picture`` it
+:data:`UNSEEN`, :data:`NO_ROOM`, :data:`NOT_RESENT`). A picture gives way whole: each ref names the ``picture`` it
 shows part of, and the strips of one picture go together (:func:`siblings`). Only
 :func:`materialise`, just before the model call, swaps each ref for its label and a data URL, in a
 new list, from the bytes of the message's :data:`ImageBank`: a data URL exists in that list alone,
@@ -48,6 +48,8 @@ RETIRED: Final = "[Image: {label}; not shown again to make room, view it again w
 OVER_CAP: Final = "[Image: {label}; not shown, at most {max} images go to the model at once; view_file shows it]"
 #: An image of the newest tool images, never shown, for which the request has no room.
 UNSEEN: Final = "[Image: {label}; not shown, there is no room for it in this request]"
+#: A picture of the question for which the request has no room.
+NO_ROOM: Final = "[Image: {label}; not shown, there is no room for it in this request; view_file shows it]"
 #: An image of an earlier turn that is not sent again.
 NOT_RESENT: Final = "[Image: {label}; not shown again, view_file shows it]"
 #: An image whose bytes could not be fetched.
