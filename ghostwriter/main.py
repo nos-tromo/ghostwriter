@@ -15,7 +15,10 @@ only while ``GHOSTWRITER_SPEECH_INPUT`` is on) shares with the turns; dictation
 runs on ``app.state.speech_threads``, a limiter of ``SPEECH_THREADS`` threads of
 its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retention`),
 which the lifespan runs a minute after start and then daily, and cancels at
-shutdown. ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
+shutdown. ``app.state.processor`` is the attachment processor (:mod:`ghostwriter.processing`), ``None``
+while workbench is off: at start it prepares again what the last process left ``processing``, or, without
+workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes.
+``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
 waits for, and cancels it at shutdown. Every request body is capped per route
 (:mod:`ghostwriter.body_limit`), as nginx caps it.
@@ -48,6 +51,7 @@ from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.inference import SPEECH_THREADS, ModelClient
 from ghostwriter.log_cfg import setup_logger
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.retention import FIRST_SWEEP_DELAY_S, SWEEP_INTERVAL_S, Sweeper
 from ghostwriter.retention_rule import run_retention_loop
 from ghostwriter.store import ChatStore
@@ -99,9 +103,11 @@ def create_app(
         """Run the audit chain and the chat store for as long as the app serves; if either cannot open, startup fails.
 
         The store's schema is brought to this release's version and the
-        configured periods are put in force before the first request; then
+        configured periods are put in force before the first request; attachments
+        left ``processing`` are prepared again, or settled without workbench; then
         the retention sweep starts, and the Ollama probe where it applies (start-up
-        does not wait for it); both are cancelled first at shutdown.
+        does not wait for it); both are cancelled first at shutdown, then the
+        attachment jobs, before the database goes.
 
         Args:
             app: The application being served.
@@ -113,6 +119,7 @@ def create_app(
         engine: Engine | None = None
         sweeps: asyncio.Task[None] | None = None
         probe: asyncio.Task[None] | None = None
+        processor: AttachmentProcessor | None = None
         try:
             start_chain(app, emitter)
             engine = make_engine(settings.db_path)
@@ -120,6 +127,13 @@ def create_app(
             store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days, now=now)
             app.state.store = store
             store.apply_periods(settings.chat_days)
+            workbench: WorkbenchClient | None = app.state.workbench
+            if workbench is not None:
+                processor = AttachmentProcessor(store, workbench, emitter)
+                processor.requeue()
+            elif settled := store.settle_processing("unavailable"):
+                logger.info("{} attachments left processing were settled without workbench.", settled)
+            app.state.processor = processor
             app.state.agent = AgentLoop(model=chat_model, workbench=app.state.workbench, store=store, settings=settings)
             app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
             app.state.speech_threads = anyio.CapacityLimiter(SPEECH_THREADS)
@@ -130,6 +144,7 @@ def create_app(
                 settings=settings,
                 turns=app.state.turns,
                 now=now,
+                processor=processor,
             )
             sweeps = asyncio.create_task(
                 run_retention_loop(app.state.sweeper.sweep, first_delay=FIRST_SWEEP_DELAY_S, interval=SWEEP_INTERVAL_S)
@@ -143,6 +158,8 @@ def create_app(
                     task.cancel()
                     with suppress(asyncio.CancelledError):
                         await task
+            if processor is not None:
+                await processor.aclose()
             if engine is not None:
                 engine.dispose()
             emitter.close()

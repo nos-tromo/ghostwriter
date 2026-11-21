@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+import anyio
 import httpx
 import pytest
 from fastapi import FastAPI
@@ -29,6 +30,7 @@ from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
 from ghostwriter.models import Attachment, Chat, Result, ToolStep
+from ghostwriter.processing import AttachmentProcessor, PrepareJob
 from ghostwriter.retention import (
     FIRST_SWEEP_DELAY_S,
     SWEEP_BATCH,
@@ -45,7 +47,7 @@ from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError
 from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import WorkbenchClient, chat_folder, session_pseudonym, user_pseudonym
 from tests.conftest import KEY, CapturedAuditStream, events, make_settings
-from tests.fakes import FakeDoor
+from tests.fakes import FakeDoor, stock_manifest
 
 DAY = timedelta(days=1)
 SECOND = timedelta(seconds=1)
@@ -379,6 +381,51 @@ async def test_a_workbench_timeout_ends_the_sweeps_calls_to_it(
     env.clock.now = NOW + DAY
     assert await env.sweeper.sweep() == SweepReport(chats=1)
     assert _deletes(env.door)[-1].headers["x-session-id"] == session_pseudonym(KEY, later)
+
+
+async def test_a_due_chats_attachment_jobs_are_cancelled_before_its_folder_goes(
+    settled: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """A picture of a due chat still being prepared: the sweep cancels its job first, then deletes the folder."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    path = f"{chat_folder(KEY, cid)}/harbour-photo.jpg"
+    env.door.manifests[path] = stock_manifest(path)
+    env.door.delays["/files/prepare"] = 2.0
+    photo = env.store.add_attachment(
+        cid,
+        file_id="b" * 32,
+        path=path,
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    sweeper = Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+    left: list[int] = []
+    env.door.on_delete = lambda: left.append(processor.cancel_chat(cid))
+    try:
+        processor.submit(PrepareJob(photo.id, cid, "user-a", path, "image", None))
+        with anyio.fail_after(5):
+            while not [r for r, _ in env.door.requests if r.url.path == "/files/prepare"]:
+                await anyio.sleep(0.01)
+        with anyio.fail_after(1.5):
+            assert await sweeper.sweep() == SweepReport(chats=1)
+        await processor.wait(photo.id, 5)
+        assert (left, processor.running(photo.id), env.has_rows(cid)) == ([0], False, False)
+        assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+    finally:
+        await processor.aclose()
 
 
 async def test_the_sweep_names_the_chat_and_the_system_reason_to_workbench(

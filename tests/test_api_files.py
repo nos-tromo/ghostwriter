@@ -3,7 +3,9 @@
 Every name, id and value here is invented.
 """
 
-from collections.abc import Iterator
+import logging
+import time
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -16,11 +18,15 @@ import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from ghostwriter.db import utcnow
+from ghostwriter import processing
+from ghostwriter.api.files import FILE_HEADERS
+from ghostwriter.config import Settings
+from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
+from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings
-from tests.fakes import UPLOAD_ID, XLSX, FakeDoor
+from tests.fakes import TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, stock_manifest
 
 MIB = 1024 * 1024
 TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
@@ -29,6 +35,11 @@ TOO_MANY_PENDING = {"detail": "Send the attached files before adding more.", "co
 NOT_FOUND = (404, {"detail": "File not found."})
 GONE = (410, {"detail": "The file has expired."})
 FID = UPLOAD_ID
+NO_ATTACHMENT = (404, {"detail": "Attachment not found."})
+PHOTO = "harbour-photo.jpg"
+SCAN = "quay-scan.pdf"
+UNREADABLE = {"detail": "unreadable_file: damaged"}
+SYSTEM = {"user": None, "via": "system"}
 
 
 class Clock:
@@ -73,6 +84,19 @@ def client(tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor, cl
         yield test_client
 
 
+@pytest.fixture
+def seeing(tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor, clock: Clock) -> Iterator[TestClient]:
+    """Serve the app with pictures offered: vision on, and a workbench that lists ``view_file``."""
+    app = create_app(
+        make_settings(tmp_path, vision=True),
+        audit_stream=audit_stream,
+        workbench_transport=httpx.MockTransport(door),
+        now=clock,
+    )
+    with TestClient(app) as test_client:
+        yield test_client
+
+
 def _state(client: TestClient) -> Any:
     app = client.app
     assert isinstance(app, FastAPI)
@@ -98,6 +122,75 @@ def _attach(
 
 def _since(stream: CapturedAuditStream, before: int) -> list[dict[str, Any]]:
     return events(stream)[before:]
+
+
+def _status(client: TestClient, cid: str, aid: str, wait: int = 0, user: str = "user-a") -> httpx2.Response:
+    return client.get(f"/api/chats/{cid}/attachments/{aid}", params={"wait": wait}, headers=as_user(user))
+
+
+def _settled(client: TestClient, cid: str, aid: str) -> str:
+    """Follow an attachment by long-poll until it is no longer processing, and return its status."""
+    r = _status(client, cid, aid, wait=20)
+    assert r.status_code == 200, r.text
+    status: str = r.json()["status"]
+    return status
+
+
+def _preview(client: TestClient, cid: str, aid: str, page: int = 1, user: str = "user-a") -> httpx2.Response:
+    return client.get(f"/api/chats/{cid}/attachments/{aid}/preview", params={"page": page}, headers=as_user(user))
+
+
+def _prepares(door: FakeDoor) -> list[httpx.Request]:
+    return [request for request, _ in door.requests if request.url.path == "/files/prepare"]
+
+
+def _views(door: FakeDoor) -> list[httpx.Request]:
+    return [request for request, _ in door.requests if request.url.path == "/files/view"]
+
+
+def _unreadable(folder: str) -> httpx.Response:
+    """Answer a prepare as workbench does a damaged file: a fresh 422 each time."""
+    return httpx.Response(422, json=UNREADABLE)
+
+
+def _wait_until(condition: Callable[[], bool], timeout_s: float = 5.0) -> None:
+    deadline = time.monotonic() + timeout_s
+    while not condition():
+        assert time.monotonic() < deadline, "the condition never held"
+        time.sleep(0.01)
+
+
+def _stranded(settings: Settings, *names: str) -> tuple[str, list[str]]:
+    """Write a chat whose attachments were still being prepared when the last process ended.
+
+    Args:
+        settings: The settings the app will start with, for its database.
+        names: The files, each ``processing``; a picture by its suffix, any other a document.
+
+    Returns:
+        The chat's id and the attachments' ids.
+    """
+    engine = make_engine(settings.db_path)
+    init_db(engine)
+    try:
+        store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
+        cid = store.create_chat("user-a").id
+        ids = [
+            store.add_attachment(
+                cid,
+                file_id=f"{n + 7:032x}",
+                path=f"{chat_folder(KEY, cid)}/{name}",
+                name=name,
+                size=64,
+                mime="image/jpeg" if name.endswith(".jpg") else "application/pdf",
+                kind="image" if name.endswith(".jpg") else "document",
+                status="processing",
+            ).id
+            for n, name in enumerate(names)
+        ]
+    finally:
+        engine.dispose()
+    return cid, ids
 
 
 # --- attachments -------------------------------------------------------------
@@ -539,3 +632,331 @@ def test_a_download_workbench_cannot_serve_is_502(
     assert (r.status_code, r.json()) == (502, {"detail": "The file could not be fetched from workbench."})
     _, failed = _since(audit_stream, before)
     assert (failed["outcome"], failed["criteria"]) == ("error", {"reason": "unreachable"})
+
+
+# --- pictures and PDFs: prepared after the upload, followed by long-poll, previewed ---
+
+
+def test_an_image_is_prepared_after_it_is_attached(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """The upload answers processing at once; workbench prepares the file it stored, and the hand-over is recorded."""
+    cid = _new(seeing)
+    before = len(events(audit_stream))
+    r = _attach(seeing, cid, PHOTO, TINY_JPEG)
+    assert r.status_code == 201
+    photo = r.json()
+    assert (photo["kind"], photo["status"], photo["mime"]) == ("image", "processing", "image/jpeg")
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    [prepare] = _prepares(door)
+    assert dict(prepare.url.params) == {"path": f"{chat_folder(KEY, cid)}/{PHOTO}"}
+    assert prepare.headers["x-session-id"] == session_pseudonym(KEY, cid)
+    collect, upload, handed, query = _since(audit_stream, before)
+    assert [(e["action"], e["operation"], e.get("recipient")) for e in (collect, upload, handed)] == [
+        ("collect", "chat.attachment", None),
+        ("disclose", "chat.attachment", "workbench:upload"),
+        ("disclose", "chat.attachment", "workbench:prepare"),
+    ]
+    target = {"kind": "attachment", "ids": [photo["id"]], "container": cid}
+    assert (handed["parent_event_id"], handed["target"], handed["criteria"], handed["outcome"]) == (
+        collect["event_id"],
+        target,
+        {"kind": "image"},
+        "ok",
+    )
+    assert (query["action"], query["operation"], query["target"], query["criteria"]) == (
+        "query",
+        "chat.attachment",
+        target,
+        {"status": "ready"},
+    )
+    assert PHOTO not in audit_stream.getvalue()
+
+
+def test_a_pdf_gets_its_manifest_and_a_word_file_none(seeing: TestClient, door: FakeDoor) -> None:
+    """A PDF is prepared and keeps its page count; a Word file is read as text, ready at once, never prepared."""
+    cid = _new(seeing)
+    store = _state(seeing).store
+    scan = _attach(seeing, cid, SCAN, b"%PDF-1.7").json()
+    assert (scan["kind"], scan["status"]) == ("document", "processing")
+    assert _settled(seeing, cid, scan["id"]) == "ready"
+    found = store.find_attachment("user-a", cid, scan["id"])
+    assert found is not None and found.manifest is not None and found.manifest["total"] == 3
+    door.upload_id = "5" * 32
+    memo = _attach(seeing, cid, "memo.docx").json()
+    assert (memo["kind"], memo["status"]) == ("document", "ready")
+    assert len(_prepares(door)) == 1
+    found = store.find_attachment("user-a", cid, memo["id"])
+    assert found is not None and found.manifest is None
+
+
+def test_an_unreadable_image_fails_and_a_pdf_stays_ready(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """A picture workbench cannot read cannot be seen: failed. A PDF it cannot render still reads as text: ready."""
+    door.answers["/files/prepare"] = _unreadable
+    cid = _new(seeing)
+    before = len(events(audit_stream))
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    door.upload_id = "5" * 32
+    scan = _attach(seeing, cid, SCAN, b"%PDF-1.7").json()
+    assert (_settled(seeing, cid, photo["id"]), _settled(seeing, cid, scan["id"])) == ("failed", "ready")
+    found = _state(seeing).store.find_attachment("user-a", cid, scan["id"])
+    assert found is not None and found.manifest is None
+    failed = [e for e in _since(audit_stream, before) if e["outcome"] == "error"]
+    assert sorted(e["target"]["ids"][0] for e in failed) == sorted([photo["id"], scan["id"]])
+    for event in failed:
+        assert (event["action"], event["operation"], event["recipient"], event["criteria"]) == (
+            "disclose",
+            "chat.attachment",
+            "workbench:prepare",
+            {"reason": "unreadable_file"},
+        )
+
+
+def test_a_busy_prepare_is_tried_once_more(seeing: TestClient, door: FakeDoor, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A busy workbench is asked once more: 503 then the manifest is ready; 503 twice is the token of the failure."""
+    monkeypatch.setattr(processing, "PREPARE_RETRY_S", 0)
+    busy = [httpx.Response(503, json={"detail": "busy, retry later"})]
+    door.answers["/files/prepare"] = lambda folder: busy.pop() if busy else None
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    assert len(_prepares(door)) == 2
+
+    door.answers["/files/prepare"] = lambda folder: httpx.Response(503, json={"detail": "busy, retry later"})
+    door.upload_id = "5" * 32
+    other = _attach(seeing, cid, "harbour-night.jpg", TINY_JPEG).json()
+    assert _settled(seeing, cid, other["id"]) == "failed"
+    assert len(_prepares(door)) == 4
+
+
+def test_the_status_route_is_the_owners_and_the_chats(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Another owner, another chat or an unknown id is not found, and nothing is recorded."""
+    cid, other = _new(seeing), _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    before = len(events(audit_stream))
+    for chat, aid, user in [
+        (cid, photo["id"], "user-b"),
+        (other, photo["id"], "user-a"),
+        (cid, "a-made-up-id", "user-a"),
+    ]:
+        r = _status(seeing, chat, aid, user=user)
+        assert (r.status_code, r.json()) == NO_ATTACHMENT
+    assert _since(audit_stream, before) == []
+
+
+def test_the_long_poll_returns_when_ready_or_after_its_wait(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """wait=0 answers at once; a longer wait returns as the job ends, or after its wait for a row no job settles."""
+    door.delays["/files/prepare"] = 0.5
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    started = time.monotonic()
+    r = _status(seeing, cid, photo["id"], wait=0)
+    assert (r.status_code, r.json()["status"]) == (200, "processing")
+    r = _status(seeing, cid, photo["id"], wait=20)
+    assert (r.status_code, r.json()["status"]) == (200, "ready")
+    assert time.monotonic() - started < 5
+    before = len(events(audit_stream))
+    assert _status(seeing, cid, photo["id"], wait=21).status_code == 422
+    assert _since(audit_stream, before) == []
+
+    stuck = _state(seeing).store.add_attachment(
+        cid,
+        file_id="6" * 32,
+        path=f"{chat_folder(KEY, cid)}/harbour-night.jpg",
+        name="harbour-night.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    started = time.monotonic()
+    r = _status(seeing, cid, stuck.id, wait=1)
+    assert (r.status_code, r.json()["status"]) == (200, "processing")
+    assert 1 <= time.monotonic() - started < 5
+
+
+def test_a_preview_streams_the_rendition_with_the_hardening(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """The picture's render streams back as workbench's jpeg, with the view's hardening; recorded before it goes."""
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    before = len(events(audit_stream))
+    r = _preview(seeing, cid, photo["id"])
+    assert (r.status_code, r.content, r.headers["content-type"]) == (200, TINY_JPEG, "image/jpeg")
+    for name, value in FILE_HEADERS.items():
+        assert r.headers[name] == value
+    [view] = _views(door)
+    assert dict(view.url.params) == {"path": f"{chat_folder(KEY, cid)}/{PHOTO}", "rendition": "1"}
+    assert view.headers["x-session-id"] == session_pseudonym(KEY, cid)
+    [preview] = _since(audit_stream, before)
+    assert (preview["action"], preview["operation"], preview["recipient"], preview["outcome"]) == (
+        "disclose",
+        "file.preview",
+        "preview",
+        "ok",
+    )
+    assert (preview["target"], preview["criteria"]) == (
+        {"kind": "file", "ids": [FID], "count": 1, "container": cid},
+        {"page": 1},
+    )
+
+
+def test_a_preview_is_found_only_through_its_chat(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Another owner or another chat is not found: workbench is not asked, nothing is recorded."""
+    cid, other = _new(seeing), _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    before = len(events(audit_stream))
+    for chat, aid, user in [
+        (cid, photo["id"], "user-b"),
+        (other, photo["id"], "user-a"),
+        (cid, "a-made-up-id", "user-a"),
+    ]:
+        r = _preview(seeing, chat, aid, user=user)
+        assert (r.status_code, r.json()) == NOT_FOUND
+    assert _views(door) == [] and _since(audit_stream, before) == []
+
+
+def test_a_preview_of_a_processing_failed_or_expired_attachment(
+    seeing: TestClient, door: FakeDoor, clock: Clock, audit_stream: CapturedAuditStream
+) -> None:
+    """Still being prepared: 409. Failed: not found. Past its file's period: gone. None of them asks workbench."""
+    cid = _new(seeing)
+    pending = _state(seeing).store.add_attachment(
+        cid,
+        file_id="6" * 32,
+        path=f"{chat_folder(KEY, cid)}/harbour-night.jpg",
+        name="harbour-night.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    door.answers["/files/prepare"] = _unreadable
+    failed = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, failed["id"]) == "failed"
+    door.answers["/files/prepare"] = None
+    door.upload_id = "5" * 32
+    ready = _attach(seeing, cid, "harbour-day.jpg", TINY_JPEG).json()
+    assert _settled(seeing, cid, ready["id"]) == "ready"
+    before = len(events(audit_stream))
+    r = _preview(seeing, cid, pending.id)
+    assert (r.status_code, r.json()) == (
+        409,
+        {"detail": "The file is still being prepared.", "code": "attachment_processing"},
+    )
+    r = _preview(seeing, cid, failed["id"])
+    assert (r.status_code, r.json()) == NOT_FOUND
+    clock.now += timedelta(days=8)
+    r = _preview(seeing, cid, ready["id"])
+    assert (r.status_code, r.json()) == GONE
+    assert _views(door) == [] and _since(audit_stream, before) == []
+
+
+def test_a_pdf_page_past_its_total_is_404(seeing: TestClient, door: FakeDoor) -> None:
+    """Pages 1 to 3 of a three-page PDF are shown; page 4 is not found unasked, and page 0 is refused."""
+    cid = _new(seeing)
+    scan = _attach(seeing, cid, SCAN, b"%PDF-1.7").json()
+    assert _settled(seeing, cid, scan["id"]) == "ready"
+    r = _preview(seeing, cid, scan["id"], page=3)
+    assert (r.status_code, r.content) == (200, TINY_JPEG)
+    assert door.last("/files/view").url.params["rendition"] == "3"
+    r = _preview(seeing, cid, scan["id"], page=4)
+    assert (r.status_code, r.json()) == NOT_FOUND
+    assert len(_views(door)) == 1
+    assert _preview(seeing, cid, scan["id"], page=0).status_code == 422
+
+
+def test_a_preview_workbench_cannot_serve(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """A render workbench no longer has is gone (410); an unreachable workbench is 502; each has an error child."""
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    before = len(events(audit_stream))
+    door.answers["/files/view"] = lambda folder: httpx.Response(404, json={"detail": "not found"})
+    r = _preview(seeing, cid, photo["id"])
+    assert (r.status_code, r.json()) == GONE
+    door.answers["/files/view"] = httpx.ConnectError("connection refused")
+    r = _preview(seeing, cid, photo["id"])
+    assert (r.status_code, r.json()) == (502, {"detail": "The file could not be fetched from workbench."})
+    recorded = _since(audit_stream, before)
+    assert [(e["operation"], e["outcome"], e.get("criteria")) for e in recorded] == [
+        ("file.preview", "ok", {"page": 1}),
+        ("file.preview", "error", {"reason": "not_found"}),
+        ("file.preview", "ok", {"page": 1}),
+        ("file.preview", "error", {"reason": "unreachable"}),
+    ]
+    for primary, child in zip(recorded[::2], recorded[1::2], strict=True):
+        assert (child["parent_event_id"], child["recipient"]) == (primary["event_id"], "preview")
+
+
+def test_a_chat_deleted_while_preparing_cancels_the_job(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """The delete does not wait for workbench's prepare: it cancels the job, which writes nothing, and the folder goes.
+
+    The prepare takes 3 s; the job ends within 1.5 s of the delete only because it was cancelled.
+    """
+    door.delays["/files/prepare"] = 3.0
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    processor = _state(seeing).processor
+    _wait_until(lambda: bool(_prepares(door)))
+    started = time.monotonic()
+    r = seeing.delete(f"/api/chats/{cid}", headers=as_user())
+    assert r.status_code == 204 and time.monotonic() - started < 1.5
+    _wait_until(lambda: not processor.running(photo["id"]), timeout_s=1.5)
+    assert door.last("/files/chat").headers["x-session-id"] == session_pseudonym(KEY, cid)
+    assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+    assert [record for record in loguru_caplog.records if record.levelno >= logging.ERROR] == []
+    assert _state(seeing).store.find_attachment("user-a", cid, photo["id"]) is None
+
+
+def test_processing_attachments_are_prepared_again_at_start(
+    tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor
+) -> None:
+    """A picture whose job ended with the last process is prepared again at start, by the system, requeued."""
+    settings = make_settings(tmp_path, vision=True)
+    cid, [aid] = _stranded(settings, PHOTO)
+    path = f"{chat_folder(KEY, cid)}/{PHOTO}"
+    door.manifests[path] = stock_manifest(path)
+    with TestClient(
+        create_app(settings, audit_stream=audit_stream, workbench_transport=httpx.MockTransport(door))
+    ) as c:
+        assert _settled(c, cid, aid) == "ready"
+        found = _state(c).store.find_attachment("user-a", cid, aid)
+        assert found is not None and found.manifest is not None and found.manifest["total"] == 1
+    assert dict(door.last("/files/prepare").url.params) == {"path": path}
+    [primary] = [e for e in events(audit_stream) if (e["action"], e["operation"]) == ("disclose", "chat.attachment")]
+    assert (primary["actor"], primary.get("parent_event_id"), primary["recipient"], primary["outcome"]) == (
+        SYSTEM,
+        None,
+        "workbench:prepare",
+        "ok",
+    )
+    assert (primary["target"], primary["criteria"]) == (
+        {"kind": "attachment", "ids": [aid], "container": cid},
+        {"kind": "image", "requeued": True},
+    )
+
+
+def test_without_workbench_stranded_rows_settle(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
+    """With workbench off nothing will prepare them: the picture fails, the PDF reads as text, ready."""
+    settings = make_settings(tmp_path, vision=True, workbench_api_key=None)
+    cid, [photo, scan] = _stranded(settings, PHOTO, SCAN)
+    with TestClient(create_app(settings, audit_stream=audit_stream)) as client:
+        assert _state(client).processor is None
+        assert [_status(client, cid, aid).json()["status"] for aid in (photo, scan)] == ["failed", "ready"]

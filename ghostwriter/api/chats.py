@@ -8,8 +8,9 @@ be written does not happen.
 
 A delete (spec §6.2) is refused while an answer runs, and holds the chat's turn
 while it runs itself; holding it, it looks the chat up again, so of two deletes
-only the first acts. It records ``chat.delete``, then asks workbench to delete
-the chat's folder, and deletes the chat's rows only after that worked. If
+only the first acts. It records ``chat.delete``, cancels the jobs that prepare
+the chat's attachments (:mod:`ghostwriter.processing`), then asks workbench to
+delete the chat's folder, and deletes the chat's rows only after that worked. If
 workbench fails, the rows stay and the user may try again. A chat that never
 used workbench (no file mark) is deleted without asking it.
 """
@@ -24,6 +25,7 @@ from pydantic import BaseModel, StringConstraints
 
 from ghostwriter.audit import Operation, audited, forward_headers
 from ghostwriter.identity import Principal, resolve_principal
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.schemas import ChatDetail, ChatOut
 from ghostwriter.store import ChatNotFound, ChatStore
 from ghostwriter.turns import TurnRegistry
@@ -182,9 +184,9 @@ def rename_chat(
 def delete_chat(
     chat_id: str, request: Request, user: User, op: Annotated[Operation, Depends(audited("delete", "chat.delete"))]
 ) -> None:
-    """Delete the user's chat: record it, delete its folder in workbench, then its rows.
+    """Delete the user's chat: record it, cancel its attachments' jobs, delete its folder in workbench, then its rows.
 
-    Runs in a worker thread; only the call to workbench runs on the event loop.
+    Runs in a worker thread; only the cancel and the call to workbench run on the event loop.
 
     Args:
         chat_id: The chat.
@@ -208,6 +210,9 @@ def delete_chat(
     try:
         owned_chat(store, user.name, chat_id)
         op.record(target=_chat(chat_id), criteria=store.chat_counts(chat_id))
+        processor: AttachmentProcessor | None = request.app.state.processor
+        if processor is not None:
+            anyio.from_thread.run_sync(processor.cancel_chat, chat_id)
         workbench: WorkbenchClient | None = request.app.state.workbench
         if workbench is None:
             op.child("delete", "chat.workbench", criteria={"workbench": "not_configured"})

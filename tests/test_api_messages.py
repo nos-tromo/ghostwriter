@@ -455,6 +455,40 @@ def test_a_message_names_only_its_chats_pending_attachments(
     assert not _state(client).turns.running(cid)
 
 
+def test_a_message_waits_for_its_attachments(
+    client: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """An attachment still being prepared holds the message back unrecorded and unstored; a failed one is taken."""
+    cid = _new(client)
+    store = _state(client).store
+    photo = store.add_attachment(
+        cid,
+        file_id=UPLOAD_ID,
+        path=f"{chat_folder(KEY, cid)}/harbour-photo.jpg",
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    sheet = _attach(client, cid, file_id="2" * 32)
+    before = len(events(audit_stream))
+    r = _send(client, cid, attachment_ids=[sheet.id, photo.id])
+    assert (r.status_code, r.json()) == (
+        409,
+        {"detail": "Wait until the attached files are ready.", "code": "attachment_processing"},
+    )
+    assert events(audit_stream)[before:] == [] and fake_openai.calls == []
+    assert not _state(client).turns.running(cid)
+    assert _detail(client, cid)["messages"] == []
+
+    assert store.settle_attachment(photo.id, status="failed", manifest=None, failure="unreadable_file")
+    fake_openai.script = [ANSWER]
+    assert _send(client, cid, attachment_ids=[sheet.id, photo.id]).status_code == 200
+    [question, _] = _detail(client, cid)["messages"]
+    assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id])
+
+
 @pytest.mark.parametrize(
     "body",
     [

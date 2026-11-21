@@ -6,15 +6,25 @@ chat's folder; the chat keeps only its reference, pending until a message sends 
 is found through its own chat, by owner, chat and file id, and streamed back from workbench's
 view route with workbench's type, length and disposition, and its hardening headers.
 
+While pictures are offered (:meth:`~ghostwriter.vision.Vision.images_offered`), a picture or a PDF
+is stored ``processing`` and its upload answers at once; the attachment processor
+(:mod:`ghostwriter.processing`) has workbench prepare it. The SPA follows its status by long-poll
+(``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds), and
+shows a page or the picture through the preview route, a render streamed from workbench's view route
+with the same hardening.
+
 The chat is marked as one that used workbench before its file goes out, so its delete asks
 workbench too. Records name a file by its id, never by its name. An attachment is ``collect`` /
 ``chat.attachment``, written before its first byte goes on, with the hand-over as its child
 ``disclose`` / ``chat.attachment`` (``workbench:upload``) and a second, ``error``, child when the
 hand-over fails; when the chat vanished during the hand-over, the delete of its folder is a
-``delete`` / ``chat.workbench`` child, recorded before it is sent. A download is ``disclose`` /
-``file.download`` (``download``), written before workbench is asked, with an ``error`` child when
-workbench cannot serve it. A refusal before those records records nothing; the 5xx among them are
-answered directly, so no failure is settled for them either.
+``delete`` / ``chat.workbench`` child, recorded before it is sent. The processor adds the prepare's
+hand-over as a further child (``workbench:prepare``). A status read is ``query`` /
+``chat.attachment`` with the status it answers. A download is ``disclose`` / ``file.download``
+(``download``) and a preview ``disclose`` / ``file.preview`` (``preview``, with the page), each
+written before workbench is asked, with an ``error`` child when workbench cannot serve it. A refusal
+before those records records nothing; the 5xx among them are answered directly, so no failure is
+settled for them either.
 """
 
 from contextlib import AsyncExitStack
@@ -22,7 +32,7 @@ from typing import Annotated, Final
 from uuid import uuid4
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
@@ -31,9 +41,11 @@ from starlette.types import Receive, Scope, Send
 from typing_extensions import override
 
 from ghostwriter.api.chats import CHAT_NOT_FOUND, owned_chat
+from ghostwriter.api.messages import PROCESSING_CODE
 from ghostwriter.audit import Operation, audited, forward_headers
 from ghostwriter.body_limit import FILE_TOO_LARGE, TOO_LARGE_CODE
 from ghostwriter.identity import Principal, resolve_principal
+from ghostwriter.processing import ATTACHMENT, MAX_WAIT_S, AttachmentProcessor, PrepareJob
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.store import ChatNotFound, ChatStore, TooManyPending
 from ghostwriter.upload import (
@@ -41,12 +53,15 @@ from ghostwriter.upload import (
     BadUpload,
     FilePart,
     TooLarge,
+    attachment_kind,
     attachment_type,
     name_problem,
+    needs_prepare,
     read_file_part,
     safe_filename,
 )
 from ghostwriter.utils.audit_event import Target
+from ghostwriter.vision import Vision
 from ghostwriter.workbench import (
     MAX_ATTACHMENT_BYTES,
     CallFor,
@@ -60,10 +75,13 @@ from ghostwriter.workbench import (
 
 router = APIRouter(prefix="/api/chats", tags=["Files"])
 
-ATTACHMENT: Final = "chat.attachment"
 UPLOAD_RECIPIENT: Final = "workbench:upload"
 DOWNLOAD: Final = "file.download"
 DOWNLOAD_RECIPIENT: Final = "download"
+PREVIEW: Final = "file.preview"
+PREVIEW_RECIPIENT: Final = "preview"
+#: The highest page a preview may ask for.
+MAX_PAGE: Final = 10_000
 
 NOT_AVAILABLE: Final = "File processing is not available."
 TOO_MANY_PENDING: Final = "Send the attached files before adding more."
@@ -75,6 +93,8 @@ STORAGE_FULL: Final = "Your files fill the space workbench allows; delete a chat
 FILE_NOT_FOUND: Final = "File not found."
 FILE_EXPIRED: Final = "The file has expired."
 NOT_FETCHED: Final = "The file could not be fetched from workbench."
+ATTACHMENT_NOT_FOUND: Final = "Attachment not found."
+STILL_PROCESSING: Final = "The file is still being prepared."
 
 #: workbench's three hardening headers for a file a browser opens (``workbench/api/hardening.py``),
 #: and no caching.
@@ -100,17 +120,23 @@ def _refused(status_code: int, detail: str, code: str | None = None) -> JSONResp
     return JSONResponse(status_code=status_code, content=content)
 
 
-def _checked_name(raw: str) -> tuple[str, str] | JSONResponse:
+def _processor(request: Request) -> AttachmentProcessor | None:
+    processor: AttachmentProcessor | None = request.app.state.processor
+    return processor
+
+
+def _checked_name(raw: str, *, images: bool) -> tuple[str, str] | JSONResponse:
     """Return an attachment's name and MIME type, or the refusal.
 
     Args:
         raw: The file name sent.
+        images: Whether pictures are offered, and so taken.
 
     Returns:
         The safe name and its type; or 415 for a type not taken, 422 for a name workbench refuses.
     """
     name = safe_filename(raw)
-    mime = None if name is None else attachment_type(name)
+    mime = None if name is None else attachment_type(name, images=images)
     if name is None or mime is None:
         return _refused(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, UNSUPPORTED)
     problem = name_problem(name)
@@ -202,7 +228,8 @@ async def attach_file(
             the hand-over; ``disclose`` / ``chat.attachment`` children record the hand-over.
 
     Returns:
-        The pending attachment, or the refusal: 409 ``too_many_pending`` at
+        The pending attachment, ``processing`` while workbench prepares a picture or a PDF, else
+        ``ready``; or the refusal: 409 ``too_many_pending`` at
         :data:`~ghostwriter.upload.MAX_PENDING` waiting files not yet expired, also
         when parallel uploads filled the chat meanwhile, counted again as the attachment is stored.
 
@@ -213,10 +240,13 @@ async def attach_file(
     store = _store(request)
     await run_in_threadpool(owned_chat, store, user.name, chat_id)
     workbench: WorkbenchClient | None = request.app.state.workbench
-    if workbench is None:
+    processor = _processor(request)
+    if workbench is None or processor is None:
         return _refused(status.HTTP_503_SERVICE_UNAVAILABLE, NOT_AVAILABLE)
     if await run_in_threadpool(store.pending_count, chat_id) >= MAX_PENDING:
         return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING, TOO_MANY_PENDING_CODE)
+    vision: Vision = request.app.state.vision
+    offered = await run_in_threadpool(vision.images_offered, workbench)
     try:
         part = await read_file_part(request, max_bytes=MAX_ATTACHMENT_BYTES)
     except TooLarge:
@@ -224,7 +254,7 @@ async def attach_file(
     except BadUpload:
         return _refused(status.HTTP_400_BAD_REQUEST, UNREADABLE)
     try:
-        checked = _checked_name(part.filename)
+        checked = _checked_name(part.filename, images=offered)
         if isinstance(checked, JSONResponse):
             return checked
         name, mime = checked
@@ -243,8 +273,10 @@ async def attach_file(
         await part.aclose()
     if isinstance(stored, JSONResponse):
         return stored
+    kind = attachment_kind(name)
+    prepared = offered and needs_prepare(name)
     try:
-        return await run_in_threadpool(
+        attachment = await run_in_threadpool(
             store.add_attachment,
             chat_id,
             file_id=stored.id,
@@ -252,6 +284,8 @@ async def attach_file(
             name=name,
             size=stored.size,
             mime=mime,
+            kind=kind,
+            status="processing" if prepared else "ready",
             id=attachment_id,
             max_pending=MAX_PENDING,
         )
@@ -260,6 +294,9 @@ async def attach_file(
     except ChatNotFound:
         await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
+    if prepared:
+        processor.submit(PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op))
+    return attachment
 
 
 async def _hand_over(
@@ -372,16 +409,167 @@ async def download_file(
     op.container = chat_id
     await run_in_threadpool(op.record, target=target, recipient=DOWNLOAD_RECIPIENT)
     call = CallFor(user.name, chat_id, forward_headers(op.context))
+    return await _streamed(workbench, op, call, ref.path, target, DOWNLOAD_RECIPIENT)
+
+
+async def _streamed(
+    workbench: WorkbenchClient,
+    op: Operation,
+    call: CallFor,
+    path: str,
+    target: Target,
+    recipient: str,
+    *,
+    rendition: int | None = None,
+) -> Response:
+    """Stream a file of the chat, or one of its renders, from workbench; a failure is the operation's ``error`` child.
+
+    Args:
+        workbench: The client.
+        op: The download's or the preview's operation, its primary written.
+        call: The chat.
+        path: The file's path in the chat's folder.
+        target: The file, by its id.
+        recipient: Where it goes, for the ``error`` child.
+        rendition: The page or picture to show; ``None`` for the file itself.
+
+    Returns:
+        The file as it streams, or 502 when workbench cannot serve it.
+
+    Raises:
+        HTTPException: 410 when workbench no longer has it.
+    """
     exchange = AsyncExitStack()
     try:
-        upstream = await exchange.enter_async_context(workbench.view(call=call, path=ref.path))
+        upstream = await exchange.enter_async_context(workbench.view(call=call, path=path, rendition=rendition))
     except WorkbenchNotFound as exc:
-        await _child_failed(op, DOWNLOAD, target, DOWNLOAD_RECIPIENT, exc.token)
+        await _child_failed(op, op.operation, target, recipient, exc.token)
         raise HTTPException(status_code=status.HTTP_410_GONE, detail=FILE_EXPIRED) from None
     except WorkbenchUnavailable as exc:
-        await _child_failed(op, DOWNLOAD, target, DOWNLOAD_RECIPIENT, exc.token)
+        await _child_failed(op, op.operation, target, recipient, exc.token)
         return _refused(status.HTTP_502_BAD_GATEWAY, NOT_FETCHED)
     except Exception:
-        await _child_failed(op, DOWNLOAD, target, DOWNLOAD_RECIPIENT, "error")
+        await _child_failed(op, op.operation, target, recipient, "error")
         raise
     return FileStream(upstream, exchange)
+
+
+async def _read_after_wait(
+    store: ChatStore, processor: AttachmentProcessor, owner: str, chat_id: str, attachment_id: str, wait: int
+) -> AttachmentOut | None:
+    """Wait for a ``processing`` attachment's job, at most ``wait`` seconds, and read it again.
+
+    Its job may have ended since it was read: without one it is read again before the wait, which
+    then lasts its whole time only for a row no job settles.
+
+    Args:
+        store: The chats.
+        processor: The attachment processor.
+        owner: Who asks.
+        chat_id: The chat.
+        attachment_id: The attachment.
+        wait: The longest wait, in seconds.
+
+    Returns:
+        The attachment as it is then, or ``None`` once it is gone.
+    """
+    if not processor.running(attachment_id):
+        found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
+        if found is None or found.status != "processing":
+            return found
+    await processor.wait(attachment_id, wait)
+    return await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
+
+
+@router.get("/{chat_id}/attachments/{attachment_id}", response_model=AttachmentOut, summary="An attachment's status")
+async def attachment_status(
+    chat_id: str,
+    attachment_id: str,
+    request: Request,
+    user: User,
+    op: Annotated[Operation, Depends(audited("query", ATTACHMENT))],
+    wait: Annotated[int, Query(ge=0, le=MAX_WAIT_S)] = 0,
+) -> AttachmentOut:
+    """Answer an attachment of the user's chat, after waiting for it to be prepared when asked to.
+
+    Args:
+        chat_id: The chat.
+        attachment_id: The attachment.
+        request: The request.
+        user: Who asks.
+        op: ``query`` / ``chat.attachment``, recorded with the status answered.
+        wait: How many seconds to wait while it is ``processing``, at most
+            :data:`~ghostwriter.processing.MAX_WAIT_S`; 0 answers at once.
+
+    Returns:
+        The attachment.
+
+    Raises:
+        HTTPException: 404 for an attachment this chat of this owner does not hold, also one
+            deleted during the wait.
+    """
+    store = _store(request)
+    found = await run_in_threadpool(store.attachment_out, user.name, chat_id, attachment_id)
+    processor = _processor(request)
+    if found is not None and found.status == "processing" and wait and processor is not None:
+        found = await _read_after_wait(store, processor, user.name, chat_id, attachment_id, wait)
+    if found is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ATTACHMENT_NOT_FOUND)
+    op.container = chat_id
+    await run_in_threadpool(
+        op.record, target=Target(kind="attachment", ids=(attachment_id,)), criteria={"status": found.status}
+    )
+    return found
+
+
+@router.get(
+    "/{chat_id}/attachments/{attachment_id}/preview",
+    response_class=StreamingResponse,
+    summary="A page or the picture of an attachment",
+)
+async def preview_attachment(
+    chat_id: str,
+    attachment_id: str,
+    request: Request,
+    user: User,
+    op: Annotated[Operation, Depends(audited("disclose", PREVIEW))],
+    page: Annotated[int, Query(ge=1, le=MAX_PAGE)] = 1,
+) -> Response:
+    """Stream a page of a prepared PDF, or a prepared picture, as workbench renders it.
+
+    Args:
+        chat_id: The chat.
+        attachment_id: The attachment.
+        request: The request.
+        user: Who asks.
+        op: ``disclose`` / ``file.preview``, recorded with the file's id and the page before
+            workbench is asked; an ``error`` child when workbench cannot serve it.
+        page: The page, counted from 1; a picture has one.
+
+    Returns:
+        The render, or the refusal: 409 ``attachment_processing`` while it is being prepared.
+
+    Raises:
+        HTTPException: 404 for an attachment this chat of this owner does not hold, one that
+            failed or has no manifest, and a page past its last; 410 once it has expired, also when
+            workbench no longer has the render.
+    """
+    store = _store(request)
+    ref = await run_in_threadpool(store.find_attachment, user.name, chat_id, attachment_id)
+    if ref is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=FILE_NOT_FOUND)
+    if ref.expired:
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail=FILE_EXPIRED)
+    if ref.status == "processing":
+        return _refused(status.HTTP_409_CONFLICT, STILL_PROCESSING, PROCESSING_CODE)
+    total = None if ref.manifest is None else ref.manifest.get("total")
+    if ref.status == "failed" or not isinstance(total, int) or page > total:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=FILE_NOT_FOUND)
+    workbench: WorkbenchClient | None = request.app.state.workbench
+    if workbench is None:
+        return _refused(status.HTTP_503_SERVICE_UNAVAILABLE, NOT_AVAILABLE)
+    target = Target(kind="file", ids=(ref.file_id,), count=1)
+    op.container = chat_id
+    await run_in_threadpool(op.record, target=target, criteria={"page": page}, recipient=PREVIEW_RECIPIENT)
+    call = CallFor(user.name, chat_id, forward_headers(op.context))
+    return await _streamed(workbench, op, call, ref.path, target, PREVIEW_RECIPIENT, rendition=page)

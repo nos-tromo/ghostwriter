@@ -63,6 +63,8 @@ MAX_MESSAGE_ATTACHMENTS: Final = 10
 ANSWER_RUNNING: Final = "An answer is still being written in this chat."
 BUSY_CODE: Final = "busy"
 UNKNOWN_ATTACHMENT: Final = "Unknown attachment."
+PROCESSING: Final = "Wait until the attached files are ready."
+PROCESSING_CODE: Final = "attachment_processing"
 NO_ANSWER: Final = "There is no answer to regenerate."
 NO_ANSWER_CODE: Final = "no_answer"
 #: What the user is told when a record of the turn could not be written.
@@ -488,7 +490,8 @@ def send_message(
             and its length before it is stored; the turn's rounds and calls are its children.
 
     Returns:
-        The stream; or 409 ``busy`` while a turn runs in the chat.
+        The stream; or 409 ``busy`` while a turn runs in the chat, ``attachment_processing`` while
+        workbench still prepares one of its attachments, before anything is recorded or stored.
 
     Raises:
         HTTPException: 404 for another owner's chat or an unknown one; 400 when an attachment
@@ -500,8 +503,12 @@ def send_message(
         return _conflict(ANSWER_RUNNING, BUSY_CODE)
     try:
         owned_chat(store, user.name, chat_id)
-        if not set(body.attachment_ids) <= store.pending_ids(chat_id):
+        statuses = store.pending_statuses(chat_id)
+        if not set(body.attachment_ids) <= statuses.keys():
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=UNKNOWN_ATTACHMENT)
+        if any(statuses[attachment_id] == "processing" for attachment_id in body.attachment_ids):
+            _turns(request).end(chat_id, claim)
+            return _conflict(PROCESSING, PROCESSING_CODE)
         question_id = str(uuid4())
         op.container = chat_id
         op.record(

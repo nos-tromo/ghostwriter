@@ -33,11 +33,14 @@ collects. Start-up writes `admin` / `config.audit` with the operating mode.
 | `POST /api/chats/{id}/messages` | `collect` `chat.message` | `message` [user id] | `ai_call` `chat.answer` per round; `disclose` `chat.tool` per call attempt, before it is sent |
 | `POST /api/chats/{id}/regenerate` | `modify` `chat.regenerate` | `message` [replaced id] | as messages |
 | `POST /api/chats/{id}/stop` | none | — | — |
-| `POST /api/chats/{id}/attachments` | `collect` `chat.attachment` | `attachment` [id] | `disclose` `chat.attachment` (`workbench:upload`), before the upload; an `error` one if it fails; `delete` `chat.workbench` (reason `chat_gone`) for a chat deleted during the upload |
+| `POST /api/chats/{id}/attachments` | `collect` `chat.attachment` | `attachment` [id] | `disclose` `chat.attachment` (`workbench:upload`), before the upload; an `error` one if it fails; `delete` `chat.workbench` (reason `chat_gone`) for a chat deleted during the upload; for a picture or a PDF, `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`), before the prepare is sent, and an `error` one (`reason`) if it fails |
+| `GET /api/chats/{id}/attachments/{attachment_id}` | `query` `chat.attachment`, after its wait | `attachment` [id], criteria `status` | — |
+| `GET /api/chats/{id}/attachments/{attachment_id}/preview` | `disclose` `file.preview` (`preview`), criteria `page` | `file` [id] | `error` child on failure |
 | `GET /api/chats/{id}/files/{file_id}` | `disclose` `file.download` (`download`) | `file` [id] | `error` child on failure |
 | `POST /api/transcribe` | `ai_call` `speech.transcribe` (`inference:asr`) | — | — |
+| start-up: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
-| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` | — |
+| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
 
 `/api/config`, `/api/whoami`, `/api/health` and `/metrics` are not audited. A
 refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records nothing.
@@ -53,6 +56,12 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
 - A failed upload records `disclose` `ok`, then `error`. A refusal after the
   hand-over leaves `collect` / `disclose` `ok` for an attachment without a row;
   the file stays in its chat's folder until the chat goes, or for 7 days.
+- A picture or a PDF is prepared after its upload has answered, so its
+  `workbench:prepare` child follows the upload's events, possibly after other
+  requests' events. A prepare whose hand-over cannot be written is not sent (the
+  attachment settles with the token `audit`, without a child). A prepare tried
+  again after a busy workbench is the same hand-over, recorded once. A chat
+  deleted meanwhile cancels the job: no `error` child follows.
 - A download cut off after its 200 keeps its `ok` event.
 - A sweep event names at most 200 ids. Its `cutoff` is the sweep's own time;
   `period_days` is the configured period, also during a notice.

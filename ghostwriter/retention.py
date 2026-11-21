@@ -13,7 +13,8 @@ Each batch of chats:
    by an answer or by its owner's delete, is left to the next sweep. Holding the turns, the sweep
    reads again what is due, so a chat deleted meanwhile is not named;
 2. records ``delete`` / ``retention.chat``: the chats, the period and the cutoff, the sweep's time;
-3. deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
+3. cancels the jobs that prepare the chats' attachments (:mod:`ghostwriter.processing`), then
+   deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
    under the batch's request id; a chat that never used workbench (no file mark) is not sent.
    After one timeout, workbench is not called again in this sweep, so a hung workbench holds
    it up once, not once per chat;
@@ -52,6 +53,7 @@ from loguru import logger
 from ghostwriter.audit import forward_headers, system_operation
 from ghostwriter.config import MAX_DAYS, Settings, load_settings
 from ghostwriter.db import utcnow
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, is_due, next_period_state
 from ghostwriter.store import CHATS_STORE, ChatStore
 from ghostwriter.turns import TurnRegistry
@@ -105,6 +107,8 @@ class Sweeper:
         settings: The chat and file periods, for the records.
         turns: The process's turn registry, whose turns the sweep holds while it deletes.
         now: The clock.
+        processor: The attachment processor, whose jobs of a due chat are cancelled before its
+            folder goes; ``None`` while workbench is off.
     """
 
     def __init__(
@@ -116,6 +120,7 @@ class Sweeper:
         settings: Settings,
         turns: TurnRegistry,
         now: Callable[[], datetime] = utcnow,
+        processor: AttachmentProcessor | None = None,
     ) -> None:
         """Keep what the sweep works with."""
         self._store = store
@@ -124,6 +129,7 @@ class Sweeper:
         self._settings = settings
         self._turns = turns
         self._now = now
+        self._processor = processor
         self._workbench_timed_out = False
 
     async def sweep(self) -> SweepReport:
@@ -197,7 +203,7 @@ class Sweeper:
                     self._turns.end(chat_id, claim)
 
     async def _delete_chats(self, batch: Sequence[tuple[str, str]], now: datetime, report: SweepReport) -> None:
-        """Record a batch of due chats, delete their folders in workbench, then their rows.
+        """Record a batch of due chats, cancel their attachment jobs, delete their workbench folders, then their rows.
 
         Args:
             batch: Each chat's id and owner, its turn held.
@@ -213,6 +219,9 @@ class Sweeper:
                 criteria={"period_days": self._settings.chat_days, "cutoff": _iso(now)},
             )
         )
+        if self._processor is not None:
+            for chat_id in ids:
+                self._processor.cancel_chat(chat_id)
         used = set() if self._workbench is None else await anyio.to_thread.run_sync(self._store.workbench_chats, ids)
         if self._workbench is None:
             child = partial(op.child, "delete", WORKBENCH_DELETE, criteria={"workbench": "not_configured"})
