@@ -85,6 +85,8 @@ export const de: Strings = {
   'trail.list_files': 'Dateien aufgelistet',
   'trail.read_document': '{detail} gelesen',
   'trail.read_document_unnamed': 'Ein Dokument gelesen',
+  'trail.view_file': '{detail} angesehen',
+  'trail.view_file_unnamed': 'Eine Datei angesehen',
   'trail.search_files': 'Nach {detail} gesucht',
   'trail.search_files_unnamed': 'Dateien durchsucht',
   'trail.run_python': 'Python ausgeführt',

@@ -132,6 +132,32 @@ describe('Trail', () => {
     ])
   })
 
+  it('names view_file steps, and a file whose name has expired, in both languages', async () => {
+    const user = userEvent.setup()
+    const steps = [
+      step({ id: 'v1', tool: 'view_file', detail: 'quay-scan.pdf' }),
+      step({ id: 'v2', tool: 'view_file', detail: null, expired: true }),
+    ]
+    const { unmount } = render(<Trail steps={steps} fileDays={7} />)
+    await user.click(screen.getByRole('button', { name: '2 steps' }))
+    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'Looked at quay-scan.pdf',
+      expect.stringMatching(/^Looked at a file/),
+    ])
+    unmount()
+
+    render(
+      <LanguageContext value="de">
+        <Trail steps={steps} fileDays={7} />
+      </LanguageContext>,
+    )
+    await user.click(screen.getByRole('button', { name: '2 Schritte' }))
+    expect(screen.getAllByRole('listitem').map((item) => item.textContent)).toEqual([
+      'quay-scan.pdf angesehen',
+      expect.stringMatching(/^Eine Datei angesehen/),
+    ])
+  })
+
   it('opens from the keyboard, as the buttons its texts are', async () => {
     const user = userEvent.setup()
     render(<Trail steps={[CODE]} fileDays={7} />)

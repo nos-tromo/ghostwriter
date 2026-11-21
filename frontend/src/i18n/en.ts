@@ -82,6 +82,8 @@ export const en = {
   'trail.list_files': 'Listed the files',
   'trail.read_document': 'Read {detail}',
   'trail.read_document_unnamed': 'Read a document',
+  'trail.view_file': 'Looked at {detail}',
+  'trail.view_file_unnamed': 'Looked at a file',
   'trail.search_files': 'Searched for {detail}',
   'trail.search_files_unnamed': 'Searched the files',
   'trail.run_python': 'Ran Python',

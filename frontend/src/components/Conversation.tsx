@@ -149,7 +149,7 @@ export function Conversation({
               onRegenerate={message.id === lastAnswer ? () => void stream.regenerate(reasoning) : undefined}
             />
           ))}
-          {stream.pendingUser !== null && <PendingUser message={stream.pendingUser} />}
+          {stream.pendingUser !== null && <PendingUser chatId={chatId} message={stream.pendingUser} />}
           {stream.draft && <DraftView chatId={chatId} draft={stream.draft} fileDays={fileDays} />}
           <NoticeLine notices={notices} />
           {failure && <FailureLine failure={failure} />}
