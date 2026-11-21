@@ -25,7 +25,7 @@ from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
 from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
-from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings
+from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings, unrecorded_child
 from tests.fakes import TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, stock_manifest
 
 MIB = 1024 * 1024
@@ -908,21 +908,58 @@ def test_a_chat_deleted_while_preparing_cancels_the_job(
 ) -> None:
     """The delete does not wait for workbench's prepare: it cancels the job, which writes nothing, and the folder goes.
 
-    The prepare takes 3 s; the job ends within 1.5 s of the delete only because it was cancelled.
+    The prepare takes 5 s; the job ends within 3 s of the delete only because it was cancelled.
     """
-    door.delays["/files/prepare"] = 3.0
+    door.delays["/files/prepare"] = 5.0
     cid = _new(seeing)
     photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
     processor = _state(seeing).processor
     _wait_until(lambda: bool(_prepares(door)))
     started = time.monotonic()
     r = seeing.delete(f"/api/chats/{cid}", headers=as_user())
-    assert r.status_code == 204 and time.monotonic() - started < 1.5
-    _wait_until(lambda: not processor.running(photo["id"]), timeout_s=1.5)
+    assert r.status_code == 204 and time.monotonic() - started < 3
+    _wait_until(lambda: not processor.running(photo["id"]), timeout_s=3)
     assert door.last("/files/chat").headers["x-session-id"] == session_pseudonym(KEY, cid)
     assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
     assert [record for record in loguru_caplog.records if record.levelno >= logging.ERROR] == []
     assert _state(seeing).store.find_attachment("user-a", cid, photo["id"]) is None
+
+
+@pytest.mark.parametrize(
+    ("failure", "answer"),
+    [
+        ("workbench", (502, {"detail": "The chat's files could not be deleted; try again."})),
+        ("audit", (500, {"detail": "Request failed."})),
+    ],
+)
+def test_a_failed_delete_prepares_the_chats_pictures_again(
+    seeing: TestClient,
+    door: FakeDoor,
+    audit_stream: CapturedAuditStream,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    answer: tuple[int, dict[str, str]],
+) -> None:
+    """The delete cancelled the job, then failed and kept the chat: its picture is prepared again, as at start.
+
+    Without that, the picture would stay processing with no job, and every message carrying it would get 409.
+    """
+    door.delays["/files/prepare"] = 1.5
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    _wait_until(lambda: bool(_prepares(door)))
+    if failure == "workbench":
+        door.answers["/files/chat"] = lambda folder: httpx.Response(503, json={"detail": "busy, retry later"})
+    else:
+        unrecorded_child(monkeypatch, "chat.workbench")
+    r = seeing.delete(f"/api/chats/{cid}", headers=as_user())
+    assert (r.status_code, r.json()) == answer
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    assert len(_prepares(door)) == 2
+    handed = [e for e in events(audit_stream) if (e["action"], e["operation"]) == ("disclose", "chat.attachment")]
+    assert [(e["actor"], e.get("parent_event_id"), e["criteria"]) for e in handed[2:]] == [
+        (SYSTEM, None, {"kind": "image", "requeued": True})
+    ]
 
 
 def test_processing_attachments_are_prepared_again_at_start(

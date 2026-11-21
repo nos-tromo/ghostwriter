@@ -241,3 +241,21 @@ async def test_an_unexpected_failure_still_settles_the_attachment(
     assert _prepares(env.door) == []
     assert _status(env, job) == ("failed", "error")
     assert "RuntimeError" in loguru_caplog.text and "harbour-photo" not in loguru_caplog.text
+
+
+async def test_a_chat_whose_delete_failed_is_prepared_again(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """After cancel_chat, requeue_chat awaits the cancelled job, then starts one new job per processing attachment."""
+    env.door.delays["/files/prepare"] = 0.5
+    job = _job(env)
+    env.processor.submit(job)
+    with anyio.fail_after(5):
+        while not _prepares(env.door):
+            await anyio.sleep(0.01)
+    assert env.processor.cancel_chat(env.chat_id) == 1
+    assert await env.processor.requeue_chat(env.chat_id) == 1
+    assert await env.processor.requeue_chat(env.chat_id) == 0
+    await env.processor.wait(job.attachment_id, 5)
+    assert _status(env, job) == ("ready", None)
+    assert len(_prepares(env.door)) == 2
+    handed = [e for e in events(audit_stream) if e["operation"] == "chat.attachment"]
+    assert [e["criteria"] for e in handed] == [{"kind": "image", "requeued": True}] * 2

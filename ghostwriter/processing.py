@@ -18,7 +18,9 @@ again (:meth:`AttachmentProcessor.requeue`); its hand-over is then a primary of 
 A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and so does the sweep's. Each
 job runs in its own cancel scope, and a store or audit call in progress finishes on its worker thread
 before the cancel takes effect: a cancelled job settles and records nothing more, and none of it writes
-after :meth:`AttachmentProcessor.aclose` has returned. Store and audit calls never run on the event loop.
+after :meth:`AttachmentProcessor.aclose` has returned. A delete that fails after its cancel keeps the
+chat, so its ``processing`` attachments are prepared again as at start
+(:meth:`AttachmentProcessor.requeue_chat`). Store and audit calls never run on the event loop.
 Logs carry the attachment's id, its kind and a token, never a name or a path.
 """
 
@@ -33,7 +35,7 @@ import anyio.to_thread
 from loguru import logger
 
 from ghostwriter.audit import Operation, forward_headers, system_operation
-from ghostwriter.store import ChatNotFound, ChatStore
+from ghostwriter.store import AttachmentRef, ChatNotFound, ChatStore
 from ghostwriter.utils.audit_event import AuditEmitter, Target
 from ghostwriter.workbench import CallFor, Manifest, StorageFull, WorkbenchClient, WorkbenchUnavailable
 
@@ -71,6 +73,19 @@ class PrepareJob:
     op: Operation | None
 
 
+def _requeued(ref: AttachmentRef) -> PrepareJob:
+    """Return the job of an attachment left ``processing``, whose hand-over is the system's.
+
+    Args:
+        ref: The attachment.
+
+    Returns:
+        Its job, with no request's operation.
+    """
+    kind: Literal["document", "image"] = "image" if ref.kind == "image" else "document"
+    return PrepareJob(ref.id, ref.chat_id, ref.owner, ref.path, kind, None)
+
+
 @dataclass(frozen=True)
 class _Running:
     """A job, the scope that cancels it and its task."""
@@ -106,7 +121,7 @@ class AttachmentProcessor:
         Args:
             job: The attachment.
         """
-        if self._closed or job.attachment_id in self._running:
+        if self._closed or self.running(job.attachment_id):
             return
         scope = anyio.CancelScope()
         task = asyncio.get_running_loop().create_task(self._run(job, scope))
@@ -122,7 +137,8 @@ class AttachmentProcessor:
         Returns:
             Whether it has.
         """
-        return attachment_id in self._running
+        running = self._running.get(attachment_id)
+        return running is not None and not running.task.done()
 
     async def wait(self, attachment_id: str, timeout_s: float) -> None:
         """Wait until the attachment's job ends, at most ``timeout_s``.
@@ -166,11 +182,44 @@ class AttachmentProcessor:
         """
         stranded = self._store.processing_attachments()
         for ref in stranded:
-            kind: Literal["document", "image"] = "image" if ref.kind == "image" else "document"
-            self.submit(PrepareJob(ref.id, ref.chat_id, ref.owner, ref.path, kind, None))
+            self.submit(_requeued(ref))
         if stranded:
             logger.info("{} attachments left processing are prepared again.", len(stranded))
         return len(stranded)
+
+    async def requeue_chat(self, chat_id: str) -> int:
+        """Prepare again a chat's ``processing`` attachments, once its delete failed after :meth:`cancel_chat`.
+
+        The chat's cancelled jobs are awaited first, so no attachment has two jobs; a job of the chat that
+        was not cancelled goes on as it is. Each new job is requeued as at start (``op=None``). On the event
+        loop; never raises, a failure to read the store is logged by its type.
+
+        Args:
+            chat_id: The chat, still there.
+
+        Returns:
+            How many jobs were started.
+        """
+        cancelled = [
+            running.task
+            for running in self._running.values()
+            if running.job.chat_id == chat_id and running.scope.cancel_called
+        ]
+        if cancelled:
+            await asyncio.gather(*cancelled, return_exceptions=True)
+        if self._closed:
+            return 0
+        try:
+            stranded = await anyio.to_thread.run_sync(self._store.processing_attachments)
+        except Exception as exc:
+            logger.warning("A chat's attachments could not be prepared again: {}", type(exc).__name__)
+            return 0
+        started = [ref for ref in stranded if ref.chat_id == chat_id and not self.running(ref.id)]
+        for ref in started:
+            self.submit(_requeued(ref))
+        if started:
+            logger.info("{} attachments of a chat whose delete failed are prepared again.", len(started))
+        return len(started)
 
     async def aclose(self) -> None:
         """Cancel every job and wait until each has ended, its store or audit call in progress included."""
@@ -315,7 +364,7 @@ class AttachmentProcessor:
             )
             return "error"
         try:
-            await anyio.to_thread.run_sync(
+            settled = await anyio.to_thread.run_sync(
                 partial(
                     self._store.settle_attachment,
                     job.attachment_id,
@@ -332,7 +381,10 @@ class AttachmentProcessor:
                 type(exc).__name__,
             )
             return "bad_answer" if isinstance(exc, TypeError | ValueError) else "error"
-        logger.debug("Attachment '{}' ({}) is ready: {} pages.", job.attachment_id, job.kind, manifest.total)
+        if settled:
+            logger.debug("Attachment '{}' ({}) is ready: {} pages.", job.attachment_id, job.kind, manifest.total)
+        else:
+            logger.debug("Attachment '{}' ({}) was prepared; its row is gone or settled.", job.attachment_id, job.kind)
         return None
 
     async def _ask(self, call: CallFor, path: str) -> Manifest:
@@ -373,5 +425,12 @@ class AttachmentProcessor:
             settle = partial(
                 self._store.settle_attachment, job.attachment_id, status="ready", manifest=None, failure=None
             )
-        await anyio.to_thread.run_sync(settle)
-        logger.info("Attachment '{}' ({}) was not prepared: {}", job.attachment_id, job.kind, token)
+        if await anyio.to_thread.run_sync(settle):
+            logger.info("Attachment '{}' ({}) was not prepared: {}", job.attachment_id, job.kind, token)
+        else:
+            logger.debug(
+                "Attachment '{}' ({}) was not prepared: {}; its row is gone or settled.",
+                job.attachment_id,
+                job.kind,
+                token,
+            )

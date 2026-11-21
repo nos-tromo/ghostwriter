@@ -38,7 +38,7 @@ collects. Start-up writes `admin` / `config.audit` with the operating mode.
 | `GET /api/chats/{id}/attachments/{attachment_id}/preview` | `disclose` `file.preview` (`preview`), criteria `page` | `file` [id] | `error` child on failure |
 | `GET /api/chats/{id}/files/{file_id}` | `disclose` `file.download` (`download`) | `file` [id] | `error` child on failure |
 | `POST /api/transcribe` | `ai_call` `speech.transcribe` (`inference:asr`) | — | — |
-| start-up: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails |
+| start-up, or a chat delete that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
 | the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
 
@@ -61,7 +61,10 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
   requests' events. A prepare whose hand-over cannot be written is not sent (the
   attachment settles with the token `audit`, without a child). A prepare tried
   again after a busy workbench is the same hand-over, recorded once. A chat
-  deleted meanwhile cancels the job: no `error` child follows.
+  deleted meanwhile cancels the job: no `error` child follows. If that delete
+  then fails (a 502, or a record that cannot be written) or a sweep batch does,
+  the chat stays and its `processing` attachments are handed over again, as at
+  start-up (`requeued`).
 - A download cut off after its 200 keeps its `ok` event.
 - A sweep event names at most 200 ids. Its `cutoff` is the sweep's own time;
   `period_days` is the configured period, also during a notice.

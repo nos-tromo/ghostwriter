@@ -16,6 +16,7 @@ Each batch of chats:
 3. cancels the jobs that prepare the chats' attachments (:mod:`ghostwriter.processing`), then
    deletes each chat's folder in workbench, as the system, for the reason ``ghostwriter chat``,
    under the batch's request id; a chat that never used workbench (no file mark) is not sent.
+   A batch that fails after the cancel keeps its chats, and their attachments are prepared again.
    After one timeout, workbench is not called again in this sweep, so a hung workbench holds
    it up once, not once per chat;
 4. records the child ``delete`` / ``retention.chat.workbench``: the files workbench deleted, the
@@ -50,7 +51,7 @@ from typing import Final
 import anyio.to_thread
 from loguru import logger
 
-from ghostwriter.audit import forward_headers, system_operation
+from ghostwriter.audit import Operation, forward_headers, system_operation
 from ghostwriter.config import MAX_DAYS, Settings, load_settings
 from ghostwriter.db import utcnow
 from ghostwriter.processing import AttachmentProcessor
@@ -219,9 +220,26 @@ class Sweeper:
                 criteria={"period_days": self._settings.chat_days, "cutoff": _iso(now)},
             )
         )
-        if self._processor is not None:
-            for chat_id in ids:
-                self._processor.cancel_chat(chat_id)
+        cancelled = [] if self._processor is None else [c for c in ids if self._processor.cancel_chat(c)]
+        try:
+            await self._delete_folders_then_rows(op, batch, report)
+        except Exception:
+            if self._processor is not None:
+                for chat_id in cancelled:
+                    await self._processor.requeue_chat(chat_id)
+            raise
+
+    async def _delete_folders_then_rows(
+        self, op: Operation, batch: Sequence[tuple[str, str]], report: SweepReport
+    ) -> None:
+        """Delete a recorded batch's folders in workbench, record how that went, then delete its rows.
+
+        Args:
+            op: The batch's ``retention.chat`` operation, its primary written.
+            batch: Each chat's id and owner, its turn held.
+            report: What the sweep did, counted on.
+        """
+        ids = tuple(chat_id for chat_id, _ in batch)
         used = set() if self._workbench is None else await anyio.to_thread.run_sync(self._store.workbench_chats, ids)
         if self._workbench is None:
             child = partial(op.child, "delete", WORKBENCH_DELETE, criteria={"workbench": "not_configured"})

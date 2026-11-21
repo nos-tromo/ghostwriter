@@ -23,7 +23,7 @@ from typing_extensions import override
 from ghostwriter.audit import Operation, audited
 from ghostwriter.config import Settings, load_settings
 from ghostwriter.main import create_app
-from ghostwriter.utils.audit_event import verify_chain
+from ghostwriter.utils.audit_event import AuditWriteError, verify_chain
 
 #: The edge secret of the test gateway, as long as the backend requires.
 SECRET = "s" * 32
@@ -61,6 +61,23 @@ def as_user(name: str = "user-a") -> dict[str, str]:
         dict[str, str]: ``X-Auth-User`` and the matching ``X-Edge-Secret``.
     """
     return {"X-Auth-User": name, "X-Edge-Secret": SECRET}
+
+
+def unrecorded_child(monkeypatch: pytest.MonkeyPatch, operation: str) -> None:
+    """Make every child event named ``operation`` fail to be written, as a broken stream would; others are written.
+
+    Args:
+        monkeypatch: The test's patcher, which undoes this at teardown.
+        operation: The child's operation name, such as ``chat.workbench``.
+    """
+    original = Operation.child
+
+    def child(self: Operation, action: str, name: str, **fields: Any) -> str:
+        if name == operation:
+            raise AuditWriteError("synthetic audit stream failure")
+        return original(self, action, name, **fields)
+
+    monkeypatch.setattr(Operation, "child", child)
 
 
 class CapturedAuditStream(io.StringIO):

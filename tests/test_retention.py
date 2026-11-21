@@ -35,6 +35,7 @@ from ghostwriter.retention import (
     FIRST_SWEEP_DELAY_S,
     SWEEP_BATCH,
     SWEEP_INTERVAL_S,
+    WORKBENCH_DELETE,
     Sweeper,
     SweepReport,
     dry_run,
@@ -46,7 +47,7 @@ from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError
 from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import WorkbenchClient, chat_folder, session_pseudonym, user_pseudonym
-from tests.conftest import KEY, CapturedAuditStream, events, make_settings
+from tests.conftest import KEY, CapturedAuditStream, events, make_settings, unrecorded_child
 from tests.fakes import FakeDoor, stock_manifest
 
 DAY = timedelta(days=1)
@@ -424,6 +425,52 @@ async def test_a_due_chats_attachment_jobs_are_cancelled_before_its_folder_goes(
         await processor.wait(photo.id, 5)
         assert (left, processor.running(photo.id), env.has_rows(cid)) == ([0], False, False)
         assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+    finally:
+        await processor.aclose()
+
+
+async def test_a_failed_sweep_batch_prepares_its_chats_pictures_again(
+    settled: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The batch cancelled the picture's job, then its record failed and the chat stayed: it is prepared again."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    path = f"{chat_folder(KEY, cid)}/harbour-photo.jpg"
+    env.door.manifests[path] = stock_manifest(path)
+    env.door.delays["/files/prepare"] = 1.0
+    photo = env.store.add_attachment(
+        cid,
+        file_id="b" * 32,
+        path=path,
+        name="harbour-photo.jpg",
+        size=64,
+        mime="image/jpeg",
+        kind="image",
+        status="processing",
+    )
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    sweeper = Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+    unrecorded_child(monkeypatch, WORKBENCH_DELETE)
+    try:
+        processor.submit(PrepareJob(photo.id, cid, "user-a", path, "image", None))
+        with anyio.fail_after(5):
+            while not [r for r, _ in env.door.requests if r.url.path == "/files/prepare"]:
+                await anyio.sleep(0.01)
+        with pytest.raises(AuditWriteError):
+            await sweeper.sweep()
+        assert env.has_rows(cid) and processor.running(photo.id)
+        await processor.wait(photo.id, 5)
+        found = env.store.find_attachment("user-a", cid, photo.id)
+        assert found is not None and found.status == "ready"
+        assert len([r for r, _ in env.door.requests if r.url.path == "/files/prepare"]) == 2
     finally:
         await processor.aclose()
 
