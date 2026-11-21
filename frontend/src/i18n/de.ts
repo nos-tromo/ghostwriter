@@ -2,7 +2,7 @@ import type { Strings } from './index'
 
 export const de: Strings = {
   // the page
-  'app.title': 'Ghostwriter · Chatassistent',
+  'app.title': 'Ghostwriter',
 
   // appheader
   'appheader.home': 'Übersicht',
