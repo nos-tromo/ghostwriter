@@ -835,7 +835,7 @@ def test_the_dry_run_counts_and_changes_nothing(settled: Env, audit_stream: Capt
     out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
     assert out == (
         "chats due now: 2 (started 95 to 120 days ago; period 90 days, in force since 2026-11-16)\n"
-        "tool contents due now: 2 steps, 1 preview (made 8 to 30 days ago; period 7 days)\n"
+        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)\n"
         "This run deletes nothing."
     )
     assert "chats due now: 2" in out
@@ -844,6 +844,33 @@ def test_the_dry_run_counts_and_changes_nothing(settled: Env, audit_stream: Capt
     for secret in (*chat_ids, "user-a", "Q3 Zahlen", "Umsatz 42", "sums.xlsx"):
         assert secret not in out
     assert _files(env) == files and len(events(audit_stream)) == before
+
+
+async def test_the_dry_run_counts_the_manifests_a_sweep_would_empty(settled: Env) -> None:
+    """A due manifest of a kept chat counts, a live one and a due chat's do not; the sweep then empties as many."""
+    env = settled
+    _scan(env, NOW - 8 * DAY)
+    _scan(env, NOW - DAY)
+    _scan(env, NOW - 100 * DAY)
+    files = _files(env)
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert (
+        out.splitlines()[1] == "tool contents due now: 0 steps, 0 previews, 1 manifest (made 8 days ago; period 7 days)"
+    )
+    assert _files(env) == files
+    assert (await env.sweeper.sweep()).manifests == 1
+
+
+def test_the_dry_run_reads_a_file_from_before_manifests(settled: Env) -> None:
+    """A file of schema 1 has no ``render`` column: the run still reports, with no manifests."""
+    env = settled
+    _scenario(env)
+    with env.engine.begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE attachments DROP COLUMN render")
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert out.splitlines()[1] == (
+        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)"
+    )
 
 
 def test_the_dry_run_previews_another_period(settled: Env) -> None:
@@ -860,7 +887,7 @@ def test_the_dry_run_previews_another_period(settled: Env) -> None:
     out = dry_run(env.settings.db_path, chat_days=None, file_days=7, notice_days=30, now=NOW)
     assert out.splitlines()[:2] == [
         "chats due now: 0 (chat retention is off)",
-        "tool contents due now: 3 steps, 2 previews (made 8 to 120 days ago; period 7 days)",
+        "tool contents due now: 3 steps, 2 previews, 0 manifests (made 8 to 120 days ago; period 7 days)",
     ]
 
 

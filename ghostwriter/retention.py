@@ -386,7 +386,9 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
 
     The chats are counted under ``chat_days`` as a start with it would put it in force: the
     period recorded, or another one previewed, with the notice a new or shorter period gives.
-    The contents are counted by the deadlines the store holds, leaving out those of due chats.
+    The contents are counted by the deadlines the store holds, leaving out those of due chats:
+    the steps, the previews and the attachments' manifests, which go at the file period. A file
+    of the schema before 2 has no manifests, and counts none.
 
     Args:
         db_path: The SQLite file, opened read-only.
@@ -413,6 +415,9 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
             "SELECT m.chat_id, r.created_at, r.preview_expires_at FROM results AS r"
             " JOIN messages AS m ON m.id = r.message_id WHERE r.preview IS NOT NULL"
         ).fetchall()
+        manifests: list[tuple[str, str]] = []
+        if any(column[1] == "render" for column in conn.execute("PRAGMA table_info(attachments)")):
+            manifests = conn.execute("SELECT chat_id, created_at FROM attachments WHERE render IS NOT NULL").fetchall()
     if chat_days is None:
         lines, due = ["chats due now: 0 (chat retention is off)"], set()
     else:
@@ -421,9 +426,16 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
     def expired(rows: list[tuple[str, str, str]]) -> list[datetime]:
         return [_aware(made) for chat_id, made, deadline in rows if chat_id not in due and _aware(deadline) <= now]
 
+    file_period = file_days * DAY
     made_steps, made_previews = expired(steps), expired(previews)
-    counts = f"{_counted(len(made_steps), 'step')}, {_counted(len(made_previews), 'preview')}"
-    ages = _ages("made", made_steps + made_previews, now)
+    made_manifests = [
+        made for chat_id, stored in manifests if chat_id not in due and (made := _aware(stored)) + file_period <= now
+    ]
+    counts = (
+        f"{_counted(len(made_steps), 'step')}, {_counted(len(made_previews), 'preview')}, "
+        f"{_counted(len(made_manifests), 'manifest')}"
+    )
+    ages = _ages("made", made_steps + made_previews + made_manifests, now)
     lines.append(f"tool contents due now: {counts} ({ages}period {_counted(file_days, 'day')})")
     lines.append("This run deletes nothing.")
     return "\n".join(lines)
