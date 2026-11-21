@@ -96,7 +96,7 @@ IMAGE_SIGNATURES: Final = {"image/jpeg": b"\xff\xd8\xff", "image/png": b"\x89PNG
 MAX_IMAGE_BYTES: Final = 1024 * 1024
 MAX_IMAGES_BYTES: Final = 3 * 1024 * 1024
 MAX_TOOL_IMAGES: Final = 8
-#: The largest rendition fetched.
+#: A rendition fetched must be smaller than this.
 MAX_RENDITION_BYTES: Final = 768 * 1024
 #: Seconds a prepare is waited for: workbench's 120 s of queue, its 120 s wall and 30 s.
 PREPARE_TIMEOUT_S: Final = 270.0
@@ -869,7 +869,7 @@ async def _refusal_token(response: httpx.Response) -> str:
 
     Returns:
         The token, such as ``unreadable_file``; ``http:<status>`` when the body is no JSON object
-        with a ``detail`` text that starts with one, or is longer than :data:`_MAX_REFUSAL_BYTES`.
+        with a ``detail`` text that starts with one and a ``:``, or is longer than :data:`_MAX_REFUSAL_BYTES`.
     """
     fallback = f"http:{response.status_code}"
     raw = bytearray()
@@ -882,8 +882,8 @@ async def _refusal_token(response: httpx.Response) -> str:
     except (ValueError, RecursionError):
         return fallback
     detail = body.get("detail") if isinstance(body, dict) else None
-    head = detail.split(":", 1)[0] if isinstance(detail, str) else ""
-    return head if _TOKEN.fullmatch(head) else fallback
+    head, colon, _ = detail.partition(":") if isinstance(detail, str) else ("", "", "")
+    return head if colon and _TOKEN.fullmatch(head) else fallback
 
 
 def _rendition(entry: object) -> Rendition | None:
@@ -959,7 +959,7 @@ async def _picture(response: httpx.Response) -> tuple[str, bytes] | None:
         response: The streamed answer.
 
     Returns:
-        Its media type and bytes when it is ``200``, a jpeg or png of at most :data:`MAX_RENDITION_BYTES` that starts
+        Its media type and bytes when it is ``200``, a jpeg or png under :data:`MAX_RENDITION_BYTES` that starts
         as its type does; else ``None``. The stream is cut at the cap.
     """
     if response.status_code != 200:
@@ -971,7 +971,7 @@ async def _picture(response: httpx.Response) -> tuple[str, bytes] | None:
     raw = bytearray()
     async for chunk in response.aiter_bytes():
         raw += chunk
-        if len(raw) > MAX_RENDITION_BYTES:
+        if len(raw) >= MAX_RENDITION_BYTES:
             return None
     return (mime, bytes(raw)) if raw.startswith(signature) else None
 
@@ -1456,7 +1456,7 @@ class WorkbenchClient:
         """Fetch several renditions at once, for a turn's thread. Never raises.
 
         One exchange within :data:`RENDITION_TIMEOUT_S`, over one client, all the requests together.
-        A picture counts only when workbench answered ``200`` with a jpeg or png of at most
+        A picture counts only when workbench answered ``200`` with a jpeg or png under
         :data:`MAX_RENDITION_BYTES` that starts as its type does.
 
         Args:
@@ -1465,7 +1465,8 @@ class WorkbenchClient:
 
         Returns:
             One entry for each of ``wanted``, in order: the media type and bytes, or ``None`` for a
-            picture outside the chat's folder, not there, not whole, or not in time.
+            picture outside the chat's folder, not there, not whole, not in time, or asked for with a
+            ``strips`` past 1 and no ``strip``.
         """
         found: list[tuple[str, bytes] | None] = [None] * len(wanted)
         key = self._key()
@@ -1516,8 +1517,8 @@ class WorkbenchClient:
             item: The request.
             headers: The chat's headers.
         """
-        params = _view_params(item.path, item.n, item.strips, item.strip)
         try:
+            params = _view_params(item.path, item.n, item.strips, item.strip)
             async with client.stream("GET", "/files/view", params=params, headers=headers) as response:
                 found[index] = await _picture(response)
         except Exception:

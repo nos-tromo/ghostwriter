@@ -12,7 +12,7 @@ import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, cast
 
 import anyio
 import httpx
@@ -932,6 +932,7 @@ async def test_prepare_asks_for_strips_only_past_one() -> None:
         (httpx.Response(422, json={"detail": "unsupported_format: .xyz"}), WorkbenchUnavailable, "unsupported_format"),
         (httpx.Response(422, json={"detail": "read_timeout: 90 s"}), WorkbenchUnavailable, "read_timeout"),
         (httpx.Response(422, json={"detail": "the file could not be processed: x"}), WorkbenchUnavailable, "http:422"),
+        (httpx.Response(422, json={"detail": "unreadable_file"}), WorkbenchUnavailable, "http:422"),
         (httpx.Response(422, json={"detail": [{"loc": ["query", "path"]}]}), WorkbenchUnavailable, "http:422"),
         (httpx.Response(422, text="not json"), WorkbenchUnavailable, "http:422"),
         (httpx.Response(428, json={"detail": "purpose"}), WorkbenchUnavailable, "http:428"),
@@ -946,6 +947,7 @@ async def test_prepare_asks_for_strips_only_past_one() -> None:
         "unsupported",
         "read_timeout",
         "sentence",
+        "no_colon",
         "validation_list",
         "not_json",
         "no_purpose",
@@ -956,7 +958,10 @@ async def test_prepare_asks_for_strips_only_past_one() -> None:
     ],
 )
 async def test_prepare_maps_workbenchs_refusals(answer: object, error: type[Exception], token: str | None) -> None:
-    """404 is not found, 507 a full store, a 422's token the text before its colon, any other status http:<status>."""
+    """404 is not found, 507 a full store, a 422's token the text before its colon, any other status http:<status>.
+
+    A 422 detail without a colon names no token, however token-like it reads.
+    """
     door = FakeDoor()
     door.files[PDF] = (b"%PDF", "application/pdf")
     door.answers["/files/prepare"] = answer
@@ -1097,6 +1102,11 @@ def test_a_rendition_asks_for_its_strip() -> None:
         httpx.Response(200, content=TINY_JPEG, headers={"Content-Type": "image/png"}),
         httpx.Response(200, content=b"", headers={"Content-Type": "image/png"}),
         httpx.Response(200, content=TINY_JPEG + bytes(MAX_RENDITION_BYTES), headers={"Content-Type": "image/jpeg"}),
+        httpx.Response(
+            200,
+            content=TINY_JPEG + bytes(MAX_RENDITION_BYTES - len(TINY_JPEG)),
+            headers={"Content-Type": "image/jpeg"},
+        ),
         httpx.Response(404, json=NOT_FOUND),
         httpx.Response(503, json={"detail": "busy, retry later"}),
         httpx.ConnectError("connection refused"),
@@ -1109,6 +1119,7 @@ def test_a_rendition_asks_for_its_strip() -> None:
         "jpeg_as_png",
         "empty",
         "past_768_kib",
+        "at_768_kib",
         "gone",
         "busy",
         "unreachable",
@@ -1116,16 +1127,16 @@ def test_a_rendition_asks_for_its_strip() -> None:
     ],
 )
 def test_a_rendition_that_is_not_a_whole_picture_is_none(answer: object) -> None:
-    """Not 200, not a jpeg or png, past 768 KiB, or without the signature of its type: None."""
+    """Not 200, not a jpeg or png, 768 KiB or more, or without the signature of its type: None."""
     door = FakeDoor()
     door.files[PHOTO] = (b"\xff\xd8\xff", "image/jpeg")
     door.answers["/files/view"] = answer
     assert _renditions(_client(door), RenditionRequest(PHOTO)) == [None]
 
 
-def test_a_png_rendition_of_at_most_768_kib_is_kept() -> None:
-    """A png under its own type is accepted, up to the cap."""
-    data = TINY_PNG + bytes(MAX_RENDITION_BYTES - len(TINY_PNG))
+def test_a_png_rendition_under_768_kib_is_kept() -> None:
+    """A png under its own type is accepted, a byte under the cap."""
+    data = TINY_PNG + bytes(MAX_RENDITION_BYTES - 1 - len(TINY_PNG))
     door = FakeDoor()
     door.files[PHOTO] = (b"x", "image/jpeg")
     door.answers["/files/view"] = httpx.Response(
@@ -1160,6 +1171,32 @@ def test_fetch_renditions_never_raises(fault: str) -> None:
 
     client = WorkbenchClient(CFG, transport=httpx.MockTransport(boom))
     assert _renditions(client, RenditionRequest(PHOTO), RenditionRequest(PHOTO, n=2)) == [None, None]
+
+
+def test_fetch_renditions_never_raises_when_the_exchange_itself_fails(
+    monkeypatch: pytest.MonkeyPatch, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failure outside any one request, here the exchange itself, gives None for every rendition and one warning."""
+
+    async def broken(*args: object) -> None:
+        raise RuntimeError("exchange broke")
+
+    monkeypatch.setattr(WorkbenchClient, "_fetch_renditions", broken)
+    door = FakeDoor()
+    door.files[PHOTO] = (b"x", "image/jpeg")
+    assert _renditions(_client(door), RenditionRequest(PHOTO), RenditionRequest(PHOTO, n=2)) == [None, None]
+    assert "workbench renditions raised RuntimeError" in loguru_caplog.text
+
+
+def test_a_malformed_rendition_request_fails_alone(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """A request whose strips name no strip is None, unsent; the others of the fetch, still in flight, come."""
+    door = FakeDoor()
+    door.files[PHOTO] = (b"x", "image/jpeg")
+    door.delays["/files/view"] = 0.05
+    malformed = RenditionRequest(PHOTO, 1, strips=2, strip=cast(int, None))
+    assert _renditions(_client(door), malformed, RenditionRequest(PHOTO)) == [None, ("image/jpeg", TINY_JPEG)]
+    assert [dict(r.url.params) for r, _ in door.requests] == [{"path": PHOTO, "rendition": "1"}]
+    assert "renditions raised" not in loguru_caplog.text
 
 
 def test_a_rendition_fetch_is_given_up_at_its_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
