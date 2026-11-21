@@ -44,7 +44,7 @@ Logs hold ids, counts, statuses and tokens only.
 | The router, speech-to-text | the recording | the same |
 | workbench `/mcp` | tool arguments; results back, with the pages or pictures a tool shows | `X-User-Id` and `X-Session-Id`: HMAC-SHA256 of the account and of the chat id under `WORKBENCH_API_KEY`; the purpose (or `ghostwriter chat`), `X-Request-ID`; `X-Accept-Images: 1` on the discovery of the listing for images, and on a turn's calls only while it sees |
 | workbench `/files/upload`, `/files/view` | an attachment's bytes, a download's bytes | the same |
-| workbench `POST /files/prepare` | the path of a picture or a PDF in the chat's folder, and with a fixed image cost `strips=2` for a large picture; the manifest back | the same |
+| workbench `POST /files/prepare` | the path of a picture, a PDF or an Office file in the chat's folder, and with a fixed image cost `strips=2` for a large picture; the manifest back | the same |
 | workbench `GET /files/view?rendition=` | the number of a page or picture; its render back, for a message's model call or for the owner's preview | the same |
 | Ollama `POST /api/show`, on the router's host | the chat model's name only, once at start; only with `INFERENCE_PROVIDER=ollama` and pictures on | the router's key |
 | workbench `DELETE /files/chat` | the chat's folder, on the owner's delete, the sweep, or an upload into a chat deleted meanwhile | the same; the sweep as the system |
@@ -62,7 +62,7 @@ is offered the listing without the header, whose `read_document` promises no
 image, and its calls carry none; so does every round after the model refused
 pictures.
 
-## A picture or a PDF, after its upload
+## A picture, a PDF or an Office file, after its upload
 
 While pictures are offered, a picture or a PDF is stored `processing` and its
 upload answers at once. The attachment processor (`ghostwriter/processing.py`,
@@ -73,6 +73,17 @@ token, and is named to the model as unreadable; a PDF is `ready` without a manif
 and reads as text. A message that names a `processing` attachment is answered
 409. One found `processing` at start, whose job ended with the last process, is
 prepared again.
+
+A Word, PowerPoint or OpenDocument text file (`.docx .dotx .pptx .potx .odt`) is
+`ready` at once, while pictures are offered, and prepared after it in the
+background, at most one at a time, so Send never waits for it. It reads as text
+until its manifest is kept; then its line names the pages or slides, and the
+model can view them. workbench 0.8.0 converts the file once and keeps the PDF as
+its own derived file, deleted with the file. The manifest keeps its `unit`
+(`page` or `slide`). A file workbench refuses (422) stays `ready` without a
+manifest and is not asked again. A background prepare cut by a restart is not run
+again: only a `processing` attachment is. Next to workbench 0.7.0 the prepare
+answers kind `none`, and the file reads as text, as before.
 
 - **The wait.** The SPA follows the status with a long poll: `GET
   /api/chats/{id}/attachments/{attachment_id}?wait=` answers when the status

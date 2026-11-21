@@ -31,7 +31,9 @@ vllm it sets `chat_template_kwargs.enable_thinking`, and the thinking is
 dropped (never shown, stored, replayed or recorded). A picture attached to a
 message, or a page or picture a tool shows, goes to the chat model as an image
 while it sees (`GHOSTWRITER_VISION`); the bytes live in memory for that one
-message. Reference: `docs/`.
+message. An attached Word, PowerPoint or OpenDocument text file is prepared too,
+so its pages and slides can be seen (workbench 0.8): it is `ready` at once and
+prepared in the background, so Send never waits for it. Reference: `docs/`.
 
 ## Where it fits
 
@@ -59,6 +61,8 @@ message. Reference: `docs/`.
   (`Vision.images_offered`) on the same condition. On Ollama, one
   `POST /api/show` to the router's host at start turns pictures off for a model
   without `vision`; on vLLM, a text-only model needs `GHOSTWRITER_VISION=off`.
+  workbench 0.8.0 converts an Office file once and keeps the PDF as a derived
+  file; next to 0.7.0 its prepare answers kind `none` and the file reads as text.
 
 ## Module map
 
@@ -79,7 +83,7 @@ message. Reference: `docs/`.
 | `ghostwriter/inference.py` | `ModelClient`: chat rounds and transcriptions through the router |
 | `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, prepare, renditions, chat delete; the pseudonyms |
 | `ghostwriter/vision.py` | `Vision.images_offered` (setting, model, `view_file` listed); the Ollama probe; `system_call` |
-| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), with the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete |
+| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), and an Office file after it is `ready`, in the background, one at a time (`BACKGROUND_SLOTS`); the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete |
 | `ghostwriter/retention_rule.py` | the period rule (docint's, verbatim) and the sweep loop |
 | `ghostwriter/retention.py` | the daily sweep and the dry run |
 | `ghostwriter/log_cfg.py` | the stderr sink; quiet HTTP and SDK loggers |
@@ -207,6 +211,8 @@ strict; lines are 120 characters.
   `frontend/nginx/default.conf`.
 - An image cap (`GHOSTWRITER_MAX_IMAGES`, `agent/images.py`, `vision.py`):
   vllm-service's `CHAT_LIMIT_MM_PER_PROMPT` must stay at or above it.
+- An Office suffix: `upload.OFFICE_SUFFIXES`, `agent/images.strips_for_path`,
+  `agent/context.attachment_facts` and workbench's `renders.OFFICE_SUFFIXES`.
 - `tests/test_scaffold.py` checks the text of `docker/compose.yaml`, the
   `Makefile`, nginx, Vite's `base` and `.env.example` (its tag comments,
   lines under 80 characters).
