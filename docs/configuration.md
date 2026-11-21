@@ -16,6 +16,9 @@ cannot work stops startup and names the variable, never its value
 | `OPENAI_API_BASE` | `http://vllm-router:4000/v1` | The OpenAI-compatible endpoint, with `/v1`. |
 | `TEXT_MODEL` | `Qwen/Qwen3.8-27B-FP8` | The chat model. |
 | `GHOSTWRITER_CONTEXT_TOKENS` | `40000` | The chat model's context: vllm-service's `CHAT_MAX_MODEL_LEN`. Each round's prompt budget follows from it (Caps per message); under 22,000 stops startup. Larger than the model's context, a long chat's round is refused by the router. |
+| `GHOSTWRITER_VISION` | `on` | On, users can attach images, which go to the chat model with their message, and the model is shown the pages that have no text. `off`, a model without vision, or a workbench before 0.7.0 behaves as before. |
+| `GHOSTWRITER_MAX_IMAGES` | `8` | The most images one request carries (1–32). Must not exceed vllm-service's `CHAT_LIMIT_MM_PER_PROMPT`. |
+| `GHOSTWRITER_IMAGE_TOKENS` | unset | Tokens one image costs the model (1–10,000). Unset: one per 32x32 pixels (Qwen). A number: a fixed cost per image (280 for gemma); pages then go as two strips. |
 | `WHISPER_MODEL` | `openai/whisper-large-v3` | The dictation model. |
 | `RESPONSE_LANGUAGE` | `en` | The SPA's language, `en` or `de`; any other value is `en`. |
 | `GHOSTWRITER_SPEECH_INPUT` | `on` | `off` removes `/api/transcribe` (404) and the microphone. |

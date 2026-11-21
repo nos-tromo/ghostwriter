@@ -221,6 +221,7 @@ def test_the_chain_opens_with_the_operating_mode(client: TestClient, audit_strea
         "file_retention_days": 7,
         "notice_days": 30,
         "speech_input": True,
+        "vision": False,
         "workbench": True,
     }
     assert SECRET not in audit_stream.getvalue() and KEY not in audit_stream.getvalue()

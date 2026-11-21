@@ -32,7 +32,10 @@ KEY = "k" * 32
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
-    """Build the settings of one test: the edge secret, the workbench key and a throwaway database.
+    """Build the settings of one test: the edge secret, the workbench key, vision off and a throwaway database.
+
+    Vision is off unless a test passes ``vision=True``, so every test that does not
+    care about pictures keeps the behaviour of a model without them.
 
     Args:
         tmp_path: The test's temporary directory, which holds the database.
@@ -40,11 +43,12 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
 
     Returns:
         Settings: The defaults of :func:`~ghostwriter.config.load_settings`
-        with ``SECRET``, ``KEY``, a ``db_path`` under ``tmp_path`` and the
-        overrides.
+        with ``SECRET``, ``KEY``, ``vision=False``, a ``db_path`` under ``tmp_path``
+        and the overrides.
     """
     settings = load_settings({"GHOSTWRITER_EDGE_SECRET": SECRET, "WORKBENCH_API_KEY": KEY})
-    return dataclasses.replace(settings, db_path=str(tmp_path / "ghostwriter.sqlite3"), **overrides)
+    fields: dict[str, Any] = {"vision": False, "db_path": str(tmp_path / "ghostwriter.sqlite3"), **overrides}
+    return dataclasses.replace(settings, **fields)
 
 
 def as_user(name: str = "user-a") -> dict[str, str]:

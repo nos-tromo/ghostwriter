@@ -289,6 +289,7 @@ def _operating_mode(settings: Settings) -> dict[str, object]:
         "file_retention_days": settings.file_days,
         "notice_days": settings.notice_days,
         "speech_input": settings.speech_input,
+        "vision": settings.vision,
         "workbench": settings.workbench_enabled,
     }
 
