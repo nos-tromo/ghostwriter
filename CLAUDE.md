@@ -48,14 +48,17 @@ message. Reference: `docs/`.
   `base` is `/ghostwriter/`.
 - **obs-plane** collects the audit chain from stdout and scrapes
   `ghostwriter-backend:8000/metrics`.
-- **The workbench seam and pictures.** workbench 0.7.0 lists `view_file` and
-  attaches images only to a call that carries `X-Accept-Images: 1`; without it,
-  it answers as 0.6.0 did. Ghostwriter sends the header on every discovery
-  (`workbench.ACCEPT_IMAGES`, so the one cached listing is the full one) and on a
-  turn's tool calls only while the model sees (`Vision.images_offered`, and not
-  after the router refused a round's images). Pictures are offered only while
-  workbench lists `view_file`. On Ollama, one `POST /api/show` to the router's
-  host at start turns pictures off for a model without `vision`.
+- **The workbench seam and pictures.** workbench 0.7.0 lists `view_file`, tells
+  `read_document` in its image words and attaches images only to a call that
+  carries `X-Accept-Images: 1` (`workbench.ACCEPT_IMAGES`); without it, it
+  answers as 0.6.0 did. Discovery is cached per listing (`discover(images=…)`).
+  A turn sees when the model sees and the image listing holds `view_file`: it is
+  offered that listing, and its calls carry the header. A turn without sight,
+  and every round after the router refused a round's images, is offered the
+  header-less listing and sends no header. Pictures are offered
+  (`Vision.images_offered`) on the same condition. On Ollama, one
+  `POST /api/show` to the router's host at start turns pictures off for a model
+  without `vision`; on vLLM, a text-only model needs `GHOSTWRITER_VISION=off`.
 
 ## Module map
 
@@ -138,11 +141,13 @@ the sweep. Never add workers or replicas.
    (`disclose` / `chat.tool`) before it goes to `WorkbenchClient.call_tool`
    over MCP, which never raises. Each round is then recorded (`ai_call` /
    `chat.answer`, with how many images it sent). With workbench off,
-   `app.state.workbench` is `None` and no tool is offered. While the model sees,
+   `app.state.workbench` is `None` and no tool is offered. While the turn sees,
    the question carries its attached pictures and a follow-up those of earlier
    questions that fit, as image parts: refs, never bytes. `fit` counts a ref by
-   `estimate_image_tokens` and puts a note in its place where it gives way; a
-   tool's images follow its tool messages in one user message. The renditions
+   `estimate_image_tokens` and puts a note in its place where it gives way: the
+   question's pictures, then the newest tool images, before the latest round's
+   own results (`agent/context.py` docstring). A tool's images follow its tool
+   messages in one user message. The renditions
    are fetched into the message's `ImageBank` (memory, for one message), and
    only `materialise`, just before the model call, swaps each ref for its label
    and a data URL, in a new list. A round the router refuses with images before

@@ -16,7 +16,7 @@ cannot work stops startup and names the variable, never its value
 | `OPENAI_API_BASE` | `http://vllm-router:4000/v1` | The OpenAI-compatible endpoint, with `/v1`. |
 | `TEXT_MODEL` | `Qwen/Qwen3.8-27B-FP8` | The chat model. |
 | `GHOSTWRITER_CONTEXT_TOKENS` | `40000` | The chat model's context: vllm-service's `CHAT_MAX_MODEL_LEN`. Each round's prompt budget follows from it (Caps per message); under 22,000 stops startup. Larger than the model's context, a long chat's round is refused by the router. |
-| `GHOSTWRITER_VISION` | `on` | On, users can attach images, which go to the chat model with their message, and the model is shown the pages that have no text. `off`, a model without vision, or a workbench before 0.7.0 behaves as before. On `INFERENCE_PROVIDER=ollama`, Ghostwriter reads the chat model's capabilities once at start (`POST /api/show` on the router's host) and turns images off when `vision` is missing; it can only turn them off, and an answer it cannot read changes nothing. With images on and workbench off, earlier pictures go as "could not be loaded" notes. |
+| `GHOSTWRITER_VISION` | `on` | On, users can attach images, which go to the chat model with their message, and the model is shown the pages that have no text. `off`, or a workbench off or before 0.7.0 (no `view_file`), behaves as before: no picture, nor a note of one, goes to the model. Only an Ollama model is checked: on `INFERENCE_PROVIDER=ollama`, Ghostwriter reads the chat model's capabilities once at start (`POST /api/show` on the router's host) and turns images off when `vision` is missing; it can only turn them off, and an answer it cannot read changes nothing. On vLLM nothing is checked: set `off` for a text-only model, or every round that carries pictures is refused by the router and goes again without them, telling the user `images_dropped`. |
 | `GHOSTWRITER_MAX_IMAGES` | `8` | The most images one request carries (1–32). Must not exceed vllm-service's `CHAT_LIMIT_MM_PER_PROMPT`. |
 | `GHOSTWRITER_IMAGE_CONTEXT_TOKENS` | unset | Tokens one image costs the model (1–10,000). Unset: one per 32x32 pixels (Qwen). A number: a fixed cost per image (280 for gemma); pages then go as two strips. |
 | `WHISPER_MODEL` | `openai/whisper-large-v3` | The dictation model. |
@@ -60,9 +60,10 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `INLINE_IMAGE_BYTES` | 10 MiB | The largest image shown inline (png, jpeg, gif, webp) |
 | `MAX_RECORDING_S` / `MAX_RECORDING_BYTES` | 120 s / 10 MiB | A recording (`inference.py`) |
 | `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment (`workbench.py`) |
-| `MAX_RENDITION_BYTES` | 768 KiB | The largest render of a page or picture fetched (`workbench.py`) |
+| `MAX_RENDITION_BYTES` | 768 KiB | A render of a page or picture fetched must be smaller (`workbench.py`) |
 | `MAX_IMAGE_BYTES` / `MAX_IMAGES_BYTES` / `MAX_TOOL_IMAGES` | 1 MiB / 3 MiB / 8 | The pictures kept from one tool answer: each, all together, and how many (`workbench.py`) |
 | `PREPARE_TIMEOUT_S` | 270 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, its 120 s wall and 30 s (`workbench.py`) |
+| `PREPARE_RETRY_S` | 10 | Pause before a prepare workbench answered busy (503) goes once more; one that timed out is not tried again (`processing.py`) |
 | `STRIPS_TIMEOUT_S` | 60 | The same for the second prepare that cuts a large picture's strips; it is not tried again (`processing.py`) |
 | `STRIP_LONG_SIDE` / `TOKEN_SIDE` | 1,024 px / 32 px | At a fixed image cost, a page or picture whose long side is over the first goes as two strips; with none set, an image costs a token per started square of the second (`agent/images.py`) |
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
