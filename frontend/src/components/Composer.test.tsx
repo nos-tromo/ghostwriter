@@ -1,13 +1,14 @@
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createEvent, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { PURPOSE_HEADER, PurposeBar, clearAllPurposes } from '@infra/ui'
+import { PURPOSE_HEADER, PurposeBar, clearAllPurposes, setPurpose } from '@infra/ui'
 import type { AppConfig, AttachmentOut } from '../api/types'
 import { LanguageContext } from '../i18n/LanguageContext'
 import { ChatPane } from './ChatPane'
 import {
   CHAT,
   CONFIG,
+  VISION_CONFIG,
   callsTo,
   detail,
   json,
@@ -508,6 +509,414 @@ describe('Composer', () => {
     const mic = screen.getByRole('button', { name: 'Dictate' })
     expect(mic).toBeDisabled()
     expect(mic).toHaveAttribute('title', 'This browser cannot record audio.')
+  })
+})
+
+describe('Composer pictures', () => {
+  const POLL = `${ATTACHMENTS}/a1?wait=20`
+  const PREVIEW = `${ATTACHMENTS}/a1/preview?page=1`
+  const HEIC = 'harbour-photo.heic'
+  // Every object URL made, and every one revoked, in order.
+  let made: string[]
+  let revoked: string[]
+
+  beforeEach(() => {
+    made = []
+    revoked = []
+    vi.spyOn(URL, 'createObjectURL').mockImplementation(() => {
+      const url = `blob:local-${made.length + 1}`
+      made.push(url)
+      return url
+    })
+    vi.spyOn(URL, 'revokeObjectURL').mockImplementation((url) => {
+      revoked.push(url)
+    })
+  })
+
+  afterEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  function picture(id: string, name: string, fields: Partial<AttachmentOut> = {}): AttachmentOut {
+    return { ...attachment(id, name, 2048), mime: 'image/png', kind: 'image', ...fields }
+  }
+
+  const image = (name: string, type = 'image/png') => new File(['png'], name, { type })
+  /** A tile's list item, by the name its face carries. */
+  const tile = (name: string) => within(composer()).getByRole('button', { name }).closest('li') as HTMLElement
+  const tileStatus = (item: HTMLElement) => item.querySelector('[data-kind]')?.getAttribute('data-status')
+  const hint = 'Sending waits until the attached files are ready.'
+
+  it('shows a dropped picture at once, prepares it, and sends once it is ready', async () => {
+    let ready!: () => void
+    const held = new Promise<void>((done) => (ready = done))
+    let polls = 0
+    const sse = sseStream()
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: async () => {
+          polls += 1
+          if (polls === 1) return json(picture('a1', 'harbour-photo.png', { status: 'processing' }))
+          await held
+          return json(picture('a1', 'harbour-photo.png'))
+        },
+        [`POST ${MESSAGES}`]: () => sse.response(),
+      },
+      VISION_CONFIG,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.type(textbox(), 'Was zeigt das Bild?')
+
+    drop(textbox(), [image('harbour-photo.png')])
+    // Its picture is there before anything has been sent.
+    const shown = composer().querySelector('li img')
+    expect(shown).toHaveAttribute('src', 'blob:local-1')
+    expect(tileStatus(tile('harbour-photo.png'))).toBe('uploading')
+
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(2))
+    expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'processing')
+    expect(tileStatus(tile('harbour-photo.png'))).toBe('processing')
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    await user.click(textbox())
+    await user.keyboard('{Enter}')
+    expect(callsTo(calls, 'POST', MESSAGES)).toHaveLength(0)
+
+    ready()
+    await waitFor(() => expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'done'))
+    expect(tileStatus(tile('harbour-photo.png'))).toBe('ready')
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    expect(callsTo(calls, 'GET', POLL)).toHaveLength(2)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    await user.keyboard('{Enter}')
+    expect(callsTo(calls, 'POST', MESSAGES).map((c) => c.body)).toEqual([
+      { content: 'Was zeigt das Bild?', attachment_ids: ['a1'], reasoning: false },
+    ])
+  })
+
+  it('picks pictures through the paperclip', async () => {
+    const { calls, container } = openChat(
+      { [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png'), 201) },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    const picker = container.querySelector('input[type="file"]') as HTMLInputElement
+    expect(picker.getAttribute('accept')?.split(',')).toContain('.png')
+
+    await userEvent.setup().upload(picker, image('harbour-photo.png'))
+    await waitFor(() => expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'done'))
+    expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['harbour-photo.png'])
+    expect(composer().querySelector('li img')).toHaveAttribute('src', 'blob:local-1')
+  })
+
+  it('fetches the thumbnail of a HEIC photo once it is ready', async () => {
+    setPurpose('ghostwriter', { reason: 'review' })
+    let polls = 0
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () =>
+          json(picture('a1', HEIC, { status: 'processing', mime: 'image/heic' }), 201),
+        [`GET ${POLL}`]: () => {
+          polls += 1
+          return json(picture('a1', HEIC, { mime: 'image/heic' }))
+        },
+        [`GET ${PREVIEW}`]: () => new Response(new Blob(['jpeg'], { type: 'image/jpeg' }), { status: 200 }),
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [image(HEIC, 'image/heic')])
+    // A browser cannot draw it: no local picture, and nothing is fetched before it is ready.
+    expect(made).toEqual([])
+    expect(composer().querySelector('li img')).toBeNull()
+
+    await waitFor(() => expect(composer().querySelector('li img')).not.toBeNull())
+    expect(polls).toBe(1)
+    const [preview] = callsTo(calls, 'GET', PREVIEW)
+    expect(preview.headers[PURPOSE_HEADER]).toBe('reason=review')
+    expect(callsTo(calls, 'GET', PREVIEW)).toHaveLength(1)
+    expect(composer().querySelector('li img')).toHaveAttribute('src', 'blob:local-1')
+    expect(tile(HEIC)).toHaveAttribute('data-status', 'done')
+  })
+
+  it('marks a picture that could not be read, and still sends it', async () => {
+    const sse = sseStream()
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => json(picture('a1', 'harbour-photo.png', { status: 'failed' })),
+        [`POST ${MESSAGES}`]: () => sse.response(),
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [image('harbour-photo.png')])
+
+    // Said below the row (the tile's own marker carries it as well, for a screen reader).
+    expect(
+      await screen.findByText('harbour-photo.png could not be read; the model will be told.', { selector: 'p' }),
+    ).toBeInTheDocument()
+    expect(tileStatus(tile('harbour-photo.png'))).toBe('failed')
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    const send = screen.getByRole('button', { name: 'Send' })
+    expect(send).toBeEnabled()
+    await userEvent.setup().click(send)
+    expect(callsTo(calls, 'POST', MESSAGES).map((c) => c.body)).toEqual([
+      { content: '', attachment_ids: ['a1'], reasoning: false },
+    ])
+  })
+
+  it('warns when more pictures wait than go to the model', async () => {
+    openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: (call: Call) => {
+          const name = uploaded(call)
+          return json(picture(`id-${name}`, name), 201)
+        },
+      },
+      { ...VISION_CONFIG, max_images: 2 },
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    const warning = 'At most 2 images go to the model with one message; the others are only named.'
+
+    drop(textbox(), [image('quay-1.png'), image('quay-2.png')])
+    await waitFor(() => expect(tile('quay-2.png')).toHaveAttribute('data-status', 'done'))
+    expect(screen.queryByText(warning)).not.toBeInTheDocument()
+
+    drop(textbox(), [image('quay-3.png')])
+    expect(await screen.findByText(warning)).toBeInTheDocument()
+  })
+
+  it('opens a thumbnail in the lightbox and closes it with Escape', async () => {
+    openChat({ [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png'), 201) }, VISION_CONFIG)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [image('harbour-photo.png')])
+    await waitFor(() => expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'done'))
+
+    const face = within(composer()).getByRole('button', { name: 'harbour-photo.png' })
+    await user.click(face)
+    const dialog = screen.getByRole('dialog', { name: 'harbour-photo.png' })
+    expect(within(dialog).getByRole('img', { name: 'harbour-photo.png' })).toHaveAttribute('src', 'blob:local-1')
+    expect(within(dialog).getByRole('button', { name: 'Close' })).toHaveFocus()
+
+    await user.keyboard('{Escape}')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(face).toHaveFocus()
+    // The picture is still the composer's own.
+    expect(revoked).toEqual([])
+  })
+
+  it('follows a waiting attachment the chat lists as processing', async () => {
+    let ready!: () => void
+    const held = new Promise<void>((done) => (ready = done))
+    const waiting = { ...detail([]), pending_attachments: [picture('a1', 'harbour-photo.png', { status: 'processing' })] }
+    const { calls } = openChat(
+      {
+        'GET /ghostwriter/api/chats/c1': waiting,
+        [`GET ${POLL}`]: async () => {
+          await held
+          return json(picture('a1', 'harbour-photo.png'))
+        },
+        [`GET ${PREVIEW}`]: () => new Response(new Blob(['png'], { type: 'image/png' }), { status: 200 }),
+      },
+      VISION_CONFIG,
+    )
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    // Nothing was uploaded, and the picture is not at hand yet.
+    expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(0)
+    expect(chip('harbour-photo.png')).toHaveAttribute('data-status', 'processing')
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    ready()
+    await waitFor(() => expect(composer().querySelector('li img')).not.toBeNull())
+    expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'done')
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    expect(callsTo(calls, 'GET', POLL)).toHaveLength(1)
+    expect(callsTo(calls, 'GET', PREVIEW)).toHaveLength(1)
+  })
+
+  it('waits two seconds after a network error and asks again, and gives up on a 404', async () => {
+    let polls = 0
+    let listed: AttachmentOut[] = []
+    const { calls, client } = openChat(
+      {
+        'GET /ghostwriter/api/chats/c1': () => json({ ...detail([]), pending_attachments: listed }),
+        [`POST ${ATTACHMENTS}`]: (call: Call) =>
+          json(picture(uploaded(call) === 'quay-1.png' ? 'a1' : 'a2', uploaded(call), { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => {
+          polls += 1
+          if (polls === 1) throw new TypeError('network down')
+          return json(picture('a1', 'quay-1.png'))
+        },
+        [`GET ${ATTACHMENTS}/a2?wait=20`]: () => json({ detail: 'not found' }, 404),
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [image('quay-1.png')])
+    await waitFor(() => expect(polls).toBe(1))
+    await act(async () => {
+      vi.advanceTimersByTime(1_500)
+    })
+    expect(polls).toBe(1)
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+    await waitFor(() => expect(tile('quay-1.png')).toHaveAttribute('data-status', 'done'))
+    expect(polls).toBe(2)
+
+    // A picture the server no longer holds is not waited for again.
+    drop(textbox(), [image('quay-2.png')])
+    expect(await screen.findByRole('alert')).toHaveTextContent('quay-2.png could not be attached.')
+    expect(callsTo(calls, 'GET', `${ATTACHMENTS}/a2?wait=20`)).toHaveLength(1)
+    expect(tile('quay-2.png')).toHaveAttribute('data-status', 'error')
+
+    // The chat lists it still: it is no second tile, and once dismissed it does not come back.
+    listed = [picture('a2', 'quay-2.png', { status: 'processing' })]
+    const reread = () => client.invalidateQueries({ queryKey: ['chat', 'c1'] })
+    await act(reread)
+    expect(within(composer()).getAllByRole('button', { name: 'quay-2.png' })).toHaveLength(1)
+    await userEvent.setup().click(within(tile('quay-2.png')).getByRole('button', { name: 'Remove quay-2.png' }))
+    await act(reread)
+    expect(within(composer()).queryByText('quay-2.png')).not.toBeInTheDocument()
+    expect(composer().querySelector('li[data-status="processing"]')).toBeNull()
+    expect(callsTo(calls, 'GET', `${ATTACHMENTS}/a2?wait=20`)).toHaveLength(1)
+  })
+
+  it('stops following when the composer goes', async () => {
+    const { calls, unmount } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => new Promise<Response>(() => {}),
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [image('harbour-photo.png')])
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    const [poll] = callsTo(calls, 'GET', POLL)
+    expect(poll.signal?.aborted).toBe(false)
+    unmount()
+    expect(poll.signal?.aborted).toBe(true)
+  })
+
+  it('revokes every local picture once: on dismissal, when a message takes it, and when the composer goes', async () => {
+    const sse = sseStream()
+    const { unmount } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: (call: Call) => {
+          const name = uploaded(call)
+          if (name === 'quay-2.png') return json({ detail: 'Storage is full.', code: 'storage_full' }, 507)
+          return json(picture(`id-${name}`, name), 201)
+        },
+        [`POST ${MESSAGES}`]: () => sse.response(),
+      },
+      VISION_CONFIG,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    // One that is sent, one that is refused and dismissed, one still waiting at the end.
+    drop(textbox(), [image('quay-1.png'), image('quay-2.png')])
+    await waitFor(() => expect(tile('quay-1.png')).toHaveAttribute('data-status', 'done'))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
+    )
+    expect(made).toEqual(['blob:local-1', 'blob:local-2'])
+    expect(revoked).toEqual([])
+
+    await user.click(within(tile('quay-2.png')).getByRole('button', { name: 'Remove quay-2.png' }))
+    expect(revoked).toEqual(['blob:local-2'])
+
+    await user.type(textbox(), 'Und?{Enter}')
+    expect(revoked).toEqual(['blob:local-2', 'blob:local-1'])
+
+    drop(textbox(), [image('quay-3.png')])
+    await waitFor(() => expect(made).toHaveLength(3))
+    unmount()
+    expect(revoked.sort()).toEqual(made.slice().sort())
+    expect(new Set(revoked).size).toBe(revoked.length)
+  })
+
+  it('attaches a lone pasted screenshot under a dated name, and two in one second apart', async () => {
+    vi.setSystemTime(new Date(2026, 10, 20, 9, 5, 7))
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: (call: Call) => {
+          const name = uploaded(call)
+          return json(picture(`id-${name}`, name), 201)
+        },
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    const screenshot = () =>
+      createEvent.paste(textbox(), {
+        clipboardData: { files: [image('image.png')], types: ['Files'], getData: () => '' },
+      })
+
+    const first = screenshot()
+    fireEvent(textbox(), first)
+    expect(first.defaultPrevented).toBe(true)
+    const second = screenshot()
+    fireEvent(textbox(), second)
+    expect(second.defaultPrevented).toBe(true)
+
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(2))
+    expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual([
+      'screenshot-20261120-090507.png',
+      'screenshot-20261120-090507-2.png',
+    ])
+    await waitFor(() => expect(tile('screenshot-20261120-090507-2.png')).toHaveAttribute('data-status', 'done'))
+
+    // A file copied in a file manager keeps its own name; so does a picture of another type.
+    const copied = createEvent.paste(textbox(), {
+      clipboardData: {
+        files: [image('harbour-photo.png')],
+        types: ['text/plain', 'Files'],
+        getData: (type: string) => (type === 'text/plain' ? 'harbour-photo.png' : ''),
+      },
+    })
+    fireEvent(textbox(), copied)
+    expect(copied.defaultPrevented).toBe(true)
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(3))
+    expect(uploaded(callsTo(calls, 'POST', ATTACHMENTS)[2])).toBe('harbour-photo.png')
+  })
+
+  it('keeps text that comes with a picture as text, also with pictures on', async () => {
+    const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'image.png'), 201) }, VISION_CONFIG)
+    await screen.findByText('Ask anything, or attach a document.')
+
+    const rich = createEvent.paste(textbox(), {
+      clipboardData: {
+        files: [image('image.png')],
+        types: ['text/plain', 'text/html', 'Files'],
+        getData: (type: string) => (type === 'text/plain' ? 'Spalte B' : ''),
+      },
+    })
+    fireEvent(textbox(), rich)
+    expect(rich.defaultPrevented).toBe(false)
+    expect(within(composer()).queryByText('image.png')).not.toBeInTheDocument()
+    expect(composer().querySelector('li')).toBeNull()
+    expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(0)
+    expect(made).toEqual([])
+
+    // Another file that comes with text is still attached.
+    const office = createEvent.paste(textbox(), {
+      clipboardData: {
+        files: [image('image.png'), file('sales.csv')],
+        types: ['text/plain', 'Files'],
+        getData: (type: string) => (type === 'text/plain' ? 'Spalte B' : ''),
+      },
+    })
+    fireEvent(textbox(), office)
+    expect(office.defaultPrevented).toBe(false)
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['sales.csv']))
   })
 })
 

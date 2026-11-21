@@ -28,6 +28,7 @@ export function ChatPane({ chatId, config }: { chatId: string; config: AppConfig
       onDropFiles={config.attachments ? attachments.add : undefined}
       composer={
         <Composer
+          chatId={chatId}
           config={config}
           stream={stream}
           attachments={attachments}

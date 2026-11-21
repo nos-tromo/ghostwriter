@@ -57,8 +57,16 @@ export const en = {
     'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
   'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
   'composer.error_too_many_pending': 'Send the attached files before adding more.',
+  'composer.processing': 'Preparing {name}…',
+  'composer.processing_hint': 'Sending waits until the attached files are ready.',
+  'composer.unreadable': '{name} could not be read; the model will be told.',
+  'composer.images_cap':
+    'At most {max} images go to the model with one message; the others are only named.',
   'composer.send': 'Send',
   'composer.stop': 'Stop',
+
+  // a picture at full size
+  'lightbox.close': 'Close',
 
   // dictation
   'mic.start': 'Dictate',

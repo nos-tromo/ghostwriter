@@ -60,8 +60,16 @@ export const de: Strings = {
   'composer.error_purpose':
     '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
   'composer.error_too_many_pending': 'Senden Sie zuerst die angehängten Dateien.',
+  'composer.processing': '{name} wird vorbereitet…',
+  'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
+  'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
+  'composer.images_cap':
+    'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',
   'composer.send': 'Senden',
   'composer.stop': 'Stopp',
+
+  // a picture at full size
+  'lightbox.close': 'Schließen',
 
   // dictation
   'mic.start': 'Diktieren',
