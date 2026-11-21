@@ -303,7 +303,7 @@ class ChatStore:
 
         Returns:
             The attachment; its manifest is ``None`` once the file's period has passed,
-            though the sweep may not have emptied it yet.
+            though the sweep may not have emptied it yet, and for one that is not a JSON object.
         """
         expired = self._gone(attachment.created_at, now)
         return AttachmentRef(
@@ -315,7 +315,7 @@ class ChatStore:
             name=attachment.name,
             kind=cast(AttachmentKind, attachment.kind),
             status=cast(AttachmentStatus, attachment.status),
-            manifest=None if expired or attachment.render is None else json.loads(attachment.render),
+            manifest=None if expired else _loaded_manifest(attachment.render),
             created_at=attachment.created_at,
             expired=expired,
         )

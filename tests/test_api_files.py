@@ -731,6 +731,20 @@ def test_a_busy_prepare_is_tried_once_more(seeing: TestClient, door: FakeDoor, m
     assert len(_prepares(door)) == 4
 
 
+def test_a_prepare_that_timed_out_is_not_tried_again(
+    seeing: TestClient, door: FakeDoor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A prepare that waited its whole time is not sent again: one request, and the picture fails at once."""
+    monkeypatch.setattr(processing, "PREPARE_RETRY_S", 0)
+    door.answers["/files/prepare"] = httpx.ReadTimeout("slow")
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert _settled(seeing, cid, photo["id"]) == "failed"
+    assert len(_prepares(door)) == 1
+    found = _state(seeing).store.find_attachment("user-a", cid, photo["id"])
+    assert found is not None and found.status == "failed"
+
+
 def test_the_status_route_is_the_owners_and_the_chats(
     seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
 ) -> None:

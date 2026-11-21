@@ -4,10 +4,12 @@ An attachment that needs preparing (:func:`~ghostwriter.upload.needs_prepare`, w
 offered) is stored ``processing`` and handed to :class:`AttachmentProcessor`: asyncio tasks of the one
 process, at most :data:`PREPARE_SLOTS` of them preparing at once. A job marks the chat's files, records
 the hand-over, has workbench prepare the file (``POST /files/prepare``, idempotent) and keeps its
-manifest: the attachment is then ``ready``. A busy or slow workbench (``http:503``, ``timeout``) is asked
-once more after :data:`PREPARE_RETRY_S`. At a fixed image cost (``image_tokens``), a picture that goes to
-the model as two strips (:func:`~ghostwriter.agent.images.strips_for_image`) is prepared once more with
-``strips=2`` before it is ``ready``, so its first turn finds the strips cut. That request waits at most
+manifest: the attachment is then ``ready``. A busy workbench (``http:503``) is asked once more after
+:data:`PREPARE_RETRY_S`; a prepare that timed out has waited its whole
+:data:`~ghostwriter.workbench.PREPARE_TIMEOUT_S` already and is not, for Send waits on it. At a fixed
+image cost (``image_tokens``), a picture that goes to the model as two strips
+(:func:`~ghostwriter.agent.images.strips_for_image`) is prepared once more with ``strips=2`` before it
+is ``ready``, so its first turn finds the strips cut. That request waits at most
 :data:`STRIPS_TIMEOUT_S` per read and is not tried again; its failure is logged by its token and the
 picture is still ``ready``, for the turn has workbench cut the strips as it views them. A prepare that
 fails is recorded as an ``error`` child, and the attachment settles as its kind allows: a picture cannot
@@ -47,14 +49,15 @@ from ghostwriter.workbench import CallFor, Manifest, StorageFull, WorkbenchClien
 
 #: The most prepares in flight at once.
 PREPARE_SLOTS: Final = 2
-#: Seconds before a busy or slow workbench is asked once more.
+#: Seconds before a busy workbench is asked once more.
 PREPARE_RETRY_S: Final = 10.0
 #: The longest a status request waits for its attachment's job, in seconds.
 MAX_WAIT_S: Final = 20
 PREPARE_RECIPIENT: Final = "workbench:prepare"
 ATTACHMENT: Final = "chat.attachment"
-#: The failures a second prepare may get past: a busy workbench and a slow one.
-RETRIED: Final = frozenset({"http:503", "timeout"})
+#: The failure a second prepare may get past: a busy workbench. A prepare that timed out has waited its
+#: whole time already, and Send waits for the picture; it is not asked again.
+RETRIED: Final = frozenset({"http:503"})
 #: The longest wait, in seconds, for each read of the prepare that cuts a picture's strips: its
 #: renditions exist by then, so a workbench that hangs delays ``ready`` by about this, not a full prepare.
 STRIPS_TIMEOUT_S: Final = 60.0
@@ -438,7 +441,7 @@ class AttachmentProcessor:
         logger.info("Attachment '{}': its strips were not cut ({}); the turn cuts them.", job.attachment_id, token)
 
     async def _ask(self, call: CallFor, path: str) -> Manifest:
-        """Prepare the file, once more after :data:`PREPARE_RETRY_S` when workbench was busy or slow.
+        """Prepare the file, once more after :data:`PREPARE_RETRY_S` when workbench was busy.
 
         Args:
             call: The chat.

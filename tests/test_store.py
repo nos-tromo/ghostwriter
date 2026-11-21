@@ -660,6 +660,18 @@ def test_a_failed_attachment_keeps_its_token_and_no_manifest(store: ChatStore, e
     assert ref is not None and (ref.status, ref.manifest) == ("failed", None)
 
 
+@pytest.mark.parametrize("render", ["not json", "[1, 2]", '"pdf"'], ids=["not_json", "list", "string"])
+def test_a_manifest_that_is_no_json_object_reads_as_none(store: ChatStore, engine: Engine, render: str) -> None:
+    """A stored manifest that is not a JSON object is read as none, by the processor's lookup as by every other read."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    assert store.settle_attachment(picture.id, status="ready", manifest={"total": 1}, failure=None) is True
+    with Session(engine) as s, s.begin():
+        s.execute(update(Attachment).where(Attachment.id == picture.id).values(render=render))
+    ref = store.find_attachment("user-a", chat.id, picture.id)
+    assert ref is not None and (ref.status, ref.manifest) == ("ready", None)
+
+
 def test_settling_is_once_and_only_from_processing(store: ChatStore, engine: Engine) -> None:
     """Only a row still being prepared settles; a later settle, a ready row and a gone row change nothing."""
     chat = store.create_chat("user-a")
