@@ -17,8 +17,8 @@ PRESENTATIONS: Final = (
 VISION: Final = (
     "Images the user attached are in their message: look at them. Read a document with read_document first; "
     "pages without text come back as images in the same answer. For how something looks (layout, design, "
-    "charts, handwriting, photos), look with view_file, at most 4 pages a call. Images of earlier messages are "
-    "not sent again: use view_file to see one again."
+    "charts, handwriting, photos), look with view_file, at most 4 pages a call. Images tools showed earlier are "
+    "not sent again, and attached pictures only while there is room: use view_file to see one again."
 )
 
 

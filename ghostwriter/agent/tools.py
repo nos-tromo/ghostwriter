@@ -4,8 +4,9 @@ The model is offered workbench's MCP tools as OpenAI functions. Its arguments ar
 smaller models write them: nothing is no arguments, a JSON string holding an object is decoded
 once, anything else is refused to the model. What it reads back is bounded: a result's text
 (which workbench writes without the table previews) cut to ``TOOL_RESULT_CHARS``, or a small
-JSON object naming why there is none. A result that showed images says how many, and whether
-they were shown. The texts here are the model-facing protocol.
+JSON object naming why there is none. A result that showed images says how many it returned,
+or that they could not be shown; which of them went to the model, the note in each one's place
+says. The texts here are the model-facing protocol.
 
 Ghostwriter sets the arguments of :data:`HIDDEN_ARGUMENTS` itself: their schemas are left out of
 what the model is offered, and whatever it sends for them is dropped.
@@ -48,8 +49,8 @@ FAILURE_CHARS: Final = 500
 HIDDEN_ARGUMENTS: Final = frozenset({"strips"})
 #: The tools whose ``strips`` Ghostwriter sets, by the file a call reads.
 STRIPPED_TOOLS: Final = frozenset({"view_file", "read_document"})
-#: What ends a result whose images went to the model.
-SHOWN: Final = "[{n} images were shown]"
+#: What ends a result whose images go to the model, as far as the request has room (the note of each says).
+SHOWN: Final = "[{n} images were returned]"
 #: What ends a result whose images could not go to the model.
 NOT_SHOWN: Final = "[{n} images could not be shown: this model does not take images]"
 

@@ -928,6 +928,11 @@ def _labelled(messages: list[dict[str, Any]]) -> list[tuple[str, str]]:
     return [(a["text"], b["image_url"]["url"]) for a, b in itertools.pairwise(parts) if b.get("type") == "image_url"]
 
 
+def _tool_names(call: dict[str, Any]) -> list[str]:
+    """Return the names of the tools a model call offered."""
+    return [tool["function"]["name"] for tool in call.get("tools", [])]
+
+
 def _refused() -> openai.BadRequestError:
     """Return the router's refusal of a request with images."""
     request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
@@ -988,7 +993,7 @@ def test_a_fixed_image_cost_sends_two_strips_of_a_large_image(loop_env: LoopEnv)
 def test_tool_images_follow_the_tool_messages_in_one_user_message(loop_env: LoopEnv) -> None:
     """A round's images go in one user message after its tool messages: per call its legend, then its images.
 
-    Each tool message names how many images were shown; the stored steps hold that same text, never the bytes.
+    Each tool message names how many images were returned; the stored steps hold that same text, never the bytes.
     """
     loop_env.workbench.answers = [_shown(_page(1), _page(2)), _shown(_page(3))]
     first = [call_chunk(0, "call_0", "view_file", VIEW_SCAN), call_chunk(1, "call_1", "read_document", VIEW_SCAN)]
@@ -1012,8 +1017,8 @@ def test_tool_images_follow_the_tool_messages_in_one_user_message(loop_env: Loop
         image,
     ]
     view, read = sent[3]["content"], sent[4]["content"]
-    assert view == json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were shown]"
-    assert read == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were shown]"
+    assert view == json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were returned]"
+    assert read == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were returned]"
     steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
     assert [step.result for step in steps] == [view, read]
     stored = json.dumps([step.model_dump(mode="json") for step in steps])
@@ -1064,7 +1069,7 @@ def test_a_follow_up_replays_tool_steps_as_text_and_attached_images_again(loop_e
         {"type": "text", "text": f"[Image: {PHOTO}]"},
         {"type": "image_url", "image_url": {"url": JPEG_URL}},
     ]
-    assert sent[3]["content"] == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were shown]"
+    assert sent[3]["content"] == json.dumps({"path": SCAN_PATH, "shown": 1}) + "\n[1 images were returned]"
     assert "Images returned by" not in json.dumps(sent) and _image_urls(sent) == [JPEG_URL]
     assert len(loop_env.workbench.fetched) == 2
 
@@ -1114,19 +1119,27 @@ def test_an_expired_or_missing_image_is_noted_and_the_turn_goes_on(loop_env: Loo
 def test_a_refused_image_round_is_tried_once_without_images(loop_env: LoopEnv) -> None:
     """A round refused with its images goes once more with a note in each image's place, after one notice.
 
-    The rest of the turn goes without images: a tool's images are named as not shown, and none is sent.
+    The rest of the turn goes without sight: view_file is no longer offered and the prompt no longer says how
+    to look; the calls ask workbench for no images and carry no strips, and a tool's images are named as not
+    shown, none sent.
     """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
     loop_env.workbench.answers = [_shown(_page(1))]
-    view = [call_chunk(0, "call_0", "view_file", VIEW_SCAN)]
-    events = loop_env.run(_refused(), view, [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    read = [call_chunk(0, "call_0", "read_document", json.dumps({"path": SCAN_PATH, "strips": 2}))]
+    events = loop_env.run(_refused(), read, [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
     assert [e for e in events if isinstance(e, NoticeEvent)] == [NoticeEvent("images_dropped")]
     assert (events[0], events[-1]) == (NoticeEvent("images_dropped"), TokenEvent("Ohne Bild."))
-    second = loop_env.sent(2)
-    assert second[1]["content"][1:] == [{"type": "text", "text": LEFT_OUT.format(label=PHOTO)}]
-    assert "image_url" not in json.dumps(second)
+    first, second = loop_env.fake.calls[:2]
+    assert VISION in first["messages"][0]["content"] and "view_file" in _tool_names(first)
+    assert VISION not in second["messages"][0]["content"] and "view_file" not in _tool_names(second)
+    assert second["messages"][1]["content"][1:] == [{"type": "text", "text": LEFT_OUT.format(label=PHOTO)}]
+    assert "image_url" not in json.dumps(second["messages"])
     assert loop_env.audit.log[:2] == ["model:1:error", "model:1:ok"] and loop_env.audit.images[:2] == [1, 0]
+    [sent] = loop_env.workbench.calls
+    assert (sent.arguments, sent.images) == ({"path": SCAN_PATH}, False)
     third = loop_env.sent(3)
-    assert "image_url" not in json.dumps(third) and third[1]["content"] == second[1]["content"]
+    assert "image_url" not in json.dumps(third) and third[1]["content"] == second["messages"][1]["content"]
+    assert VISION not in third[0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[2])
     assert third[-1]["role"] == "tool"
     assert third[-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
     assert loop_env.audit.images == [1, 0, 0]
@@ -1165,6 +1178,10 @@ def test_the_prompt_tells_the_model_how_to_look_only_with_vision(loop_env: LoopE
     assert VISION in seeing and seeing.index("days after they were made.") < seeing.index(VISION)
     assert seeing.index(VISION) < seeing.index(PRESENTATIONS)
     assert VISION not in plain and VISION not in toolless
+    assert VISION.endswith(
+        "Images tools showed earlier are not sent again, and attached pictures only while there is room: "
+        "use view_file to see one again."
+    )
 
 
 def test_tool_images_past_the_cap_are_retired(loop_env: LoopEnv) -> None:
@@ -1203,6 +1220,7 @@ def test_a_reused_call_id_keeps_each_image_its_own(loop_env: LoopEnv) -> None:
     ]
     [turn], _ = loop_env.store.past_turns(CHAT, before_position=99)
     assert [call.call_id for calls in turn.rounds for call in calls] == ids
+    assert loop_env.audit.call_ids == ids
 
 
 def test_an_image_never_shown_is_never_said_to_be_shown_before(loop_env: LoopEnv) -> None:
@@ -1218,3 +1236,28 @@ def test_an_image_never_shown_is_never_said_to_be_shown_before(loop_env: LoopEnv
         sent = loop_env.sent(n)
         assert unseen in json.dumps(sent) and retired not in json.dumps(sent)
         assert [label for label, _ in _labelled(sent)] == ["[Image: quay-scan.pdf, page 2]"]
+    steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert [step.result for step in steps if step.tool == "view_file"] == [
+        json.dumps({"path": SCAN_PATH, "shown": 2}) + "\n[2 images were returned]"
+    ]
+
+
+def test_images_past_the_cap_in_one_round_are_returned_and_named_unseen(loop_env: LoopEnv) -> None:
+    """Two calls of 8 images in one round, at most 8 a request: the tool messages say 16 were returned, never shown.
+
+    The first call's 8 go as notes that they were never shown, the second's as images; the stored steps say
+    the same as the tool messages.
+    """
+    first, second = (tuple(_page(n) for n in pages) for pages in (range(1, 9), range(9, 17)))
+    loop_env.workbench.answers = [_shown(*first), _shown(*second)]
+    views = [call_chunk(0, "call_0", "view_file", VIEW_SCAN), call_chunk(1, "call_1", "view_file", VIEW_SCAN)]
+    loop_env.run(views, [text_chunk("Sechzehn Seiten.")], vision=True)
+    sent = loop_env.sent(2)
+    returned = json.dumps({"path": SCAN_PATH, "shown": 8}) + "\n[8 images were returned]"
+    assert [m["content"] for m in sent if m["role"] == "tool"] == [returned, returned]
+    steps = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert [step.result for step in steps] == [returned, returned]
+    assert [label for label, _ in _labelled(sent)] == [f"[Image: quay-scan.pdf, page {n}]" for n in range(9, 17)]
+    text = json.dumps(sent)
+    assert all(UNSEEN.format(label=f"quay-scan.pdf, page {n}") in text for n in range(1, 9))
+    assert "were shown" not in text

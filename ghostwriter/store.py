@@ -875,7 +875,7 @@ class ChatStore:
             id: The step's id, minted before the ``running`` frame.
             position: Its place in the answer.
             round: The model round that called it.
-            call_id: The model's id for the call.
+            call_id: The call's id in the turn: the model's, unless an earlier call of the turn had it.
             tool: The tool's name.
             arguments: The arguments as the model wrote them.
             result: What the model read back.

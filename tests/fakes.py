@@ -891,6 +891,7 @@ class RecordingAudit:
         log: ``disclose:<tool>:<round>:<attempt>`` and ``model:<round>:<outcome>``, in order.
         rounds: Each ``model_called``'s round, as the loop reported it.
         images: Each ``model_called``'s count of the images the round sent.
+        call_ids: Each ``disclosed``'s call id, in order.
         failing: The writes that fail, ``disclose`` or ``model``.
         on_model: Called with the round after each ``model_called`` was written.
     """
@@ -900,6 +901,7 @@ class RecordingAudit:
         self.log: list[str] = []
         self.rounds: list[RoundDone | None] = []
         self.images: list[int] = []
+        self.call_ids: list[str] = []
         self.failing: set[str] = set()
         self.on_model: Callable[[int], None] | None = None
 
@@ -909,7 +911,7 @@ class RecordingAudit:
         Args:
             tool: The tool.
             round: The model round that asked for it.
-            call_id: The model's id for the call.
+            call_id: The call's id in the turn.
             attempt: 1, or 2 for the retry after a busy answer.
 
         Raises:
@@ -918,6 +920,7 @@ class RecordingAudit:
         if "disclose" in self.failing:
             raise AuditWriteError("synthetic audit failure")
         self.log.append(f"disclose:{tool}:{round}:{attempt}")
+        self.call_ids.append(call_id)
 
     def model_called(self, *, round: int, done: RoundDone | None, outcome: str, images: int = 0) -> None:
         """Record a model round.

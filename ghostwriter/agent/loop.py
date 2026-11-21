@@ -25,16 +25,20 @@ call and each retry. A call id an earlier call of the turn already has is made u
 each call's images and records stay its own.
 
 While the model sees (:class:`~ghostwriter.vision.Vision`), images go with the rounds
-(:mod:`ghostwriter.agent.images`): ``view_file`` is offered, and the turn's calls ask workbench for
-images. The question carries its attached pictures, and a follow-up those of earlier questions that
-fit; their renditions are fetched before the round that first sends them, once per message, and one
-not found is a note. A round's tool images follow its tool messages in one user message, the oldest
-retired beyond ``GHOSTWRITER_MAX_IMAGES``; one the request had no room for stays named as never shown.
-Ghostwriter sets the ``strips`` of ``view_file`` and ``read_document`` by the file a call reads. The
-bytes live in the message's bank, in memory, until its answer ends, and a data URL exists only in the
-list a round is streamed with. A round the router refuses with images before any text
+(:mod:`ghostwriter.agent.images`): ``view_file`` is offered, the system prompt says how to look, and
+the turn's calls ask workbench for images. The question carries its attached pictures, and a
+follow-up those of earlier questions that fit; their renditions are fetched before the round that
+first sends them, once per message, and one not found is a note. A round's tool images follow its
+tool messages in one user message, the oldest retired beyond ``GHOSTWRITER_MAX_IMAGES``; one the
+request had no room for stays named as never shown, and the tool message says how many were
+returned, never that they were shown. Ghostwriter sets the ``strips`` of ``view_file`` and
+``read_document`` by the file a call reads. The bytes live in the message's bank, in memory, until
+its answer ends, and a data URL exists only in the list a round is streamed with. A round the
+router refuses with images before any text
 (:data:`REFUSED_IMAGE_STATUSES`) is sent once more without them, after a :class:`NoticeEvent`, and
-the rest of the turn goes without images. Each round is recorded with how many images it sent.
+the rest of the turn goes as for a model that does not see: no ``view_file``, no word on how to look,
+no images asked for, no ``strips``, and a tool's images named as not shown. Each round is recorded
+with how many images it sent.
 
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
 a label or an image.
@@ -46,14 +50,14 @@ import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Final, Literal, Protocol, TypeAlias
 from uuid import uuid4
 
 import openai
 from loguru import logger
 
-from ghostwriter.agent.context import fit
+from ghostwriter.agent.context import PastTurn, fit
 from ghostwriter.agent.images import (
     UNSEEN,
     ImageBank,
@@ -106,6 +110,7 @@ from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.vision import VIEW_TOOL, Vision
 from ghostwriter.workbench import (
     CallFor,
+    McpTool,
     OutputFile,
     RenditionRequest,
     ToolFailure,
@@ -268,14 +273,13 @@ class _Sight:
     """What one message's answer does with images.
 
     Attributes:
-        sees: Whether the model sees images: ``view_file`` is offered, the calls ask workbench for
-            images, and Ghostwriter sets their ``strips``.
+        sees: Whether the model sees images, as the message began.
         budget: What an image costs a round and how many a request carries; ``None`` while the model
             does not see.
         known: The sizes of the pictures the chat attached that are ready to be seen, by path.
         bank: The bytes of the message's images, by ref key; it goes when the answer ends.
         tried: The keys of the attached pictures whose renditions were asked for, found or not.
-        dropped: Whether the model refused images: the rest of the turn goes without them.
+        dropped: Whether the model refused images: the rest of the turn goes as without sight.
     """
 
     sees: bool
@@ -287,15 +291,24 @@ class _Sight:
 
     @property
     def showing(self) -> bool:
-        """Whether images go to the model now: it sees, and has not refused them."""
+        """Whether images go to the model now: it sees, and has not refused them.
+
+        Only then is ``view_file`` offered, do the calls ask workbench for images and carry ``strips``,
+        and do a tool's images go to the model.
+        """
         return self.sees and not self.dropped
+
+    @property
+    def fixed(self) -> int | None:
+        """The tokens one image costs, or ``None`` to count it by its pixels."""
+        return None if self.budget is None else self.budget.fixed
 
     def arguments(self, tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Return a call's arguments with those Ghostwriter sets.
 
         Whatever the model sent for :data:`~ghostwriter.agent.tools.HIDDEN_ARGUMENTS` is dropped.
-        While the model sees, a ``view_file`` or ``read_document`` call of a path gets the strips
-        :func:`~ghostwriter.agent.images.strips_for_path` names for its file, if any.
+        While images go to the model, a ``view_file`` or ``read_document`` call of a path gets the
+        strips :func:`~ghostwriter.agent.images.strips_for_path` names for its file, if any.
 
         Args:
             tool: The tool.
@@ -306,12 +319,72 @@ class _Sight:
         """
         kept = {key: value for key, value in arguments.items() if key not in HIDDEN_ARGUMENTS}
         path = arguments.get("path")
-        if self.sees and tool in STRIPPED_TOOLS and isinstance(path, str):
-            fixed = None if self.budget is None else self.budget.fixed
-            strips = strips_for_path(path, fixed=fixed, known=self.known)
+        if self.showing and tool in STRIPPED_TOOLS and isinstance(path, str):
+            strips = strips_for_path(path, fixed=self.fixed, known=self.known)
             if strips is not None:
                 kept["strips"] = strips
         return kept
+
+
+@dataclass(frozen=True)
+class _Offer:
+    """A round's system prompt and the tools it may offer.
+
+    Attributes:
+        system: The system prompt.
+        tools: The tools, as OpenAI functions.
+        names: Their names.
+    """
+
+    system: str
+    tools: list[dict[str, Any]]
+    names: list[str]
+
+
+@dataclass(frozen=True)
+class _Request:
+    """What each round's request is fitted from, besides the current turn.
+
+    Attributes:
+        seeing: The offer while images go to the model: ``view_file`` among the tools, and the
+            system prompt saying how to look.
+        blind: The offer without either, for a model that does not see, or that refused images.
+        past: The earlier turns, oldest first.
+        budget: The tokens a round's prompt may take.
+    """
+
+    seeing: _Offer
+    blind: _Offer
+    past: Sequence[PastTurn]
+    budget: int
+
+    def offer(self, sight: _Sight) -> _Offer:
+        """Return the offer of a round.
+
+        Args:
+            sight: The turn's images.
+
+        Returns:
+            :attr:`seeing` while images go to the model, else :attr:`blind`.
+        """
+        return self.seeing if sight.showing else self.blind
+
+    def fitted(
+        self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Return a round's messages, fitted to the budget, and the tools it offers.
+
+        Args:
+            current: The current turn's messages.
+            sight: The turn's images: the offer, and what an image costs.
+            tooled: Whether the round may offer tools.
+
+        Returns:
+            The messages (:func:`~ghostwriter.agent.context.fit`), their refs still refs; and the tools.
+        """
+        offer = self.offer(sight)
+        tools = offer.tools if tooled else []
+        return fit(offer.system, tools, self.past, current, budget=self.budget, images=sight.budget), tools
 
 
 def _preview(output: OutputFile) -> dict[str, Any] | None:
@@ -511,27 +584,25 @@ class AgentLoop:
         workbench = self._workbench
         sees = self._vision is not None and self._vision.model_sees
         discovery = workbench.discover(call=turn.call) if workbench is not None else None
-        found = [tool for tool in discovery.tools if sees or tool.name != VIEW_TOOL] if discovery is not None else []
-        offered: list[dict[str, Any]] = function_tools(found)
-        names: list[str] = [tool.name for tool in found]
+        discovered = discovery.tools if discovery is not None else ()
         folder = chat_folder(key, turn.chat_id) if discovery is not None and key else None
         question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=sees)
         past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=sees)
-        system = system_prompt(
-            today=self._now().date(),
-            folder=folder,
-            file_days=settings.file_days,
-            expired=expired,
-            presentations="write_presentation" in names,
-            vision=sees and VIEW_TOOL in names,
-        )
+        today = self._now().date()
+        blind = self._offer(discovered, seeing=False, folder=folder, expired=expired, today=today)
+        seeing = self._offer(discovered, seeing=True, folder=folder, expired=expired, today=today) if sees else blind
         attached = [*question.images, *(image for earlier in past for image in earlier.images)]
         sight = _Sight(
             sees=sees,
             budget=ImageBudget(settings.image_tokens, settings.max_images) if sees else None,
             known={image.path: (image.width, image.height) for image in attached},
         )
-        budget = prompt_tokens(settings.context_tokens, reasoning=turn.reasoning)
+        request = _Request(
+            seeing=seeing,
+            blind=blind,
+            past=past,
+            budget=prompt_tokens(settings.context_tokens, reasoning=turn.reasoning),
+        )
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
         current: list[dict[str, Any]] = [_asked(question, sight)]
@@ -539,17 +610,13 @@ class AgentLoop:
         round_no = 0
         while not turn.cancel.is_set():
             round_no += 1
-            tools = (
-                offered
-                if round_no <= MAX_TOOL_ROUNDS and not message.withdrawn and self._left(message) >= TOOL_CUTOFF_S
-                else []
-            )
-            fitted = fit(system, tools, past, current, budget=budget, images=sight.budget)
-            done = yield from self._round(
-                turn, audit, message, sight, current, fitted, tools=tools, round_no=round_no, headers=headers
+            tooled = round_no <= MAX_TOOL_ROUNDS and not message.withdrawn and self._left(message) >= TOOL_CUTOFF_S
+            done, tools = yield from self._round(
+                turn, audit, message, sight, request, current, tooled=tooled, round_no=round_no, headers=headers
             )
             if done is None or done.stopped or not done.calls or not tools or workbench is None:
                 return
+            names = request.offer(sight).names
             # vLLM ends a round in which a call's name streamed with "tool_calls", at the cap too: the usage tells.
             at_cap = done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
             calls: list[dict[str, Any]] = []
@@ -580,35 +647,63 @@ class AgentLoop:
             current.extend(answers)
             self._tool_images(current, sight, shown)
 
+    def _offer(
+        self, discovered: Sequence[McpTool], *, seeing: bool, folder: str | None, expired: bool, today: date
+    ) -> _Offer:
+        """Return what a round offers, with sight or without it.
+
+        Args:
+            discovered: The tools discovery found.
+            seeing: Whether images go to the model: only then is ``view_file`` offered and the system
+                prompt says how to look.
+            folder: The chat's folder in workbench; ``None`` when no tool is offered.
+            expired: Whether files or tool results of earlier messages have expired.
+            today: The date the message is answered on.
+
+        Returns:
+            The system prompt, and the tools with their names.
+        """
+        found = [tool for tool in discovered if seeing or tool.name != VIEW_TOOL]
+        names = [tool.name for tool in found]
+        system = system_prompt(
+            today=today,
+            folder=folder,
+            file_days=self._settings.file_days,
+            expired=expired,
+            presentations="write_presentation" in names,
+            vision=seeing and VIEW_TOOL in names,
+        )
+        return _Offer(system, function_tools(found), names)
+
     def _round(
         self,
         turn: Turn,
         audit: TurnAudit,
         message: _Progress,
         sight: _Sight,
+        request: _Request,
         current: list[dict[str, Any]],
-        fitted: list[dict[str, Any]],
         *,
-        tools: list[dict[str, Any]],
+        tooled: bool,
         round_no: int,
         headers: Mapping[str, str],
-    ) -> Generator[TurnEvent, None, RoundDone | None]:
-        """Stream one round with its images and record it; a round refused with images goes once more without.
+    ) -> Generator[TurnEvent, None, tuple[RoundDone | None, list[dict[str, Any]]]]:
+        """Fit one round, stream it with its images and record it; a round refused with images goes once more.
 
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
         with a status of :data:`REFUSED_IMAGE_STATUSES`, of a round that carried images is recorded as a
-        failed round and told with a :class:`NoticeEvent`; the round goes again without images, as the
-        rest of the turn does, and a second failure is the model error.
+        failed round and told with a :class:`NoticeEvent`. The round is then fitted again without sight,
+        as the rest of the turn is, and sent without images; a second failure is the model error.
 
         Args:
             turn: The message.
             audit: The turn's audit.
             message: The answer so far.
             sight: The turn's images.
+            request: What the round's request is fitted from.
             current: The current turn's messages.
-            fitted: The round's messages, as :func:`~ghostwriter.agent.context.fit` returned them.
-            tools: The tool schemas the round offers.
+            tooled: Whether the round may offer tools.
             round_no: The round.
             headers: The inference headers.
 
@@ -616,8 +711,9 @@ class AgentLoop:
             TurnEvent: The round's text, and a notice when it goes again without images.
 
         Returns:
-            How the round ended; ``None`` when the turn ends with it, as it failed.
+            How the round ended, ``None`` when the turn ends with it as it failed; and the tools it offered.
         """
+        fitted, tools = request.fitted(current, sight, tooled=tooled)
         if sight.showing:
             self._fetch(turn, sight, fitted)
             _keep_unseen(current, fitted, sight.bank)
@@ -653,14 +749,15 @@ class AgentLoop:
                     logger.info("Model round {} goes again without its {} images", round_no, count)
                     _drop_images(current, sight)
                     yield NoticeEvent("images_dropped")
+                    fitted, tools = request.fitted(current, sight, tooled=tooled)
                     continue
                 if not stopped:
                     yield ErrorEvent("model", MODEL_ERROR)
-                return None
+                return None, tools
             if done is None:
                 raise RuntimeError("a model round ended without its last event")
             audit.model_called(round=round_no, done=done, outcome="ok", images=count)
-            return done
+            return done, tools
 
     def _fetch(self, turn: Turn, sight: _Sight, fitted: Sequence[Mapping[str, Any]]) -> None:
         """Fetch, in one exchange, the renditions of the attached pictures a round is the first to send.
@@ -761,7 +858,7 @@ class AgentLoop:
     ) -> Generator[TurnEvent, None, ToolResult | ToolFailure | Refusal]:
         """Run one call of a round, or refuse it.
 
-        The call asks workbench for images while the model sees, and its step keeps the text the model reads.
+        The call asks workbench for images while they go to the model, and its step keeps the text the model reads.
 
         Args:
             turn: The message.
@@ -802,7 +899,7 @@ class AgentLoop:
         attempt = 1
         while True:
             audit.disclosed(tool=call.name, round=round_no, call_id=call.id, attempt=attempt)
-            outcome = workbench.call_tool(call.name, arguments, call=turn.call, timeout_s=timeout, images=sight.sees)
+            outcome = workbench.call_tool(call.name, arguments, call=turn.call, timeout_s=timeout, images=sight.showing)
             busy = isinstance(outcome, ToolFailure) and outcome.token in BUSY_TOKENS
             if not busy or attempt == 2 or self._left(message) - BUSY_RETRY_S < timeout:
                 break
@@ -858,6 +955,5 @@ def _asked(question: UserTurn, sight: _Sight) -> dict[str, Any]:
     """
     if not sight.sees or not question.images:
         return {"role": "user", "content": question.text}
-    fixed = None if sight.budget is None else sight.budget.fixed
-    parts = attachment_parts(question.images, fixed=fixed)
+    parts = attachment_parts(question.images, fixed=sight.fixed)
     return {"role": "user", "content": [{"type": "text", "text": question.text}, *parts]}
