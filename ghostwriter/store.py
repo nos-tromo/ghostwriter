@@ -57,7 +57,7 @@ FILES_STORE: Final = "files"
 #: The longest title the first message gives a chat.
 TITLE_CHARS: Final = 60
 #: What a manifest keeps of what workbench reports: counts, kinds and sizes, never a path, a hint or bytes.
-STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames")
+STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames", "unit")
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
 
@@ -1238,6 +1238,30 @@ class ChatStore:
                 ),
             )
             return settled.rowcount == 1
+
+    def keep_manifest(self, attachment_id: str, manifest: Mapping[str, Any]) -> bool:
+        """Keep the manifest a background prepare reported, for an attachment that is ready already.
+
+        Only a ``ready`` row without a manifest changes, so a second keep, a ``processing`` or
+        ``failed`` row and a row deleted meanwhile change nothing. The status never changes.
+
+        Args:
+            attachment_id: The attachment.
+            manifest: What workbench reported of the file; cut as :meth:`settle_attachment` cuts it.
+
+        Returns:
+            Whether the row changed: ``False`` when it is gone, not ``ready`` or has a manifest.
+        """
+        with self._transaction() as s:
+            kept = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    update(Attachment)
+                    .where(Attachment.id == attachment_id, Attachment.status == "ready", Attachment.render.is_(None))
+                    .values(render=_stored_manifest(manifest))
+                ),
+            )
+            return kept.rowcount == 1
 
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.

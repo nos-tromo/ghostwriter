@@ -874,7 +874,7 @@ async def test_prepare_answers_the_manifest() -> None:
     req = door.last("/files/prepare")
     assert req.method == "POST" and dict(req.url.params) == {"path": PDF} and req.content == b""
     assert req.headers["x-session-id"] == session_pseudonym(KEY, CHAT)
-    assert req.extensions["timeout"]["read"] == PREPARE_TIMEOUT_S == 270.0
+    assert req.extensions["timeout"]["read"] == PREPARE_TIMEOUT_S == 390.0
     assert got.kind == "pdf" and got.total == 3 and got.pages_without_text == (2,) and got.frames is None
     assert got.renditions == tuple(Rendition(n, 1131, 1600, "image/jpeg") for n in (1, 2, 3))
     stored = got.as_stored()
@@ -885,8 +885,60 @@ async def test_prepare_answers_the_manifest() -> None:
         "pages_without_text": [2],
         "renditions": [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg"} for n in (1, 2, 3)],
         "frames": None,
+        "unit": "page",
     }
     assert json.loads(json.dumps(stored)) == stored
+
+
+async def test_a_prepare_waits_390_s() -> None:
+    """Workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s."""
+    door = FakeDoor()
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    await _client(door).prepare(call=CALL, path=PDF)
+    request = door.last("/files/prepare")
+    assert (request.method, request.extensions["timeout"]["read"]) == ("POST", 390.0)
+    assert PREPARE_TIMEOUT_S == 390.0
+
+
+async def test_prepare_reads_an_office_manifest_with_its_unit() -> None:
+    """A deck is kind office and counts slides; a Word file is kind office and counts pages; the unit is kept."""
+    door = FakeDoor()
+    deck, memo = f"{FOLDER}/harbour-deck.pptx", f"{FOLDER}/quay-memo.docx"
+    for path in (deck, memo):
+        door.files[path] = (b"PK", "application/octet-stream")
+    client = _client(door)
+    slides = await client.prepare(call=CALL, path=deck)
+    assert (slides.kind, slides.unit, slides.total, slides.pages_without_text) == ("office", "slide", 3, (2,))
+    assert slides.renditions == tuple(Rendition(n, 1131, 1600, "image/jpeg") for n in (1, 2, 3))
+    assert slides.as_stored()["unit"] == "slide" and slides.as_stored()["kind"] == "office"
+    pages = await client.prepare(call=CALL, path=memo)
+    assert (pages.kind, pages.unit, pages.total, pages.pages_without_text) == ("office", "page", 3, ())
+    assert tuple(pages.as_stored()) == STORED_MANIFEST_KEYS
+
+
+async def test_a_manifest_without_unit_reads_as_page() -> None:
+    """Workbench 0.7 sends seven keys: a pdf's unit is then a page, and a docx it answers none for stays none."""
+    door = FakeDoor()
+    memo = f"{FOLDER}/quay-memo.docx"
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    door.files[memo] = (b"PK", "application/octet-stream")
+    seven: dict[str, Any] = {
+        "path": memo,
+        "kind": "none",
+        "total": 0,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+    }
+    door.manifests[PDF] = {key: value for key, value in stock_manifest(PDF).items() if key != "unit"}
+    door.manifests[memo] = {**seven, "hint": None}
+    client = _client(door)
+    scan = await client.prepare(call=CALL, path=PDF)
+    assert (scan.kind, scan.unit, scan.total) == ("pdf", "page", 3)
+    assert scan.as_stored()["unit"] == "page"
+    word = await client.prepare(call=CALL, path=memo)
+    assert (word.kind, word.unit) == ("none", "page")
+    assert word == Manifest("none", 0, (), (), None)
 
 
 async def test_a_prepare_that_cuts_strips_may_wait_less() -> None:
@@ -979,6 +1031,8 @@ async def test_prepare_maps_workbenchs_refusals(answer: object, error: type[Exce
     [
         {"kind": "video"},
         {"kind": None},
+        {"unit": "sheet"},
+        {"unit": 1},
         {"total": -1},
         {"total": "3"},
         {"pages_without_text": [0]},

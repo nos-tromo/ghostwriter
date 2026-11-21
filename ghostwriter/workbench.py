@@ -98,14 +98,20 @@ MAX_IMAGES_BYTES: Final = 3 * 1024 * 1024
 MAX_TOOL_IMAGES: Final = 8
 #: A rendition fetched must be smaller than this.
 MAX_RENDITION_BYTES: Final = 768 * 1024
-#: Seconds a prepare is waited for: workbench's 120 s of queue, its 120 s wall and 30 s.
-PREPARE_TIMEOUT_S: Final = 270.0
+#: Seconds a prepare is waited for: workbench's 120 s of queue, two job walls of 120 s (an Office file is
+#: converted, then drawn, in one turn) and 30 s.
+PREPARE_TIMEOUT_S: Final = 390.0
 #: Seconds the renditions of one fetch get together.
 RENDITION_TIMEOUT_S: Final = 30.0
 #: A table preview's most columns, rows and characters a cell, as workbench's executor cuts them.
 PREVIEW_COLUMNS = 20
 PREVIEW_ROWS = 5
 PREVIEW_CELL_CHARS = 100
+
+#: What a file is to the tools that show it: a picture, a PDF, an Office file drawn as pages or slides, or none.
+Kind = Literal["image", "pdf", "office", "none"]
+#: What an Office file's renders count: the pages of a document, or the slides of a deck.
+Unit = Literal["page", "slide"]
 
 _PATH = "/mcp"
 # A picture's label, as workbench's ``shown`` writes it, and the largest side it names.
@@ -115,7 +121,8 @@ _MAX_SIDE = 4096
 _MAX_IMAGE_BASE64 = (MAX_IMAGE_BYTES + 2) // 3 * 4
 # The most of a refusal's body read for its token.
 _MAX_REFUSAL_BYTES = 16 * 1024
-_KINDS: Final[dict[str, Literal["image", "pdf", "none"]]] = {"image": "image", "pdf": "pdf", "none": "none"}
+_KINDS: Final[dict[str, Kind]] = {"image": "image", "pdf": "pdf", "office": "office", "none": "none"}
+_UNITS: Final[dict[str, Unit]] = {"page": "page", "slide": "slide"}
 _ACCEPT = "application/json, text/event-stream"
 _USER_LABEL = b"workbench-user/v1"
 _SESSION_LABEL = b"workbench-session/v1"
@@ -316,21 +323,25 @@ class Manifest:
     """What workbench says a file is to the tools that show it, as :meth:`WorkbenchClient.prepare` reads it.
 
     Attributes:
-        kind: ``image``, ``pdf``, or ``none`` for a file that is not shown as pictures.
-        total: The pages of a PDF; 1 for a picture; 0 for ``none``.
-        pages_without_text: The pages of a PDF with no text of their own, counted from 1.
+        kind: ``image``, ``pdf``, ``office`` for a Word, PowerPoint or OpenDocument text file drawn as pages
+            or slides, or ``none`` for a file that is not shown as pictures.
+        total: The pages of a PDF or an Office file, or its slides; 1 for a picture; 0 for ``none``.
+        pages_without_text: The pages or slides with no text of their own, counted from 1.
         renditions: The renders that exist now.
         frames: The frames of a picture that has several, of which only the first is shown; else ``None``.
+        unit: What ``total`` and the renders count: ``slide`` for a deck, else ``page``; an answer of workbench 0.7
+            names none, and reads as ``page``.
     """
 
-    kind: Literal["image", "pdf", "none"]
+    kind: Kind
     total: int
     pages_without_text: tuple[int, ...]
     renditions: tuple[Rendition, ...]
     frames: int | None
+    unit: Unit = "page"
 
     def as_stored(self) -> dict[str, Any]:
-        """Return what a chat keeps of the manifest: its five counts and kinds, never a path or a hint.
+        """Return what a chat keeps of the manifest: its six counts and kinds, never a path or a hint.
 
         Returns:
             The keys of ``STORED_MANIFEST_KEYS`` as plain JSON values.
@@ -343,6 +354,7 @@ class Manifest:
                 {"n": item.n, "width": item.width, "height": item.height, "mime": item.mime} for item in self.renditions
             ],
             "frames": self.frames,
+            "unit": self.unit,
         }
 
 
@@ -903,14 +915,17 @@ def _manifest(answer: object) -> Manifest | None:
 
     Returns:
         The manifest; ``None`` when it is not an object with a known ``kind``, a count for ``total``,
-        pages counted from 1, renditions of a jpeg or png and a frame count or ``null``. Its ``path``
-        and ``hint`` are not read.
+        pages counted from 1, renditions of a jpeg or png, a frame count or ``null`` and a ``unit`` of
+        ``page`` or ``slide``, which reads as ``page`` when the answer names none (workbench 0.7). Its
+        ``path`` and ``hint`` are not read.
     """
     if not isinstance(answer, dict):
         return None
     kind, total, frames = answer.get("kind"), _count(answer.get("total")), answer.get("frames")
-    pages, listed = answer.get("pages_without_text"), answer.get("renditions")
+    pages, listed, unit = answer.get("pages_without_text"), answer.get("renditions"), answer.get("unit", "page")
     if not isinstance(kind, str) or kind not in _KINDS or total is None:
+        return None
+    if not isinstance(unit, str) or unit not in _UNITS:
         return None
     if (
         not isinstance(pages, list)
@@ -922,7 +937,7 @@ def _manifest(answer: object) -> Manifest | None:
     renditions = tuple(item for item in (_rendition(entry) for entry in listed) if item is not None)
     if len(numbers) < len(pages) or len(renditions) < len(listed):
         return None
-    return Manifest(_KINDS[kind], total, numbers, renditions, frames)
+    return Manifest(_KINDS[kind], total, numbers, renditions, frames, _UNITS[unit])
 
 
 def _view_params(path: str, rendition: int | None, strips: int, strip: int | None) -> dict[str, str | int]:

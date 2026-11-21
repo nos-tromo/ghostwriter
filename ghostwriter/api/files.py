@@ -8,10 +8,12 @@ view route with workbench's type, length and disposition, and its hardening head
 
 While pictures are offered (:meth:`~ghostwriter.vision.Vision.images_offered`), a picture or a PDF
 is stored ``processing`` and its upload answers at once; the attachment processor
-(:mod:`ghostwriter.processing`) has workbench prepare it. The SPA follows its status by long-poll
-(``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds), and
-shows a page or the picture through the preview route, a render streamed from workbench's view route
-with the same hardening.
+(:mod:`ghostwriter.processing`) has workbench prepare it. A Word, PowerPoint or OpenDocument text file
+(:func:`~ghostwriter.upload.prepared_later`) is stored ``ready`` and prepared after it, as a background job
+that only adds its facts. The SPA follows a ``processing`` status by long-poll
+(``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds; a ``ready``
+one is answered at once), and shows a page or the picture through the preview route, a render streamed from
+workbench's view route with the same hardening.
 
 The chat is marked as one that used workbench before its file goes out, so its delete asks
 workbench too. Records name a file by its id, never by its name. An attachment is ``collect`` /
@@ -57,6 +59,7 @@ from ghostwriter.upload import (
     attachment_type,
     name_problem,
     needs_prepare,
+    prepared_later,
     read_file_part,
     safe_filename,
 )
@@ -229,7 +232,7 @@ async def attach_file(
 
     Returns:
         The pending attachment, ``processing`` while workbench prepares a picture or a PDF, else
-        ``ready``; or the refusal: 409 ``too_many_pending`` at
+        ``ready``, an Office file too, which is prepared after; or the refusal: 409 ``too_many_pending`` at
         :data:`~ghostwriter.upload.MAX_PENDING` waiting files not yet expired, also
         when parallel uploads filled the chat meanwhile, counted again as the attachment is stored.
 
@@ -275,6 +278,7 @@ async def attach_file(
         return stored
     kind = attachment_kind(name)
     prepared = offered and needs_prepare(name)
+    later = offered and prepared_later(name)
     try:
         attachment = await run_in_threadpool(
             store.add_attachment,
@@ -294,8 +298,8 @@ async def attach_file(
     except ChatNotFound:
         await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
-    if prepared:
-        processor.submit(PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op))
+    if prepared or later:
+        processor.submit(PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op, background=later))
     return attachment
 
 
@@ -459,8 +463,9 @@ async def _read_after_wait(
 ) -> AttachmentOut | None:
     """Wait for a ``processing`` attachment's job, at most ``wait`` seconds, and read it again.
 
-    Its job may have ended since it was read: without one it is read again before the wait, which
-    then lasts its whole time only for a row no job settles.
+    The row is read first, and answered at once unless it is ``processing``: a ``ready`` one, an Office
+    file whose background job still runs included, is never waited for. A ``processing`` row whose job has
+    ended since is read again before the wait, which then lasts its whole time only for a row no job settles.
 
     Args:
         store: The chats.
@@ -473,6 +478,9 @@ async def _read_after_wait(
     Returns:
         The attachment as it is then, or ``None`` once it is gone.
     """
+    found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
+    if found is None or found.status != "processing":
+        return found
     if not processor.running(attachment_id):
         found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
         if found is None or found.status != "processing":

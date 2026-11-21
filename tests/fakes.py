@@ -267,14 +267,17 @@ def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str,
 
 
 def stock_manifest(path: str) -> dict[str, Any]:
-    """Return the manifest the door gives a stored file, by its suffix.
+    """Return the manifest the door gives a stored file, by its suffix: workbench 0.8's eight keys.
 
     Args:
         path: The file's path.
 
     Returns:
         A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
-        text. Anything else: kind ``none``.
+        text. A deck (``.pptx``, ``.potx``): kind ``office``, unit ``slide``, three slides drawn
+        as a pdf's pages are, the second without text. A Word or OpenDocument text file (``.docx``,
+        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. Anything else: kind
+        ``none``. The unit is ``page`` for every kind but a deck.
     """
     lower = path.lower()
     manifest: dict[str, Any] = {
@@ -284,14 +287,26 @@ def stock_manifest(path: str) -> dict[str, Any]:
         "pages_without_text": [],
         "renditions": [],
         "frames": None,
+        "unit": "page",
         "hint": None,
     }
     if lower.endswith(_IMAGE_SUFFIXES):
         rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
         return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
+    pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
     if lower.endswith(".pdf"):
-        pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
         return {**manifest, "kind": "pdf", "total": 3, "pages_without_text": [2], "renditions": pages}
+    if lower.endswith((".pptx", ".potx")):
+        return {
+            **manifest,
+            "kind": "office",
+            "unit": "slide",
+            "total": 3,
+            "pages_without_text": [2],
+            "renditions": pages,
+        }
+    if lower.endswith((".docx", ".dotx", ".odt")):
+        return {**manifest, "kind": "office", "total": 3, "renditions": pages}
     return manifest
 
 

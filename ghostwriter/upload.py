@@ -12,7 +12,9 @@ An attachment's type is decided by its extension alone, in any case, through
 while pictures are offered; its name is :func:`safe_filename`'s, and :func:`name_problem` refuses
 what workbench would. :func:`attachment_kind` says whether a name is a picture, and
 :func:`needs_prepare` whether workbench prepares it (renders its pages or its picture) once
-it is stored.
+it is stored, before the attachment is ready. A Word, PowerPoint or OpenDocument text file
+(:data:`OFFICE_SUFFIXES`) is ready at once and prepared after it (:func:`prepared_later`): its
+pages are an addition, never a wait.
 """
 
 import re
@@ -65,6 +67,9 @@ IMAGE_TYPES: Final[dict[str, str]] = {
 }
 #: The extensions workbench prepares once a file is stored: a pdf and every picture.
 PREPARED_SUFFIXES: Final = frozenset({".pdf", *IMAGE_TYPES})
+#: The Office extensions workbench converts and draws, and the attachment is ready before that: Word, PowerPoint
+#: and OpenDocument text. Never in :data:`PREPARED_SUFFIXES`, so such an attachment is never ``processing``.
+OFFICE_SUFFIXES: Final = frozenset({".docx", ".dotx", ".pptx", ".potx", ".odt"})
 #: The most attachments a chat may hold before a message sends them.
 MAX_PENDING: Final = 10
 #: The longest file name, in characters and in UTF-8 bytes, as workbench takes it.
@@ -190,6 +195,18 @@ def needs_prepare(name: str) -> bool:
         Whether the extension is in :data:`PREPARED_SUFFIXES`.
     """
     return _suffix(name) in PREPARED_SUFFIXES
+
+
+def prepared_later(name: str) -> bool:
+    """Say whether workbench prepares a file of this name after it is ready, as a background job.
+
+    Args:
+        name: A name :func:`safe_filename` returned.
+
+    Returns:
+        Whether the extension, in any case, is in :data:`OFFICE_SUFFIXES`.
+    """
+    return _suffix(name) in OFFICE_SUFFIXES
 
 
 def name_problem(name: str) -> str | None:

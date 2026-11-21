@@ -4,6 +4,7 @@ A store, a :class:`~ghostwriter.workbench.WorkbenchClient` over :class:`~tests.f
 emitter on :class:`~tests.conftest.CapturedAuditStream`. Every name, id and value here is invented.
 """
 
+import asyncio
 from collections.abc import AsyncIterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,13 @@ from ghostwriter.audit import open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment
-from ghostwriter.processing import PREPARE_SLOTS, STRIPS_TIMEOUT_S, AttachmentProcessor, PrepareJob
+from ghostwriter.processing import (
+    BACKGROUND_SLOTS,
+    PREPARE_SLOTS,
+    STRIPS_TIMEOUT_S,
+    AttachmentProcessor,
+    PrepareJob,
+)
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditEmitter
 from ghostwriter.workbench import PREPARE_TIMEOUT_S, WorkbenchClient, chat_folder
@@ -96,6 +103,31 @@ def _job(env: Env, name: str = "harbour-photo.jpg", kind: Literal["document", "i
         status="processing",
     )
     return PrepareJob(out.id, env.chat_id, "user-a", path, kind, None)
+
+
+def _deck(env: Env, name: str = "harbour-deck.pptx") -> PrepareJob:
+    """Store a ``ready`` Office attachment whose file the door holds, and return its background job.
+
+    Args:
+        env: The test's env.
+        name: The file's name.
+
+    Returns:
+        The job, with no request's operation, for a file that is ready already.
+    """
+    path = f"{chat_folder(KEY, env.chat_id)}/{name}"
+    env.door.files[path] = (b"PK", "application/octet-stream")
+    out = env.store.add_attachment(
+        env.chat_id,
+        file_id="5" * 32,
+        path=path,
+        name=name,
+        size=2,
+        mime="application/octet-stream",
+        kind="document",
+        status="ready",
+    )
+    return PrepareJob(out.id, env.chat_id, "user-a", path, "document", None, background=True)
 
 
 def _prepares(door: FakeDoor) -> list[httpx.Request]:
@@ -190,7 +222,7 @@ async def test_a_manifest_this_client_cannot_read_fails_a_picture_and_leaves_a_d
     """A manifest of a kind this client does not know is a bad answer: the picture fails, the PDF reads as text."""
     photo, scan = _job(env), _job(env, "quay-scan.pdf", "document")
     for job in (photo, scan):
-        env.door.manifests[job.path] = {**stock_manifest(job.path), "kind": "office"}
+        env.door.manifests[job.path] = {**stock_manifest(job.path), "kind": "video"}
         env.processor.submit(job)
     for job in (photo, scan):
         await env.processor.wait(job.attachment_id, 5)
@@ -358,3 +390,118 @@ async def test_an_unexpected_strips_failure_is_a_warning(env: Env, loguru_caplog
     assert len(_prepares(env.door)) == 2 and _status(env, job) == ("ready", None)
     assert "RuntimeError" in loguru_caplog.text and job.attachment_id in loguru_caplog.text
     assert "synthetic transport failure" not in loguru_caplog.text and "harbour-photo" not in loguru_caplog.text
+
+
+async def test_an_office_attachment_is_prepared_in_the_background(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """A deck that is ready already is handed to workbench, stays ready while it is drawn, and keeps what it reports."""
+    env.door.delays["/files/prepare"] = 0.3
+    job = _deck(env)
+    assert job.background is True
+    env.processor.submit(job)
+    with anyio.fail_after(5):
+        while not _prepares(env.door):
+            await anyio.sleep(0.01)
+    found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
+    assert _status(env, job) == ("ready", None) and found is not None and found.manifest is None
+    await env.processor.wait(job.attachment_id, 5)
+    assert _status(env, job) == ("ready", None)
+    found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
+    assert found is not None and found.manifest is not None
+    assert (found.manifest["kind"], found.manifest["unit"], found.manifest["total"]) == ("office", "slide", 3)
+    assert found.manifest["pages_without_text"] == [2] and len(found.manifest["renditions"]) == 3
+    assert len(_prepares(env.door)) == 1
+    handed = [e for e in events(audit_stream) if e["operation"] == "chat.attachment"]
+    assert [(e["action"], e["recipient"], e["outcome"]) for e in handed] == [("disclose", "workbench:prepare", "ok")]
+
+
+@pytest.mark.parametrize(
+    "detail",
+    [
+        "unreadable_file: the file holds more or larger pictures than can be drawn within the memory limit",
+        "unsupported_format: .pptx",
+    ],
+    ids=["unreadable", "unsupported"],
+)
+async def test_an_office_file_workbench_cannot_convert_stays_ready_without_facts(
+    env: Env, audit_stream: CapturedAuditStream, detail: str
+) -> None:
+    """A refused conversion changes nothing the user sees: ready, no manifest, no failure; one ``error`` child.
+
+    workbench's 422 is final, so the prepare is sent once and never again.
+    """
+    env.door.answers["/files/prepare"] = lambda folder: httpx.Response(422, json={"detail": detail})
+    job = _deck(env)
+    env.processor.submit(job)
+    await env.processor.wait(job.attachment_id, 5)
+    assert _status(env, job) == ("ready", None)
+    found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
+    assert found is not None and found.manifest is None
+    assert len(_prepares(env.door)) == 1
+    [failed] = [e for e in events(audit_stream) if e["outcome"] == "error"]
+    token = detail.partition(":")[0]
+    assert (failed["action"], failed["recipient"], failed["criteria"]) == (
+        "disclose",
+        "workbench:prepare",
+        {"reason": token},
+    )
+
+
+async def test_background_prepares_take_one_slot(env: Env) -> None:
+    """With every prepare held open, a second deck waits for the first, while a picture takes the other slot."""
+    jobs = [_deck(env, "harbour-deck.pptx"), _deck(env, "quay-deck.pptx")]
+    picture = _job(env)
+    gates = {job.path: asyncio.Event() for job in (*jobs, picture)}
+    started: list[str] = []
+    ended: list[str] = []
+    ended_when_started: dict[str, list[str]] = {}
+
+    async def held(request: httpx.Request) -> httpx.Response:
+        if request.url.path != "/files/prepare":
+            return await env.door(request)
+        path = request.url.params["path"]
+        started.append(path)
+        ended_when_started[path] = list(ended)
+        await gates[path].wait()
+        try:
+            return await env.door(request)
+        finally:
+            ended.append(path)
+
+    processor = AttachmentProcessor(
+        env.store, WorkbenchClient(env.settings, transport=httpx.MockTransport(held)), env.emitter
+    )
+    first, second = jobs
+    try:
+        for job in (first, second, picture):
+            processor.submit(job)
+        with anyio.fail_after(5):
+            while len(started) < 2:
+                await anyio.sleep(0.01)
+        await anyio.sleep(0.2)
+        assert BACKGROUND_SLOTS == 1 and PREPARE_SLOTS == 2
+        assert sorted(started) == sorted([first.path, picture.path])
+        gates[first.path].set()
+        with anyio.fail_after(5):
+            while second.path not in started:
+                await anyio.sleep(0.01)
+        assert ended_when_started[second.path] == [first.path]
+        for gate in gates.values():
+            gate.set()
+        with anyio.fail_after(5):
+            while any(processor.running(job.attachment_id) for job in (*jobs, picture)):
+                await anyio.sleep(0.01)
+    finally:
+        for gate in gates.values():
+            gate.set()
+        await processor.aclose()
+    assert len(_prepares(env.door)) == 3
+    assert [_status(env, job) for job in (*jobs, picture)] == [("ready", None)] * 3
+
+
+async def test_a_ready_deck_is_not_requeued(env: Env) -> None:
+    """A deck without facts is ready, not processing: nothing finds it at start, and nothing is prepared."""
+    job = _deck(env)
+    assert env.processor.requeue() == 0
+    await anyio.sleep(0.1)
+    assert _prepares(env.door) == [] and _status(env, job) == ("ready", None)
+    assert not env.processor.running(job.attachment_id)

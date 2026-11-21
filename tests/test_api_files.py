@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
 
 import anyio
 import httpx
@@ -19,10 +20,11 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ghostwriter import processing
-from ghostwriter.api.files import FILE_HEADERS
+from ghostwriter.api.files import FILE_HEADERS, _read_after_wait
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings, unrecorded_child
@@ -673,8 +675,8 @@ def test_an_image_is_prepared_after_it_is_attached(
     assert PHOTO not in audit_stream.getvalue()
 
 
-def test_a_pdf_gets_its_manifest_and_a_word_file_none(seeing: TestClient, door: FakeDoor) -> None:
-    """A PDF is prepared and keeps its page count; a Word file is read as text, ready at once, never prepared."""
+def test_a_pdf_waits_and_a_word_file_is_ready_at_once(seeing: TestClient, door: FakeDoor) -> None:
+    """A PDF is processing until it is prepared; a Word file is ready at once and prepared after, a sheet never."""
     cid = _new(seeing)
     store = _state(seeing).store
     scan = _attach(seeing, cid, SCAN, b"%PDF-1.7").json()
@@ -685,9 +687,68 @@ def test_a_pdf_gets_its_manifest_and_a_word_file_none(seeing: TestClient, door: 
     door.upload_id = "5" * 32
     memo = _attach(seeing, cid, "memo.docx").json()
     assert (memo["kind"], memo["status"]) == ("document", "ready")
-    assert len(_prepares(door)) == 1
+
+    def kept() -> bool:
+        found = store.find_attachment("user-a", cid, memo["id"])
+        return found is not None and found.manifest is not None
+
+    _wait_until(kept)
     found = store.find_attachment("user-a", cid, memo["id"])
+    assert found is not None and found.status == "ready" and found.manifest is not None
+    assert (found.manifest["kind"], found.manifest["unit"], found.manifest["total"]) == ("office", "page", 3)
+    door.upload_id = "6" * 32
+    sheet = _attach(seeing, cid, "figures.xlsx").json()
+    assert (sheet["kind"], sheet["status"]) == ("document", "ready")
+    assert not _state(seeing).processor.running(sheet["id"])
+    found = store.find_attachment("user-a", cid, sheet["id"])
+    assert found is not None and found.status == "ready" and found.manifest is None
+    assert len(_prepares(door)) == 2
+
+
+def test_an_office_file_is_not_prepared_with_vision_off(client: TestClient, door: FakeDoor) -> None:
+    """Without a model that sees, a deck is ready at once as in 0.3.0: no job is submitted, workbench is not asked."""
+    cid = _new(client)
+    deck = _attach(client, cid, "harbour-deck.pptx", b"PK").json()
+    assert (deck["kind"], deck["status"]) == ("document", "ready")
+    assert not _state(client).processor.running(deck["id"])
+    time.sleep(0.2)
+    assert _prepares(door) == []
+    found = _state(client).store.find_attachment("user-a", cid, deck["id"])
     assert found is not None and found.manifest is None
+
+
+async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Path) -> None:
+    """A ready deck whose background job runs is answered at once, whatever wait was asked; a processing row waits."""
+    settings = make_settings(tmp_path, vision=True)
+    engine = make_engine(settings.db_path)
+    init_db(engine)
+    try:
+        store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
+        cid = store.create_chat("user-a").id
+
+        def add(name: str, status: str) -> str:
+            return store.add_attachment(
+                cid,
+                file_id="7" * 32,
+                path=f"{chat_folder(KEY, cid)}/{name}",
+                name=name,
+                size=2,
+                mime="application/octet-stream",
+                kind="document",
+                status=status,
+            ).id
+
+        deck, scan = add("harbour-deck.pptx", "ready"), add("quay-scan.pdf", "processing")
+        processor = create_autospec(AttachmentProcessor, instance=True)
+        processor.running.return_value = True
+        found = await _read_after_wait(store, processor, "user-a", cid, deck, wait=20)
+        assert found is not None and found.status == "ready"
+        processor.wait.assert_not_called()
+        found = await _read_after_wait(store, processor, "user-a", cid, scan, wait=20)
+        assert found is not None and found.status == "processing"
+        processor.wait.assert_awaited_once_with(scan, 20)
+    finally:
+        engine.dispose()
 
 
 def test_an_unreadable_image_fails_and_a_pdf_stays_ready(
