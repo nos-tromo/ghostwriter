@@ -8,7 +8,7 @@ import { MarkdownProse } from './MarkdownProse'
 import { ResultCard } from './ResultCard'
 import { Trail } from './Trail'
 
-/** A file the message bound, as a chip that reads on the blue of the user's bubble. */
+/** A file the message bound, as a chip that reads on the accent of the user's bubble. */
 function AttachmentChip({ attachment }: { attachment: AttachmentOut }) {
   const t = useT()
   const lang = useLang()
