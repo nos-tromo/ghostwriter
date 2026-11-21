@@ -1,10 +1,12 @@
-"""What the model reads: tool schemas, arguments as models write them, the budget, follow-ups, the system prompt.
+"""What the model reads: tool schemas, arguments as models write them, the budget and images, follow-ups, the prompt.
 
 Every name, id and value here is invented.
 """
 
+import copy
+import dataclasses
 import json
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,27 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import Engine
 
-from ghostwriter.agent.context import CLEARED, PastCall, PastTurn, estimate_tokens, fit, user_content
+from ghostwriter.agent.context import (
+    CLEARED,
+    PastCall,
+    PastTurn,
+    attachment_facts,
+    estimate_tokens,
+    fit,
+    user_content,
+)
+from ghostwriter.agent.images import (
+    LABEL,
+    NOT_RESENT,
+    OVER_CAP,
+    RETIRED,
+    AttachedImage,
+    ImageBudget,
+    attachment_parts,
+    note,
+    refs,
+    tool_image_message,
+)
 from ghostwriter.agent.limits import (
     HISTORY_ARGUMENT_CHARS,
     HISTORY_RESULT_CHARS,
@@ -35,8 +57,9 @@ from ghostwriter.agent.tools import (
 )
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.schemas import AttachmentOut
-from ghostwriter.store import ChatStore
-from ghostwriter.workbench import McpTool, OutputFile, TablePreview, ToolFailure, ToolResult
+from ghostwriter.store import ChatStore, UserTurn
+from ghostwriter.workbench import McpTool, OutputFile, TablePreview, ToolFailure, ToolImage, ToolResult
+from tests.fakes import TINY_JPEG, TINY_PNG, stock_manifest
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -399,8 +422,8 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     store.finish_assistant_message(store.start_assistant_message(chat.id), "42")
     second = store.add_user_message("user-a", chat.id, "Und Spalte C?", [])
     named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]"
-    assert store.user_turn(chat.id, first.id) == (named, 0)
-    assert store.user_turn(chat.id, second.id) == ("Und Spalte C?", 2)
+    assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0)
+    assert store.user_turn(chat.id, second.id) == UserTurn("Und Spalte C?", (), 2)
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(named, (), "42", False)], False)
     clock.now = T0 + 7 * DAY
     gone = "Summe der Spalte B\n[Attached: sales.xlsx; expired]"
@@ -460,3 +483,264 @@ def test_the_presentation_sentence_comes_with_the_tool() -> None:
     assert PRESENTATIONS not in SYSTEM
     bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False, presentations=True)
     assert bare == system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
+
+
+PAGE = ToolImage("quay-scan.pdf, page 2", 1131, 1600, "image/jpeg", TINY_JPEG)
+CHART = ToolImage("plot.png", 640, 480, "image/png", TINY_PNG)
+
+
+def _photo(n: int, name: str, *, width: int = 64, height: int = 48) -> AttachedImage:
+    return AttachedImage(file_id=str(n) * 32, path=f"{FOLDER}/{name}", name=name, width=width, height=height)
+
+
+def _text(text: str) -> dict[str, Any]:
+    return {"type": "text", "text": text}
+
+
+def _labelled(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the messages with each image ref as its label: what the budget counts of them in characters."""
+    return [
+        {**m, "content": [note(p, LABEL) if p.get("type") == "image_ref" else p for p in m["content"]]}
+        if isinstance(m.get("content"), list)
+        else m
+        for m in messages
+    ]
+
+
+def _text_tokens(current: list[dict[str, Any]]) -> int:
+    """Return the tokens of the system prompt and the current turn without their images' own cost."""
+    return estimate_tokens(_labelled([{"role": "system", "content": SYSTEM}, *current]))
+
+
+def _image_manifest(width: int, height: int) -> dict[str, Any]:
+    rendition = {"n": 1, "width": width, "height": height, "mime": "image/jpeg"}
+    return {"kind": "image", "total": 1, "pages_without_text": [], "renditions": [rendition], "frames": None}
+
+
+def _pdf_manifest(total: int, blank: list[int]) -> dict[str, Any]:
+    return {"kind": "pdf", "total": total, "pages_without_text": blank, "renditions": [], "frames": None}
+
+
+def test_the_attachment_line_carries_facts() -> None:
+    """The line names an image's size, a PDF's pages and those without text; a failed or expired file says so."""
+    times = "\N{MULTIPLICATION SIGN}"
+    assert attachment_facts("image", _image_manifest(2048, 1536), seen=True) == f"image 2048{times}1536"
+    assert attachment_facts("image", _image_manifest(2048, 1536), seen=False) == (
+        f"image 2048{times}1536; not shown: this model does not take images"
+    )
+    assert (
+        attachment_facts("document", _pdf_manifest(12, [3, 7]), seen=True) == "PDF, 12 pages; pages 3, 7 have no text"
+    )
+    assert attachment_facts("document", _pdf_manifest(12, []), seen=False) == "PDF, 12 pages"
+    assert attachment_facts("document", _pdf_manifest(5, [3]), seen=True) == "PDF, 5 pages; page 3 has no text"
+    assert attachment_facts("document", _pdf_manifest(1, []), seen=True) == "PDF, 1 page"
+    assert attachment_facts("document", {"kind": "none", "total": 0}, seen=True) is None
+    assert attachment_facts("document", None, seen=True) is None
+
+    def attached(name: str, size: int, **changes: Any) -> AttachmentOut:
+        fields: dict[str, Any] = {"kind": "document", "status": "ready", "expired": False, **changes}
+        return AttachmentOut(
+            id=f"att-{name}", file_id="1" * 32, name=name, size=size, mime="image/jpeg", created_at=T0, **fields
+        )
+
+    photo = attached("harbour-photo.jpg", 48_000, kind="image")
+    files = [
+        photo,
+        attached("quay-scan.pdf", 900_000),
+        attached("quay-letter.pdf", 70_000),
+        attached("letter.pdf", 2_000),
+        attached("sales.xlsx", 14),
+        attached("blurred-photo.jpg", 300, kind="image", status="failed"),
+        attached("old-scan.pdf", 5_000, expired=True),
+    ]
+    manifests: dict[str, Mapping[str, Any]] = {
+        "att-harbour-photo.jpg": _image_manifest(2048, 1536),
+        "att-quay-scan.pdf": _pdf_manifest(12, [3, 7]),
+        "att-quay-letter.pdf": _pdf_manifest(5, [3]),
+        "att-letter.pdf": _pdf_manifest(1, []),
+        "att-old-scan.pdf": _pdf_manifest(2, []),
+    }
+
+    def path_of(a: AttachmentOut) -> str:
+        return f"{FOLDER}/{a.name}"
+
+    text = user_content(
+        "Was steht darin?",
+        files,
+        path_of=path_of,
+        facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=True),
+    )
+    assert text.split("\n") == [
+        "Was steht darin?",
+        f"[Attached: harbour-photo.jpg ({FOLDER}/harbour-photo.jpg, 48000 bytes; image 2048{times}1536)]",
+        f"[Attached: quay-scan.pdf ({FOLDER}/quay-scan.pdf, 900000 bytes; PDF, 12 pages; pages 3, 7 have no text)]",
+        f"[Attached: quay-letter.pdf ({FOLDER}/quay-letter.pdf, 70000 bytes; PDF, 5 pages; page 3 has no text)]",
+        f"[Attached: letter.pdf ({FOLDER}/letter.pdf, 2000 bytes; PDF, 1 page)]",
+        f"[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]",
+        "[Attached: blurred-photo.jpg; could not be read]",
+        "[Attached: old-scan.pdf; expired]",
+    ]
+    unseen = user_content(
+        "", [photo], path_of=path_of, facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=False)
+    )
+    assert unseen == (
+        f"[Attached: harbour-photo.jpg ({FOLDER}/harbour-photo.jpg, 48000 bytes; "
+        f"image 2048{times}1536; not shown: this model does not take images)]"
+    )
+
+
+def test_an_image_counts_its_estimate_against_the_budget() -> None:
+    """At 280 tokens an image, room for one of two tool images retires the older; room for both retires none."""
+    images = ImageBudget(fixed=280, max_images=8)
+    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
+    current = [_user("Was zeigen die Seiten?"), *_round_with_results(1, chars=100), shown]
+    before = copy.deepcopy(current)
+    text = _text_tokens(current)
+    both = fit(SYSTEM, [], [], current, budget=text + 560, images=images)
+    assert refs(both) == refs(current) and both[1:] == current
+    one = fit(SYSTEM, [], [], current, budget=text + 559, images=images)
+    assert one[-1]["content"][1] == note(shown["content"][1], RETIRED)
+    assert one[-1]["content"][1]["text"] == (
+        "[Image: quay-scan.pdf, page 2; not shown again to make room, view it again with view_file]"
+    )
+    assert one[-1]["content"][2] == shown["content"][2] and len(refs(one)) == 1
+    assert estimate_tokens(_labelled(one)) + 280 <= text + 559
+    assert [m["content"] for m in one if m["role"] == "tool"] == ["0" * 100]
+    assert current == before
+
+
+def test_tool_images_retire_oldest_first_before_results_are_cleared() -> None:
+    """Short by one image, the older image retires and no result is cleared; short by more, all images, then results."""
+    images = ImageBudget(fixed=280, max_images=8)
+    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
+    current = [_user("Was zeigen die Seiten?"), *_round_with_results(2, chars=3_000), shown]
+    text = _text_tokens(current)
+    short_by_one = fit(SYSTEM, [], [], current, budget=text + 560 - 1, images=images)
+    assert short_by_one[-1]["content"][1:] == [note(shown["content"][1], RETIRED), shown["content"][2]]
+    assert [m["content"] for m in short_by_one if m["role"] == "tool"] == ["0" * 3_000, "1" * 3_000]
+    short_by_more = fit(SYSTEM, [], [], current, budget=text - 100, images=images)
+    assert refs(short_by_more) == []
+    assert short_by_more[-1]["content"][1:] == [note(part, RETIRED) for part in shown["content"][1:]]
+    assert [m["content"] for m in short_by_more if m["role"] == "tool"] == [CLEARED, "1" * 3_000]
+    assert estimate_tokens(short_by_more) <= text - 100
+
+
+def test_the_image_cap_holds_across_the_request() -> None:
+    """At most three images go: the question's two and the newest tool image; an earlier turn's image is a note."""
+    photos = (_photo(1, "harbour-photo.jpg"), _photo(2, "quay-photo.jpg"))
+    question = {"role": "user", "content": [_text("Vergleiche die Bilder"), *attachment_parts(photos, fixed=None)]}
+    shown, _ = tool_image_message([("view_file", "call_0", [PAGE, CHART])])
+    current = [question, *_round_with_results(1, chars=50), shown]
+    pier = _photo(3, "pier-photo.jpg")
+    past = [PastTurn("Zeig das Foto", (), "Ein Hafen.", False, (pier,))]
+    messages = fit(SYSTEM, [], past, current, images=ImageBudget(fixed=None, max_images=3))
+    assert [p["key"] for p in refs(messages)] == [
+        "att:" + "1" * 32 + ":1/1",
+        "att:" + "2" * 32 + ":1/1",
+        "tool:call_0:2",
+    ]
+    assert messages[-1]["content"][1] == note(shown["content"][1], RETIRED)
+    assert messages[1] == {"role": "user", "content": "Zeig das Foto\n" + NOT_RESENT.format(label="pier-photo.jpg")}
+    assert NOT_RESENT.format(label="pier-photo.jpg") == "[Image: pier-photo.jpg; not shown again, view_file shows it]"
+    crowded = {"role": "user", "content": [_text("Vergleiche"), *attachment_parts((*photos, pier), fixed=None)]}
+    over = fit(SYSTEM, [], [], [crowded], images=ImageBudget(fixed=None, max_images=2))
+    assert over[1]["content"] == [*crowded["content"][:3], note(crowded["content"][3], OVER_CAP, max=2)]
+    assert over[1]["content"][3]["text"] == (
+        "[Image: pier-photo.jpg; not shown, at most 2 images go to the model at once; view_file shows it]"
+    )
+    assert len(crowded["content"]) == 4 and len(refs([crowded])) == 3
+
+
+def test_earlier_turns_replay_with_their_images_while_budget_and_cap_allow() -> None:
+    """Newest first, a turn goes with its images, else with notes; a turn that fits neither way ends the replay."""
+    oldest = PastTurn("alt: " + "Größe " * 3_000, (), "kurz", False, (_photo(4, "old-photo.jpg"),))
+    newest = PastTurn("Zeig die Fotos", (), "Ein Hafen.", False, (_photo(1, "harbour-photo.jpg"), _photo(2, "kai.jpg")))
+    middle = PastTurn("Und das?", (), "Ein Kai.", False, (_photo(3, "pier-photo.jpg"),))
+    by_cap = fit(
+        SYSTEM, [], [oldest, middle, newest], [_user("Weiter")], budget=4_000, images=ImageBudget(280, max_images=2)
+    )
+    assert [m["content"] for m in by_cap if m["role"] == "user"] == [
+        "Und das?\n[Image: pier-photo.jpg; not shown again, view_file shows it]",
+        [_text("Zeig die Fotos"), *attachment_parts(newest.images, fixed=280)],
+        "Weiter",
+    ]
+    plan = PastTurn("Und der Plan?", (), "Ein Plan.", False, (_photo(5, "site-plan.png", width=2048, height=1536),))
+    small = PastTurn("Zeig das Foto", (), "Ein Hafen.", False, (_photo(1, "harbour-photo.jpg"),))
+    by_budget = fit(
+        SYSTEM, [], [oldest, plan, small], [_user("Weiter")], budget=3_000, images=ImageBudget(None, max_images=8)
+    )
+    assert [m["content"] for m in by_budget if m["role"] == "user"] == [
+        "Und der Plan?\n[Image: site-plan.png; not shown again, view_file shows it]",
+        [_text("Zeig das Foto"), *attachment_parts(small.images, fixed=None)],
+        "Weiter",
+    ]
+    assert estimate_tokens(_labelled(by_budget)) + 4 <= 3_000
+
+
+def test_without_an_image_budget_nothing_changes() -> None:
+    """Without ``images`` an earlier turn's images are not replayed; with it, messages without images fit as before."""
+    past = [_past_turn(user=f"{n}: " + "Größe " * 700, answer="Übersicht " * 400) for n in range(30)]
+    current = [_user("Fasse zusammen"), *_round_with_results(3, chars=12_000)]
+    plain = fit(SYSTEM, TOOLS, past, current, budget=9_000)
+    assert fit(SYSTEM, TOOLS, past, current, budget=9_000, images=ImageBudget(None, max_images=8)) == plain
+    pictured = [dataclasses.replace(turn, images=(_photo(1, "harbour-photo.jpg"),)) for turn in past]
+    assert fit(SYSTEM, TOOLS, pictured, current, budget=9_000) == plain
+    assert refs(plain) == [] and CLEARED in json.dumps(plain)
+
+
+def test_the_store_lists_ready_images_of_a_turn(store: ChatStore, clock: Clock) -> None:
+    """Only a ready, unexpired picture with a rendition is listed; not one processing, failed or expired, nor a PDF."""
+
+    def attach(name: str, kind: str, status: str, manifest: dict[str, Any] | None = None) -> str:
+        clock.now += timedelta(seconds=1)
+        path = f"{FOLDER}/{name}"
+        out = store.add_attachment(
+            chat.id,
+            file_id=name[0] * 32,
+            path=path,
+            name=name,
+            size=64,
+            mime="image/jpeg",
+            kind=kind,
+            status="processing",
+        )
+        if status != "processing":
+            failure = "unreadable_file" if status == "failed" else None
+            store.settle_attachment(out.id, status="failed" if failure else "ready", manifest=manifest, failure=failure)
+        return out.id
+
+    chat = store.create_chat("user-a")
+    clock.now = T0 - 7 * DAY
+    old = attach("old-photo.jpg", "image", "ready", stock_manifest(f"{FOLDER}/old-photo.jpg"))
+    clock.now = T0
+    ready = attach("harbour-photo.jpg", "image", "ready", stock_manifest(f"{FOLDER}/harbour-photo.jpg"))
+    waiting = attach("quay-photo.jpg", "image", "processing")
+    broken = attach("blurred-photo.jpg", "image", "failed")
+    scan = attach("scan.pdf", "document", "ready", stock_manifest(f"{FOLDER}/scan.pdf"))
+    first = store.add_user_message("user-a", chat.id, "Was zeigen sie?", [old, ready, waiting, broken, scan])
+    times = "\N{MULTIPLICATION SIGN}"
+    photo = AttachedImage("h" * 32, f"{FOLDER}/harbour-photo.jpg", "harbour-photo.jpg", 64, 48)
+    seen = store.user_turn(chat.id, first.id, seen=True)
+    assert seen == UserTurn(
+        "\n".join(
+            [
+                "Was zeigen sie?",
+                "[Attached: old-photo.jpg; expired]",
+                f"[Attached: harbour-photo.jpg ({FOLDER}/harbour-photo.jpg, 64 bytes; image 64{times}48)]",
+                f"[Attached: quay-photo.jpg ({FOLDER}/quay-photo.jpg, 64 bytes; image)]",
+                "[Attached: blurred-photo.jpg; could not be read]",
+                f"[Attached: scan.pdf ({FOLDER}/scan.pdf, 64 bytes; PDF, 3 pages; page 2 has no text)]",
+            ]
+        ),
+        (photo,),
+        0,
+    )
+    unseen = store.user_turn(chat.id, first.id)
+    assert unseen.images == (photo,) and f"image 64{times}48; not shown: this model does not take images" in unseen.text
+    store.finish_assistant_message(store.start_assistant_message(chat.id), "Einen Hafen.")
+    store.add_user_message("user-a", chat.id, "Und weiter?", [])
+    [turn], expired = store.past_turns(chat.id, before_position=2, seen=True)
+    assert (turn, expired) == (PastTurn(seen.text, (), "Einen Hafen.", True, (photo,)), True)
+    clock.now = T0 + 8 * DAY
+    [gone], _ = store.past_turns(chat.id, before_position=2, seen=True)
+    assert gone.images == () and "[Attached: harbour-photo.jpg; expired]" in gone.user

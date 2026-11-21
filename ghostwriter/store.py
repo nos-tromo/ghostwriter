@@ -29,7 +29,8 @@ from loguru import logger
 from sqlalchemy import CursorResult, Engine, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
-from ghostwriter.agent.context import PastCall, PastTurn, user_content
+from ghostwriter.agent.context import PastCall, PastTurn, attachment_facts, user_content
+from ghostwriter.agent.images import AttachedImage, rendition_size
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
@@ -116,6 +117,40 @@ class AttachmentRef:
     manifest: Mapping[str, Any] | None
     created_at: datetime
     expired: bool
+
+
+@dataclass(frozen=True)
+class UserTurn:
+    """A user's message as the model reads it.
+
+    Attributes:
+        text: The text, each attachment named with its facts
+            (:func:`~ghostwriter.agent.context.user_content`).
+        images: The pictures it attached that are ready to be seen, in their order.
+        position: The message's place in the chat.
+    """
+
+    text: str
+    images: tuple[AttachedImage, ...]
+    position: int
+
+
+def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
+    """Read a stored manifest.
+
+    Args:
+        render: The row's ``render``.
+
+    Returns:
+        The manifest, or ``None`` without one or for one that is not a JSON object.
+    """
+    if render is None:
+        return None
+    try:
+        manifest = json.loads(render)
+    except ValueError:
+        return None
+    return cast(Mapping[str, Any], manifest) if isinstance(manifest, dict) else None
 
 
 def _stored_manifest(manifest: Mapping[str, Any]) -> str:
@@ -1231,34 +1266,64 @@ class ChatStore:
             )
             return pictures.rowcount + others.rowcount
 
-    def _prompt_text(self, message: Message, attachments: Sequence[Attachment], now: datetime) -> str:
+    def _prompt_text(self, message: Message, attachments: Sequence[Attachment], now: datetime, *, seen: bool) -> str:
         """Return a user's message as the model reads it.
 
         Args:
             message: The message.
             attachments: The files it sent.
             now: The time of the read.
+            seen: Whether the model sees images, which a picture's line says.
 
         Returns:
-            The text, then each attachment with its path and size, or as expired.
+            The text, then each attachment with its path, size and facts
+            (:func:`~ghostwriter.agent.context.attachment_facts`), or as expired or unreadable.
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
+        facts = {
+            attachment.id: attachment_facts(attachment.kind, _loaded_manifest(attachment.render), seen=seen)
+            for attachment in attachments
+        }
         return user_content(
             message.content,
             [self._attachment_out(attachment, now) for attachment in attachments],
             path_of=lambda attachment: paths[attachment.id],
+            facts_of=lambda attachment: facts[attachment.id],
         )
 
-    def user_turn(self, chat_id: str, message_id: str) -> tuple[str, int]:
-        """Return a user's message as the model reads it, and its place in the chat.
+    def _images(self, attachments: Sequence[Attachment], now: datetime) -> tuple[AttachedImage, ...]:
+        """Return the pictures among a message's attachments that are ready to be seen.
+
+        Args:
+            attachments: The files it sent, in order.
+            now: The time of the read.
+
+        Returns:
+            Each ``image`` attachment that is ``ready``, has not expired and has a first
+            rendition, with that rendition's size.
+        """
+        images: list[AttachedImage] = []
+        for attachment in attachments:
+            if attachment.kind != "image" or attachment.status != "ready" or self._gone(attachment.created_at, now):
+                continue
+            size = rendition_size(_loaded_manifest(attachment.render))
+            if size is not None:
+                images.append(
+                    AttachedImage(attachment.workbench_file_id, attachment.path, attachment.name, size[0], size[1])
+                )
+        return tuple(images)
+
+    def user_turn(self, chat_id: str, message_id: str, *, seen: bool = False) -> UserTurn:
+        """Return a user's message as the model reads it, its pictures, and its place in the chat.
 
         Args:
             chat_id: The chat.
             message_id: The user's message.
+            seen: Whether the model sees images, which a picture's line says.
 
         Returns:
             The text with its attachments named (:func:`~ghostwriter.agent.context.user_content`),
-            and the message's position.
+            the pictures that are ready to be seen, and the message's position.
 
         Raises:
             sqlalchemy.exc.NoResultFound: If the chat has no such user's message.
@@ -1273,17 +1338,23 @@ class ChatStore:
                 .where(Attachment.message_id == message_id)
                 .order_by(Attachment.created_at, Attachment.id)
             ).all()
-            return self._prompt_text(message, attachments, now), message.position
+            return UserTurn(
+                self._prompt_text(message, attachments, now, seen=seen),
+                self._images(attachments, now),
+                message.position,
+            )
 
-    def past_turns(self, chat_id: str, *, before_position: int) -> tuple[list[PastTurn], bool]:
+    def past_turns(self, chat_id: str, *, before_position: int, seen: bool = False) -> tuple[list[PastTurn], bool]:
         """Return the turns before a message, for a follow-up: questions, live tool contents, answers.
 
         A question is followed by its answer, if it has one. A step whose content has
-        expired is not replayed, and a round left without a step goes with it.
+        expired is not replayed, and a round left without a step goes with it. A question
+        keeps the pictures it attached that are still ready to be seen.
 
         Args:
             chat_id: The chat.
             before_position: The position of the message being answered.
+            seen: Whether the model sees images, which a picture's line says.
 
         Returns:
             The turns, oldest first, and whether any of their files or tool contents have expired.
@@ -1311,23 +1382,23 @@ class ChatStore:
             ).all()
             gone_results = {message_id for message_id, made in results if made + self._file_period <= now}
             turns: list[PastTurn] = []
-            question: tuple[str, bool] | None = None
+            question: tuple[str, bool, tuple[AttachedImage, ...]] | None = None
             for message in messages:
                 if message.role == "user":
                     if question is not None:
-                        turns.append(PastTurn(question[0], (), "", question[1]))
+                        turns.append(PastTurn(question[0], (), "", question[1], question[2]))
                     sent = [a for a in attachments if a.message_id == message.id]
                     lost = any(a.created_at + self._file_period <= now for a in sent)
-                    question = (self._prompt_text(message, sent, now), lost)
+                    question = (self._prompt_text(message, sent, now, seen=seen), lost, self._images(sent, now))
                     continue
                 if question is None:
                     continue
                 rounds, lost = self._live_rounds([step for step in steps if step.message_id == message.id], now)
                 lost = lost or question[1] or message.id in gone_results
-                turns.append(PastTurn(question[0], rounds, message.content, lost))
+                turns.append(PastTurn(question[0], rounds, message.content, lost, question[2]))
                 question = None
             if question is not None:
-                turns.append(PastTurn(question[0], (), "", question[1]))
+                turns.append(PastTurn(question[0], (), "", question[1], question[2]))
             return turns, any(turn.expired for turn in turns)
 
     @staticmethod

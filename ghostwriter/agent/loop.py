@@ -323,8 +323,8 @@ class AgentLoop:
         offered: list[dict[str, Any]] = function_tools(discovery.tools) if discovery is not None else []
         names: list[str] = [tool.name for tool in discovery.tools] if discovery is not None else []
         folder = chat_folder(key, turn.chat_id) if discovery is not None and key else None
-        text, position = self._store.user_turn(turn.chat_id, turn.user_message_id)
-        past, expired = self._store.past_turns(turn.chat_id, before_position=position)
+        question = self._store.user_turn(turn.chat_id, turn.user_message_id)
+        past, expired = self._store.past_turns(turn.chat_id, before_position=question.position)
         system = system_prompt(
             today=self._now().date(),
             folder=folder,
@@ -335,7 +335,7 @@ class AgentLoop:
         budget = prompt_tokens(self._settings.context_tokens, reasoning=turn.reasoning)
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
-        current: list[dict[str, Any]] = [{"role": "user", "content": text}]
+        current: list[dict[str, Any]] = [{"role": "user", "content": question.text}]
         round_no = 0
         while not turn.cancel.is_set():
             round_no += 1
