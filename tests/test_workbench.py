@@ -302,9 +302,12 @@ def test_each_listing_is_cached_and_tried_again_on_its_own() -> None:
 
 
 def test_one_listing_in_progress_does_not_hold_the_other() -> None:
-    """Single-flight per listing: a slow discovery with images and one without run side by side."""
+    """Single-flight per listing: a slow discovery with images and one without run side by side.
+
+    Each waits 1 s at the door, so one after the other would take 2 s.
+    """
     door = FakeDoor()
-    door.delays["server/discover"] = 0.4
+    door.delays["server/discover"] = 1.0
     client = _client(door)
     found: dict[bool, Any] = {}
 
@@ -317,7 +320,7 @@ def test_one_listing_in_progress_does_not_hold_the_other() -> None:
         thread.start()
     for thread in threads:
         thread.join(timeout=5.0)
-    assert time.monotonic() - started < 0.75
+    assert time.monotonic() - started < 1.6
     assert found[True] is not None and found[False] is not None
     assert door.methods().count("server/discover") == 2
 
