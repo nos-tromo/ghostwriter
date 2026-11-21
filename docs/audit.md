@@ -21,7 +21,9 @@ collects. Start-up writes `admin` / `config.audit` with the operating mode.
 ## Catalogue
 
 `ai_call` events name the output by its hash only; `chat.answer` carries
-`reasoning: true|false` in its criteria, never the thinking.
+`reasoning: true|false` and `images` (how many images the round sent) in its
+criteria, never the thinking or an image. A round the model refused with its
+images, sent again without them, is two `chat.answer` events.
 
 | Route | Action / operation | Target | Children |
 |---|---|---|---|

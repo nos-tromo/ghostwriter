@@ -13,10 +13,23 @@ PRESENTATIONS: Final = (
     "order, key points, figures and sources) and stop. Call write_presentation only in a later message, after the "
     "user has agreed. Images for slides are made with run_python; prefer native charts."
 )
+#: How the model looks at pictures and pages, given only while it sees and has the tools.
+VISION: Final = (
+    "Images the user attached are in their message: look at them. Read a document with read_document first; "
+    "pages without text come back as images in the same answer. For how something looks (layout, design, "
+    "charts, handwriting, photos), look with view_file, at most 4 pages a call. Images of earlier messages are "
+    "not sent again: use view_file to see one again."
+)
 
 
 def system_prompt(
-    *, today: date, folder: str | None, file_days: int, expired: bool, presentations: bool = False
+    *,
+    today: date,
+    folder: str | None,
+    file_days: int,
+    expired: bool,
+    presentations: bool = False,
+    vision: bool = False,
 ) -> str:
     """Return the system prompt of a message.
 
@@ -27,6 +40,8 @@ def system_prompt(
         expired: Whether files or tool results of earlier messages have expired.
         presentations: Whether workbench offers ``write_presentation``; the outline-first rule is given
             only then, and only when tools are offered.
+        vision: Whether the model sees images and is offered ``view_file``; :data:`VISION` follows the
+            sentences on the chat's folder only then, and only when tools are offered.
 
     Returns:
         The prompt, its sentences joined by single spaces.
@@ -44,6 +59,8 @@ def system_prompt(
             "the user below your answer with a download button: name them, and do not repeat their content or write "
             f"links to them. Files and tool results are deleted {file_days} days after they were made."
         )
+        if vision:
+            parts.append(VISION)
         if presentations:
             parts.append(PRESENTATIONS)
     else:

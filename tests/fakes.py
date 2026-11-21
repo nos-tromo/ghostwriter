@@ -32,6 +32,7 @@ from ghostwriter.workbench import (
     CallFor,
     Discovery,
     McpTool,
+    RenditionRequest,
     ToolFailure,
     ToolResult,
     WorkbenchClient,
@@ -873,12 +874,14 @@ class SentCall:
         arguments: Its arguments.
         call: The chat it was made for.
         timeout_s: Its deadline.
+        images: Whether it asked workbench for images (``X-Accept-Images: 1``).
     """
 
     name: str
     arguments: dict[str, Any]
     call: CallFor
     timeout_s: float
+    images: bool = False
 
 
 class RecordingAudit:
@@ -887,6 +890,7 @@ class RecordingAudit:
     Attributes:
         log: ``disclose:<tool>:<round>:<attempt>`` and ``model:<round>:<outcome>``, in order.
         rounds: Each ``model_called``'s round, as the loop reported it.
+        images: Each ``model_called``'s count of the images the round sent.
         failing: The writes that fail, ``disclose`` or ``model``.
         on_model: Called with the round after each ``model_called`` was written.
     """
@@ -895,6 +899,7 @@ class RecordingAudit:
         """Record nothing yet, and fail nothing."""
         self.log: list[str] = []
         self.rounds: list[RoundDone | None] = []
+        self.images: list[int] = []
         self.failing: set[str] = set()
         self.on_model: Callable[[int], None] | None = None
 
@@ -914,13 +919,14 @@ class RecordingAudit:
             raise AuditWriteError("synthetic audit failure")
         self.log.append(f"disclose:{tool}:{round}:{attempt}")
 
-    def model_called(self, *, round: int, done: RoundDone | None, outcome: str) -> None:
+    def model_called(self, *, round: int, done: RoundDone | None, outcome: str, images: int = 0) -> None:
         """Record a model round.
 
         Args:
             round: The round.
             done: How it ended; ``None`` when it failed.
             outcome: ``ok`` or ``error``.
+            images: How many images the round sent.
 
         Raises:
             AuditWriteError: While ``model`` is failing.
@@ -929,16 +935,17 @@ class RecordingAudit:
             raise AuditWriteError("synthetic audit failure")
         self.log.append(f"model:{round}:{outcome}")
         self.rounds.append(done)
+        self.images.append(images)
         if self.on_model is not None:
             self.on_model(round)
 
 
 class FakeWorkbench:
-    """``WorkbenchClient`` as the agent loop calls it: ``discover`` and ``call_tool``.
+    """``WorkbenchClient`` as the agent loop calls it: ``discover``, ``call_tool`` and ``fetch_renditions``.
 
     Discovery answers :attr:`discovery`. Each call answers the next of :attr:`answers`, or
     :data:`PLAIN_RESULT` once they are used up, and is recorded with the audit line written
-    last before it went out.
+    last before it went out. A rendition is :data:`TINY_JPEG`, unless its path is in :attr:`missing`.
 
     Attributes:
         discovery: What every discovery answers; ``None`` is a workbench that is not usable.
@@ -947,6 +954,8 @@ class FakeWorkbench:
         discoveries: The chat of every discovery, in order.
         sent_after: For every call, the audit's last line when it was sent.
         audit: The audit whose log :attr:`sent_after` reads.
+        missing: The paths whose renditions are not there.
+        fetched: The renditions each ``fetch_renditions`` asked for, in order.
     """
 
     def __init__(
@@ -971,6 +980,8 @@ class FakeWorkbench:
         self.discoveries: list[CallFor] = []
         self.sent_after: list[str | None] = []
         self.audit = audit
+        self.missing: set[str] = set()
+        self.fetched: list[tuple[RenditionRequest, ...]] = []
 
     def as_client(self) -> WorkbenchClient:
         """Return this fake typed as the client, for ``AgentLoop(workbench=...)``.
@@ -993,7 +1004,7 @@ class FakeWorkbench:
         return self.discovery
 
     def call_tool(
-        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float
+        self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float, images: bool = False
     ) -> ToolResult | ToolFailure:
         """Record a call and answer it from the script.
 
@@ -1002,11 +1013,25 @@ class FakeWorkbench:
             arguments: Its arguments.
             call: The chat.
             timeout_s: Its deadline.
+            images: Whether it asks for images; the script answers the same either way.
 
         Returns:
             The next scripted answer.
         """
-        self.calls.append(SentCall(name, dict(arguments), call, timeout_s))
+        self.calls.append(SentCall(name, dict(arguments), call, timeout_s, images))
         self.sent_after.append(self.audit.log[-1] if self.audit is not None and self.audit.log else None)
         answer = self.answers.pop(0) if self.answers else PLAIN_RESULT
         return answer() if callable(answer) else answer
+
+    def fetch_renditions(self, wanted: Sequence[RenditionRequest], *, call: CallFor) -> list[tuple[str, bytes] | None]:
+        """Record a fetch and answer each rendition.
+
+        Args:
+            wanted: The renditions.
+            call: The chat.
+
+        Returns:
+            ``("image/jpeg", TINY_JPEG)`` for each, ``None`` for a path in :attr:`missing`.
+        """
+        self.fetched.append(tuple(wanted))
+        return [None if item.path in self.missing else ("image/jpeg", TINY_JPEG) for item in wanted]
