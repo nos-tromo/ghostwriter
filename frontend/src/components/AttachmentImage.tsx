@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { AttachmentTile, ImageLightbox, type AttachmentTileStatus } from '@infra/ui'
 import { fileBlob } from '../api/chats'
 import { isGone } from '../api/client'
@@ -17,7 +17,8 @@ import { RequestError } from './RequestError'
  * when the message takes the file. An expired picture is marked and not fetched; so is one
  * that could not be read, or whose file the server no longer has (a 410 or a 404 on the
  * rendition or on the original), and neither opens. The lightbox saves the original, fetched
- * on the click: a failure closes it and is said below the tile, where the bubble's text is.
+ * on the click, one fetch at a time (each is an audited download): a failure closes it and is
+ * said below the tile, where the bubble's text is.
  */
 export function AttachmentImage({ chatId, attachment }: { chatId: string; attachment: AttachmentOut }) {
   const t = useT()
@@ -25,6 +26,8 @@ export function AttachmentImage({ chatId, attachment }: { chatId: string; attach
   const [open, setOpen] = useState(false)
   const [lost, setLost] = useState(false)
   const [failure, setFailure] = useState<unknown>(null)
+  // A download under way: further clicks start no second fetch until it is through.
+  const downloadingRef = useRef(false)
 
   let status: AttachmentTileStatus = 'ready'
   if (attachment.expired || gone || lost) status = 'expired'
@@ -32,6 +35,8 @@ export function AttachmentImage({ chatId, attachment }: { chatId: string; attach
   const viewable = status === 'ready' && url !== null
 
   const download = async () => {
+    if (downloadingRef.current) return
+    downloadingRef.current = true
     setFailure(null)
     try {
       saveBlob(await fileBlob(chatId, attachment.file_id), attachment.name)
@@ -39,6 +44,8 @@ export function AttachmentImage({ chatId, attachment }: { chatId: string; attach
       setOpen(false)
       if (isGone(error)) setLost(true)
       else setFailure(error)
+    } finally {
+      downloadingRef.current = false
     }
   }
 

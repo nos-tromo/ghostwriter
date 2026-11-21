@@ -888,6 +888,82 @@ describe('Composer pictures', () => {
     expect(uploaded(callsTo(calls, 'POST', ATTACHMENTS)[2])).toBe('harbour-photo.png')
   })
 
+  it("keeps the name of a lone pasted PNG that is not the browser's image.png", async () => {
+    const { calls } = openChat(
+      { [`POST ${ATTACHMENTS}`]: (call: Call) => json(picture('a1', uploaded(call)), 201) },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    const pasted = createEvent.paste(textbox(), {
+      clipboardData: { files: [image('harbour-chart.png')], types: ['Files'], getData: () => '' },
+    })
+    fireEvent(textbox(), pasted)
+    expect(pasted.defaultPrevented).toBe(true)
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(1))
+    expect(uploaded(callsTo(calls, 'POST', ATTACHMENTS)[0])).toBe('harbour-chart.png')
+  })
+
+  it('does not bring back a picture whose poll was refused, once a message went instead', async () => {
+    let listed: AttachmentOut[] = []
+    const sse = sseStream()
+    const { calls, client } = openChat(
+      {
+        'GET /ghostwriter/api/chats/c1': () => json({ ...detail([]), pending_attachments: listed }),
+        [`POST ${ATTACHMENTS}`]: (call: Call) => json(picture('a1', uploaded(call), { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => json({ detail: 'forbidden' }, 403),
+        [`POST ${MESSAGES}`]: () => sse.response(),
+      },
+      VISION_CONFIG,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [image('quay-1.png')])
+    expect(await screen.findByRole('alert')).toHaveTextContent('quay-1.png could not be attached.')
+    expect(tile('quay-1.png')).toHaveAttribute('data-status', 'error')
+
+    // The chat still lists it as being prepared; a message goes without it, its tile not dismissed.
+    listed = [picture('a1', 'quay-1.png', { status: 'processing' })]
+    const reread = () => client.invalidateQueries({ queryKey: ['chat', 'c1'] })
+    await act(reread)
+    await user.type(textbox(), 'Und?{Enter}')
+    await waitFor(() => expect(callsTo(calls, 'POST', MESSAGES)).toHaveLength(1))
+    expect(callsTo(calls, 'POST', MESSAGES)[0].body).toEqual({ content: 'Und?', attachment_ids: [], reasoning: false })
+    await act(reread)
+    expect(composer().querySelector('li')).toBeNull()
+    expect(callsTo(calls, 'GET', POLL)).toHaveLength(1)
+  })
+
+  it('asks again no sooner than half a second after a processing answer', async () => {
+    let polls = 0
+    openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'harbour-photo.png', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => {
+          polls += 1
+          return json(picture('a1', 'harbour-photo.png', polls < 3 ? { status: 'processing' } : {}))
+        },
+      },
+      VISION_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [image('harbour-photo.png')])
+    await waitFor(() => expect(polls).toBe(1))
+    await act(async () => {
+      vi.advanceTimersByTime(400)
+    })
+    expect(polls).toBe(1)
+    await act(async () => {
+      vi.advanceTimersByTime(200)
+    })
+    await waitFor(() => expect(polls).toBe(2))
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+    await waitFor(() => expect(tile('harbour-photo.png')).toHaveAttribute('data-status', 'done'))
+    expect(polls).toBe(3)
+  })
+
   it('keeps text that comes with a picture as text, also with pictures on', async () => {
     const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(picture('a1', 'image.png'), 201) }, VISION_CONFIG)
     await screen.findByText('Ask anything, or attach a document.')

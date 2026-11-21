@@ -314,6 +314,41 @@ describe('Conversation pictures', () => {
     await waitFor(() => expect(revoked).toContain(saved[0].href))
   })
 
+  it('fetches the original once while its download is under way', async () => {
+    const saved: string[] = []
+    vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      saved.push(this.download)
+    })
+    let release!: () => void
+    const held = new Promise<void>((done) => (release = done))
+    const calls = serve({
+      [CHAT_URL]: detail([question([picture('a1', 'harbour-photo.jpg')])]),
+      [`GET ${preview('a1')}`]: jpeg,
+      [`GET ${original('a1')}`]: async () => {
+        await held
+        return new Response(new Blob(['original'], { type: 'image/jpeg' }), { status: 200 })
+      },
+    })
+    const user = userEvent.setup()
+    renderWithClient(<StreamedConversation chatId="c1" config={VISION_CONFIG} reasoning={false} />)
+
+    const face = await within(await bubble()).findByRole('button', { name: 'harbour-photo.jpg' })
+    await waitFor(() => expect(face.querySelector('img')).not.toBeNull())
+    await user.click(face)
+    const download = within(screen.getByRole('dialog')).getByRole('button', { name: 'Download' })
+    await user.click(download)
+    await user.click(download)
+    await user.click(download)
+    expect(callsTo(calls, 'GET', original('a1'))).toHaveLength(1)
+
+    release()
+    await waitFor(() => expect(saved).toEqual(['harbour-photo.jpg']))
+    // Once it is through, the next click downloads again.
+    await user.click(download)
+    await waitFor(() => expect(saved).toEqual(['harbour-photo.jpg', 'harbour-photo.jpg']))
+    expect(callsTo(calls, 'GET', original('a1'))).toHaveLength(2)
+  })
+
   it('turns a picture expired when its original is gone, and says so when the download fails', async () => {
     vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => {})
     serve({

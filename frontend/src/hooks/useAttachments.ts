@@ -53,6 +53,10 @@ const POLL_WAIT_S = 20
 /** How long to wait before asking again after a request that did not get through. */
 const RETRY_MS = 2_000
 
+/** The least time from one request to the next after a `processing` answer, should one come early
+ *  (a proxy that drops `?wait`): the long poll never turns into a loop. */
+const PROCESSING_FLOOR_MS = 500
+
 /** A name's extension as the backend reads it (`.pdf`), lower-cased; a dot-file has none. */
 function extensionOf(name: string): string {
   const dot = name.lastIndexOf('.')
@@ -126,10 +130,12 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * one can be sent. Each one still being prepared, uploaded here or listed by
  * the chat, is followed once, by requests that wait on the server until its
  * preparation ends (20 s at most, then asked again): it becomes `done`, with
- * the attachment as it then is, a `failed` one included. A request that does
- * not get through, or a server error, is tried again after 2 s; any other
+ * the attachment as it then is, a `failed` one included. A `processing` answer
+ * is asked again no sooner than 500 ms after its request began. A request that
+ * does not get through, or a server error, is tried again after 2 s; any other
  * refusal (a 404 above all: the server no longer holds the file) settles the
- * file as an error. Leaving the chat stops it. A picture a browser can draw
+ * file as an error, and the chat's list never brings it back as one still
+ * being prepared. Leaving the chat stops it. A picture a browser can draw
  * shows from the file in hand at once (an object URL, never leaked); the
  * others, once prepared, from the server's rendition.
  *
@@ -274,7 +280,9 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
   }, [])
 
   // An attachment the server no longer answers for: an error tile, in place of the file or
-  // standing for the listed one.
+  // standing for the listed one. The chat's list may still name it as being prepared; it is
+  // taken out of that list here, so once its tile goes (dismissed, or a message cleared it) it
+  // never comes back as a tile still being prepared, which nothing would follow again.
   const lost = useCallback((file: PendingFile) => {
     const refused = { status: 'error' as const, error: 'upload' as const }
     setLocal((files) =>
@@ -282,6 +290,8 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
         ? files.map((f) => (f.key === file.key ? { ...f, ...refused } : f))
         : [...files, { ...file, ...refused }],
     )
+    const id = file.attachment?.id
+    if (id !== undefined) setTaken((ids) => new Set(ids).add(id))
   }, [])
 
   const follow = useCallback(
@@ -289,9 +299,13 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
       const signal = controllerRef.current?.signal
       if (chatId === null || file.attachment === undefined || signal === undefined) return
       while (!signal.aborted) {
+        const asked = Date.now()
         try {
           const latest = await getAttachment(chatId, file.attachment.id, POLL_WAIT_S, signal)
-          if (latest.status === 'processing') continue
+          if (latest.status === 'processing') {
+            await pause(Math.max(0, PROCESSING_FLOOR_MS - (Date.now() - asked)), signal)
+            continue
+          }
           if (!signal.aborted) ended(file, latest)
           return
         } catch (error) {

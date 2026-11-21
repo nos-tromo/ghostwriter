@@ -171,8 +171,8 @@ export function Composer({
   // it is a picture of that text (an office program's copy), never attached,
   // and any other file of a type that can be attached is. Text that is just
   // a pasted file's name (a file manager's copy) is that file, not text to
-  // paste. A lone PNG with no text is a screenshot: browsers call it
-  // `image.png`, so it is named by the moment it was taken.
+  // paste. A lone PNG with no text that the browser calls `image.png` is a
+  // screenshot, named by the moment it was taken; any other keeps its name.
   const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     if (!config.attachments) return
     const files = Array.from(event.clipboardData.files)
@@ -185,7 +185,7 @@ export function Composer({
     }
     event.preventDefault()
     const [only] = files
-    if (!pasted && files.length === 1 && only.type === 'image/png') {
+    if (!pasted && files.length === 1 && only.type === 'image/png' && only.name === 'image.png') {
       const name = screenshotName(new Date(), new Set(attachments.pending.map((f) => f.name)))
       // Where pictures cannot be attached, it stays as it came, and is refused as ever.
       if (isAttachable(name, config)) {
