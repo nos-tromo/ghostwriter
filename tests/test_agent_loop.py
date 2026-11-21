@@ -1310,13 +1310,16 @@ def test_a_picture_without_room_is_never_said_to_be_shown_before(loop_env: LoopE
     loop_env.workbench.answers = [RESULT]
     attach = [_photo(4096, 3072), _photo(4096, 3072, name=quay)]
     loop_env.run(_calls(READ_SALES), [text_chunk("Zwei Bilder.")], vision=True, attach=attach)
+    # Both were attached at one instant, so which of them is the question's last is the store's choice.
+    [went] = [name for name in (PHOTO, quay) if f"[Image: {name}]" in json.dumps(loop_env.sent(1))]
+    left = quay if went == PHOTO else PHOTO
     for n in (1, 2):
         sent = json.dumps(loop_env.sent(n))
-        assert NO_ROOM.format(label=quay) in sent
-        assert RETIRED.format(label=quay) not in sent and NOT_RESENT.format(label=quay) not in sent
-        assert [label for label, _ in _labelled(loop_env.sent(n))] == [f"[Image: {PHOTO}]"]
+        assert NO_ROOM.format(label=left) in sent
+        assert RETIRED.format(label=left) not in sent and NOT_RESENT.format(label=left) not in sent
+        assert [label for label, _ in _labelled(loop_env.sent(n))] == [f"[Image: {went}]"]
     assert loop_env.sent(2)[-1]["content"] == RESULT.text
-    assert loop_env.workbench.fetched == [(RenditionRequest(PHOTO_PATH, n=1, strips=1, strip=1),)]
+    assert loop_env.workbench.fetched == [(RenditionRequest(f"{FOLDER}/{went}", n=1, strips=1, strip=1),)]
     assert loop_env.audit.images == [1, 1]
 
 
