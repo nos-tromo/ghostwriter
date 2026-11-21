@@ -61,6 +61,8 @@ from ghostwriter.workbench import (
 )
 from tests.conftest import KEY, make_settings
 from tests.fakes import (
+    CONTRACT_TOOLS,
+    READ_DOCUMENT_TEXT,
     TINY_JPEG,
     Chunk,
     FakeOpenAI,
@@ -702,7 +704,7 @@ def test_with_workbench_the_prompt_names_the_chats_folder(loop_env: LoopEnv) -> 
     """The system prompt names this chat's folder, and discovery asks for this chat."""
     loop_env.run([text_chunk("Hallo!")])
     assert f"This chat's files are in {FOLDER};" in loop_env.sent(1)[0]["content"]
-    assert loop_env.workbench.discoveries == [CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"})]
+    assert loop_env.workbench.discoveries == [(CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"}), False)]
 
 
 @pytest.mark.parametrize(
@@ -933,6 +935,15 @@ def _tool_names(call: dict[str, Any]) -> list[str]:
     return [tool["function"]["name"] for tool in call.get("tools", [])]
 
 
+def _read_document_told(call: dict[str, Any]) -> str:
+    """Return what a model call was told of ``read_document``."""
+    return next(t["function"]["description"] for t in call["tools"] if t["function"]["name"] == "read_document")
+
+
+#: What a call that takes images is told of ``read_document``: its pages without text come back as images.
+READ_DOCUMENT_IMAGES = CONTRACT_TOOLS["read_document"][0]
+
+
 def _refused() -> openai.BadRequestError:
     """Return the router's refusal of a request with images."""
     request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
@@ -1142,6 +1153,53 @@ def test_a_refused_image_round_is_tried_once_without_images(loop_env: LoopEnv) -
     assert VISION not in third[0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[2])
     assert third[-1]["role"] == "tool"
     assert third[-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
+    assert loop_env.audit.images == [1, 0, 0]
+
+
+def test_a_turn_is_offered_the_listing_its_sight_takes(loop_env: LoopEnv) -> None:
+    """A seeing turn is offered workbench's listing for images; a turn without vision 0.6's, without view_file.
+
+    So a model that is shown no image is never told that pages come back as images.
+    """
+    loop_env.run([text_chunk("Hallo!")], vision=True)
+    loop_env.run([text_chunk("Hallo!")])
+    seeing, blind = loop_env.fake.calls
+    assert "view_file" in _tool_names(seeing) and _read_document_told(seeing) == READ_DOCUMENT_IMAGES
+    assert "view_file" not in _tool_names(blind) and _read_document_told(blind) == READ_DOCUMENT_TEXT
+    call = CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"})
+    assert loop_env.workbench.discoveries == [(call, True), (call, False)]
+
+
+def test_after_a_refusal_the_turn_is_offered_the_listing_without_images(loop_env: LoopEnv) -> None:
+    """The round sent again without images, and every round after it, get the listing of a call without images."""
+    read = [call_chunk(0, "call_0", "read_document", VIEW_SCAN)]
+    loop_env.run(_refused(), read, [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    first, again, last = loop_env.fake.calls
+    assert _read_document_told(first) == READ_DOCUMENT_IMAGES
+    for call in (again, last):
+        assert "view_file" not in _tool_names(call) and _read_document_told(call) == READ_DOCUMENT_TEXT
+    assert [images for _, images in loop_env.workbench.discoveries] == [True, False]
+    assert [sent.images for sent in loop_env.workbench.calls] == [False]
+
+
+def test_vision_with_a_workbench_that_shows_no_images_has_no_sight(loop_env: LoopEnv) -> None:
+    """With vision on and no view_file listed, the turn goes as without vision: no picture, and no note of one.
+
+    A follow-up's earlier picture is not sent, and no note says view_file shows it: there is none.
+    """
+    loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    older = FakeWorkbench(tools=[t for t in contract_tools() if t.name != "view_file"], audit=loop_env.audit)
+    older.answers = [_shown(_page(1))]
+    read = [call_chunk(0, "call_0", "read_document", VIEW_SCAN)]
+    events = loop_env.run(read, [text_chunk("Ein Kran.")], content="Und links?", vision=True, workbench=older)
+    assert events[-1] == TokenEvent("Ein Kran.")
+    sent = [loop_env.sent(n) for n in (2, 3)]
+    assert "image_url" not in json.dumps(sent) and "view_file" not in json.dumps(sent)
+    assert NOT_LOADED.format(label=PHOTO) not in json.dumps(sent)
+    assert VISION not in sent[0][0]["content"] and "view_file" not in _tool_names(loop_env.fake.calls[1])
+    assert _read_document_told(loop_env.fake.calls[1]) == READ_DOCUMENT_TEXT
+    assert older.fetched == [] and [call.images for call in older.calls] == [False]
+    assert sent[1][-1]["content"].endswith("\n[1 images could not be shown: this model does not take images]")
     assert loop_env.audit.images == [1, 0, 0]
 
 

@@ -8,6 +8,7 @@ import base64
 import hashlib
 import hmac
 import json
+import threading
 import time
 from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
@@ -60,6 +61,7 @@ from tests.fakes import (
     CONTRACT_TOOLS,
     NOT_FOUND,
     OUTPUT_ID,
+    READ_DOCUMENT_TEXT,
     TINY_JPEG,
     TINY_PNG,
     UPLOAD_ID,
@@ -67,6 +69,7 @@ from tests.fakes import (
     FakeDoor,
     RpcError,
     call_result,
+    discover_result,
     image_block,
     output,
     refusal,
@@ -164,7 +167,7 @@ def log_lines() -> Iterator[list[str]]:
 def test_discovery_offers_the_tools_workbench_lists() -> None:
     """Discovery asks server/discover, then tools/list, and offers every listed tool, in workbench's order."""
     door = FakeDoor()
-    found = WorkbenchClient(CFG, transport=httpx.MockTransport(door)).discover(call=CALL)
+    found = WorkbenchClient(CFG, transport=httpx.MockTransport(door)).discover(call=CALL, images=True)
     assert found is not None
     assert _tool_names(found) == [
         "fill_template",
@@ -201,7 +204,7 @@ def test_discovery_offers_nothing_without_the_revision_and_a_usable_tool(change:
         door.answers["tools/list"] = {**listed, "tools": [*tools, {"name": "x", "inputSchema": "object"}]}
     else:
         door.answers["server/discover"] = httpx.Response(404, json={"detail": "not found"})
-    assert _client(door).discover(call=CALL) is None
+    assert _client(door).discover(call=CALL, images=True) is None
 
 
 def test_a_tool_without_an_object_schema_is_dropped() -> None:
@@ -213,7 +216,7 @@ def test_a_tool_without_an_object_schema_is_dropped() -> None:
     tools[0]["inputSchema"] = {"type": "array"}
     del tools[1]["inputSchema"]
     door.answers["tools/list"] = {**listed, "tools": tools}
-    found = _client(door).discover(call=CALL)
+    found = _client(door).discover(call=CALL, images=True)
     assert found is not None
     assert _tool_names(found) == sorted(CONTRACT_TOOLS)[2:]
 
@@ -223,15 +226,15 @@ def test_each_result_is_cached_for_its_ttl() -> None:
     door = FakeDoor()
     clock = FakeClock()
     client = _client(door, clock)
-    client.discover(call=CALL)
+    client.discover(call=CALL, images=True)
     clock.advance(299)
-    client.discover(call=CALL)
+    client.discover(call=CALL, images=True)
     assert door.methods() == ["server/discover", "tools/list"]
     clock.advance(2)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods() == ["server/discover", "tools/list", "tools/list"]
     clock.advance(3600)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods()[-2:] == ["server/discover", "tools/list"]
     assert len(door.methods()) == 5
 
@@ -242,37 +245,99 @@ def test_a_failed_discovery_is_tried_again_at_most_once_a_minute() -> None:
     door.answers["server/discover"] = httpx.Response(503, text="unavailable")
     clock = FakeClock()
     client = _client(door, clock)
-    assert client.discover(call=CALL) is None
+    assert client.discover(call=CALL, images=True) is None
     clock.advance(59)
-    assert client.discover(call=CALL) is None
+    assert client.discover(call=CALL, images=True) is None
     assert door.methods() == ["server/discover"]
     clock.advance(2)
     door.answers["server/discover"] = FakeDoor().answers["server/discover"]
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods() == ["server/discover", "server/discover", "tools/list"]
 
 
-def test_discovery_always_asks_for_images_so_the_cached_listing_is_the_full_one() -> None:
-    """Both discovery requests carry X-Accept-Images, though the asking call's headers do not."""
+def _description(found: Any, name: str) -> str:
+    return next(tool.description for tool in found.tools if tool.name == name)
+
+
+def test_each_listing_is_asked_with_its_own_header() -> None:
+    """With images, both requests carry X-Accept-Images and list view_file; without, neither does, as 0.6 lists.
+
+    The asking call's headers carry no such header either way.
+    """
     assert ACCEPT_IMAGES == {"X-Accept-Images": "1"} and "x-accept-images" not in {k.lower() for k in CALL.headers}
     door = FakeDoor()
-    found = _client(door).discover(call=CALL)
-    assert found is not None and "view_file" in _tool_names(found)
-    assert door.methods() == ["server/discover", "tools/list"]
-    assert [request.headers.get("x-accept-images") for request, _ in door.requests] == ["1", "1"]
+    client = _client(door)
+    full = client.discover(call=CALL, images=True)
+    plain = client.discover(call=CALL, images=False)
+    assert full is not None and plain is not None
+    assert "view_file" in _tool_names(full) and _tool_names(plain) == [n for n in _tool_names(full) if n != "view_file"]
+    assert _description(full, "read_document") == CONTRACT_TOOLS["read_document"][0]
+    assert _description(plain, "read_document") == READ_DOCUMENT_TEXT != CONTRACT_TOOLS["read_document"][0]
+    assert door.methods() == ["server/discover", "tools/list"] * 2
+    assert [request.headers.get("x-accept-images") for request, _ in door.requests] == ["1", "1", None, None]
 
 
-async def test_the_door_lists_view_file_only_for_a_call_that_accepts_images() -> None:
-    """As workbench 0.7: nine tools without X-Accept-Images, ten with it."""
+def test_each_listing_is_cached_and_tried_again_on_its_own() -> None:
+    """A listing's cache window and retry delay are its own; a call that drops the discovery drops both."""
+    door = FakeDoor()
+    clock = FakeClock()
+    client = _client(door, clock)
+    door.answers["server/discover"] = httpx.Response(503, text="unavailable")
+    assert client.discover(call=CALL, images=True) is None
+    door.answers["server/discover"] = discover_result()
+    assert client.discover(call=CALL, images=False) is not None
+    assert client.discover(call=CALL, images=True) is None
+    assert client.discover(call=CALL, images=False) is not None
+    assert door.methods() == ["server/discover", "server/discover", "tools/list"]
+    clock.advance(61)
+    assert client.discover(call=CALL, images=True) is not None
+    assert client.discover(call=CALL, images=False) is not None
+    assert door.methods()[3:] == ["server/discover", "tools/list"]
+
+    door.answers["tools/call"] = httpx.ConnectError("connection refused")
+    _call(client)
+    assert client.discover(call=CALL, images=True) is not None
+    assert client.discover(call=CALL, images=False) is not None
+    assert door.methods()[6:] == ["server/discover", "tools/list"] * 2
+
+
+def test_one_listing_in_progress_does_not_hold_the_other() -> None:
+    """Single-flight per listing: a slow discovery with images and one without run side by side."""
+    door = FakeDoor()
+    door.delays["server/discover"] = 0.4
+    client = _client(door)
+    found: dict[bool, Any] = {}
+
+    def ask(images: bool) -> None:
+        found[images] = client.discover(call=CALL, images=images)
+
+    threads = [threading.Thread(target=ask, args=(images,)) for images in (True, False)]
+    started = time.monotonic()
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5.0)
+    assert time.monotonic() - started < 0.75
+    assert found[True] is not None and found[False] is not None
+    assert door.methods().count("server/discover") == 2
+
+
+async def test_the_door_lists_as_workbench_0_7_does_with_and_without_images() -> None:
+    """As workbench 0.7: nine tools and 0.6's read_document text without X-Accept-Images, ten with it."""
     auth = {"Authorization": f"Bearer {KEY}"}
     message: dict[str, Any] = {"jsonrpc": "2.0", "id": 1, "method": "tools/list", "params": {}}
     async with httpx.AsyncClient(transport=httpx.MockTransport(FakeDoor()), base_url="http://workbench.test") as http:
         plain = (await http.post("/mcp", json=message, headers=auth)).json()
         full = (await http.post("/mcp", json=message, headers={**auth, **ACCEPT_IMAGES})).json()
-    plain_names = [tool["name"] for tool in plain["result"]["tools"]]
-    full_names = [tool["name"] for tool in full["result"]["tools"]]
-    assert "view_file" not in plain_names and len(plain_names) == 9
-    assert sorted(full_names) == sorted(CONTRACT_TOOLS)
+    plain_tools = {tool["name"]: tool["description"] for tool in plain["result"]["tools"]}
+    full_tools = {tool["name"]: tool["description"] for tool in full["result"]["tools"]}
+    assert "view_file" not in plain_tools and len(plain_tools) == 9
+    assert sorted(full_tools) == sorted(CONTRACT_TOOLS)
+    assert (plain_tools["read_document"], full_tools["read_document"]) == (
+        READ_DOCUMENT_TEXT,
+        CONTRACT_TOOLS["read_document"][0],
+    )
+    assert plain_tools["run_python"] == full_tools["run_python"]
     assert "view_file" in CONTRACT_TOOLS and "strips" in CONTRACT_TOOLS["read_document"][1]
 
 
@@ -283,7 +348,7 @@ def test_every_request_states_the_modern_revision() -> None:
     """Each POST to /mcp carries the key, the content types, the revision, its method and the client's _meta."""
     door = FakeDoor()
     client = _client(door)
-    client.discover(call=CALL)
+    client.discover(call=CALL, images=True)
     _call(client)
     assert len(door.requests) == 3
     for request, body in door.requests:
@@ -348,7 +413,7 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
     door.files[PDF] = (b"%PDF", "application/pdf")
     client = _client(door)
     if operation == "discover":
-        client.discover(call=CALL)
+        client.discover(call=CALL, images=True)
     elif operation == "call_tool":
         _call(client)
     elif operation == "upload":
@@ -625,30 +690,30 @@ def test_an_unreachable_call_drops_the_discovery() -> None:
     """No answer, a timeout or invalid_arguments: the next turn discovers again. A busy door keeps it."""
     door = FakeDoor()
     client = _client(door)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
 
     door.answers["tools/call"] = httpx.ConnectError("connection refused")
     result = _call(client)
     assert isinstance(result, ToolFailure) and (result.token, result.answered) == ("unreachable", False)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods()[-2:] == ["server/discover", "tools/list"]
 
     door.answers["tools/call"] = refusal("invalid_arguments")
     assert _call(client) == ToolFailure("invalid_arguments", "busy, retry later", answered=True)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods()[-2:] == ["server/discover", "tools/list"]
 
     door.answers["tools/call"] = call_result
     door.delays = {"tools/call": 1.0}
     result = _call(client, timeout_s=0.1)
     assert isinstance(result, ToolFailure) and result.token == "timeout"
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods()[-2:] == ["server/discover", "tools/list"]
 
     door.delays = {}
     door.answers["tools/call"] = refusal("queue_full")
     assert _call(client) == ToolFailure("queue_full", "busy, retry later", answered=True)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods()[-1] == "tools/call"
     assert door.methods().count("server/discover") == 4
 
@@ -658,15 +723,15 @@ def test_an_unknown_tool_or_a_refused_revision_drops_the_discovery(code: int) ->
     """-32602 and -32022 mean the discovery may be stale: the next turn asks again. Other codes keep it."""
     door = FakeDoor()
     client = _client(door)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     door.answers["tools/call"] = RpcError(code, "unknown tool")
     assert _call(client) == ToolFailure(f"jsonrpc:{code}", "unknown tool", answered=True)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods().count("server/discover") == 2
 
     door.answers["tools/call"] = RpcError(-32603, "internal error", status=500)
     _call(client)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert door.methods().count("server/discover") == 2
 
 
@@ -1129,7 +1194,7 @@ async def test_without_a_key_nothing_is_sent() -> None:
     """With workbench off, discovery offers nothing, a call fails and the file routes are unavailable."""
     door = FakeDoor()
     client = _client(door, settings=make_settings(Path("unused"), workbench_api_key=None))
-    assert client.discover(call=CALL) is None
+    assert client.discover(call=CALL, images=True) is None
     result = _call(client)
     assert isinstance(result, ToolFailure) and result.token == "not_configured"
     with pytest.raises(WorkbenchUnavailable):
@@ -1173,7 +1238,7 @@ def test_the_client_takes_no_proxy_from_the_environment(monkeypatch: pytest.Monk
     door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
     door.files[PHOTO] = (b"\xff\xd8\xff", "image/jpeg")
     client = _client(door)
-    assert client.discover(call=CALL) is not None
+    assert client.discover(call=CALL, images=True) is not None
     assert isinstance(_call(client), ToolResult)
 
     async def files() -> None:
@@ -1205,7 +1270,7 @@ def test_the_log_holds_no_names_or_content(log_lines: list[str]) -> None:
     door = FakeDoor()
     door.answers["server/discover"] = httpx.Response(503, text=secret)
     client = _client(door)
-    client.discover(call=CALL)
+    client.discover(call=CALL, images=True)
     success = call_result(FOLDER)
     success["content"][0]["text"] = f"{secret} sales.xlsx"
     answers: list[object] = [

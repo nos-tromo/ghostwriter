@@ -6,9 +6,9 @@ configured, except on Ollama, where :meth:`Vision.probe` reads the model's capab
 and turns the pictures off for a model that lists no ``vision``. Any other answer, or none, leaves the
 setting as it is: the probe never blocks start-up and never turns pictures on.
 
-workbench is asked with :func:`system_call`: the system's own call, for no chat. Its discovery reads no
-principal; the client adds ``X-Accept-Images: 1`` to every discovery itself, so the cached listing is the
-one a caller that takes pictures gets, ``view_file`` included. Neither the probe's answer, the model's name
+workbench is asked with :func:`system_call`: the system's own call, for no chat, for the listing a call
+that takes pictures gets (``images=True``: the client sends ``X-Accept-Images: 1``), ``view_file`` included
+when workbench shows images. Its discovery reads no principal. Neither the probe's answer, the model's name
 nor the router's key is ever logged: a failed probe logs its kind only.
 """
 
@@ -32,7 +32,7 @@ PROBE_TIMEOUT_S: Final = 5.0
 def system_call() -> CallFor:
     """Return the call workbench's capabilities are asked for with: the system's, for no chat.
 
-    The discovery adds ``X-Accept-Images: 1`` itself.
+    The discovery adds ``X-Accept-Images: 1`` itself, when asked for the listing that takes images.
 
     Returns:
         The call, under a fresh request id.
@@ -62,8 +62,9 @@ class Vision:
     def images_offered(self, workbench: WorkbenchClient | None) -> bool:
         """Say whether pictures are offered: the setting, a model that sees and a workbench that shows them.
 
-        workbench is asked only while the first two hold. Its discovery is the cached, single-flight one,
-        so this blocks at most once per cache window; call it from a thread, never on the event loop.
+        workbench is asked only while the first two hold, for the listing of a call that takes images. Its
+        discovery is the cached, single-flight one, so this blocks at most once per cache window; call it
+        from a thread, never on the event loop.
 
         Args:
             workbench: The workbench client, ``None`` while workbench is off.
@@ -73,7 +74,7 @@ class Vision:
         """
         if not self.model_sees or workbench is None:
             return False
-        found = workbench.discover(call=system_call())
+        found = workbench.discover(call=system_call(), images=True)
         return found is not None and any(tool.name == VIEW_TOOL for tool in found.tools)
 
     async def probe(self, *, transport: httpx.AsyncBaseTransport | None = None) -> None:

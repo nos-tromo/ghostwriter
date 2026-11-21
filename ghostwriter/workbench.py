@@ -9,12 +9,13 @@ its own; the caller waits at most the exchange's deadline plus half a second
 called from any context, a running event loop included.
 
 Discovery (``server/discover``, then ``tools/list``, within :data:`DISCOVERY_TIMEOUT_S`
-together) is single-flight and cached per result for its ``ttlMs``, for every chat. It
-succeeds when workbench serves this revision and lists at least one tool whose
-``inputSchema`` is an object; other tools are dropped. A failure offers no tool and is
-tried again at most once per :data:`DISCOVERY_RETRY_S`. A call without an answer, refused
-arguments, ``-32022`` or ``-32602`` drops the cache. workbench's discovery reads no
-principal; it carries the asking turn's headers only because every request does.
+together) is single-flight and cached per result for its ``ttlMs``, for every chat, once
+for each listing: a call that takes images, and one that does not. It succeeds when
+workbench serves this revision and lists at least one tool whose ``inputSchema`` is an
+object; other tools are dropped. A failure offers no tool and is tried again at most once
+per :data:`DISCOVERY_RETRY_S`; each listing keeps its own cache, lock and retry delay. A call
+without an answer, refused arguments, ``-32022`` or ``-32602`` drops both caches. workbench's
+discovery reads no principal; it carries the asking turn's headers only because every request does.
 
 The model reads a result's ``content[0].text``, which workbench writes without the table
 previews; the cards come from ``structuredContent.outputs``, kept only inside the chat's
@@ -22,8 +23,9 @@ folder, each preview clamped. A refusal is read by its ``structuredContent.reaso
 :meth:`WorkbenchClient.call_tool` never raises.
 
 Images. workbench 0.7 lists ``view_file`` and attaches images to an answer only for a request
-that carries ``X-Accept-Images: 1`` (:data:`ACCEPT_IMAGES`). Discovery always sends it, so the
-one cached listing is the full one; a call sends it only when asked (``images=True``). The
+that carries ``X-Accept-Images: 1`` (:data:`ACCEPT_IMAGES`); without it, it lists as 0.6 did, with
+``read_document`` told in 0.6's words, which promise no image. A discovery and a call send it only
+when asked (``images=True``), so each listing is the one its calls get. The
 image blocks of an answer, ``content[1:]``, are kept paired by position with
 ``structuredContent.shown``: a block that is no jpeg or png of its type, is too large, or has no
 valid entry is dropped, and so is whatever passes the caps on one answer.
@@ -396,6 +398,17 @@ class _Server:
 class _Tools:
     tools: tuple[McpTool, ...]
     expires_at: float
+
+
+@dataclass
+class _Listing:
+    """One listing's discovery: its lock, its cached results, its retry delay and what was last logged."""
+
+    flight: threading.Lock = field(default_factory=threading.Lock)
+    server: _Server | None = None
+    tools: _Tools | None = None
+    retry_at: float | None = None
+    up: bool | None = None
 
 
 class _Unusable(Exception):
@@ -1021,12 +1034,9 @@ class WorkbenchClient:
         self._settings = settings
         self._transport = transport
         self._clock = clock
-        self._flight = threading.Lock()
         self._ids = itertools.count(1)
-        self._server: _Server | None = None
-        self._tools: _Tools | None = None
-        self._retry_at: float | None = None
-        self._up: bool | None = None
+        # By whether the listing is the one of a call that takes images.
+        self._listings = {True: _Listing(), False: _Listing()}
 
     def _key(self) -> str | None:
         key = self._settings.workbench_api_key
@@ -1112,18 +1122,19 @@ class WorkbenchClient:
 
     # --- discovery -------------------------------------------------------
 
-    def discover(self, *, call: CallFor) -> Discovery | None:
-        """Return the cached discovery, discovering first when a result has expired.
+    def discover(self, *, call: CallFor, images: bool) -> Discovery | None:
+        """Return a listing's cached discovery, discovering first when a result has expired.
 
-        Concurrent callers wait for the one discovery in progress, never longer than its limit
-        plus half a second; a caller that would is offered no tool on this turn.
-
-        Both requests carry ``X-Accept-Images: 1`` whatever the asking call is, so the one cached
-        listing is the full one, ``view_file`` included.
+        Concurrent callers for one listing wait for its one discovery in progress, never longer than
+        its limit plus half a second; a caller that would is offered no tool on this turn. The two
+        listings never wait for each other.
 
         Args:
             call: The asking turn's chat. Its headers go with the requests, as with every request
                 to workbench; workbench's discovery reads no principal from them.
+            images: Whether to ask for the listing of a call that takes images: both requests then carry
+                ``X-Accept-Images: 1``, and workbench 0.7 lists ``view_file`` and its image texts. Without
+                it, the listing is the one workbench 0.6 gave.
 
         Returns:
             The tools and the version, or ``None`` when workbench is not usable on this turn.
@@ -1131,55 +1142,58 @@ class WorkbenchClient:
         key = self._key()
         if key is None:
             return None
-        if not self._flight.acquire(timeout=DISCOVERY_TIMEOUT_S + _GRACE_S):
+        listing = self._listings[images]
+        if not listing.flight.acquire(timeout=DISCOVERY_TIMEOUT_S + _GRACE_S):
             return None
         try:
-            return self._discover_held({**self._headers(key, call), **ACCEPT_IMAGES})
+            return self._discover_held(listing, {**self._headers(key, call), **(ACCEPT_IMAGES if images else {})})
         finally:
-            self._flight.release()
+            listing.flight.release()
 
-    def _discover_held(self, headers: Mapping[str, str]) -> Discovery | None:
-        """Discover, holding the single-flight lock.
+    def _discover_held(self, listing: _Listing, headers: Mapping[str, str]) -> Discovery | None:
+        """Discover one listing, holding its single-flight lock.
 
         Args:
-            headers: The asking turn's headers.
+            listing: The listing.
+            headers: The asking turn's headers, and the listing's.
 
         Returns:
             As :meth:`discover`.
         """
         now = self._clock()
-        server, tools = self._server, self._tools
+        server, tools = listing.server, listing.tools
         server = server if server is not None and now < server.expires_at else None
         tools = tools if tools is not None and now < tools.expires_at else None
         if server is not None and tools is not None:
             return Discovery(tools=tools.tools, server_version=server.version)
-        if self._retry_at is not None and now < self._retry_at:
+        if listing.retry_at is not None and now < listing.retry_at:
             return None
         try:
             fresh_server, fresh_tools = _detached(
                 lambda: self._discover(server, tools, now, headers), DISCOVERY_TIMEOUT_S + _GRACE_S
             )
         except _Unusable as exc:
-            return self._discovery_failed(now, exc.token)
+            return self._discovery_failed(listing, now, exc.token)
         except (TimeoutError, httpx.TimeoutException):
-            return self._discovery_failed(now, "timeout")
+            return self._discovery_failed(listing, now, "timeout")
         except httpx.TransportError:
-            return self._discovery_failed(now, "unreachable")
+            return self._discovery_failed(listing, now, "unreachable")
         except Exception as exc:
             logger.warning("workbench discovery raised {}", type(exc).__name__)
-            return self._discovery_failed(now, "error")
+            return self._discovery_failed(listing, now, "error")
         # Only what was fetched is written back: a forget() meanwhile keeps its effect.
         if fresh_server is not server:
-            self._server = fresh_server
+            listing.server = fresh_server
         if fresh_tools is not tools:
-            self._tools = fresh_tools
-        self._retry_at = None
+            listing.tools = fresh_tools
+        listing.retry_at = None
         found = Discovery(tools=fresh_tools.tools, server_version=fresh_server.version)
-        if self._up is not True:
-            self._up = True
+        if listing.up is not True:
+            listing.up = True
             logger.info(
-                "workbench is discovered: {} tools are offered (workbench '{}')",
+                "workbench is discovered: {} tools are offered to calls {} images (workbench '{}')",
                 len(found.tools),
+                "with" if listing is self._listings[True] else "without",
                 found.server_version,
             )
         return found
@@ -1203,10 +1217,10 @@ class WorkbenchClient:
                     tools = _Tools(tools=usable, expires_at=now + _ttl_s(result))
         return server, tools
 
-    def _discovery_failed(self, now: float, token: str) -> None:
-        self._retry_at = now + DISCOVERY_RETRY_S
-        if self._up is not False:
-            self._up = False
+    def _discovery_failed(self, listing: _Listing, now: float, token: str) -> None:
+        listing.retry_at = now + DISCOVERY_RETRY_S
+        if listing.up is not False:
+            listing.up = False
             logger.warning(
                 "workbench discovery failed: {}. No tool is offered; the next try comes after {} s",
                 token,
@@ -1214,9 +1228,10 @@ class WorkbenchClient:
             )
 
     def forget(self) -> None:
-        """Drop both cached results, so the next turn discovers again."""
-        self._server = None
-        self._tools = None
+        """Drop both listings' cached results, so the next turn discovers again."""
+        for listing in self._listings.values():
+            listing.server = None
+            listing.tools = None
 
     # --- tools -------------------------------------------------------------
 

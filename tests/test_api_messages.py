@@ -39,6 +39,8 @@ from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import CallFor, chat_folder
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings
 from tests.fakes import (
+    CONTRACT_TOOLS,
+    READ_DOCUMENT_TEXT,
     TINY_JPEG,
     UPLOAD_ID,
     XLSX,
@@ -981,19 +983,45 @@ def test_a_refused_image_round_streams_a_notice(
     ]
 
 
+def _listings(door: FakeDoor) -> list[httpx.Request]:
+    return [request for request, body in door.requests if request.url.path == "/mcp" and body["method"] == "tools/list"]
+
+
+def _read_document_told(call: dict[str, Any]) -> str:
+    return next(t["function"]["description"] for t in call["tools"] if t["function"]["name"] == "read_document")
+
+
 def test_a_turn_asks_workbench_for_images_only_while_the_model_sees(
     client: TestClient, door: FakeDoor, fake_openai: FakeOpenAI
 ) -> None:
-    """With vision off, a turn's calls go without ``X-Accept-Images``; discovery always carries it."""
+    """With vision off, neither the turn's discovery nor its calls carry ``X-Accept-Images``.
+
+    The model is offered workbench's listing for a call without images: no view_file, 0.6's read_document text.
+    """
     cid = _new(client)
     fake_openai.script = [_read_call(cid), ANSWER]
     _frames(_send(client, cid))
     [call] = _tool_calls(door)
     assert "x-accept-images" not in call.headers
-    listings = [
-        request for request, body in door.requests if request.url.path == "/mcp" and body["method"] == "tools/list"
-    ]
+    listings = _listings(door)
+    assert listings and all("x-accept-images" not in request.headers for request in listings)
+    offered = fake_openai.calls[0]
+    assert "view_file" not in [tool["function"]["name"] for tool in offered["tools"]]
+    assert _read_document_told(offered) == READ_DOCUMENT_TEXT
+
+
+def test_a_seeing_turn_is_offered_the_listing_for_images(
+    seeing: TestClient, door: FakeDoor, fake_openai: FakeOpenAI
+) -> None:
+    """With pictures offered, the turn's discovery asks for images, and the model is told read_document's image text."""
+    cid = _new(seeing)
+    fake_openai.script = [ANSWER]
+    _frames(_send(seeing, cid))
+    listings = _listings(door)
     assert listings and all(request.headers["x-accept-images"] == "1" for request in listings)
+    offered = fake_openai.calls[0]
+    assert "view_file" in [tool["function"]["name"] for tool in offered["tools"]]
+    assert _read_document_told(offered) == CONTRACT_TOOLS["read_document"][0]
 
 
 def test_no_data_url_reaches_the_log_the_store_or_the_audit(

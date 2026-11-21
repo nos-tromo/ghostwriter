@@ -10,6 +10,7 @@ invented.
 """
 
 import base64
+import dataclasses
 import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -53,10 +54,16 @@ TINY_PNG = b"\x89PNG\r\n\x1a\n" + bytes(56)
 ACCEPT_IMAGES_HEADER = "x-accept-images"
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
 
-#: The ten workspace tools of the contract: name, description and input properties.
+#: What workbench 0.7 tells a call that takes no images of ``read_document``: 0.6's text, which promises none.
+READ_DOCUMENT_TEXT = "Read a document as text, from its text layer only."
+#: The ten workspace tools of the contract: name, description (as a call that takes images is told) and input
+#: properties.
 CONTRACT_TOOLS: dict[str, tuple[str, dict[str, Any]]] = {
     "list_files": ("List the files in the chat's folder.", {"path": {"type": "string"}}),
-    "read_document": ("Read a document as text.", {"path": {"type": "string"}, "strips": {"type": "integer"}}),
+    "read_document": (
+        "Read a document as text; pages without text come back as images.",
+        {"path": {"type": "string"}, "strips": {"type": "integer"}},
+    ),
     "search_files": ("Search the chat's files for a text.", {"query": {"type": "string"}}),
     "run_python": ("Run Python on the chat's files.", {"code": {"type": "string"}}),
     "inspect_template": ("List a template's fields.", {"path": {"type": "string"}}),
@@ -327,8 +334,9 @@ class FakeDoor:
     with its path, size and :attr:`upload_id`; a prepare answers the file's manifest; a view
     serves a stored file of the chat, or with ``rendition`` one of its renders.
 
-    As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` only for a request that
-    carries ``X-Accept-Images: 1``; every request is kept with its headers in :attr:`requests`.
+    As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
+    ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
+    :func:`listed_without_images`. Every request is kept with its headers in :attr:`requests`.
 
     Attributes:
         key: The key the door accepts.
@@ -413,7 +421,7 @@ class FakeDoor:
             if route == "tools/call" and isinstance(answer, dict):
                 self.last_call_answer = answer
             if route == "tools/list" and isinstance(answer, dict) and not _accepts_images(request):
-                answer = _without_view_file(answer)
+                answer = listed_without_images(answer)
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": answer})
         if answer is None and path == "/files/upload":
             return self._store(request, body, folder)
@@ -564,16 +572,21 @@ def _accepts_images(request: httpx.Request) -> bool:
     return request.headers.get(ACCEPT_IMAGES_HEADER) == "1"
 
 
-def _without_view_file(listing: dict[str, Any]) -> dict[str, Any]:
-    """Return a ``tools/list`` result without ``view_file``, as workbench lists it to a call that takes no images.
+def listed_without_images(listing: dict[str, Any]) -> dict[str, Any]:
+    """Return a ``tools/list`` result as workbench 0.7 lists it to a call that takes no images.
 
     Args:
-        listing: The result.
+        listing: The result, as a call that takes images gets it.
 
     Returns:
-        A copy without the tool.
+        A copy without ``view_file``, and ``read_document`` told as 0.6 told it (:data:`READ_DOCUMENT_TEXT`).
     """
-    return {**listing, "tools": [tool for tool in listing["tools"] if tool.get("name") != "view_file"]}
+    tools = [
+        {**tool, "description": READ_DOCUMENT_TEXT} if tool.get("name") == "read_document" else tool
+        for tool in listing["tools"]
+        if tool.get("name") != "view_file"
+    ]
+    return {**listing, "tools": tools}
 
 
 def _rpc_error(body: dict[str, Any], error: RpcError) -> httpx.Response:
@@ -946,15 +959,17 @@ class RecordingAudit:
 class FakeWorkbench:
     """``WorkbenchClient`` as the agent loop calls it: ``discover``, ``call_tool`` and ``fetch_renditions``.
 
-    Discovery answers :attr:`discovery`. Each call answers the next of :attr:`answers`, or
+    Discovery answers :attr:`discovery` to a call that takes images and, as workbench 0.7 does, the
+    same without ``view_file`` and with 0.6's ``read_document`` text to one that does not
+    (:data:`READ_DOCUMENT_TEXT`). Each call answers the next of :attr:`answers`, or
     :data:`PLAIN_RESULT` once they are used up, and is recorded with the audit line written
     last before it went out. A rendition is :data:`TINY_JPEG`, unless its path is in :attr:`missing`.
 
     Attributes:
-        discovery: What every discovery answers; ``None`` is a workbench that is not usable.
+        discovery: What every discovery that takes images answers; ``None`` is a workbench that is not usable.
         answers: The scripted answers, in order.
         calls: Every call, in order.
-        discoveries: The chat of every discovery, in order.
+        discoveries: The chat of every discovery, and whether it asked for images, in order.
         sent_after: For every call, the audit's last line when it was sent.
         audit: The audit whose log :attr:`sent_after` reads.
         missing: The paths whose renditions are not there.
@@ -980,7 +995,7 @@ class FakeWorkbench:
         self.discovery: Discovery | None = Discovery(tools=found, server_version="0.3.0") if found else None
         self.answers: list[Answer] = list(answers)
         self.calls: list[SentCall] = []
-        self.discoveries: list[CallFor] = []
+        self.discoveries: list[tuple[CallFor, bool]] = []
         self.sent_after: list[str | None] = []
         self.audit = audit
         self.missing: set[str] = set()
@@ -994,17 +1009,25 @@ class FakeWorkbench:
         """
         return cast(WorkbenchClient, self)
 
-    def discover(self, *, call: CallFor) -> Discovery | None:
+    def discover(self, *, call: CallFor, images: bool) -> Discovery | None:
         """Answer a discovery.
 
         Args:
             call: The asking turn's chat.
+            images: Whether it asks for the listing of a call that takes images.
 
         Returns:
-            :attr:`discovery`.
+            :attr:`discovery`, or without images its tools as workbench 0.7 lists them then.
         """
-        self.discoveries.append(call)
-        return self.discovery
+        self.discoveries.append((call, images))
+        if images or self.discovery is None:
+            return self.discovery
+        tools = tuple(
+            dataclasses.replace(tool, description=READ_DOCUMENT_TEXT) if tool.name == "read_document" else tool
+            for tool in self.discovery.tools
+            if tool.name != "view_file"
+        )
+        return dataclasses.replace(self.discovery, tools=tools)
 
     def call_tool(
         self, name: str, arguments: Mapping[str, Any], *, call: CallFor, timeout_s: float, images: bool = False

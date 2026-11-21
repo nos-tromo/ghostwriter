@@ -1,6 +1,6 @@
 """One message's answer: model rounds, and workbench's tools between them, within the message's caps.
 
-The loop discovers workbench's tools once, then streams rounds. Each round's messages are
+The loop discovers workbench's tools, then streams rounds. Each round's messages are
 fitted to the prompt budget (:func:`~ghostwriter.agent.context.fit`); a reasoning message has
 the smaller budget and every round of it asks the model to think. Text goes out as it
 arrives, a blank line between two rounds' texts, and the answer stored is exactly what went
@@ -24,9 +24,12 @@ assumed to end in any given time: the wall is read from the clock before each ro
 call and each retry. A call id an earlier call of the turn already has is made unique, so that
 each call's images and records stay its own.
 
-While the model sees (:class:`~ghostwriter.vision.Vision`), images go with the rounds
-(:mod:`ghostwriter.agent.images`): ``view_file`` is offered, the system prompt says how to look, and
-the turn's calls ask workbench for images. The question carries its attached pictures, and a
+A turn sees when the model sees (:class:`~ghostwriter.vision.Vision`) and workbench's listing for a
+call that takes images holds ``view_file``. Then images go with the rounds
+(:mod:`ghostwriter.agent.images`): the rounds are offered that listing, ``view_file`` included, the system
+prompt says how to look, and the turn's calls ask workbench for images. A turn that does not see is
+offered the listing of a call without images, as workbench 0.6 gave it, which promises no image; so is
+every round after a refusal. The question carries its attached pictures, and a
 follow-up those of earlier questions that fit; their renditions are fetched before the round that
 first sends them, once per message, and one not found is a note. A round's tool images follow its
 tool messages in one user message, the oldest retired beyond ``GHOSTWRITER_MAX_IMAGES``; one the
@@ -110,7 +113,7 @@ from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.vision import VIEW_TOOL, Vision
 from ghostwriter.workbench import (
     CallFor,
-    McpTool,
+    Discovery,
     OutputFile,
     RenditionRequest,
     ToolFailure,
@@ -273,8 +276,9 @@ class _Sight:
     """What one message's answer does with images.
 
     Attributes:
-        sees: Whether the model sees images, as the message began.
-        budget: What an image costs a round and how many a request carries; ``None`` while the model
+        sees: Whether the turn sees, as the message began: the model sees, and workbench's listing for
+            images holds ``view_file``.
+        budget: What an image costs a round and how many a request carries; ``None`` while the turn
             does not see.
         known: The sizes of the pictures the chat attached that are ready to be seen, by path.
         bank: The bytes of the message's images, by ref key; it goes when the answer ends.
@@ -341,22 +345,25 @@ class _Offer:
     names: list[str]
 
 
-@dataclass(frozen=True)
+@dataclass
 class _Request:
     """What each round's request is fitted from, besides the current turn.
 
     Attributes:
-        seeing: The offer while images go to the model: ``view_file`` among the tools, and the
-            system prompt saying how to look.
-        blind: The offer without either, for a model that does not see, or that refused images.
+        seeing: The offer while images go to the model: workbench's listing for images, ``view_file``
+            among the tools, and the system prompt saying how to look; ``None`` for a turn that does not see.
+        blind: Makes the offer without either, from workbench's listing for a call without images, for a
+            turn that does not see, or once the model refused images; asked at most once, when a round
+            first needs it.
         past: The earlier turns, oldest first.
         budget: The tokens a round's prompt may take.
     """
 
-    seeing: _Offer
-    blind: _Offer
+    seeing: _Offer | None
+    blind: Callable[[], _Offer]
     past: Sequence[PastTurn]
     budget: int
+    _blind: _Offer | None = field(default=None, init=False, repr=False)
 
     def offer(self, sight: _Sight) -> _Offer:
         """Return the offer of a round.
@@ -365,9 +372,13 @@ class _Request:
             sight: The turn's images.
 
         Returns:
-            :attr:`seeing` while images go to the model, else :attr:`blind`.
+            :attr:`seeing` while images go to the model, else the blind offer.
         """
-        return self.seeing if sight.showing else self.blind
+        if sight.showing and self.seeing is not None:
+            return self.seeing
+        if self._blind is None:
+            self._blind = self.blind()
+        return self._blind
 
     def fitted(
         self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool
@@ -580,17 +591,21 @@ class AgentLoop:
         if turn.cancel.is_set():
             return
         settings = self._settings
-        key = settings.workbench_api_key
         workbench = self._workbench
-        sees = self._vision is not None and self._vision.model_sees
-        discovery = workbench.discover(call=turn.call) if workbench is not None else None
-        discovered = discovery.tools if discovery is not None else ()
-        folder = chat_folder(key, turn.chat_id) if discovery is not None and key else None
+        model_sees = self._vision is not None and self._vision.model_sees
+        full = workbench.discover(call=turn.call, images=True) if workbench is not None and model_sees else None
+        sees = full is not None and any(tool.name == VIEW_TOOL for tool in full.tools)
         question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=sees)
         past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=sees)
         today = self._now().date()
-        blind = self._offer(discovered, seeing=False, folder=folder, expired=expired, today=today)
-        seeing = self._offer(discovered, seeing=True, folder=folder, expired=expired, today=today) if sees else blind
+
+        def blind() -> _Offer:
+            # A workbench that failed the discovery for images offers no tool this turn, as any failed one.
+            failed = model_sees and full is None
+            plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
+            return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
+
+        seeing = self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today) if sees else None
         attached = [*question.images, *(image for earlier in past for image in earlier.images)]
         sight = _Sight(
             sees=sees,
@@ -648,21 +663,25 @@ class AgentLoop:
             self._tool_images(current, sight, shown)
 
     def _offer(
-        self, discovered: Sequence[McpTool], *, seeing: bool, folder: str | None, expired: bool, today: date
+        self, discovery: Discovery | None, *, seeing: bool, chat_id: str, expired: bool, today: date
     ) -> _Offer:
         """Return what a round offers, with sight or without it.
 
         Args:
-            discovered: The tools discovery found.
+            discovery: The listing discovery found: for images while ``seeing``, else for a call without
+                images; ``None`` offers no tool.
             seeing: Whether images go to the model: only then is ``view_file`` offered and the system
                 prompt says how to look.
-            folder: The chat's folder in workbench; ``None`` when no tool is offered.
+            chat_id: The chat, whose folder the prompt names while a tool is offered.
             expired: Whether files or tool results of earlier messages have expired.
             today: The date the message is answered on.
 
         Returns:
             The system prompt, and the tools with their names.
         """
+        key = self._settings.workbench_api_key
+        folder = chat_folder(key, chat_id) if discovery is not None and key else None
+        discovered = discovery.tools if discovery is not None else ()
         found = [tool for tool in discovered if seeing or tool.name != VIEW_TOOL]
         names = [tool.name for tool in found]
         system = system_prompt(
