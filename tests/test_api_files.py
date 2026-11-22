@@ -675,7 +675,9 @@ def test_an_image_is_prepared_after_it_is_attached(
     assert PHOTO not in audit_stream.getvalue()
 
 
-def test_a_pdf_waits_and_a_word_file_is_ready_at_once(seeing: TestClient, door: FakeDoor) -> None:
+def test_a_pdf_waits_and_a_word_file_is_ready_at_once(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
     """A PDF is processing until it is prepared; a Word file is ready at once and prepared after, a sheet never."""
     cid = _new(seeing)
     store = _state(seeing).store
@@ -685,6 +687,7 @@ def test_a_pdf_waits_and_a_word_file_is_ready_at_once(seeing: TestClient, door: 
     found = store.find_attachment("user-a", cid, scan["id"])
     assert found is not None and found.manifest is not None and found.manifest["total"] == 3
     door.upload_id = "5" * 32
+    before = len(events(audit_stream))
     memo = _attach(seeing, cid, "memo.docx").json()
     assert (memo["kind"], memo["status"]) == ("document", "ready")
 
@@ -696,6 +699,9 @@ def test_a_pdf_waits_and_a_word_file_is_ready_at_once(seeing: TestClient, door: 
     found = store.find_attachment("user-a", cid, memo["id"])
     assert found is not None and found.status == "ready" and found.manifest is not None
     assert (found.manifest["kind"], found.manifest["unit"], found.manifest["total"]) == ("office", "page", 3)
+    [collect] = [e for e in _since(audit_stream, before) if e["action"] == "collect"]
+    [handed] = [e for e in _since(audit_stream, before) if e.get("recipient") == "workbench:prepare"]
+    assert (handed["parent_event_id"], handed["criteria"]) == (collect["event_id"], {"kind": "document"})
     door.upload_id = "6" * 32
     sheet = _attach(seeing, cid, "figures.xlsx").json()
     assert (sheet["kind"], sheet["status"]) == ("document", "ready")
