@@ -75,15 +75,38 @@ and reads as text. A message that names a `processing` attachment is answered
 prepared again.
 
 A Word, PowerPoint or OpenDocument text file (`.docx .dotx .pptx .potx .odt`) is
-`ready` at once, while pictures are offered, and prepared after it in the
-background, at most one at a time, so Send never waits for it. It reads as text
-until its manifest is kept; then its line names the pages or slides, and the
-model can view them. workbench 0.8.0 converts the file once and keeps the PDF as
-its own derived file, deleted with the file. The manifest keeps its `unit`
-(`page` or `slide`). A file workbench refuses (422) stays `ready` without a
-manifest and is not asked again. A background prepare cut by a restart is not run
-again: only a `processing` attachment is. Next to workbench 0.7.0 the prepare
-answers kind `none`, and the file reads as text, as before.
+`ready` as soon as its upload answers, and Send never waits for it. While
+pictures are offered, it is also prepared after that, in the background and one
+at a time; without them it is `ready` and never prepared, as before 0.5.0. Until
+its manifest is kept it reads as text. Then its line names the pages or slides,
+and the model can view them, while the turn sees. The manifest keeps its `unit`
+(`page` or `slide`). workbench 0.8.0 converts the file once and keeps the PDF as
+its own derived file, deleted with the file.
+
+Three things of workbench 0.8.0 make that true:
+
+- **Conversions have a gate of their own.** workbench converts one Office file
+  of Ghostwriter's at a time, over all its users, apart from the gate where
+  pictures and PDFs are prepared. A picture's or a PDF's prepare is therefore
+  admitted while a deck converts, and Send waits for the picture only. This
+  holds while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its
+  default: a conversion, a picture's prepare and a tool call each take one. With
+  fewer, a prepare or a tool call can queue behind a conversion.
+- **A tool call waits out the prepare.** A call that needs a deck's slides while
+  its background prepare runs (`view_file`, or the pictures of `read_document`)
+  waits for it in workbench, up to 120 s, and then shows the slides. No second
+  conversion runs. 120 s is less than `WORKBENCH_TIMEOUT` (150 s). Past it,
+  workbench answers busy and the call is retried once, as every busy call is.
+- **A refusal is remembered.** A file workbench refuses as unreadable or
+  unsupported (422) stays `ready` without a manifest, and Ghostwriter does not
+  ask for its prepare again. workbench answers every later view or picture read
+  of that file with the same refusal at once, with no new conversion, until it
+  restarts or the file is deleted. A refusal that may pass (a timeout, a busy
+  answer) is not remembered. `read_document` still reads the text.
+
+A background prepare cut by a restart is not run again: only a `processing`
+attachment is. Next to workbench 0.7.0 the prepare answers kind `none`, and the
+file reads as text, as before.
 
 - **The wait.** The SPA follows the status with a long poll: `GET
   /api/chats/{id}/attachments/{attachment_id}?wait=` answers when the status

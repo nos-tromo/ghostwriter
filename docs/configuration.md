@@ -62,13 +62,13 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment (`workbench.py`) |
 | `MAX_RENDITION_BYTES` | 768 KiB | A render of a page or picture fetched must be smaller (`workbench.py`) |
 | `MAX_IMAGE_BYTES` / `MAX_IMAGES_BYTES` / `MAX_TOOL_IMAGES` | 1 MiB / 3 MiB / 8 | The pictures kept from one tool answer: each, all together, and how many (`workbench.py`) |
-| `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`) |
+| `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`). A prepare whose file another call is still making waits for that call first, up to 120 s more, and then usually finds the manifest made; the rare one that waits it out and then converts the file itself can pass 390 s and is cut, and the file reads as text |
 | `PREPARE_RETRY_S` | 10 | Pause before a prepare workbench answered busy (503) goes once more; one that timed out is not tried again (`processing.py`) |
 | `STRIPS_TIMEOUT_S` | 60 | The same for the second prepare that cuts a large picture's strips; it is not tried again (`processing.py`) |
 | `STRIP_LONG_SIDE` / `TOKEN_SIDE` | 1,024 px / 32 px | At a fixed image cost, a page or picture whose long side is over the first goes as two strips; with none set, an image costs a token per started square of the second (`agent/images.py`) |
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
 | `PREPARE_SLOTS` | 2 | Attachments prepared at once, in the one process (`processing.py`) |
-| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS` (`processing.py`) |
+| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). In workbench 0.8.0 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
 | `MAX_WAIT_S` | 20 | The longest `?wait=` of an attachment's status long poll (`processing.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
 | `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |
