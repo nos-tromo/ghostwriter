@@ -83,7 +83,8 @@ and the model can view them, while the turn sees. The manifest keeps its `unit`
 (`page` or `slide`). workbench 0.8.0 converts the file once and keeps the PDF as
 its own derived file, deleted with the file.
 
-Three things of workbench 0.8.0 make that true:
+Three things of workbench 0.8.1 matter here (0.8.0 converts and draws the file,
+but has none of them):
 
 - **Conversions have a gate of their own.** workbench converts one Office file
   of Ghostwriter's at a time, over all its users, apart from the gate where

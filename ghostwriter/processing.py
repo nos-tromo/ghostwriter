@@ -21,7 +21,7 @@ An Office file (:func:`~ghostwriter.upload.prepared_later`) is not waited for: i
 answers, and its job (``background``) only adds its facts, its pages or slides, once workbench has converted and
 drawn it, which takes far longer than a picture or a PDF. Such a job takes the one :data:`BACKGROUND_SLOTS`
 before one of the :data:`PREPARE_SLOTS`, so Office files never fill both and a picture is not queued behind
-them here. workbench 0.8.0 does the same on its side: it converts in a gate of its own, one file at a time, so a
+them here. workbench 0.8.1 does the same on its side: it converts in a gate of its own, one file at a time, so a
 picture's prepare is admitted while a deck converts (its ``GHOSTWRITER_WORKBENCH_SLOTS`` at 3 or more, its
 default), and a tool call for the deck's slides waits out the deck's prepare there, up to 120 s. Its manifest is
 kept with :meth:`~ghostwriter.store.ChatStore.keep_manifest`, which changes only a

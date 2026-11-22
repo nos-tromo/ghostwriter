@@ -68,7 +68,7 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `STRIP_LONG_SIDE` / `TOKEN_SIDE` | 1,024 px / 32 px | At a fixed image cost, a page or picture whose long side is over the first goes as two strips; with none set, an image costs a token per started square of the second (`agent/images.py`) |
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
 | `PREPARE_SLOTS` | 2 | Attachments prepared at once, in the one process (`processing.py`) |
-| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). In workbench 0.8.0 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
+| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). From workbench 0.8.1 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
 | `MAX_WAIT_S` | 20 | The longest `?wait=` of an attachment's status long poll (`processing.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
 | `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |

@@ -32,7 +32,7 @@ dropped (never shown, stored, replayed or recorded). A picture attached to a
 message, or a page or picture a tool shows, goes to the chat model as an image
 while it sees (`GHOSTWRITER_VISION`); the bytes live in memory for that one
 message. An attached Word, PowerPoint or OpenDocument text file is prepared too,
-so its pages and slides can be seen (workbench 0.8.0): it is `ready` at once and
+so its pages and slides can be seen (workbench 0.8.1): it is `ready` at once and
 prepared in the background, so Send never waits for it. That holds because
 workbench converts in a gate of its own, with `GHOSTWRITER_WORKBENCH_SLOTS` at 3
 or more (its default). Reference: `docs/`.
@@ -65,7 +65,7 @@ or more (its default). Reference: `docs/`.
   without `vision`; on vLLM, a text-only model needs `GHOSTWRITER_VISION=off`.
   workbench 0.8.0 converts an Office file once and keeps the PDF as a derived
   file; next to 0.7.0 its prepare answers kind `none` and the file reads as text.
-  It converts one file at a time in a gate apart from the pictures' and PDFs'
+  From 0.8.1 it converts one file at a time in a gate apart from the pictures' and PDFs'
   prepares; a tool call for a deck's slides waits out the deck's background
   prepare, up to 120 s (within `WORKBENCH_TIMEOUT`, 150 s); and a file it refuses
   as unreadable or unsupported is refused again at once on later views, until it
