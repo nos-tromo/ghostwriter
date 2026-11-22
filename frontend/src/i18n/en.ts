@@ -47,7 +47,6 @@ export const en = {
   'composer.placeholder': 'Write a message',
   'composer.attach': 'Attach files',
   'composer.drop': 'Drop files to attach them',
-  'composer.files_stay': 'Attached files stay in this chat until it is deleted, for {days} days at most.',
   'composer.uploading': 'Attaching {name}…',
   'composer.remove': 'Remove {name}',
   'composer.error_type': '{name}: this file type is not supported.',

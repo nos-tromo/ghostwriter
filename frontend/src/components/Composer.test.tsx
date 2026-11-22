@@ -109,9 +109,8 @@ describe('Composer', () => {
     release()
     await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
     expect(chip('sales.xlsx')).toHaveTextContent('4 KB')
-    expect(
-      screen.getByText('Attached files stay in this chat until it is deleted, for 7 days at most.'),
-    ).toBeInTheDocument()
+    // The file period is said once, in the page's footer (RetentionNote), never above the composer.
+    expect(screen.queryByText(/7 days/)).not.toBeInTheDocument()
     await user.click(textbox())
     await user.keyboard('{Enter}')
     expect(callsTo(calls, 'POST', MESSAGES).map((c) => c.body)).toEqual([
@@ -175,18 +174,14 @@ describe('Composer', () => {
     const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'Bericht.PDF'), 201) })
     await screen.findByText('Ask anything, or attach a document.')
 
-    const stay = 'Attached files stay in this chat until it is deleted, for 7 days at most.'
     drop(textbox(), [file('tool.exe'), file('big.pdf', 51 * 1024 * 1024)])
     expect(await screen.findByText('tool.exe: this file type is not supported.')).toBeInTheDocument()
     expect(screen.getByText('big.pdf is larger than 50 MB.')).toBeInTheDocument()
     expect(chip('tool.exe')).toHaveAttribute('data-status', 'error')
     expect(chip('big.pdf')).toHaveAttribute('data-status', 'error')
-    // Nothing stays in the chat when every file was refused.
-    expect(screen.queryByText(stay)).not.toBeInTheDocument()
     // The extension is matched in any case.
     drop(textbox(), [file('Bericht.PDF')])
     await waitFor(() => expect(chip('Bericht.PDF')).toHaveAttribute('data-status', 'done'))
-    expect(screen.getByText(stay)).toBeInTheDocument()
     expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['Bericht.PDF'])
 
     // A refused file can be taken out of view.

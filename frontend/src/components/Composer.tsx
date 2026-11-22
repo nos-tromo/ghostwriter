@@ -218,11 +218,6 @@ export function Composer({
           }}
         />
         {processing && <p className="text-xs text-muted-foreground">{t('composer.processing_hint')}</p>}
-        {attachments.pending.some((f) => f.status !== 'error') && (
-          <p className="text-xs text-muted-foreground">
-            {t('composer.files_stay', { days: config.file_retention_days })}
-          </p>
-        )}
         <ChatComposer
           ref={textRef}
           value={text}

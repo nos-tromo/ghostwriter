@@ -49,7 +49,6 @@ export const de: Strings = {
   'composer.placeholder': 'Nachricht schreiben',
   'composer.attach': 'Dateien anhängen',
   'composer.drop': 'Dateien zum Anhängen ablegen',
-  'composer.files_stay': 'Angehängte Dateien bleiben in diesem Chat, bis er gelöscht wird, höchstens {days} Tage.',
   'composer.uploading': '{name} wird angehängt…',
   'composer.remove': '{name} entfernen',
   'composer.error_type': '{name}: Dieser Dateityp wird nicht unterstützt.',
