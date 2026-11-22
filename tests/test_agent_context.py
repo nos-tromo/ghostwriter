@@ -497,19 +497,22 @@ def test_the_presentation_sentence_comes_with_the_tool() -> None:
 def test_the_deck_check_comes_with_sight_and_the_tool() -> None:
     """How to check and restyle a built deck follows the outline rule only while the model sees and has the tool.
 
-    The model looks at every file of the chat, those it made too, rather than say it cannot see them; a deck it
-    wrote is looked at, and a better look is made with python-pptx in run_python.
+    The model looks at the files of the chat that view_file shows, those it made too, rather than say it cannot see
+    them; a deck it wrote is looked at and mended without changing what the user agreed to, and a better look the
+    user asks for is made with python-pptx in run_python. Without sight, no sentence names view_file.
     """
     assert DECK_CHECK == (
-        "After write_presentation, look at the new deck with view_file and fix what looks wrong. To make a deck "
-        "look better, pick layouts with pictures, native charts and tables, and use fewer words; set colours, "
-        "fonts, backgrounds and shapes with python-pptx in run_python, which writes the restyled deck as a new "
-        "file, and look at it again."
+        "After write_presentation, look at the new deck's first slides with view_file. Mend what is broken (text "
+        "that overflows or overlaps, an empty place) with run_python or by writing the deck again from the agreed "
+        "outline; change its content only when the user asks. When the user asks for a better look, pick layouts "
+        "with pictures, native charts and tables, and set colours, fonts, backgrounds and shapes with python-pptx in "
+        "run_python, which writes the restyled deck as a new file; look at it again, and name the file that is now "
+        "the deck."
     )
     assert VISION.endswith(
-        "use view_file to see one again. You can see every file of this chat, also those you made yourself: when "
-        "the user asks whether you can see one, or how it looks, look at it with view_file instead of saying you "
-        "cannot."
+        "use view_file to see one again. You can see the pictures, PDF, Word, OpenDocument text and PowerPoint files "
+        "of this chat, also those you made yourself: when the user asks whether you can see one, or how it looks, "
+        "look at it with view_file instead of saying you cannot."
     )
     day = date(2026, 11, 16)
     both = system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, presentations=True, vision=True)
@@ -519,6 +522,7 @@ def test_the_deck_check_comes_with_sight_and_the_tool() -> None:
             today=day, folder=FOLDER, file_days=7, expired=False, presentations=presentations, vision=vision
         )
         assert DECK_CHECK not in one
+        assert vision or "view_file" not in one
     bare = system_prompt(today=day, folder=None, file_days=7, expired=False, presentations=True, vision=True)
     assert bare == system_prompt(today=day, folder=None, file_days=7, expired=False)
 

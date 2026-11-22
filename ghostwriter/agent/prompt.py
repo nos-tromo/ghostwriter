@@ -19,16 +19,19 @@ VISION: Final = (
     "pages without text come back as images in the same answer. For how something looks (layout, design, "
     "charts, handwriting, photos), look with view_file, at most 4 pages a call. Images tools showed earlier are "
     "not sent again, and attached pictures only while there is room: use view_file to see one again. You can see "
-    "every file of this chat, also those you made yourself: when the user asks whether you can see one, or how it "
-    "looks, look at it with view_file instead of saying you cannot."
+    "the pictures, PDF, Word, OpenDocument text and PowerPoint files of this chat, also those you made yourself: "
+    "when the user asks whether you can see one, or how it looks, look at it with view_file instead of saying you "
+    "cannot."
 )
 #: How the model checks and restyles a deck it built, given only while it sees and write_presentation is offered:
-#: it looks at the slides it wrote, and a better look is made with the tools it has, not declined.
+#: it looks at the slides it wrote and mends what is broken without changing what the user agreed to, and a better
+#: look the user asks for is made with the tools it has, not declined.
 DECK_CHECK: Final = (
-    "After write_presentation, look at the new deck with view_file and fix what looks wrong. To make a deck look "
-    "better, pick layouts with pictures, native charts and tables, and use fewer words; set colours, fonts, "
-    "backgrounds and shapes with python-pptx in run_python, which writes the restyled deck as a new file, and look "
-    "at it again."
+    "After write_presentation, look at the new deck's first slides with view_file. Mend what is broken (text that "
+    "overflows or overlaps, an empty place) with run_python or by writing the deck again from the agreed outline; "
+    "change its content only when the user asks. When the user asks for a better look, pick layouts with pictures, "
+    "native charts and tables, and set colours, fonts, backgrounds and shapes with python-pptx in run_python, which "
+    "writes the restyled deck as a new file; look at it again, and name the file that is now the deck."
 )
 
 
