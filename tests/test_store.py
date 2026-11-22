@@ -518,6 +518,23 @@ def test_a_message_binds_only_this_chats_pending_attachments(store: ChatStore) -
         store.add_user_message("user-a", chat.id, "Nochmal", [mine.id])
 
 
+def test_only_an_unsent_attachment_of_the_owners_chat_is_taken_back(store: ChatStore) -> None:
+    """Another owner, another chat and a sent attachment keep their rows; the owner's unsent one goes, once."""
+    chat = store.create_chat("user-a")
+    other = store.create_chat("user-a")
+    mine, kept, sent = _attach(store, chat.id), _attach(store, chat.id), _attach(store, chat.id)
+    store.add_user_message("user-a", chat.id, "Hallo", [sent.id])
+    assert store.find_pending_attachment("user-a", chat.id, mine.id) is not None
+    assert store.find_pending_attachment("user-a", chat.id, sent.id) is None
+    assert not store.remove_pending_attachment("user-b", chat.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", other.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", chat.id, sent.id)
+    assert store.remove_pending_attachment("user-a", chat.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", chat.id, mine.id)
+    assert [a.id for a in store.chat_detail("user-a", chat.id).pending_attachments] == [kept.id]
+    assert store.find_attachment("user-a", chat.id, sent.id) is not None
+
+
 def test_deleting_a_chat_takes_every_row_with_it(store: ChatStore, engine: Engine) -> None:
     """Messages, steps, results and attachments, bound or pending, go with their chat; other chats stay."""
 
@@ -590,6 +607,7 @@ MANIFEST: dict[str, Any] = {
         {"n": 2, "width": 800, "height": 1000, "mime": "image/jpeg", "bytes": 5120, "hint": "scan"},
     ],
     "frames": [],
+    "unit": "page",
     "hint": "two pages carry no text",
 }
 
@@ -640,6 +658,37 @@ def test_a_settled_manifest_keeps_metadata_only(store: ChatStore, engine: Engine
     assert all(word not in render for word in ("/workspace", "hint", "bytes", "scan"))
 
 
+def test_a_settled_manifest_keeps_its_unit(store: ChatStore) -> None:
+    """A deck's manifest keeps ``unit``; one stored by 0.3.0 has none, and still reads."""
+    chat = store.create_chat("user-a")
+    deck = _picture(store, chat.id, kind="document")
+    manifest = {
+        "kind": "office",
+        "total": 3,
+        "pages_without_text": [2],
+        "renditions": [{"n": 1, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 4096}],
+        "frames": None,
+        "unit": "slide",
+        "hint": "a note",
+    }
+    assert store.settle_attachment(deck.id, status="ready", manifest=manifest, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, deck.id)
+    assert ref is not None and ref.manifest is not None
+    assert (ref.manifest["kind"], ref.manifest["unit"], ref.manifest["total"]) == ("office", "slide", 3)
+    older = _picture(store, chat.id, kind="document")
+    stored_by_0_3_0: dict[str, Any] = {
+        "kind": "pdf",
+        "total": 3,
+        "pages_without_text": [2],
+        "renditions": [],
+        "frames": None,
+    }
+    assert store.settle_attachment(older.id, status="ready", manifest=stored_by_0_3_0, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, older.id)
+    assert ref is not None and ref.manifest is not None
+    assert ref.manifest == stored_by_0_3_0 and "unit" not in ref.manifest
+
+
 def test_a_manifest_without_some_keys_keeps_those_it_has(store: ChatStore) -> None:
     """A picture has no pages: only what its manifest reports is kept."""
     chat = store.create_chat("user-a")
@@ -683,6 +732,34 @@ def test_settling_is_once_and_only_from_processing(store: ChatStore, engine: Eng
     assert store.settle_attachment(document.id, status="failed", manifest=None, failure="late") is False
     assert _raw_attachment(engine, document.id) == ("ready", None, None)
     assert store.settle_attachment(str(uuid4()), status="ready", manifest=None, failure=None) is False
+
+
+def test_keep_manifest_fills_only_a_ready_row_without_one(store: ChatStore, engine: Engine) -> None:
+    """A background prepare's manifest goes to a ``ready`` row that has none, once; nothing else changes."""
+    chat = store.create_chat("user-a")
+    deck = _picture(store, chat.id, kind="document", status="ready")
+    manifest = {"kind": "office", "unit": "slide", "total": 3, "pages_without_text": [2], "path": "/workspace/s/x"}
+    assert store.keep_manifest(deck.id, manifest) is True
+    ref = store.find_attachment("user-a", chat.id, deck.id)
+    assert ref is not None and ref.status == "ready" and ref.manifest is not None
+    assert (ref.manifest["kind"], ref.manifest["unit"], ref.manifest["total"]) == ("office", "slide", 3)
+    assert "path" not in ref.manifest
+    kept = _raw_attachment(engine, deck.id)
+    assert store.keep_manifest(deck.id, {"kind": "office", "unit": "page", "total": 9}) is False
+    assert _raw_attachment(engine, deck.id) == kept
+
+    processing = _picture(store, chat.id, kind="document")
+    failed = _picture(store, chat.id)
+    assert store.settle_attachment(failed.id, status="failed", manifest=None, failure="unreadable") is True
+    assert store.keep_manifest(processing.id, manifest) is False
+    assert store.keep_manifest(failed.id, manifest) is False
+    assert _raw_attachment(engine, processing.id) == ("processing", None, None)
+    assert _raw_attachment(engine, failed.id) == ("failed", None, "unreadable")
+
+    gone = _picture(store, chat.id, kind="document", status="ready")
+    store.delete_chat_rows(chat.id)
+    assert store.keep_manifest(gone.id, manifest) is False
+    assert store.keep_manifest(str(uuid4()), manifest) is False
 
 
 def test_an_attachment_is_found_only_through_its_owners_chat(store: ChatStore) -> None:

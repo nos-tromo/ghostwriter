@@ -18,6 +18,7 @@ from sqlalchemy import Engine
 
 from ghostwriter.agent.context import (
     CLEARED,
+    OFFICE_FORMATS,
     PastCall,
     PastTurn,
     attachment_facts,
@@ -51,7 +52,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import PRESENTATIONS, system_prompt
+from ghostwriter.agent.prompt import DECK_CHECK, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
     REFUSALS,
     Refusal,
@@ -65,6 +66,7 @@ from ghostwriter.agent.tools import (
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.store import ChatStore, UserTurn
+from ghostwriter.upload import OFFICE_SUFFIXES
 from ghostwriter.workbench import McpTool, OutputFile, TablePreview, ToolFailure, ToolImage, ToolResult
 from tests.fakes import TINY_JPEG, TINY_PNG, stock_manifest
 
@@ -492,6 +494,39 @@ def test_the_presentation_sentence_comes_with_the_tool() -> None:
     assert bare == system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
 
 
+def test_the_deck_check_comes_with_sight_and_the_tool() -> None:
+    """How to check and restyle a built deck follows the outline rule only while the model sees and has the tool.
+
+    The model looks at the files of the chat that view_file shows, those it made too, rather than say it cannot see
+    them; a deck it wrote is looked at and mended without changing what the user agreed to, and a better look the
+    user asks for is made with python-pptx in run_python. Without sight, no sentence names view_file.
+    """
+    assert DECK_CHECK == (
+        "After write_presentation, look at the new deck's first slides with view_file. Mend what is broken (text "
+        "that overflows or overlaps, an empty place) with run_python or by writing the deck again from the agreed "
+        "outline; change its content only when the user asks. When the user asks for a better look, pick layouts "
+        "with pictures, native charts and tables, and set colours, fonts, backgrounds and shapes with python-pptx in "
+        "run_python, which writes the restyled deck as a new file; look at it again, and name the file that is now "
+        "the deck."
+    )
+    assert VISION.endswith(
+        "use view_file to see one again. You can see the pictures, PDF, Word, OpenDocument text and PowerPoint files "
+        "of this chat, also those you made yourself: when the user asks whether you can see one, or how it looks, "
+        "look at it with view_file instead of saying you cannot."
+    )
+    day = date(2026, 11, 16)
+    both = system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, presentations=True, vision=True)
+    assert both == f"{SYSTEM} {VISION} {PRESENTATIONS} {DECK_CHECK}"
+    for presentations, vision in ((True, False), (False, True), (False, False)):
+        one = system_prompt(
+            today=day, folder=FOLDER, file_days=7, expired=False, presentations=presentations, vision=vision
+        )
+        assert DECK_CHECK not in one
+        assert vision or "view_file" not in one
+    bare = system_prompt(today=day, folder=None, file_days=7, expired=False, presentations=True, vision=True)
+    assert bare == system_prompt(today=day, folder=None, file_days=7, expired=False)
+
+
 PAGE = ToolImage("quay-scan.pdf, page 2", 1131, 1600, "image/jpeg", TINY_JPEG)
 CHART = ToolImage("plot.png", 640, 480, "image/png", TINY_PNG)
 
@@ -528,21 +563,40 @@ def _pdf_manifest(total: int, blank: list[int]) -> dict[str, Any]:
     return {"kind": "pdf", "total": total, "pages_without_text": blank, "renditions": [], "frames": None}
 
 
+def _office_manifest(unit: str, total: int, blank: list[int]) -> dict[str, Any]:
+    pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg"} for n in range(1, total + 1)]
+    return {
+        "kind": "office",
+        "total": total,
+        "pages_without_text": blank,
+        "renditions": pages,
+        "frames": None,
+        "unit": unit,
+    }
+
+
 def test_the_attachment_line_carries_facts() -> None:
     """The line names an image's size, a PDF's pages and those without text; a failed or expired file says so."""
     times = "\N{MULTIPLICATION SIGN}"
-    assert attachment_facts("image", _image_manifest(2048, 1536), seen=True) == f"image 2048{times}1536"
-    assert attachment_facts("image", _image_manifest(2048, 1536), seen=False) == (
+    assert (
+        attachment_facts("image", _image_manifest(2048, 1536), seen=True, name="harbour-photo.jpg")
+        == f"image 2048{times}1536"
+    )
+    assert attachment_facts("image", _image_manifest(2048, 1536), seen=False, name="harbour-photo.jpg") == (
         f"image 2048{times}1536; not shown to the model"
     )
     assert (
-        attachment_facts("document", _pdf_manifest(12, [3, 7]), seen=True) == "PDF, 12 pages; pages 3, 7 have no text"
+        attachment_facts("document", _pdf_manifest(12, [3, 7]), seen=True, name="quay-scan.pdf")
+        == "PDF, 12 pages; pages 3, 7 have no text"
     )
-    assert attachment_facts("document", _pdf_manifest(12, []), seen=False) == "PDF, 12 pages"
-    assert attachment_facts("document", _pdf_manifest(5, [3]), seen=True) == "PDF, 5 pages; page 3 has no text"
-    assert attachment_facts("document", _pdf_manifest(1, []), seen=True) == "PDF, 1 page"
-    assert attachment_facts("document", {"kind": "none", "total": 0}, seen=True) is None
-    assert attachment_facts("document", None, seen=True) is None
+    assert attachment_facts("document", _pdf_manifest(12, []), seen=False, name="quay-scan.pdf") == "PDF, 12 pages"
+    assert (
+        attachment_facts("document", _pdf_manifest(5, [3]), seen=True, name="quay-scan.pdf")
+        == "PDF, 5 pages; page 3 has no text"
+    )
+    assert attachment_facts("document", _pdf_manifest(1, []), seen=True, name="quay-scan.pdf") == "PDF, 1 page"
+    assert attachment_facts("document", {"kind": "none", "total": 0}, seen=True, name="quay-scan.pdf") is None
+    assert attachment_facts("document", None, seen=True, name="quay-scan.pdf") is None
 
     def attached(name: str, size: int, **changes: Any) -> AttachmentOut:
         fields: dict[str, Any] = {"kind": "document", "status": "ready", "expired": False, **changes}
@@ -575,7 +629,7 @@ def test_the_attachment_line_carries_facts() -> None:
         "Was steht darin?",
         files,
         path_of=path_of,
-        facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=True),
+        facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=True, name=a.name),
     )
     assert text.split("\n") == [
         "Was steht darin?",
@@ -588,7 +642,10 @@ def test_the_attachment_line_carries_facts() -> None:
         "[Attached: old-scan.pdf; expired]",
     ]
     unseen = user_content(
-        "", [photo], path_of=path_of, facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=False)
+        "",
+        [photo],
+        path_of=path_of,
+        facts_of=lambda a: attachment_facts(a.kind, manifests.get(a.id), seen=False, name=a.name),
     )
     assert unseen == (
         f"[Attached: harbour-photo.jpg ({FOLDER}/harbour-photo.jpg, 48000 bytes; "
@@ -910,27 +967,93 @@ def test_fit_refuses_images_without_an_image_budget() -> None:
     assert len(refs(fit(SYSTEM, [], [], [question], images=ImageBudget(None, max_images=8)))) == 1
 
 
+def test_an_office_attachment_line_names_its_slides_or_pages() -> None:
+    """A deck says slides, a Word or OpenDocument text file pages, both in a PDF's shapes; the format is the name's."""
+    deck = _office_manifest("slide", 24, [3, 7])
+    assert attachment_facts("document", deck, seen=True, name="harbour-deck.pptx") == (
+        "PowerPoint, 24 slides; slides 3, 7 have no text"
+    )
+    assert attachment_facts("document", deck, seen=False, name="harbour-deck.pptx") == (
+        "PowerPoint, 24 slides; slides 3, 7 have no text"
+    )
+    assert attachment_facts("document", _office_manifest("page", 12, []), seen=True, name="quay-report.docx") == (
+        "Word document, 12 pages"
+    )
+    assert attachment_facts("document", _office_manifest("page", 1, []), seen=True, name="survey-notes.odt") == (
+        "OpenDocument text, 1 page"
+    )
+    assert attachment_facts(
+        "document", _office_manifest("slide", 5, [1, 2, 3, 4, 5]), seen=True, name="quay-master.potx"
+    ) == ("PowerPoint, 5 slides; no slide has text")
+    assert attachment_facts("document", _office_manifest("slide", 9, [4]), seen=True, name="harbour-deck.PPTX") == (
+        "PowerPoint, 9 slides; slide 4 has no text"
+    )
+    assert attachment_facts("document", _office_manifest("slide", 1, []), seen=True, name="one-slide.pptx") == (
+        "PowerPoint, 1 slide"
+    )
+    assert attachment_facts("document", _office_manifest("page", 4, [2]), seen=True, name="quay-template.dotx") == (
+        "Word document, 4 pages; page 2 has no text"
+    )
+    assert attachment_facts("document", _office_manifest("page", 3, [2]), seen=True, name="survey-notes.odt") == (
+        "OpenDocument text, 3 pages; page 2 has no text"
+    )
+
+
+def test_every_office_suffix_has_a_format_name() -> None:
+    """The line can name the format of every file workbench prepares as Office, and of no other."""
+    assert set(OFFICE_FORMATS) == OFFICE_SUFFIXES
+
+
+def test_an_office_manifest_without_a_unit_counts_pages() -> None:
+    """A manifest that names no unit counts pages, as 0.7's PDF does."""
+    manifest = _office_manifest("page", 6, [])
+    del manifest["unit"]
+    assert attachment_facts("document", manifest, seen=True, name="quay-report.docx") == "Word document, 6 pages"
+
+
+def test_a_long_list_of_office_slides_without_text_is_cut() -> None:
+    """At most ten slides are named, then how many more."""
+    assert attachment_facts(
+        "document", _office_manifest("slide", 40, list(range(1, 15))), seen=True, name="harbour-deck.pptx"
+    ) == ("PowerPoint, 40 slides; slides 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, and 4 more have no text")
+
+
+def test_an_office_attachment_without_facts_says_nothing() -> None:
+    """A kind-none manifest (workbench 0.7's, or a file it could not draw) and none at all give no facts."""
+    none: dict[str, Any] = {"kind": "none", "total": 0, "pages_without_text": [], "renditions": [], "frames": None}
+    assert attachment_facts("document", none, seen=True, name="quay-report.docx") is None
+    assert attachment_facts("document", None, seen=True, name="harbour-deck.pptx") is None
+    assert attachment_facts("document", _office_manifest("slide", 0, []), seen=True, name="harbour-deck.pptx") is None
+    assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.xlsx") is None
+
+
 def test_a_long_list_of_pages_without_text_is_cut() -> None:
     """At most ten pages are named, then how many more; a scan whose pages all lack text says so."""
-    assert attachment_facts("document", _pdf_manifest(40, list(range(3, 18))), seen=True) == (
+    assert attachment_facts("document", _pdf_manifest(40, list(range(3, 18))), seen=True, name="quay-scan.pdf") == (
         "PDF, 40 pages; pages 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, and 5 more have no text"
     )
-    assert attachment_facts("document", _pdf_manifest(12, list(range(1, 11))), seen=True) == (
+    assert attachment_facts("document", _pdf_manifest(12, list(range(1, 11))), seen=True, name="quay-scan.pdf") == (
         "PDF, 12 pages; pages 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 have no text"
     )
-    assert attachment_facts("document", _pdf_manifest(300, list(range(1, 301))), seen=True) == (
+    assert attachment_facts("document", _pdf_manifest(300, list(range(1, 301))), seen=True, name="quay-scan.pdf") == (
         "PDF, 300 pages; no page has text"
     )
-    assert attachment_facts("document", _pdf_manifest(2, [1, 2]), seen=True) == "PDF, 2 pages; no page has text"
-    assert attachment_facts("document", _pdf_manifest(1, [1]), seen=True) == "PDF, 1 page; page 1 has no text"
+    assert (
+        attachment_facts("document", _pdf_manifest(2, [1, 2]), seen=True, name="quay-scan.pdf")
+        == "PDF, 2 pages; no page has text"
+    )
+    assert (
+        attachment_facts("document", _pdf_manifest(1, [1]), seen=True, name="quay-scan.pdf")
+        == "PDF, 1 page; page 1 has no text"
+    )
 
 
 def test_a_huge_page_count_is_read_from_the_short_list() -> None:
     """A manifest's total is workbench's word: a billion pages with three blank ones answers at once, as three."""
     started = time.monotonic()
-    facts = attachment_facts("document", _pdf_manifest(10**9, [2, 5, 9]), seen=True)
+    facts = attachment_facts("document", _pdf_manifest(10**9, [2, 5, 9]), seen=True, name="quay-scan.pdf")
     assert facts == "PDF, 1000000000 pages; pages 2, 5, 9 have no text"
-    assert attachment_facts("document", _pdf_manifest(3, [1, 2, 2, 3, 7]), seen=True) == (
+    assert attachment_facts("document", _pdf_manifest(3, [1, 2, 2, 3, 7]), seen=True, name="quay-scan.pdf") == (
         "PDF, 3 pages; no page has text"
     )
     assert time.monotonic() - started < 1.0

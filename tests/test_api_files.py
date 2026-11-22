@@ -10,6 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from unittest.mock import create_autospec
 
 import anyio
 import httpx
@@ -19,14 +20,15 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from ghostwriter import processing
-from ghostwriter.api.files import FILE_HEADERS
+from ghostwriter.api.files import FILE_HEADERS, _read_after_wait
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
+from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
 from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings, unrecorded_child
-from tests.fakes import TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, stock_manifest
+from tests.fakes import TAKE_BACK, TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, stock_manifest
 
 MIB = 1024 * 1024
 TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
@@ -535,6 +537,251 @@ def test_a_required_purpose_refuses_an_upload_unread(
         assert denied["operation"] == "chat.attachment"
 
 
+# --- taking an attachment back ------------------------------------------------
+
+NOT_REMOVED = (502, {"detail": "The file could not be removed from workbench."})
+
+
+def _remove(client: TestClient, cid: str, aid: str, user: str = "user-a") -> httpx2.Response:
+    return client.delete(f"/api/chats/{cid}/attachments/{aid}", headers=as_user(user))
+
+
+def _taken_back(door: FakeDoor) -> list[httpx.Request]:
+    return [
+        request for request, _ in door.requests if (request.method, request.url.path) == ("DELETE", "/files/upload")
+    ]
+
+
+def _pending(client: TestClient, cid: str) -> list[str]:
+    detail = client.get(f"/api/chats/{cid}", headers=as_user()).json()
+    return [attachment["id"] for attachment in detail["pending_attachments"]]
+
+
+def test_an_attachment_not_sent_is_taken_back(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Its file goes in workbench, by its path in the chat's session, then its row; recorded first, the file a child."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    before = len(events(audit_stream))
+    r = _remove(client, cid, aid)
+    assert r.status_code == 204
+    (request,) = _taken_back(door)
+    assert request.url.params["path"] == f"{chat_folder(KEY, cid)}/sales.xlsx"
+    assert request.headers["x-session-id"] == session_pseudonym(KEY, cid)
+    assert door.files == {}
+    assert (_status(client, cid, aid).status_code, _status(client, cid, aid).json()) == NO_ATTACHMENT
+    assert _pending(client, cid) == []
+    primary, child = _since(audit_stream, before)[:2]
+    assert (primary["action"], primary["operation"], primary["outcome"]) == ("delete", "chat.attachment", "ok")
+    assert primary["target"] == {"kind": "attachment", "ids": [aid], "container": cid}
+    assert primary["criteria"]["status"] == "ready"
+    assert (child["action"], child["operation"], child["outcome"]) == ("delete", "chat.workbench", "ok")
+    assert child["target"] == {"kind": "file", "ids": [FID], "container": cid}
+    assert child["criteria"]["files_deleted"] == 1
+
+
+def test_a_taken_back_attachment_frees_its_place(client: TestClient, door: FakeDoor) -> None:
+    """Ten files may wait; one taken back leaves room for another."""
+    cid = _new(client)
+    ids = []
+    for n in range(10):
+        door.upload_id = f"{n:032x}"
+        ids.append(_attach(client, cid, f"sales-{n}.xlsx").json()["id"])
+    assert _attach(client, cid, "sales-10.xlsx").status_code == 409
+    assert _remove(client, cid, ids[0]).status_code == 204
+    door.upload_id = f"{10:032x}"
+    assert _attach(client, cid, "sales-10.xlsx").status_code == 201
+
+
+def test_a_picture_being_prepared_is_taken_back_and_its_job_cancelled(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """The take-back does not wait for workbench's prepare: the job is cancelled and writes nothing.
+
+    The prepare takes 5 s; the job ends within 3 s of the take-back only because it was cancelled.
+    """
+    door.delays["/files/prepare"] = 5.0
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    processor = _state(seeing).processor
+    _wait_until(lambda: bool(_prepares(door)))
+    started = time.monotonic()
+    assert _remove(seeing, cid, photo["id"]).status_code == 204
+    _wait_until(lambda: not processor.running(photo["id"]), timeout_s=3)
+    assert time.monotonic() - started < 3
+    assert _state(seeing).store.find_attachment("user-a", cid, photo["id"]) is None
+    assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
+    assert [record for record in loguru_caplog.records if record.levelno >= logging.ERROR] == []
+
+
+def test_a_picture_that_failed_is_taken_back(seeing: TestClient, door: FakeDoor) -> None:
+    """A picture workbench could not prepare still holds its file there: taking it back deletes it."""
+    door.answers["/files/prepare"] = httpx.Response(422, json=UNREADABLE)
+    cid = _new(seeing)
+    aid = _attach(seeing, cid, PHOTO, TINY_JPEG).json()["id"]
+    assert _settled(seeing, cid, aid) == "failed"
+    assert _remove(seeing, cid, aid).status_code == 204
+    assert len(_taken_back(door)) == 1 and _pending(seeing, cid) == []
+
+
+def test_only_the_owners_unsent_attachment_is_taken_back(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Another owner, another chat, an unknown id and a sent attachment are 404: nothing is recorded or sent."""
+    cid, other = _new(client), _new(client)
+    aid = _attach(client, cid).json()["id"]
+    door.upload_id = f"{1:032x}"
+    sent = _attach(client, cid, "harbour-report.xlsx").json()["id"]
+    _state(client).store.add_user_message("user-a", cid, "Invented question", [sent])
+    _new(client, "user-b")
+    before = len(events(audit_stream))
+    for chat, attachment, user in (
+        (cid, aid, "user-b"),
+        (other, aid, "user-a"),
+        (cid, "0" * 32, "user-a"),
+        (cid, sent, "user-a"),
+    ):
+        r = _remove(client, chat, attachment, user)
+        assert r.status_code == 404, (chat, attachment, user)
+    assert _since(audit_stream, before) == []
+    assert _taken_back(door) == []
+    assert _pending(client, cid) == [aid]
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [httpx.Response(503, json={"detail": "busy, retry later"}), httpx.Response(405, json={"detail": "no"})],
+    ids=["busy", "a workbench before 0.8.1"],
+)
+def test_a_file_workbench_could_not_delete_keeps_the_attachment(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, answer: httpx.Response
+) -> None:
+    """502, and the attachment stays to be sent or taken back again; the child records why, as an error."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    door.answers[TAKE_BACK] = answer
+    before = len(events(audit_stream))
+    r = _remove(client, cid, aid)
+    assert (r.status_code, r.json()) == NOT_REMOVED
+    assert _pending(client, cid) == [aid]
+    primary, child = _since(audit_stream, before)[:2]
+    assert (primary["operation"], primary["outcome"]) == ("chat.attachment", "ok")
+    assert (child["operation"], child["outcome"]) == ("chat.workbench", "error")
+    assert child["criteria"]["reason"] == f"http:{answer.status_code}"
+
+
+def test_a_file_workbench_no_longer_holds_is_taken_back(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Workbench's 404 means the file is gone already: the attachment goes, its child counts no file."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    door.files.clear()
+    before = len(events(audit_stream))
+    assert _remove(client, cid, aid).status_code == 204
+    assert _pending(client, cid) == []
+    child = _since(audit_stream, before)[1]
+    assert (child["operation"], child["outcome"], child["criteria"]["files_deleted"]) == ("chat.workbench", "ok", 0)
+
+
+def test_a_picture_kept_by_a_failed_take_back_is_prepared_again(seeing: TestClient, door: FakeDoor) -> None:
+    """Its job was cancelled before workbench was asked; workbench could not delete it, so it is prepared again."""
+    door.delays["/files/prepare"] = 0.5
+    cid = _new(seeing)
+    aid = _attach(seeing, cid, PHOTO, TINY_JPEG).json()["id"]
+    _wait_until(lambda: bool(_prepares(door)))
+    door.answers[TAKE_BACK] = httpx.Response(503, json={"detail": "busy, retry later"})
+    assert _remove(seeing, cid, aid).status_code == 502
+    assert _settled(seeing, cid, aid) == "ready"
+    assert len(_prepares(door)) == 2
+
+
+def test_a_picture_whose_take_back_could_not_be_recorded_is_prepared_again(
+    seeing: TestClient, door: FakeDoor, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Its job was cancelled; the file's delete could not be recorded, so the attachment stays and is prepared again."""
+    door.delays["/files/prepare"] = 0.5
+    cid = _new(seeing)
+    aid = _attach(seeing, cid, PHOTO, TINY_JPEG).json()["id"]
+    _wait_until(lambda: bool(_prepares(door)))
+    unrecorded_child(monkeypatch, "chat.workbench")
+    assert _remove(seeing, cid, aid).status_code == 500
+    assert _settled(seeing, cid, aid) in ("ready", "failed")
+    assert len(_prepares(door)) == 2
+
+
+def test_an_attachment_gone_meanwhile_is_not_found(client: TestClient, door: FakeDoor) -> None:
+    """An attachment whose row went while workbench deleted its file (taken back twice at once) is 404, not sent."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    store = _state(client).store
+
+    def gone_meanwhile(folder: str) -> dict[str, int]:
+        store.remove_pending_attachment("user-a", cid, aid)
+        return {"deleted": 1, "renders": 0}
+
+    door.answers[TAKE_BACK] = gone_meanwhile
+    r = _remove(client, cid, aid)
+    assert (r.status_code, r.json()) == NO_ATTACHMENT
+    assert len(_taken_back(door)) == 1
+
+
+def test_without_workbench_nothing_is_taken_back(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
+    """With workbench off there is no attachment to take back: 503, nothing recorded."""
+    settings = make_settings(tmp_path, workbench_api_key=None)
+    with TestClient(create_app(settings, audit_stream=audit_stream)) as client:
+        cid = _new(client)
+        before = len(events(audit_stream))
+        r = _remove(client, cid, "0" * 32)
+        assert (r.status_code, r.json()) == (503, {"detail": "File processing is not available."})
+        assert _since(audit_stream, before) == []
+
+
+def test_an_unrecorded_take_back_changes_nothing(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """Without its event, nothing is sent to workbench and the attachment stays."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    audit_stream.writes_left = 0
+    r = _remove(client, cid, aid)
+    audit_stream.writes_left = None
+    assert r.status_code == 500
+    assert _taken_back(door) == [] and _pending(client, cid) == [aid]
+
+
+def test_an_attachment_sent_meanwhile_keeps_its_row(client: TestClient, door: FakeDoor) -> None:
+    """A message that binds the attachment while workbench deletes its file keeps it: 409 ``attachment_sent``."""
+    cid = _new(client)
+    aid = _attach(client, cid).json()["id"]
+    store = _state(client).store
+
+    def send_meanwhile(folder: str) -> dict[str, int]:
+        store.add_user_message("user-a", cid, "Invented question", [aid])
+        return {"deleted": 1, "renders": 0}
+
+    door.answers[TAKE_BACK] = send_meanwhile
+    r = _remove(client, cid, aid)
+    assert (r.status_code, r.json()) == (409, {"detail": "The file was sent meanwhile.", "code": "attachment_sent"})
+    assert store.find_attachment("user-a", cid, aid) is not None
+
+
+def test_a_required_purpose_refuses_a_take_back_unsent(
+    tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor
+) -> None:
+    """A required ``delete`` purpose refuses the take-back with 428 before anything is sent."""
+    settings = make_settings(tmp_path, require_purpose=frozenset({"delete"}))
+    app = create_app(settings, audit_stream=audit_stream, workbench_transport=httpx.MockTransport(door))
+    with TestClient(app) as client:
+        cid = _new(client)
+        aid = _attach(client, cid).json()["id"]
+        r = _remove(client, cid, aid)
+        assert r.status_code == 428 and _taken_back(door) == []
+        [denied] = [e for e in events(audit_stream) if e["outcome"] == "denied"]
+        assert denied["operation"] == "chat.attachment"
+
+
 # --- downloads ---------------------------------------------------------------
 
 
@@ -673,8 +920,10 @@ def test_an_image_is_prepared_after_it_is_attached(
     assert PHOTO not in audit_stream.getvalue()
 
 
-def test_a_pdf_gets_its_manifest_and_a_word_file_none(seeing: TestClient, door: FakeDoor) -> None:
-    """A PDF is prepared and keeps its page count; a Word file is read as text, ready at once, never prepared."""
+def test_a_pdf_waits_and_a_word_file_is_ready_at_once(
+    seeing: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """A PDF is processing until it is prepared; a Word file is ready at once and prepared after, a sheet never."""
     cid = _new(seeing)
     store = _state(seeing).store
     scan = _attach(seeing, cid, SCAN, b"%PDF-1.7").json()
@@ -683,11 +932,74 @@ def test_a_pdf_gets_its_manifest_and_a_word_file_none(seeing: TestClient, door: 
     found = store.find_attachment("user-a", cid, scan["id"])
     assert found is not None and found.manifest is not None and found.manifest["total"] == 3
     door.upload_id = "5" * 32
+    before = len(events(audit_stream))
     memo = _attach(seeing, cid, "memo.docx").json()
     assert (memo["kind"], memo["status"]) == ("document", "ready")
-    assert len(_prepares(door)) == 1
+
+    def kept() -> bool:
+        found = store.find_attachment("user-a", cid, memo["id"])
+        return found is not None and found.manifest is not None
+
+    _wait_until(kept)
     found = store.find_attachment("user-a", cid, memo["id"])
+    assert found is not None and found.status == "ready" and found.manifest is not None
+    assert (found.manifest["kind"], found.manifest["unit"], found.manifest["total"]) == ("office", "page", 3)
+    [collect] = [e for e in _since(audit_stream, before) if e["action"] == "collect"]
+    [handed] = [e for e in _since(audit_stream, before) if e.get("recipient") == "workbench:prepare"]
+    assert (handed["parent_event_id"], handed["criteria"]) == (collect["event_id"], {"kind": "document"})
+    door.upload_id = "6" * 32
+    sheet = _attach(seeing, cid, "figures.xlsx").json()
+    assert (sheet["kind"], sheet["status"]) == ("document", "ready")
+    assert not _state(seeing).processor.running(sheet["id"])
+    found = store.find_attachment("user-a", cid, sheet["id"])
+    assert found is not None and found.status == "ready" and found.manifest is None
+    assert len(_prepares(door)) == 2
+
+
+def test_an_office_file_is_not_prepared_with_vision_off(client: TestClient, door: FakeDoor) -> None:
+    """Without a model that sees, a deck is ready at once as in 0.3.0: no job is submitted, workbench is not asked."""
+    cid = _new(client)
+    deck = _attach(client, cid, "harbour-deck.pptx", b"PK").json()
+    assert (deck["kind"], deck["status"]) == ("document", "ready")
+    assert not _state(client).processor.running(deck["id"])
+    time.sleep(0.2)
+    assert _prepares(door) == []
+    found = _state(client).store.find_attachment("user-a", cid, deck["id"])
     assert found is not None and found.manifest is None
+
+
+async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Path) -> None:
+    """A ready deck whose background job runs is answered at once, whatever wait was asked; a processing row waits."""
+    settings = make_settings(tmp_path, vision=True)
+    engine = make_engine(settings.db_path)
+    init_db(engine)
+    try:
+        store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
+        cid = store.create_chat("user-a").id
+
+        def add(name: str, status: str) -> str:
+            return store.add_attachment(
+                cid,
+                file_id="7" * 32,
+                path=f"{chat_folder(KEY, cid)}/{name}",
+                name=name,
+                size=2,
+                mime="application/octet-stream",
+                kind="document",
+                status=status,
+            ).id
+
+        deck, scan = add("harbour-deck.pptx", "ready"), add("quay-scan.pdf", "processing")
+        processor = create_autospec(AttachmentProcessor, instance=True)
+        processor.running.return_value = True
+        found = await _read_after_wait(store, processor, "user-a", cid, deck, wait=20)
+        assert found is not None and found.status == "ready"
+        processor.wait.assert_not_called()
+        found = await _read_after_wait(store, processor, "user-a", cid, scan, wait=20)
+        assert found is not None and found.status == "processing"
+        processor.wait.assert_awaited_once_with(scan, 20)
+    finally:
+        engine.dispose()
 
 
 def test_an_unreadable_image_fails_and_a_pdf_stays_ready(

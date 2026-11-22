@@ -49,7 +49,6 @@ export const de: Strings = {
   'composer.placeholder': 'Nachricht schreiben',
   'composer.attach': 'Dateien anhängen',
   'composer.drop': 'Dateien zum Anhängen ablegen',
-  'composer.files_stay': 'Angehängte Dateien bleiben in diesem Chat, bis er gelöscht wird, höchstens {days} Tage.',
   'composer.uploading': '{name} wird angehängt…',
   'composer.remove': '{name} entfernen',
   'composer.error_type': '{name}: Dieser Dateityp wird nicht unterstützt.',
@@ -61,6 +60,8 @@ export const de: Strings = {
     '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
   'composer.error_too_many_pending': 'Senden Sie zuerst die angehängten Dateien.',
   'composer.processing': '{name} wird vorbereitet…',
+  'composer.removing': '{name} wird entfernt…',
+  'composer.error_remove': '{name} konnte nicht entfernt werden.',
   'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
   'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
   'composer.images_cap':

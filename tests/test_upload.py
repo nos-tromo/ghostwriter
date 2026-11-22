@@ -14,6 +14,7 @@ from typing_extensions import override
 
 from ghostwriter.upload import (
     IMAGE_TYPES,
+    OFFICE_SUFFIXES,
     PREPARED_SUFFIXES,
     BadUpload,
     TooLarge,
@@ -21,6 +22,7 @@ from ghostwriter.upload import (
     attachment_type,
     name_problem,
     needs_prepare,
+    prepared_later,
     read_file_part,
     safe_filename,
 )
@@ -236,6 +238,7 @@ def test_the_image_types_are_the_spec_s() -> None:
         ".heif": "image/heif",
     }
     assert PREPARED_SUFFIXES == frozenset({".pdf", *IMAGE_TYPES})
+    assert OFFICE_SUFFIXES == frozenset({".docx", ".dotx", ".pptx", ".potx", ".odt"})
 
 
 @pytest.mark.parametrize(
@@ -243,6 +246,7 @@ def test_the_image_types_are_the_spec_s() -> None:
     [
         ("quay-scan.pdf", "document", True),
         ("deck.pptx", "document", False),
+        ("quay-report.docx", "document", False),
         ("harbour-photo.jpg", "image", True),
         ("Harbour-Photo.JPEG", "image", True),
         ("notes.txt", "document", False),
@@ -252,3 +256,24 @@ def test_kinds_and_preparation_follow_the_extension(name: str, kind: str, prepar
     """A picture or a pdf is prepared when it is stored; a picture is the one image kind."""
     assert attachment_kind(name) == kind
     assert needs_prepare(name) is prepared
+
+
+@pytest.mark.parametrize(
+    ("name", "later"),
+    [
+        ("harbour-deck.PPTX", True),
+        ("quay-master.potx", True),
+        ("quay-form.dotx", True),
+        ("survey-notes.odt", True),
+        ("quay-report.docx", True),
+        ("harbour-figures.xlsx", False),
+        ("survey.ods", False),
+        ("harbour-scan.pdf", False),
+        ("pier-photo.png", False),
+    ],
+)
+def test_office_files_are_prepared_later(name: str, later: bool) -> None:
+    """A Word, PowerPoint or OpenDocument text file is prepared after it is ready; a sheet, pdf or picture not."""
+    assert prepared_later(name) is later
+    assert needs_prepare(name) is (name in {"harbour-scan.pdf", "pier-photo.png"})
+    assert attachment_kind(name) == ("image" if name == "pier-photo.png" else "document")

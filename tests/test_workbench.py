@@ -62,6 +62,7 @@ from tests.fakes import (
     NOT_FOUND,
     OUTPUT_ID,
     READ_DOCUMENT_TEXT,
+    TAKE_BACK,
     TINY_JPEG,
     TINY_PNG,
     UPLOAD_ID,
@@ -407,7 +408,8 @@ def test_a_call_asks_for_images_only_when_told_to() -> None:
 
 
 @pytest.mark.parametrize(
-    "operation", ["discover", "call_tool", "upload", "view", "delete_chat", "prepare", "fetch_renditions"]
+    "operation",
+    ["discover", "call_tool", "upload", "view", "delete_chat", "delete_upload", "prepare", "fetch_renditions"],
 )
 async def test_every_request_carries_the_session_purpose_and_request_id(operation: str) -> None:
     """Discovery, tools/call and the file routes each carry the chat, the user, the purpose and the request id."""
@@ -430,6 +432,8 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
         assert (
             _renditions(client, RenditionRequest(PDF, 1), RenditionRequest(PDF, 2)) == [("image/jpeg", TINY_JPEG)] * 2
         )
+    elif operation == "delete_upload":
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
     else:
         await client.delete_chat(call=CALL)
     assert door.requests
@@ -874,7 +878,7 @@ async def test_prepare_answers_the_manifest() -> None:
     req = door.last("/files/prepare")
     assert req.method == "POST" and dict(req.url.params) == {"path": PDF} and req.content == b""
     assert req.headers["x-session-id"] == session_pseudonym(KEY, CHAT)
-    assert req.extensions["timeout"]["read"] == PREPARE_TIMEOUT_S == 270.0
+    assert req.extensions["timeout"]["read"] == PREPARE_TIMEOUT_S == 390.0
     assert got.kind == "pdf" and got.total == 3 and got.pages_without_text == (2,) and got.frames is None
     assert got.renditions == tuple(Rendition(n, 1131, 1600, "image/jpeg") for n in (1, 2, 3))
     stored = got.as_stored()
@@ -885,8 +889,60 @@ async def test_prepare_answers_the_manifest() -> None:
         "pages_without_text": [2],
         "renditions": [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg"} for n in (1, 2, 3)],
         "frames": None,
+        "unit": "page",
     }
     assert json.loads(json.dumps(stored)) == stored
+
+
+async def test_a_prepare_waits_390_s() -> None:
+    """Workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s."""
+    door = FakeDoor()
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    await _client(door).prepare(call=CALL, path=PDF)
+    request = door.last("/files/prepare")
+    assert (request.method, request.extensions["timeout"]["read"]) == ("POST", 390.0)
+    assert PREPARE_TIMEOUT_S == 390.0
+
+
+async def test_prepare_reads_an_office_manifest_with_its_unit() -> None:
+    """A deck is kind office and counts slides; a Word file is kind office and counts pages; the unit is kept."""
+    door = FakeDoor()
+    deck, memo = f"{FOLDER}/harbour-deck.pptx", f"{FOLDER}/quay-memo.docx"
+    for path in (deck, memo):
+        door.files[path] = (b"PK", "application/octet-stream")
+    client = _client(door)
+    slides = await client.prepare(call=CALL, path=deck)
+    assert (slides.kind, slides.unit, slides.total, slides.pages_without_text) == ("office", "slide", 3, (2,))
+    assert slides.renditions == tuple(Rendition(n, 1131, 1600, "image/jpeg") for n in (1, 2, 3))
+    assert slides.as_stored()["unit"] == "slide" and slides.as_stored()["kind"] == "office"
+    pages = await client.prepare(call=CALL, path=memo)
+    assert (pages.kind, pages.unit, pages.total, pages.pages_without_text) == ("office", "page", 3, ())
+    assert tuple(pages.as_stored()) == STORED_MANIFEST_KEYS
+
+
+async def test_a_manifest_without_unit_reads_as_page() -> None:
+    """Workbench 0.7 sends seven keys: a pdf's unit is then a page, and a docx it answers none for stays none."""
+    door = FakeDoor()
+    memo = f"{FOLDER}/quay-memo.docx"
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    door.files[memo] = (b"PK", "application/octet-stream")
+    seven: dict[str, Any] = {
+        "path": memo,
+        "kind": "none",
+        "total": 0,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+    }
+    door.manifests[PDF] = {key: value for key, value in stock_manifest(PDF).items() if key != "unit"}
+    door.manifests[memo] = {**seven, "hint": None}
+    client = _client(door)
+    scan = await client.prepare(call=CALL, path=PDF)
+    assert (scan.kind, scan.unit, scan.total) == ("pdf", "page", 3)
+    assert scan.as_stored()["unit"] == "page"
+    word = await client.prepare(call=CALL, path=memo)
+    assert (word.kind, word.unit) == ("none", "page")
+    assert word == Manifest("none", 0, (), (), None)
 
 
 async def test_a_prepare_that_cuts_strips_may_wait_less() -> None:
@@ -979,6 +1035,8 @@ async def test_prepare_maps_workbenchs_refusals(answer: object, error: type[Exce
     [
         {"kind": "video"},
         {"kind": None},
+        {"unit": "sheet"},
+        {"unit": 1},
         {"total": -1},
         {"total": "3"},
         {"pages_without_text": [0]},
@@ -1230,6 +1288,48 @@ async def test_deleting_a_chat_returns_workbenchs_count() -> None:
         await client.delete_chat(call=CALL)
 
 
+async def test_taking_back_an_upload_deletes_it_in_its_chat() -> None:
+    """DELETE /files/upload names the upload by its path; a file workbench does not hold is not found."""
+    door = FakeDoor()
+    door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
+    client = _client(door)
+    await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+    request = door.last("/files/upload", "DELETE")
+    assert request.url.params["path"] == f"{FOLDER}/sales.xlsx" and door.files == {}
+    with pytest.raises(WorkbenchNotFound):
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+
+
+async def test_an_upload_outside_the_chats_folder_is_not_asked_for() -> None:
+    """A path that is not below the chat's folder never reaches workbench."""
+    door = FakeDoor()
+    client = _client(door)
+    for path in ("/workspace/elsewhere/sales.xlsx", f"{FOLDER}/../sales.xlsx", f"{FOLDER}/sales\x01.xlsx"):
+        with pytest.raises(WorkbenchNotFound):
+            await client.delete_upload(call=CALL, path=path)
+    assert door.requests == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "token"),
+    [
+        (httpx.Response(405, json={"detail": "Method Not Allowed"}), "http:405"),
+        (httpx.Response(503, json={"detail": "busy, retry later"}), "http:503"),
+        ({"deleted": 0}, "bad_answer"),
+        (httpx.TimeoutException("synthetic timeout"), "timeout"),
+    ],
+    ids=["a workbench before 0.8.1", "busy", "a bad answer", "a timeout"],
+)
+async def test_an_upload_workbench_could_not_take_back_is_unavailable(answer: object, token: str) -> None:
+    """Anything but a deleted upload or a 404 is unavailable, a workbench without the route among them."""
+    door = FakeDoor()
+    door.answers[TAKE_BACK] = answer
+    client = _client(door)
+    with pytest.raises(WorkbenchUnavailable) as caught:
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+    assert caught.value.token == token and not isinstance(caught.value, WorkbenchNotFound)
+
+
 async def test_without_a_key_nothing_is_sent() -> None:
     """With workbench off, discovery offers nothing, a call fails and the file routes are unavailable."""
     door = FakeDoor()
@@ -1244,6 +1344,8 @@ async def test_without_a_key_nothing_is_sent() -> None:
             pass
     with pytest.raises(WorkbenchUnavailable):
         await client.delete_chat(call=CALL)
+    with pytest.raises(WorkbenchUnavailable):
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
     assert door.requests == []
 
 

@@ -42,7 +42,7 @@ from ghostwriter.agent.loop import (
     Turn,
     TurnEvent,
 )
-from ghostwriter.agent.prompt import PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import DECK_CHECK, PRESENTATIONS, VISION
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
@@ -1267,18 +1267,19 @@ def test_a_round_with_images_that_failed_otherwise_is_not_retried(
 
 
 def test_the_prompt_tells_the_model_how_to_look_only_with_vision(loop_env: LoopEnv) -> None:
-    """How to look at files is told right after the chat's folder while the model sees and has the tools; else not."""
+    """How to look at files follows the folder, and the deck check the outline rule, only with sight and tools."""
     loop_env.run([text_chunk("Hallo!")], vision=True)
     loop_env.run([text_chunk("Hallo!")])
     loop_env.run([text_chunk("Hallo!")], vision=True, workbench=None)
     seeing, plain, toolless = (call["messages"][0]["content"] for call in loop_env.fake.calls)
     assert VISION in seeing and seeing.index("days after they were made.") < seeing.index(VISION)
-    assert seeing.index(VISION) < seeing.index(PRESENTATIONS)
+    assert seeing.index(VISION) < seeing.index(PRESENTATIONS) < seeing.index(DECK_CHECK)
     assert VISION not in plain and VISION not in toolless
-    assert VISION.endswith(
+    assert DECK_CHECK not in plain and DECK_CHECK not in toolless and PRESENTATIONS in plain
+    assert (
         "Images tools showed earlier are not sent again, and attached pictures only while there is room: "
         "use view_file to see one again."
-    )
+    ) in VISION
 
 
 def test_tool_images_past_the_cap_are_retired(loop_env: LoopEnv) -> None:

@@ -13,6 +13,7 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, cast
 
+import anyio
 import httpx
 import httpx2
 import openai
@@ -51,12 +52,14 @@ from tests.fakes import (
     call_chunk,
     image_block,
     reasoning_chunk,
+    stock_manifest,
     text_chunk,
     usage_chunk,
     view_result,
 )
 
 ANSWER: Round = [text_chunk("Summe: 42"), usage_chunk(950, 5, "served-model")]
+PPTX = "application/vnd.openxmlformats-officedocument.presentationml.presentation"
 RUNNING = (409, {"detail": "An answer is still being written in this chat.", "code": "busy"})
 NOT_FOUND = (404, {"detail": "Chat not found."})
 THINKING_ON = {"chat_template_kwargs": {"enable_thinking": True}}
@@ -494,6 +497,127 @@ def test_a_message_waits_for_its_attachments(
     assert _send(client, cid, attachment_ids=[sheet.id, photo.id]).status_code == 200
     [question, _] = _detail(client, cid)["messages"]
     assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id])
+
+
+def _prompt_users(call: dict[str, Any]) -> list[str]:
+    """Return the text of each user message a model call carried, in order."""
+    texts: list[str] = []
+    for message in call["messages"]:
+        if message["role"] != "user":
+            continue
+        content = message["content"]
+        texts.append(
+            content
+            if isinstance(content, str)
+            else "\n".join(part["text"] for part in content if part.get("type") == "text")
+        )
+    return texts
+
+
+def test_a_message_sends_while_its_deck_is_prepared(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """A deck is ready at once: its message streams, its line has no facts until its manifest is kept, then slides."""
+    cid = _new(client)
+    store = _state(client).store
+    deck = store.add_attachment(
+        cid,
+        file_id=UPLOAD_ID,
+        path=f"{chat_folder(KEY, cid)}/harbour-deck.pptx",
+        name="harbour-deck.pptx",
+        size=48_213,
+        mime=PPTX,
+        kind="document",
+        status="ready",
+    )
+    assert deck.status == "ready"
+    line = f"[Attached: harbour-deck.pptx ({chat_folder(KEY, cid)}/harbour-deck.pptx, 48213 bytes)]"
+    fake_openai.script = [ANSWER, ANSWER]
+    response = _send(client, cid, content="Worum geht es?", attachment_ids=[deck.id])
+    assert response.status_code == 200
+    assert _frames(response)[-1].event == "final"
+    assert _prompt_users(fake_openai.calls[0]) == [f"Worum geht es?\n{line}"]
+
+    assert store.keep_manifest(deck.id, stock_manifest("harbour-deck.pptx"))
+    assert _send(client, cid, content="Und die Folien?").status_code == 200
+    facts = f"{line[:-2]}; PowerPoint, 3 slides; slide 2 has no text)]"
+    assert _prompt_users(fake_openai.calls[1]) == [f"Worum geht es?\n{facts}", "Und die Folien?"]
+
+
+class _HeldDoor(FakeDoor):
+    """A door whose prepare of a deck waits until ``release`` is set, as workbench's does while it converts.
+
+    Attributes:
+        reached: Set once a prepare of a deck is in flight, held.
+        release: Set by the test to let the held prepare go on.
+    """
+
+    def __init__(self) -> None:
+        """Answer as a healthy workbench does, but hold the prepare of a ``.pptx``."""
+        super().__init__()
+        self.reached = threading.Event()
+        self.release = threading.Event()
+
+    @override
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Hold a deck's prepare open, then answer every request as :class:`FakeDoor` does.
+
+        Args:
+            request: The request the client sent.
+
+        Returns:
+            The answer.
+        """
+        if request.url.path == "/files/prepare" and request.url.params.get("path", "").endswith(".pptx"):
+            self.reached.set()
+            while not self.release.is_set():
+                await anyio.sleep(0.01)
+        return await super().__call__(request)
+
+
+@pytest.fixture
+def held_door() -> Iterator[_HeldDoor]:
+    """Return a door that holds a deck's prepare, and let it go when the test ends, so no shutdown waits for it."""
+    held = _HeldDoor()
+    yield held
+    held.release.set()
+
+
+def test_a_deck_attached_through_the_route_is_seen_once_its_prepare_ends(
+    tmp_path: Path, audit_stream: CapturedAuditStream, held_door: _HeldDoor, fake_openai: FakeOpenAI
+) -> None:
+    """A message sends while the deck's prepare is held open, with no facts; once it ends, the next names the slides."""
+    with TestClient(_app(tmp_path, audit_stream, held_door, fake_openai, vision=True)) as seeing_held:
+        cid = _new(seeing_held)
+        files = {"file": ("harbour-deck.pptx", b"PK", "application/octet-stream")}
+        uploaded = seeing_held.post(f"/api/chats/{cid}/attachments", files=files, headers=as_user())
+        assert uploaded.status_code == 201, uploaded.text
+        deck = uploaded.json()
+        assert (deck["kind"], deck["status"]) == ("document", "ready")
+        _wait_until(held_door.reached.is_set)
+        processor = _state(seeing_held).processor
+        assert processor.running(deck["id"])
+        path = f"{chat_folder(KEY, cid)}/harbour-deck.pptx"
+        line = f"[Attached: harbour-deck.pptx ({path}, 2 bytes)]"
+
+        fake_openai.script = [ANSWER, ANSWER]
+        first = _send(seeing_held, cid, content="Worum geht es?", attachment_ids=[deck["id"]])
+        assert first.status_code == 200
+        assert _frames(first)[-1].event == "final"
+        assert _prompt_users(fake_openai.calls[0]) == [f"Worum geht es?\n{line}"]
+        assert processor.running(deck["id"])
+        found = _state(seeing_held).store.find_attachment("user-a", cid, deck["id"])
+        assert found is not None and found.manifest is None
+
+        held_door.release.set()
+        _wait_until(lambda: not processor.running(deck["id"]))
+        found = _state(seeing_held).store.find_attachment("user-a", cid, deck["id"])
+        assert found is not None and found.status == "ready" and found.manifest is not None
+        second = _send(seeing_held, cid, content="Und die Folien?")
+        assert second.status_code == 200
+        assert _frames(second)[-1].event == "final"
+        facts = f"[Attached: harbour-deck.pptx ({path}, 2 bytes; PowerPoint, 3 slides; slide 2 has no text)]"
+        assert _prompt_users(fake_openai.calls[1]) == [f"Worum geht es?\n{facts}", "Und die Folien?"]
+        prepares = [r for r, _ in held_door.requests if r.url.path == "/files/prepare"]
+        assert len(prepares) == 1
 
 
 @pytest.mark.parametrize(

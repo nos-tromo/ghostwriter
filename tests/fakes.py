@@ -15,7 +15,7 @@ import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Final, cast
 from urllib.parse import quote
 
 import anyio
@@ -84,12 +84,15 @@ _ROUTES = frozenset(
     {
         ("POST", "/mcp"),
         ("POST", "/files/upload"),
+        ("DELETE", "/files/upload"),
         ("POST", "/files/prepare"),
         ("GET", "/files/view"),
         ("DELETE", "/files/chat"),
     }
 )
 _DISCOVERY = frozenset({"server/discover", "tools/list"})
+#: The key a ``DELETE`` of an upload is scripted and delayed by in :attr:`FakeDoor.answers`, apart from its ``POST``.
+TAKE_BACK: Final = "DELETE /files/upload"
 
 
 @dataclass(frozen=True)
@@ -267,14 +270,17 @@ def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str,
 
 
 def stock_manifest(path: str) -> dict[str, Any]:
-    """Return the manifest the door gives a stored file, by its suffix.
+    """Return the manifest the door gives a stored file, by its suffix: workbench 0.8's eight keys.
 
     Args:
         path: The file's path.
 
     Returns:
         A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
-        text. Anything else: kind ``none``.
+        text. A deck (``.pptx``, ``.potx``): kind ``office``, unit ``slide``, three slides drawn
+        as a pdf's pages are, the second without text. A Word or OpenDocument text file (``.docx``,
+        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. Anything else: kind
+        ``none``. The unit is ``page`` for every kind but a deck.
     """
     lower = path.lower()
     manifest: dict[str, Any] = {
@@ -284,14 +290,26 @@ def stock_manifest(path: str) -> dict[str, Any]:
         "pages_without_text": [],
         "renditions": [],
         "frames": None,
+        "unit": "page",
         "hint": None,
     }
     if lower.endswith(_IMAGE_SUFFIXES):
         rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
         return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
+    pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
     if lower.endswith(".pdf"):
-        pages = [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg", "bytes": 182311} for n in (1, 2, 3)]
         return {**manifest, "kind": "pdf", "total": 3, "pages_without_text": [2], "renditions": pages}
+    if lower.endswith((".pptx", ".potx")):
+        return {
+            **manifest,
+            "kind": "office",
+            "unit": "slide",
+            "total": 3,
+            "pages_without_text": [2],
+            "renditions": pages,
+        }
+    if lower.endswith((".docx", ".dotx", ".odt")):
+        return {**manifest, "kind": "office", "total": 3, "renditions": pages}
     return manifest
 
 
@@ -329,10 +347,11 @@ class FakeDoor:
     no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
-    folder and returns one of those. ``None`` for ``/files/upload``, ``/files/prepare`` and
+    folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare`` and
     ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
-    with its path, size and :attr:`upload_id`; a prepare answers the file's manifest; a view
-    serves a stored file of the chat, or with ``rendition`` one of its renders.
+    with its path, size and :attr:`upload_id`; a take-back deletes a stored file of the chat (404 for none); a
+    prepare answers the file's manifest; a view serves a stored file of the chat, or with ``rendition`` one of its
+    renders.
 
     As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
     ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
@@ -363,6 +382,7 @@ class FakeDoor:
             "tools/list": tools_result(),
             "tools/call": call_result,
             "/files/upload": None,
+            TAKE_BACK: None,
             "/files/prepare": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
@@ -390,10 +410,12 @@ class FakeDoor:
         body: Any = None
         if path == "/mcp":
             body = json.loads(request.content)
-        elif path == "/files/upload":
+        elif path == "/files/upload" and request.method == "POST":
             body = await _parse_upload(request)
         self.requests.append((request, body))
         route = body["method"] if path == "/mcp" else path
+        if (request.method, path) == ("DELETE", "/files/upload"):
+            route = TAKE_BACK
         if route in self.delays:
             await anyio.sleep(self.delays[route])
         if request.headers.get("authorization") != f"Bearer {self.key}":
@@ -423,6 +445,8 @@ class FakeDoor:
             if route == "tools/list" and isinstance(answer, dict) and not _accepts_images(request):
                 answer = listed_without_images(answer)
             return httpx.Response(200, json={"jsonrpc": "2.0", "id": body["id"], "result": answer})
+        if answer is None and route == TAKE_BACK:
+            return self._take_back(request, folder)
         if answer is None and path == "/files/upload":
             return self._store(request, body, folder)
         if answer is None and path == "/files/prepare":
@@ -449,6 +473,22 @@ class FakeDoor:
         path = f"{folder}/{upload.filename}"
         self.files[path] = (upload.data, upload.content_type)
         return httpx.Response(200, json={"path": path, "size": len(upload.data), "id": self.upload_id})
+
+    def _take_back(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Delete a stored upload of the chat, as workbench 0.8.1 does for Ghostwriter.
+
+        Args:
+            request: The delete, its ``path`` a query parameter.
+            folder: The chat's folder.
+
+        Returns:
+            ``deleted`` 1 and no renders; 404 for a file the chat does not hold.
+        """
+        path = request.url.params.get("path", "")
+        if not path.startswith(f"{folder}/") or path not in self.files:
+            return httpx.Response(404, json=NOT_FOUND)
+        del self.files[path]
+        return httpx.Response(200, json={"deleted": 1, "renders": 0})
 
     def _serve(self, request: httpx.Request, folder: str) -> httpx.Response:
         """Serve a stored file of the chat.
@@ -537,11 +577,12 @@ class FakeDoor:
         """
         return [body["method"] for request, body in self.requests if request.url.path == "/mcp"]
 
-    def last(self, path: str) -> httpx.Request:
-        """Return the last request to a path.
+    def last(self, path: str, method: str | None = None) -> httpx.Request:
+        """Return the last request to a path, by any method or the one given.
 
         Args:
             path: The route, such as ``/files/upload``.
+            method: The method, such as ``DELETE``; any when left out.
 
         Returns:
             The request.
@@ -550,7 +591,7 @@ class FakeDoor:
             LookupError: When no request went there.
         """
         for request, _ in reversed(self.requests):
-            if request.url.path == path:
+            if request.url.path == path and method in (None, request.method):
                 return request
         raise LookupError(path)
 

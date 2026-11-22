@@ -41,6 +41,7 @@ cut, as before; an earlier turn is replayed as its text, and the current turn mu
 import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from pathlib import PurePosixPath
 from typing import Any, Final, Literal
 
 from loguru import logger
@@ -74,8 +75,17 @@ from ghostwriter.schemas import AttachmentOut
 CLEARED: Final = "[cleared to make room; call the tool again if you need it]"
 #: How an earlier turn is replayed: with its images, with a note per image, or as its text alone.
 ReplayMode = Literal["images", "notes", "none"]
-#: The most pages without text an attachment's line lists.
+#: The most pages or slides without text an attachment's line lists.
 LISTED_PAGES: Final = 10
+#: What an Office attachment's line calls its format, by the name's suffix: the keys are
+#: :data:`~ghostwriter.upload.OFFICE_SUFFIXES`.
+OFFICE_FORMATS: Final[Mapping[str, str]] = {
+    ".docx": "Word document",
+    ".dotx": "Word document",
+    ".pptx": "PowerPoint",
+    ".potx": "PowerPoint",
+    ".odt": "OpenDocument text",
+}
 #: What a picture's line says while the turn does not see, whatever the cause: vision off, a model
 #: that takes no images, or a workbench that shows none.
 UNSEEN_PICTURE: Final = "not shown to the model"
@@ -163,42 +173,68 @@ def user_content(
     return "\n".join(lines)
 
 
-def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: bool) -> str | None:
+def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: bool, name: str) -> str | None:
     """Say what an attachment is, from what workbench reported of it.
 
     Args:
         kind: The attachment's kind: ``document``, ``image`` or ``media``.
         manifest: Its manifest as the chat keeps it, or ``None``.
         seen: Whether the turn sees images.
+        name: The attachment's name, whose suffix says an Office file's format.
 
     Returns:
         For a picture ``image`` and its first rendition's size, followed by :data:`UNSEEN_PICTURE`
-        when not ``seen``; for a PDF its pages, and those without text: at most
-        :data:`LISTED_PAGES` of them and how many more, or that no page has text when that holds
-        for more than one page; else ``None``.
+        when not ``seen``; for a PDF its pages, for an Office file (``PowerPoint``, ``Word document`` or
+        ``OpenDocument text``) its slides or pages as the manifest's ``unit`` says, and for either those
+        without text (:func:`_pages_told`), whether ``seen`` or not; else ``None``, which a manifest of
+        kind ``none`` also gives.
     """
     if kind == "image":
         size = rendition_size(manifest)
         facts = "image" if size is None else f"image {size[0]}\N{MULTIPLICATION SIGN}{size[1]}"
         return facts if seen else f"{facts}; {UNSEEN_PICTURE}"
-    if manifest is None or manifest.get("kind") != "pdf":
+    if manifest is None:
         return None
+    if manifest.get("kind") == "pdf":
+        return _pages_told(manifest, "PDF", "page")
+    if manifest.get("kind") == "office":
+        office = OFFICE_FORMATS.get(PurePosixPath(name).suffix.lower())
+        if office is None:
+            return None
+        return _pages_told(manifest, office, "slide" if manifest.get("unit") == "slide" else "page")
+    return None
+
+
+def _pages_told(manifest: Mapping[str, Any], format_name: str, unit: str) -> str | None:
+    """Say how many pages or slides a document has, and which have no text.
+
+    Args:
+        manifest: Its manifest as the chat keeps it.
+        format_name: What the line calls the format: ``PDF``, ``PowerPoint``.
+        unit: The noun for one of them: ``page`` or ``slide``.
+
+    Returns:
+        ``PDF, 12 pages`` or ``PowerPoint, 1 slide``, then ``; page 3 has no text`` for one without
+        text, ``; pages 3, 7 have no text`` for more, at most :data:`LISTED_PAGES` of them and how many
+        more, or ``; no page has text`` when that holds for more than one; ``None`` without a count
+        of at least one.
+    """
     total = manifest.get("total")
     if not isinstance(total, int) or isinstance(total, bool) or total < 1:
         return None
-    facts = "PDF, 1 page" if total == 1 else f"PDF, {total} pages"
+    facts = f"{format_name}, 1 {unit}" if total == 1 else f"{format_name}, {total} {unit}s"
     listed = manifest.get("pages_without_text")
     blank: list[int] = [page for page in listed if isinstance(page, int)] if isinstance(listed, list) else []
     distinct = {page for page in blank if 1 <= page <= total}
     if total > 1 and len(distinct) == total:
-        return f"{facts}; no page has text"
+        return f"{facts}; no {unit} has text"
     if len(blank) == 1:
-        return f"{facts}; page {blank[0]} has no text"
+        return f"{facts}; {unit} {blank[0]} has no text"
     if not blank:
         return facts
-    pages = ", ".join(str(page) for page in blank[:LISTED_PAGES])
+    numbers = ", ".join(str(page) for page in blank[:LISTED_PAGES])
     more = f", and {len(blank) - LISTED_PAGES} more" if len(blank) > LISTED_PAGES else ""
-    return f"{facts}; pages {pages}{more} have no text"
+    return f"{facts}; {unit}s {numbers}{more} have no text"
 
 
 def _cut_arguments(raw: str, limit: int) -> str:

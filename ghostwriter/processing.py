@@ -1,4 +1,8 @@
-"""The attachment processor: workbench prepares a picture or a PDF after its upload has answered.
+"""The attachment processor: workbench prepares a picture or a PDF before it is ready, an Office file after.
+
+A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and an attachment taken back before it is
+sent cancels its own (:meth:`AttachmentProcessor.cancel`); a cancelled job writes nothing. When either fails after
+the cancel, :meth:`AttachmentProcessor.requeue_chat` prepares the chat's ``processing`` attachments again.
 
 An attachment that needs preparing (:func:`~ghostwriter.upload.needs_prepare`, while pictures are
 offered) is stored ``processing`` and handed to :class:`AttachmentProcessor`: asyncio tasks of the one
@@ -17,6 +21,17 @@ be seen unprepared and goes ``failed`` with the token; a document still reads as
 without a manifest. So no attachment stays ``processing``, which would hold its message back (409), once
 its job has ended.
 
+An Office file (:func:`~ghostwriter.upload.prepared_later`) is not waited for: it is ``ready`` when its upload
+answers, and its job (``background``) only adds its facts, its pages or slides, once workbench has converted and
+drawn it, which takes far longer than a picture or a PDF. Such a job takes the one :data:`BACKGROUND_SLOTS`
+before one of the :data:`PREPARE_SLOTS`, so Office files never fill both and a picture is not queued behind
+them here. workbench 0.8.1 does the same on its side: it converts in a gate of its own, one file at a time, so a
+picture's prepare is admitted while a deck converts (its ``GHOSTWRITER_WORKBENCH_SLOTS`` at 3 or more, its
+default), and a tool call for the deck's slides waits out the deck's prepare there, up to 120 s. Its manifest is
+kept with :meth:`~ghostwriter.store.ChatStore.keep_manifest`, which changes only a
+``ready`` row without one. A failure is recorded as an ``error`` child as for any document and changes no row:
+the file reads as text, as before. Only a ``processing`` row is requeued, so such a job is not.
+
 The hand-over is ``disclose`` / ``chat.attachment`` (``workbench:prepare``), the upload's child, written
 before the prepare is sent; unrecorded, nothing is sent and the attachment settles with the token
 ``audit``. An attachment found ``processing`` at start, whose job ended with the last process, is prepared
@@ -32,7 +47,7 @@ Logs carry the attachment's id, its kind and a token, never a name or a path.
 """
 
 import asyncio
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from dataclasses import dataclass
 from functools import partial
 from typing import Final, Literal
@@ -49,6 +64,8 @@ from ghostwriter.workbench import CallFor, Manifest, StorageFull, WorkbenchClien
 
 #: The most prepares in flight at once.
 PREPARE_SLOTS: Final = 2
+#: The most Office files prepared in the background at once; each also holds one of :data:`PREPARE_SLOTS`.
+BACKGROUND_SLOTS: Final = 1
 #: Seconds before a busy workbench is asked once more.
 PREPARE_RETRY_S: Final = 10.0
 #: The longest a status request waits for its attachment's job, in seconds.
@@ -75,6 +92,9 @@ class PrepareJob:
         kind: ``image`` or ``document``: what it settles as when the prepare fails.
         op: The upload's operation, its primary written, whose child the hand-over is; ``None`` for a job
             requeued at start, whose hand-over is a system operation's primary.
+        background: Whether the attachment is ``ready`` already (an Office file) and the job only adds its facts:
+            it takes a :data:`BACKGROUND_SLOTS` slot first, keeps its manifest with
+            :meth:`~ghostwriter.store.ChatStore.keep_manifest` and changes no status.
     """
 
     attachment_id: str
@@ -83,6 +103,7 @@ class PrepareJob:
     path: str
     kind: Literal["document", "image"]
     op: Operation | None
+    background: bool = False
 
 
 def _requeued(ref: AttachmentRef) -> PrepareJob:
@@ -127,6 +148,7 @@ class AttachmentProcessor:
         self._emitter = emitter
         self._image_tokens = image_tokens
         self._slots = asyncio.Semaphore(PREPARE_SLOTS)
+        self._background = asyncio.Semaphore(BACKGROUND_SLOTS)
         self._running: dict[str, _Running] = {}
         self._closed = False
 
@@ -173,6 +195,22 @@ class AttachmentProcessor:
             return
         await asyncio.wait({running.task}, timeout=timeout_s)
 
+    def cancel(self, attachment_id: str) -> bool:
+        """Cancel an attachment's job, as its user takes it back. Call it on the event loop's thread only.
+
+        Args:
+            attachment_id: The attachment.
+
+        Returns:
+            Whether a job of it was running and is cancelled now; one cancelled already is not counted again.
+        """
+        running = self._running.get(attachment_id)
+        if running is None or running.scope.cancel_called:
+            return False
+        running.scope.cancel()
+        logger.debug("an attachment's job was cancelled as it was taken back.")
+        return True
+
     def cancel_chat(self, chat_id: str) -> int:
         """Cancel the chat's jobs, as its delete begins. Call it on the event loop's thread only.
 
@@ -205,7 +243,7 @@ class AttachmentProcessor:
         return len(stranded)
 
     async def requeue_chat(self, chat_id: str) -> int:
-        """Prepare again a chat's ``processing`` attachments, once its delete failed after :meth:`cancel_chat`.
+        """Prepare again a chat's ``processing`` attachments, once its delete or a take-back failed after a cancel.
 
         The chat's cancelled jobs are awaited first, so no attachment has two jobs; a job of the chat that
         was not cancelled goes on as it is. Each new job is requeued as at start (``op=None``). On the event
@@ -261,6 +299,8 @@ class AttachmentProcessor:
     async def _run(self, job: PrepareJob, scope: anyio.CancelScope) -> None:
         """Run one job in its cancel scope, under a slot; a cancel ends it with nothing more written.
 
+        A background job takes the :data:`BACKGROUND_SLOTS` slot first, then one of the :data:`PREPARE_SLOTS`.
+
         A job that fails unexpectedly still settles its attachment as a failure, best effort, so its
         message is not held back by a row nothing settles any more.
 
@@ -270,7 +310,8 @@ class AttachmentProcessor:
         """
         with scope:
             try:
-                async with self._slots:
+                gate = self._background if job.background else nullcontext()
+                async with gate, self._slots:
                     await self._prepare(job)
             except Exception as exc:
                 logger.error(
@@ -366,7 +407,8 @@ class AttachmentProcessor:
             op: The operation the hand-over belongs to, for the purpose and the request id.
 
         Returns:
-            ``None`` once the attachment is ``ready`` with its manifest; else the token of the failure.
+            ``None`` once the attachment is ``ready`` with its manifest; else the token of the failure. A background
+            job's manifest is kept with :meth:`~ghostwriter.store.ChatStore.keep_manifest`, which leaves its status.
         """
         call = CallFor(job.owner, job.chat_id, forward_headers(op.context))
         try:
@@ -382,16 +424,18 @@ class AttachmentProcessor:
             return "error"
         if job.kind == "image":
             await self._cut_strips(call, job, manifest)
-        try:
-            settled = await anyio.to_thread.run_sync(
-                partial(
-                    self._store.settle_attachment,
-                    job.attachment_id,
-                    status="ready",
-                    manifest=manifest.as_stored(),
-                    failure=None,
-                )
+        if job.background:
+            keep = partial(self._store.keep_manifest, job.attachment_id, manifest.as_stored())
+        else:
+            keep = partial(
+                self._store.settle_attachment,
+                job.attachment_id,
+                status="ready",
+                manifest=manifest.as_stored(),
+                failure=None,
             )
+        try:
+            settled = await anyio.to_thread.run_sync(keep)
         except Exception as exc:
             logger.warning(
                 "Attachment '{}' ({}): its manifest could not be kept: {}",
@@ -465,6 +509,9 @@ class AttachmentProcessor:
 
     async def _settle_failed(self, job: PrepareJob, token: str) -> None:
         """Settle an attachment whose prepare failed: a picture ``failed``, a document ``ready`` without a manifest.
+
+        A background job's attachment is ``ready`` already, and only a ``processing`` row settles, so
+        this changes nothing for it.
 
         Args:
             job: The attachment.

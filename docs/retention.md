@@ -62,8 +62,10 @@ so and nothing is fetched.
 Tool contents are recorded, then emptied. Deleted rows are overwritten
 (`secure_delete`), and each sweep ends with a write-ahead-log checkpoint.
 
-A file attached by mistake is taken back by deleting the chat: workbench offers
-this caller no single-file delete. Otherwise it goes after its 7 days.
+A file attached by mistake is taken back before it is sent: the X on its tile
+deletes it in workbench with its renders (workbench 0.8.1), and then its row; a
+job preparing it is cancelled. A sent file stays with its message until the chat
+is deleted or its 7 days are over.
 
 ## The dry run
 

@@ -16,8 +16,10 @@ const ERROR_KEYS: Record<PendingError, keyof Strings> = {
   purpose: 'composer.error_purpose',
 }
 
-/** Where a file stands, as its tile says it: refused or unreadable files are `failed`. */
+/** Where a file stands, as its tile says it: refused or unreadable files are `failed`; one being
+ *  taken back spins, as work on it does. */
 function tileStatus(file: PendingFile): AttachmentTileStatus {
+  if (file.removing) return 'processing'
   if (file.status === 'uploading') return 'uploading'
   if (file.status === 'processing') return 'processing'
   if (file.status === 'error' || file.attachment?.status === 'failed') return 'failed'
@@ -38,18 +40,20 @@ function goesToModel(file: PendingFile): boolean {
 interface TileProps {
   chatId: string
   file: PendingFile
-  onDismiss: (key: string) => void
+  onRemove: (key: string) => void
 }
 
 /** One file as a tile, with its picture (when it has one) opening in the lightbox. */
-function Tile({ file, picture, onDismiss }: Omit<TileProps, 'chatId'> & { picture: string | undefined }) {
+function Tile({ file, picture, onRemove }: Omit<TileProps, 'chatId'> & { picture: string | undefined }) {
   const t = useT()
   const lang = useLang()
   const [open, setOpen] = useState(false)
   const status = tileStatus(file)
   const statusLabel = {
     uploading: t('composer.uploading', { name: file.name }),
-    processing: t('composer.processing', { name: file.name }),
+    processing: file.removing
+      ? t('composer.removing', { name: file.name })
+      : t('composer.processing', { name: file.name }),
     failed: file.error
       ? t(ERROR_KEYS[file.error], { name: file.name })
       : t('composer.unreadable', { name: file.name }),
@@ -68,7 +72,7 @@ function Tile({ file, picture, onDismiss }: Omit<TileProps, 'chatId'> & { pictur
         detail={formatSize(file.size, lang)}
         statusLabel={statusLabel}
         onOpen={viewable ? () => setOpen(true) : undefined}
-        onRemove={file.status === 'error' ? () => onDismiss(file.key) : undefined}
+        onRemove={file.removing ? undefined : () => onRemove(file.key)}
         removeLabel={t('composer.remove', { name: file.name })}
       />
       {viewable && (
@@ -95,7 +99,8 @@ function FetchedTile({ chatId, attachment, ...props }: TileProps & { attachment:
  * The files the next message sends, one tile each: a picture shows itself (from the file in hand
  * at once, else from the server's rendition) and opens full size; every other file shows its kind,
  * name and size. A tile says where its file stands: being attached, being prepared, refused or
- * unreadable, expired. A refused file can be taken out of view; nothing of it was stored.
+ * unreadable, expired, being taken back. Any file can be taken back before it is sent: the X on its tile.
+ * One whose taking back failed says so below the row, and stays.
  *
  * The row sits above the composer's pill, never inside it. The refusals are said below it, each by
  * the reason the server gave; so is the cap on pictures, once more wait than go to the model.
@@ -104,12 +109,12 @@ export function AttachmentTiles({
   chatId,
   pending,
   maxImages,
-  onDismiss,
+  onRemove,
 }: {
   chatId: string
   pending: PendingFile[]
   maxImages: number
-  onDismiss: (key: string) => void
+  onRemove: (key: string) => void
 }) {
   const t = useT()
   if (pending.length === 0) return null
@@ -122,13 +127,20 @@ export function AttachmentTiles({
         {pending.map((file) => (
           <li key={file.key} data-status={file.status} className="max-w-full">
             {file.attachment && file.kind === 'image' && file.localUrl === undefined ? (
-              <FetchedTile chatId={chatId} file={file} attachment={file.attachment} onDismiss={onDismiss} />
+              <FetchedTile chatId={chatId} file={file} attachment={file.attachment} onRemove={onRemove} />
             ) : (
-              <Tile file={file} picture={file.localUrl} onDismiss={onDismiss} />
+              <Tile file={file} picture={file.localUrl} onRemove={onRemove} />
             )}
           </li>
         ))}
       </ul>
+      {pending
+        .filter((f) => f.removeFailed)
+        .map((file) => (
+          <p key={`${file.key}-remove`} role="alert" className="text-xs text-danger">
+            {t('composer.error_remove', { name: file.name })}
+          </p>
+        ))}
       {refused.map(({ file, error }) => (
         <p key={file.key} role="alert" className="text-xs text-danger">
           {t(ERROR_KEYS[error], { name: file.name })}

@@ -75,6 +75,21 @@ def test_strips_only_for_a_fixed_cost() -> None:
     assert strips_for_path("/workspace/c/plot.svg", fixed=280, known={}) is None
 
 
+def test_an_office_file_goes_as_two_strips_at_a_fixed_cost() -> None:
+    """A deck, a Word file and an OpenDocument text file draw their pages as a PDF's are drawn, in any case."""
+    for path in (
+        "/workspace/c/harbour-deck.PPTX",
+        "/workspace/c/quay-master.potx",
+        "/workspace/c/quay-report.docx",
+        "/workspace/c/quay-template.DOTX",
+        "/workspace/c/survey-notes.odt",
+    ):
+        assert strips_for_path(path, fixed=280, known={}) == 2
+        assert strips_for_path(path, fixed=None, known={}) is None
+    assert strips_for_path("/workspace/c/harbour-figures.xlsx", fixed=280, known={}) is None
+    assert strips_for_path("/workspace/c/harbour-notes.doc", fixed=280, known={}) is None
+
+
 def test_attachment_parts_label_each_strip() -> None:
     """A large picture at a fixed cost is two refs, one per strip; at a cost by pixels it is one, named."""
     parts = attachment_parts([PHOTO], fixed=280)

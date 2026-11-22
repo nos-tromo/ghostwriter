@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useQueryClient } from '@tanstack/react-query'
 import { getPurpose, requestPurpose } from '@infra/ui'
-import { getAttachment, uploadAttachment } from '../api/chats'
+import { deleteAttachment, getAttachment, uploadAttachment } from '../api/chats'
 import { ApiError, PURPOSE_SCOPE, isPurposeRefusal } from '../api/client'
 import type { AppConfig, AttachmentOut } from '../api/types'
-import { nextMark, readMarkOf, useChat } from './useChats'
+import { chatKey, nextMark, readMarkOf, useChat } from './useChats'
 
 /** Why a file is not attached: its type, its size, the upload, workbench's
  *  space, the files already waiting, or a purpose the user did not state. */
@@ -24,8 +25,12 @@ export interface PendingFile {
   /** When the upload was done, on the page's order of events (`nextMark`). */
   doneMark?: number
   /** An object URL of a picture the browser can draw, made when it was added and
-   *  revoked when it is dismissed, sent or the composer goes. */
+   *  revoked when it is removed, sent or the composer goes. */
   localUrl?: string
+  /** It is being taken back: deleted on the server, then out of view. */
+  removing?: boolean
+  /** Its taking back failed; it stays, and can be sent or taken back again. */
+  removeFailed?: boolean
 }
 
 export interface Attachments {
@@ -36,8 +41,9 @@ export interface Attachments {
   clear(): PendingFile[]
   /** Put back what `clear` took: the message that was to send them was refused. */
   restore(files: PendingFile[]): void
-  /** Take a refused file out of view. */
-  dismiss(key: string): void
+  /** Take a file out of the composer, whatever its state: one the server holds is deleted there
+   *  first, one on its way once it is stored, and a refused one simply goes. */
+  remove(key: string): void
 }
 
 /** The audit actions the attachment route records: a purpose required for
@@ -97,6 +103,17 @@ function waiting(attachment: AttachmentOut): PendingFile {
   }
 }
 
+/** Delete an attachment the user takes back. Whether it is out of the composer's hands: deleted, held no more by
+ *  the server (a 404), or sent meanwhile by a message (a 409 `attachment_sent`). */
+async function takenBack(chatId: string, id: string): Promise<boolean> {
+  try {
+    await deleteAttachment(chatId, id)
+    return true
+  } catch (error) {
+    return error instanceof ApiError && (error.status === 404 || error.code === 'attachment_sent')
+  }
+}
+
 /** Resolves after `ms`, or as soon as `signal` aborts. */
 function pause(ms: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
@@ -135,7 +152,15 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * does not get through, or a server error, is tried again after 2 s; any other
  * refusal (a 404 above all: the server no longer holds the file) settles the
  * file as an error, and the chat's list never brings it back as one still
- * being prepared. Leaving the chat stops it. A picture a browser can draw
+ * being prepared. Leaving the chat stops it.
+ *
+ * Any file can be taken back before a message sends it. One the server holds
+ * is deleted there first (it is `removing` meanwhile, and nothing is sent); it
+ * leaves the view only once that succeeded, or the server holds it no more (a
+ * 404) or a message sent it meanwhile, and its following ends quietly. If the
+ * delete fails, the file stays, marked `removeFailed`, to be sent or taken back
+ * again. A file still on its way is taken out of the queue, or, being uploaded,
+ * deleted as soon as it is stored; a refused file simply goes. A picture a browser can draw
  * shows from the file in hand at once (an object URL, never leaked); the
  * others, once prepared, from the server's rendition.
  *
@@ -159,6 +184,14 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
   const followedRef = useRef<Set<string>>(new Set())
   // A followed attachment of the chat's own list, as it is now, by id.
   const [prepared, setPrepared] = useState<ReadonlyMap<string, AttachmentOut>>(() => new Map())
+  // Attachments being or having been taken back, by id: their following and their upload end quietly.
+  const removedRef = useRef<Set<string>>(new Set())
+  // Files taken back while on their way, by key: deleted as soon as their upload is stored.
+  const abandonedRef = useRef<Set<string>>(new Set())
+  // Files being taken back, and those whose taking back failed, by key.
+  const [removing, setRemoving] = useState<ReadonlySet<string>>(() => new Set())
+  const [removeFailed, setRemoveFailed] = useState<ReadonlySet<string>>(() => new Set())
+  const queryClient = useQueryClient()
   const needsPurpose = config.require_purpose.some((action) => UPLOAD_ACTIONS.has(action))
 
   useEffect(() => {
@@ -210,15 +243,33 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
             size: attachment.size,
             doneMark: nextMark(),
           }
+          if (abandonedRef.current.delete(next.key)) {
+            // Taken back while on its way: it goes on the server as soon as it is there.
+            removedRef.current.add(attachment.id)
+            if (await takenBack(chatId, attachment.id)) {
+              void queryClient.invalidateQueries({ queryKey: chatKey(chatId) })
+              if (aliveRef.current) setTaken((ids) => new Set(ids).add(attachment.id))
+              continue
+            }
+            // It could not be deleted: it comes back, said to be so, to be sent or taken back again.
+            removedRef.current.delete(attachment.id)
+            if (aliveRef.current) {
+              const kind = isImageName(attachment.name, config) ? ('image' as const) : ('document' as const)
+              setLocal((files) => [...files, { key: next.key, kind, ...stored }])
+              setRemoveFailed((keys) => new Set(keys).add(next.key))
+            }
+            continue
+          }
           if (aliveRef.current) settle(new Set([next.key]), stored)
         } catch (error) {
+          if (abandonedRef.current.delete(next.key)) continue
           if (aliveRef.current) settle(new Set([next.key]), { status: 'error', error: refusalOf(error) })
         }
       }
     } finally {
       runningRef.current = false
     }
-  }, [chatId, needsPurpose, settle])
+  }, [chatId, config, needsPurpose, queryClient, settle])
 
   const add = useCallback(
     (files: File[]) => {
@@ -265,8 +316,12 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
     )
     // A listed attachment still preparing is as the follow found it, once it has.
     const found = earlier.map((a) => waiting(a.status === 'processing' ? (prepared.get(a.id) ?? a) : a))
-    return [...found, ...current]
-  }, [chat, local, taken, prepared])
+    const marked = (f: PendingFile): PendingFile =>
+      removing.has(f.key) || removeFailed.has(f.key)
+        ? { ...f, ...(removing.has(f.key) && { removing: true }), ...(removeFailed.has(f.key) && { removeFailed: true }) }
+        : f
+    return [...found, ...current].map(marked)
+  }, [chat, local, taken, prepared, removing, removeFailed])
 
   // An attachment whose preparation ended: a file of this composer takes it, and so
   // does the chat's list.
@@ -281,35 +336,37 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
 
   // An attachment the server no longer answers for: an error tile, in place of the file or
   // standing for the listed one. The chat's list may still name it as being prepared; it is
-  // taken out of that list here, so once its tile goes (dismissed, or a message cleared it) it
+  // taken out of that list here, so once its tile goes (removed, or a message cleared it) it
   // never comes back as a tile still being prepared, which nothing would follow again.
   const lost = useCallback((file: PendingFile) => {
     const refused = { status: 'error' as const, error: 'upload' as const }
     setLocal((files) =>
       files.some((f) => f.key === file.key)
         ? files.map((f) => (f.key === file.key ? { ...f, ...refused } : f))
-        : [...files, { ...file, ...refused }],
+        : [...files, { ...file, ...refused, removing: undefined, removeFailed: undefined }],
     )
     const id = file.attachment?.id
     if (id !== undefined) setTaken((ids) => new Set(ids).add(id))
   }, [])
 
-  const follow = useCallback(
-    async (file: PendingFile) => {
+  // One follower's requests, until the attachment's preparation ends, the server refuses it, or `gone` holds.
+  const followed = useCallback(
+    async (file: PendingFile, gone: () => boolean) => {
       const signal = controllerRef.current?.signal
       if (chatId === null || file.attachment === undefined || signal === undefined) return
-      while (!signal.aborted) {
+      const id = file.attachment.id
+      while (!gone()) {
         const asked = Date.now()
         try {
-          const latest = await getAttachment(chatId, file.attachment.id, POLL_WAIT_S, signal)
+          const latest = await getAttachment(chatId, id, POLL_WAIT_S, signal)
           if (latest.status === 'processing') {
             await pause(Math.max(0, PROCESSING_FLOOR_MS - (Date.now() - asked)), signal)
             continue
           }
-          if (!signal.aborted) ended(file, latest)
+          if (!gone()) ended(file, latest)
           return
         } catch (error) {
-          if (signal.aborted) return
+          if (gone()) return
           // A refusal is no network trouble: asking again would only be refused again.
           if (error instanceof ApiError && error.status < 500) {
             lost(file)
@@ -320,6 +377,23 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
       }
     },
     [chatId, ended, lost],
+  )
+
+  const follow = useCallback(
+    async (file: PendingFile) => {
+      const signal = controllerRef.current?.signal
+      if (chatId === null || file.attachment === undefined || signal === undefined) return
+      const id = file.attachment.id
+      // Taken back: its answer, a 404 above all, is no news of the file. Its entry is let go, so a taking back
+      // that fails has it followed again, by one follower.
+      const gone = () => signal.aborted || removedRef.current.has(id)
+      try {
+        await followed(file, gone)
+      } finally {
+        if (removedRef.current.has(id)) followedRef.current.delete(id)
+      }
+    },
+    [chatId, followed],
   )
 
   useEffect(() => {
@@ -339,7 +413,10 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
     for (const f of pending) if (f.status !== 'uploading' && f.status !== 'processing') revoke(f.key)
     setTaken((ids) => new Set([...ids, ...done.flatMap((f) => (f.attachment ? [f.attachment.id] : []))]))
     setLocal((files) => files.filter((f) => f.status === 'uploading' || f.status === 'processing'))
-    return done.map((f) => ({ ...f, localUrl: undefined }))
+    // A file a message took is no longer one whose taking back failed.
+    const sent = new Set(done.map((f) => f.key))
+    setRemoveFailed((keys) => new Set([...keys].filter((key) => !sent.has(key))))
+    return done.map((f) => ({ ...f, localUrl: undefined, removing: undefined, removeFailed: undefined }))
   }, [pending, revoke])
 
   const restore = useCallback((files: PendingFile[]) => {
@@ -348,18 +425,59 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
     setLocal((current) => [...files.filter((f) => !current.some((c) => c.key === f.key)), ...current])
   }, [])
 
-  const dismiss = useCallback(
-    (key: string) => {
-      const file = pending.find((f) => f.key === key)
-      if (file?.status !== 'error') return
-      setLocal((files) => files.filter((f) => f.key !== key || f.status !== 'error'))
+  // Out of view for good: the server holds it no more, or a message has it.
+  const forget = useCallback(
+    (key: string, id: string | undefined) => {
+      setLocal((files) => files.filter((f) => f.key !== key))
       revoke(key)
-      // One the server holds still, and the chat lists, stays out of view too.
-      const id = file.attachment?.id
       if (id !== undefined) setTaken((ids) => new Set(ids).add(id))
     },
-    [pending, revoke],
+    [revoke],
   )
 
-  return { pending, add, clear, restore, dismiss }
+  const takeBack = useCallback(
+    async (key: string, id: string) => {
+      if (chatId === null) return
+      const gone = await takenBack(chatId, id)
+      // Read again even once the composer went, so the chat's cached list never offers the file again.
+      if (gone) void queryClient.invalidateQueries({ queryKey: chatKey(chatId) })
+      if (!aliveRef.current) return
+      setRemoving((keys) => new Set([...keys].filter((k) => k !== key)))
+      if (!gone) {
+        // It stays: a follower that let it go for the delete starts again if it is still being prepared.
+        removedRef.current.delete(id)
+        setRemoveFailed((keys) => new Set(keys).add(key))
+        return
+      }
+      forget(key, id)
+    },
+    [chatId, forget, queryClient],
+  )
+
+  const remove = useCallback(
+    (key: string) => {
+      const file = pending.find((f) => f.key === key)
+      if (file === undefined || file.removing) return
+      setRemoveFailed((keys) => new Set([...keys].filter((k) => k !== key)))
+      if (file.status === 'uploading') {
+        // Not sent yet: it never will be. Being sent: it is deleted once stored.
+        const waiting = queueRef.current.length
+        queueRef.current = queueRef.current.filter((q) => q.key !== key)
+        if (queueRef.current.length === waiting) abandonedRef.current.add(key)
+        forget(key, undefined)
+        return
+      }
+      const id = file.attachment?.id
+      if (id === undefined) {
+        forget(key, undefined)
+        return
+      }
+      removedRef.current.add(id)
+      setRemoving((keys) => new Set(keys).add(key))
+      void takeBack(key, id)
+    },
+    [pending, forget, takeBack],
+  )
+
+  return { pending, add, clear, restore, remove }
 }

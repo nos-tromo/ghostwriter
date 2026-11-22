@@ -142,7 +142,7 @@ export function Composer({
 
   const done = attachments.pending.filter((f) => f.status === 'done' && f.attachment)
   const processing = attachments.pending.some((f) => f.status === 'processing')
-  const busy = processing || attachments.pending.some((f) => f.status === 'uploading')
+  const busy = processing || attachments.pending.some((f) => f.status === 'uploading' || f.removing)
   const content = text.trim()
   const canSend = !stream.streaming && !busy && (content !== '' || done.length > 0)
 
@@ -211,14 +211,13 @@ export function Composer({
           chatId={chatId}
           pending={attachments.pending}
           maxImages={config.max_images}
-          onDismiss={attachments.dismiss}
+          onRemove={(key) => {
+            attachments.remove(key)
+            // The X goes with its tile: the composer keeps the focus.
+            textRef.current?.focus()
+          }}
         />
         {processing && <p className="text-xs text-muted-foreground">{t('composer.processing_hint')}</p>}
-        {attachments.pending.some((f) => f.status !== 'error') && (
-          <p className="text-xs text-muted-foreground">
-            {t('composer.files_stay', { days: config.file_retention_days })}
-          </p>
-        )}
         <ChatComposer
           ref={textRef}
           value={text}

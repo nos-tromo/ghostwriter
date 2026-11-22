@@ -57,7 +57,7 @@ FILES_STORE: Final = "files"
 #: The longest title the first message gives a chat.
 TITLE_CHARS: Final = 60
 #: What a manifest keeps of what workbench reports: counts, kinds and sizes, never a path, a hint or bytes.
-STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames")
+STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames", "unit")
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
 
@@ -1165,6 +1165,59 @@ class ChatStore:
             ).one_or_none()
             return None if attachment is None else self._attachment_ref(attachment, owner, now)
 
+    def find_pending_attachment(self, owner: str, chat_id: str, attachment_id: str) -> AttachmentRef | None:
+        """Find an attachment that no message has sent yet, through its owner's chat only.
+
+        Args:
+            owner: Who asks.
+            chat_id: The chat.
+            attachment_id: The attachment.
+
+        Returns:
+            The attachment, or ``None`` when this owner's chat holds no such one waiting to be sent.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            attachment = s.scalars(
+                select(Attachment)
+                .join(Chat, Attachment.chat_id == Chat.id)
+                .where(
+                    Attachment.id == attachment_id,
+                    Attachment.chat_id == chat_id,
+                    Attachment.message_id.is_(None),
+                    Chat.owner == owner,
+                )
+            ).one_or_none()
+            return None if attachment is None else self._attachment_ref(attachment, owner, now)
+
+    def remove_pending_attachment(self, owner: str, chat_id: str, attachment_id: str) -> bool:
+        """Delete an attachment its user takes back before a message sends it, through its owner's chat only.
+
+        A row a message has bound meanwhile stays: it is the message's now. Nothing else refers to an attachment, and
+        the chat's file mark stays, as its folder may still hold files.
+
+        Args:
+            owner: Who asks.
+            chat_id: The chat.
+            attachment_id: The attachment.
+
+        Returns:
+            Whether the row was deleted: ``False`` when it is gone, another's, or sent.
+        """
+        with self._transaction() as s:
+            owned = select(Chat.id).where(Chat.id == chat_id, Chat.owner == owner).scalar_subquery()
+            removed = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    delete(Attachment).where(
+                        Attachment.id == attachment_id,
+                        Attachment.chat_id == owned,
+                        Attachment.message_id.is_(None),
+                    )
+                ),
+            )
+            return removed.rowcount == 1
+
     def attachment_out(self, owner: str, chat_id: str, attachment_id: str) -> AttachmentOut | None:
         """Serve an attachment through its owner's chat only.
 
@@ -1239,6 +1292,30 @@ class ChatStore:
             )
             return settled.rowcount == 1
 
+    def keep_manifest(self, attachment_id: str, manifest: Mapping[str, Any]) -> bool:
+        """Keep the manifest a background prepare reported, for an attachment that is ready already.
+
+        Only a ``ready`` row without a manifest changes, so a second keep, a ``processing`` or
+        ``failed`` row and a row deleted meanwhile change nothing. The status never changes.
+
+        Args:
+            attachment_id: The attachment.
+            manifest: What workbench reported of the file; cut as :meth:`settle_attachment` cuts it.
+
+        Returns:
+            Whether the row changed: ``False`` when it is gone, not ``ready`` or has a manifest.
+        """
+        with self._transaction() as s:
+            kept = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    update(Attachment)
+                    .where(Attachment.id == attachment_id, Attachment.status == "ready", Attachment.render.is_(None))
+                    .values(render=_stored_manifest(manifest))
+                ),
+            )
+            return kept.rowcount == 1
+
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.
 
@@ -1281,7 +1358,9 @@ class ChatStore:
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
         facts = {
-            attachment.id: attachment_facts(attachment.kind, _loaded_manifest(attachment.render), seen=seen)
+            attachment.id: attachment_facts(
+                attachment.kind, _loaded_manifest(attachment.render), seen=seen, name=attachment.name
+            )
             for attachment in attachments
         }
         return user_content(
