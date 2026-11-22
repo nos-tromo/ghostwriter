@@ -52,7 +52,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import PRESENTATIONS, system_prompt
+from ghostwriter.agent.prompt import DECK_CHECK, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
     REFUSALS,
     Refusal,
@@ -492,6 +492,35 @@ def test_the_presentation_sentence_comes_with_the_tool() -> None:
     assert PRESENTATIONS not in SYSTEM
     bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False, presentations=True)
     assert bare == system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
+
+
+def test_the_deck_check_comes_with_sight_and_the_tool() -> None:
+    """How to check and restyle a built deck follows the outline rule only while the model sees and has the tool.
+
+    The model looks at every file of the chat, those it made too, rather than say it cannot see them; a deck it
+    wrote is looked at, and a better look is made with python-pptx in run_python.
+    """
+    assert DECK_CHECK == (
+        "After write_presentation, look at the new deck with view_file and fix what looks wrong. To make a deck "
+        "look better, pick layouts with pictures, native charts and tables, and use fewer words; set colours, "
+        "fonts, backgrounds and shapes with python-pptx in run_python, which writes the restyled deck as a new "
+        "file, and look at it again."
+    )
+    assert VISION.endswith(
+        "use view_file to see one again. You can see every file of this chat, also those you made yourself: when "
+        "the user asks whether you can see one, or how it looks, look at it with view_file instead of saying you "
+        "cannot."
+    )
+    day = date(2026, 11, 16)
+    both = system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, presentations=True, vision=True)
+    assert both == f"{SYSTEM} {VISION} {PRESENTATIONS} {DECK_CHECK}"
+    for presentations, vision in ((True, False), (False, True), (False, False)):
+        one = system_prompt(
+            today=day, folder=FOLDER, file_days=7, expired=False, presentations=presentations, vision=vision
+        )
+        assert DECK_CHECK not in one
+    bare = system_prompt(today=day, folder=None, file_days=7, expired=False, presentations=True, vision=True)
+    assert bare == system_prompt(today=day, folder=None, file_days=7, expired=False)
 
 
 PAGE = ToolImage("quay-scan.pdf, page 2", 1131, 1600, "image/jpeg", TINY_JPEG)

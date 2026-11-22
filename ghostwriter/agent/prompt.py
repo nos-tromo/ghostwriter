@@ -18,7 +18,17 @@ VISION: Final = (
     "Images the user attached are in their message: look at them. Read a document with read_document first; "
     "pages without text come back as images in the same answer. For how something looks (layout, design, "
     "charts, handwriting, photos), look with view_file, at most 4 pages a call. Images tools showed earlier are "
-    "not sent again, and attached pictures only while there is room: use view_file to see one again."
+    "not sent again, and attached pictures only while there is room: use view_file to see one again. You can see "
+    "every file of this chat, also those you made yourself: when the user asks whether you can see one, or how it "
+    "looks, look at it with view_file instead of saying you cannot."
+)
+#: How the model checks and restyles a deck it built, given only while it sees and write_presentation is offered:
+#: it looks at the slides it wrote, and a better look is made with the tools it has, not declined.
+DECK_CHECK: Final = (
+    "After write_presentation, look at the new deck with view_file and fix what looks wrong. To make a deck look "
+    "better, pick layouts with pictures, native charts and tables, and use fewer words; set colours, fonts, "
+    "backgrounds and shapes with python-pptx in run_python, which writes the restyled deck as a new file, and look "
+    "at it again."
 )
 
 
@@ -41,7 +51,8 @@ def system_prompt(
         presentations: Whether workbench offers ``write_presentation``; the outline-first rule is given
             only then, and only when tools are offered.
         vision: Whether the model sees images and is offered ``view_file``; :data:`VISION` follows the
-            sentences on the chat's folder only then, and only when tools are offered.
+            sentences on the chat's folder only then, and only when tools are offered. With ``presentations``
+            too, :data:`DECK_CHECK` follows the outline-first rule.
 
     Returns:
         The prompt, its sentences joined by single spaces.
@@ -63,6 +74,8 @@ def system_prompt(
             parts.append(VISION)
         if presentations:
             parts.append(PRESENTATIONS)
+            if vision:
+                parts.append(DECK_CHECK)
     else:
         parts.append("You have no tools in this chat, and files cannot be read.")
     if expired:
