@@ -1165,6 +1165,59 @@ class ChatStore:
             ).one_or_none()
             return None if attachment is None else self._attachment_ref(attachment, owner, now)
 
+    def find_pending_attachment(self, owner: str, chat_id: str, attachment_id: str) -> AttachmentRef | None:
+        """Find an attachment that no message has sent yet, through its owner's chat only.
+
+        Args:
+            owner: Who asks.
+            chat_id: The chat.
+            attachment_id: The attachment.
+
+        Returns:
+            The attachment, or ``None`` when this owner's chat holds no such one waiting to be sent.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            attachment = s.scalars(
+                select(Attachment)
+                .join(Chat, Attachment.chat_id == Chat.id)
+                .where(
+                    Attachment.id == attachment_id,
+                    Attachment.chat_id == chat_id,
+                    Attachment.message_id.is_(None),
+                    Chat.owner == owner,
+                )
+            ).one_or_none()
+            return None if attachment is None else self._attachment_ref(attachment, owner, now)
+
+    def remove_pending_attachment(self, owner: str, chat_id: str, attachment_id: str) -> bool:
+        """Delete an attachment its user takes back before a message sends it, through its owner's chat only.
+
+        A row a message has bound meanwhile stays: it is the message's now. Nothing else refers to an attachment, and
+        the chat's file mark stays, as its folder may still hold files.
+
+        Args:
+            owner: Who asks.
+            chat_id: The chat.
+            attachment_id: The attachment.
+
+        Returns:
+            Whether the row was deleted: ``False`` when it is gone, another's, or sent.
+        """
+        with self._transaction() as s:
+            owned = select(Chat.id).where(Chat.id == chat_id, Chat.owner == owner).scalar_subquery()
+            removed = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    delete(Attachment).where(
+                        Attachment.id == attachment_id,
+                        Attachment.chat_id == owned,
+                        Attachment.message_id.is_(None),
+                    )
+                ),
+            )
+            return removed.rowcount == 1
+
     def attachment_out(self, owner: str, chat_id: str, attachment_id: str) -> AttachmentOut | None:
         """Serve an attachment through its owner's chat only.
 

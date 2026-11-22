@@ -1539,6 +1539,33 @@ class WorkbenchClient:
         except Exception:
             found[index] = None
 
+    async def delete_upload(self, *, call: CallFor, path: str) -> None:
+        """Delete one upload of the chat that its user takes back before sending it, with its renders (workbench 0.8.1).
+
+        Args:
+            call: The chat.
+            path: The upload's path in the chat's folder.
+
+        Raises:
+            WorkbenchNotFound: When the chat has no such upload; a path outside its folder is not asked for.
+            WorkbenchUnavailable: On any other failure, a workbench before 0.8.1 among them (``http:405``).
+        """
+        with _rest_errors("upload delete"):
+            key = self._required_key()
+            if _inside(chat_folder(key, call.chat_id), path) is None:
+                raise WorkbenchNotFound("not_found")
+            headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
+            async with (
+                self._http(self._settings.workbench_timeout_s) as client,
+                client.stream("DELETE", "/files/upload", params={"path": path}, headers=headers) as response,
+            ):
+                if response.status_code == 404:
+                    raise WorkbenchNotFound("not_found")
+                answer = await _json_answer(response)
+            if not isinstance(answer, dict) or _count(answer.get("deleted")) != 1:
+                raise WorkbenchUnavailable("bad_answer")
+        logger.debug("workbench deleted an upload with {} renders", _count(answer.get("renders")))
+
     async def delete_chat(self, *, call: CallFor) -> int:
         """Delete the chat's folder in workbench, with its files and jobs.
 

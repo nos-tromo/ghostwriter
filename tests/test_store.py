@@ -518,6 +518,23 @@ def test_a_message_binds_only_this_chats_pending_attachments(store: ChatStore) -
         store.add_user_message("user-a", chat.id, "Nochmal", [mine.id])
 
 
+def test_only_an_unsent_attachment_of_the_owners_chat_is_taken_back(store: ChatStore) -> None:
+    """Another owner, another chat and a sent attachment keep their rows; the owner's unsent one goes, once."""
+    chat = store.create_chat("user-a")
+    other = store.create_chat("user-a")
+    mine, kept, sent = _attach(store, chat.id), _attach(store, chat.id), _attach(store, chat.id)
+    store.add_user_message("user-a", chat.id, "Hallo", [sent.id])
+    assert store.find_pending_attachment("user-a", chat.id, mine.id) is not None
+    assert store.find_pending_attachment("user-a", chat.id, sent.id) is None
+    assert not store.remove_pending_attachment("user-b", chat.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", other.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", chat.id, sent.id)
+    assert store.remove_pending_attachment("user-a", chat.id, mine.id)
+    assert not store.remove_pending_attachment("user-a", chat.id, mine.id)
+    assert [a.id for a in store.chat_detail("user-a", chat.id).pending_attachments] == [kept.id]
+    assert store.find_attachment("user-a", chat.id, sent.id) is not None
+
+
 def test_deleting_a_chat_takes_every_row_with_it(store: ChatStore, engine: Engine) -> None:
     """Messages, steps, results and attachments, bound or pending, go with their chat; other chats stay."""
 

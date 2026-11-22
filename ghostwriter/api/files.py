@@ -22,8 +22,10 @@ workbench too. Records name a file by its id, never by its name. An attachment i
 hand-over fails; when the chat vanished during the hand-over, the delete of its folder is a
 ``delete`` / ``chat.workbench`` child, recorded before it is sent. The processor adds the prepare's
 hand-over as a further child (``workbench:prepare``). A status read is ``query`` /
-``chat.attachment`` with the status it answers. A download is ``disclose`` / ``file.download``
-(``download``) and a preview ``disclose`` / ``file.preview`` (``preview``, with the page), each
+``chat.attachment`` with the status it answers. An attachment its user takes back before sending it is ``delete`` /
+``chat.attachment``, written first, its job cancelled, with the file's delete in workbench (``DELETE /files/upload``,
+workbench 0.8.1) as its child ``delete`` / ``chat.workbench``; then its row goes. A download is ``disclose`` /
+``file.download`` (``download``) and a preview ``disclose`` / ``file.preview`` (``preview``, with the page), each
 written before workbench is asked, with an ``error`` child when workbench cannot serve it. A refusal
 before those records records nothing; the 5xx among them are answered directly, so no failure is
 settled for them either.
@@ -97,6 +99,9 @@ FILE_NOT_FOUND: Final = "File not found."
 FILE_EXPIRED: Final = "The file has expired."
 NOT_FETCHED: Final = "The file could not be fetched from workbench."
 ATTACHMENT_NOT_FOUND: Final = "Attachment not found."
+NOT_REMOVED: Final = "The file could not be removed from workbench."
+ATTACHMENT_SENT: Final = "The file was sent meanwhile."
+ATTACHMENT_SENT_CODE: Final = "attachment_sent"
 STILL_PROCESSING: Final = "The file is still being prepared."
 
 #: workbench's three hardening headers for a file a browser opens (``workbench/api/hardening.py``),
@@ -487,6 +492,104 @@ async def _read_after_wait(
             return found
     await processor.wait(attachment_id, wait)
     return await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
+
+
+@router.delete(
+    "/{chat_id}/attachments/{attachment_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=None,
+    summary="Take back an attachment not yet sent",
+)
+async def remove_attachment(
+    chat_id: str,
+    attachment_id: str,
+    request: Request,
+    user: User,
+    op: Annotated[Operation, Depends(audited("delete", ATTACHMENT))],
+) -> Response:
+    """Take back an attachment its user has not sent: its job is cancelled, its file goes in workbench, then its row.
+
+    The removal is recorded first, with the chat as container; the file's delete in workbench is its child ``delete`` /
+    ``chat.workbench``. The attachment's job is cancelled before workbench is asked, so a prepare in flight never
+    fails on a file gone and records nothing; when workbench could not delete the file, or a record of it failed, the
+    chat's ``processing`` attachments are prepared again (as after a failed chat delete), and the attachment stays.
+    That may resubmit the row of a second take-back of the chat still waiting on workbench: its new job then fails on
+    the file gone, as a job of a deleted file does. A message that sent the attachment meanwhile keeps its row, its
+    file gone.
+
+    Args:
+        chat_id: The chat.
+        attachment_id: The attachment.
+        request: The request.
+        user: Who asks.
+        op: ``delete`` / ``chat.attachment``, recorded first, by the attachment and its status.
+
+    Returns:
+        204; or 404 for another owner's chat, an unknown attachment or one already sent, with nothing recorded; 503
+        without workbench; 502 when workbench could not delete the file, the attachment kept; 409
+        ``attachment_sent`` when a message sent it meanwhile (404 when it went otherwise meanwhile: its chat deleted,
+        or taken back twice at once).
+    """
+    store = _store(request)
+    await run_in_threadpool(owned_chat, store, user.name, chat_id)
+    workbench: WorkbenchClient | None = request.app.state.workbench
+    processor = _processor(request)
+    if workbench is None or processor is None:
+        return _refused(status.HTTP_503_SERVICE_UNAVAILABLE, NOT_AVAILABLE)
+    found = await run_in_threadpool(store.find_pending_attachment, user.name, chat_id, attachment_id)
+    if found is None:
+        return _refused(status.HTTP_404_NOT_FOUND, ATTACHMENT_NOT_FOUND)
+    op.container = chat_id
+    target = Target(kind="attachment", ids=(attachment_id,))
+    await run_in_threadpool(op.record, target=target, criteria={"status": found.status})
+    call = CallFor(user.name, chat_id, forward_headers(op.context))
+    file = Target(kind="file", ids=(found.file_id,))
+    cancelled = processor.cancel(attachment_id)
+    try:
+        deleted = await _delete_upload(workbench, op, call, file, found.path)
+    except BaseException:  # a record of it failed: the attachment stays, so its job runs again
+        if cancelled:
+            await processor.requeue_chat(chat_id)
+        raise
+    if deleted is None:
+        if cancelled:
+            await processor.requeue_chat(chat_id)
+        return _refused(status.HTTP_502_BAD_GATEWAY, NOT_REMOVED)
+    if await run_in_threadpool(store.remove_pending_attachment, user.name, chat_id, attachment_id):
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    if await run_in_threadpool(store.find_attachment, user.name, chat_id, attachment_id) is None:
+        return _refused(status.HTTP_404_NOT_FOUND, ATTACHMENT_NOT_FOUND)
+    return _refused(status.HTTP_409_CONFLICT, ATTACHMENT_SENT, ATTACHMENT_SENT_CODE)
+
+
+async def _delete_upload(
+    workbench: WorkbenchClient, op: Operation, call: CallFor, file: Target, path: str
+) -> int | None:
+    """Have workbench delete an attachment's file, recorded as the take-back's child ``delete`` / ``chat.workbench``.
+
+    Args:
+        workbench: The client.
+        op: The take-back's operation, its primary written.
+        call: The chat.
+        file: The file, by workbench's id.
+        path: Its path in the chat's folder.
+
+    Returns:
+        How many files went: 1, or 0 when workbench held it no more; ``None`` when workbench could not delete it,
+        its ``error`` child written.
+    """
+    try:
+        await workbench.delete_upload(call=call, path=path)
+    except WorkbenchNotFound:
+        deleted = 0
+    except WorkbenchUnavailable as exc:
+        criteria: dict[str, object] = {"reason": exc.token}
+        await run_in_threadpool(op.child, "delete", "chat.workbench", target=file, criteria=criteria, outcome="error")
+        return None
+    else:
+        deleted = 1
+    await run_in_threadpool(op.child, "delete", "chat.workbench", target=file, criteria={"files_deleted": deleted})
+    return deleted
 
 
 @router.get("/{chat_id}/attachments/{attachment_id}", response_model=AttachmentOut, summary="An attachment's status")

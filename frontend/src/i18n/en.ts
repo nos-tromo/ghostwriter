@@ -58,6 +58,8 @@ export const en = {
   'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
   'composer.error_too_many_pending': 'Send the attached files before adding more.',
   'composer.processing': 'Preparing {name}…',
+  'composer.removing': 'Removing {name}…',
+  'composer.error_remove': '{name} could not be removed.',
   'composer.processing_hint': 'Sending waits until the attached files are ready.',
   'composer.unreadable': '{name} could not be read; the model will be told.',
   'composer.images_cap':

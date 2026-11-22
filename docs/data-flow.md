@@ -12,7 +12,7 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 | `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
 | `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at | with the chat |
 | `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 12,000 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
-| `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders), failure (a token), created_at | with the chat; `render` until the file period (7 days), then emptied ([retention.md](retention.md)) |
+| `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders), failure (a token), created_at | with the chat, or until its owner takes it back before sending it; `render` until the file period (7 days), then emptied ([retention.md](retention.md)) |
 | `results` | id, message_id, position, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `file_marks` | chat_id, created_at: when the chat's workbench folder may have got a file (an attachment, a hand-over, a tool call, a step or a result) | with the chat |
 | `retention_periods` | the chat period's state, and the file period the content deadlines were set under | no personal data |
@@ -47,6 +47,7 @@ Logs hold ids, counts, statuses and tokens only.
 | workbench `POST /files/prepare` | the path of a picture, a PDF or an Office file in the chat's folder, and with a fixed image cost `strips=2` for a large picture; the manifest back | the same |
 | workbench `GET /files/view?rendition=` | the number of a page or picture; its render back, for a message's model call or for the owner's preview | the same |
 | Ollama `POST /api/show`, on the router's host | the chat model's name only, once at start; only with `INFERENCE_PROVIDER=ollama` and pictures on | the router's key |
+| workbench `DELETE /files/upload` | the path of an attachment not yet sent, which its owner takes back | the same |
 | workbench `DELETE /files/chat` | the chat's folder, on the owner's delete, the sweep, or an upload into a chat deleted meanwhile | the same; the sweep as the system |
 | obs-plane | the audit chain, references only ([audit.md](audit.md)), kept by obs-plane | the account as actor |
 
@@ -83,7 +84,7 @@ and the model can view them, while the turn sees. The manifest keeps its `unit`
 (`page` or `slide`). workbench 0.8.0 converts the file once and keeps the PDF as
 its own derived file, deleted with the file.
 
-Three things of workbench 0.8.1 matter here (0.8.0 converts and draws the file,
+Four things of workbench 0.8.1 matter here (0.8.0 converts and draws the file,
 but has none of them):
 
 - **Conversions have a gate of their own.** workbench converts one Office file
@@ -104,6 +105,11 @@ but has none of them):
   of that file with the same refusal at once, with no new conversion, until it
   restarts or the file is deleted. A refusal that may pass (a timeout, a busy
   answer) is not remembered. `read_document` still reads the text.
+- **An attachment is taken back before it is sent.** The X on its tile cancels
+  its job and has workbench delete its file and renders (`DELETE
+  /files/upload`), and then its row goes; the model no longer finds it in
+  `list_files`. Next to workbench 0.8.0 the take-back answers 502 (workbench
+  answers 405), and the file stays.
 
 A background prepare cut by a restart is not run again: only a `processing`
 attachment is. Next to workbench 0.7.0 the prepare answers kind `none`, and the

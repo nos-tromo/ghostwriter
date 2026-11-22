@@ -62,6 +62,7 @@ from tests.fakes import (
     NOT_FOUND,
     OUTPUT_ID,
     READ_DOCUMENT_TEXT,
+    TAKE_BACK,
     TINY_JPEG,
     TINY_PNG,
     UPLOAD_ID,
@@ -407,7 +408,8 @@ def test_a_call_asks_for_images_only_when_told_to() -> None:
 
 
 @pytest.mark.parametrize(
-    "operation", ["discover", "call_tool", "upload", "view", "delete_chat", "prepare", "fetch_renditions"]
+    "operation",
+    ["discover", "call_tool", "upload", "view", "delete_chat", "delete_upload", "prepare", "fetch_renditions"],
 )
 async def test_every_request_carries_the_session_purpose_and_request_id(operation: str) -> None:
     """Discovery, tools/call and the file routes each carry the chat, the user, the purpose and the request id."""
@@ -430,6 +432,8 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
         assert (
             _renditions(client, RenditionRequest(PDF, 1), RenditionRequest(PDF, 2)) == [("image/jpeg", TINY_JPEG)] * 2
         )
+    elif operation == "delete_upload":
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
     else:
         await client.delete_chat(call=CALL)
     assert door.requests
@@ -1284,6 +1288,48 @@ async def test_deleting_a_chat_returns_workbenchs_count() -> None:
         await client.delete_chat(call=CALL)
 
 
+async def test_taking_back_an_upload_deletes_it_in_its_chat() -> None:
+    """DELETE /files/upload names the upload by its path; a file workbench does not hold is not found."""
+    door = FakeDoor()
+    door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
+    client = _client(door)
+    await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+    request = door.last("/files/upload", "DELETE")
+    assert request.url.params["path"] == f"{FOLDER}/sales.xlsx" and door.files == {}
+    with pytest.raises(WorkbenchNotFound):
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+
+
+async def test_an_upload_outside_the_chats_folder_is_not_asked_for() -> None:
+    """A path that is not below the chat's folder never reaches workbench."""
+    door = FakeDoor()
+    client = _client(door)
+    for path in ("/workspace/elsewhere/sales.xlsx", f"{FOLDER}/../sales.xlsx", f"{FOLDER}/sales\x01.xlsx"):
+        with pytest.raises(WorkbenchNotFound):
+            await client.delete_upload(call=CALL, path=path)
+    assert door.requests == []
+
+
+@pytest.mark.parametrize(
+    ("answer", "token"),
+    [
+        (httpx.Response(405, json={"detail": "Method Not Allowed"}), "http:405"),
+        (httpx.Response(503, json={"detail": "busy, retry later"}), "http:503"),
+        ({"deleted": 0}, "bad_answer"),
+        (httpx.TimeoutException("synthetic timeout"), "timeout"),
+    ],
+    ids=["a workbench before 0.8.1", "busy", "a bad answer", "a timeout"],
+)
+async def test_an_upload_workbench_could_not_take_back_is_unavailable(answer: object, token: str) -> None:
+    """Anything but a deleted upload or a 404 is unavailable, a workbench without the route among them."""
+    door = FakeDoor()
+    door.answers[TAKE_BACK] = answer
+    client = _client(door)
+    with pytest.raises(WorkbenchUnavailable) as caught:
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+    assert caught.value.token == token and not isinstance(caught.value, WorkbenchNotFound)
+
+
 async def test_without_a_key_nothing_is_sent() -> None:
     """With workbench off, discovery offers nothing, a call fails and the file routes are unavailable."""
     door = FakeDoor()
@@ -1298,6 +1344,8 @@ async def test_without_a_key_nothing_is_sent() -> None:
             pass
     with pytest.raises(WorkbenchUnavailable):
         await client.delete_chat(call=CALL)
+    with pytest.raises(WorkbenchUnavailable):
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
     assert door.requests == []
 
 

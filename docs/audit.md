@@ -36,11 +36,12 @@ images, sent again without them, is two `chat.answer` events.
 | `POST /api/chats/{id}/regenerate` | `modify` `chat.regenerate` | `message` [replaced id] | as messages |
 | `POST /api/chats/{id}/stop` | none | — | — |
 | `POST /api/chats/{id}/attachments` | `collect` `chat.attachment` | `attachment` [id] | `disclose` `chat.attachment` (`workbench:upload`), before the upload; an `error` one if it fails; `delete` `chat.workbench` (reason `chat_gone`) for a chat deleted during the upload; for a picture, a PDF or an Office file, `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`), before the prepare is sent (for an Office file, when its background prepare starts), and an `error` one (`reason`) if it fails |
+| `DELETE /api/chats/{id}/attachments/{attachment_id}` | `delete` `chat.attachment`, an attachment not yet sent, before anything goes | `attachment` [id], criteria `status` | `delete` `chat.workbench` with the file [workbench id] after workbench's delete: `files_deleted` (0 when workbench held it no more), or an `error` one (`reason`) when workbench could not delete it, the attachment kept |
 | `GET /api/chats/{id}/attachments/{attachment_id}` | `query` `chat.attachment`, after its wait | `attachment` [id], criteria `status` | — |
 | `GET /api/chats/{id}/attachments/{attachment_id}/preview` | `disclose` `file.preview` (`preview`), criteria `page` | `file` [id] | `error` child on failure |
 | `GET /api/chats/{id}/files/{file_id}` | `disclose` `file.download` (`download`) | `file` [id] | `error` child on failure |
 | `POST /api/transcribe` | `ai_call` `speech.transcribe` (`inference:asr`) | — | — |
-| start-up, or a chat delete that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails |
+| start-up, a chat delete that failed, or a take-back that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
 | the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
 

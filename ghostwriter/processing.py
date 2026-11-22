@@ -1,5 +1,9 @@
 """The attachment processor: workbench prepares a picture or a PDF before it is ready, an Office file after.
 
+A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and an attachment taken back before it is
+sent cancels its own (:meth:`AttachmentProcessor.cancel`); a cancelled job writes nothing. When either fails after
+the cancel, :meth:`AttachmentProcessor.requeue_chat` prepares the chat's ``processing`` attachments again.
+
 An attachment that needs preparing (:func:`~ghostwriter.upload.needs_prepare`, while pictures are
 offered) is stored ``processing`` and handed to :class:`AttachmentProcessor`: asyncio tasks of the one
 process, at most :data:`PREPARE_SLOTS` of them preparing at once. A job marks the chat's files, records
@@ -191,6 +195,22 @@ class AttachmentProcessor:
             return
         await asyncio.wait({running.task}, timeout=timeout_s)
 
+    def cancel(self, attachment_id: str) -> bool:
+        """Cancel an attachment's job, as its user takes it back. Call it on the event loop's thread only.
+
+        Args:
+            attachment_id: The attachment.
+
+        Returns:
+            Whether a job of it was running and is cancelled now; one cancelled already is not counted again.
+        """
+        running = self._running.get(attachment_id)
+        if running is None or running.scope.cancel_called:
+            return False
+        running.scope.cancel()
+        logger.debug("an attachment's job was cancelled as it was taken back.")
+        return True
+
     def cancel_chat(self, chat_id: str) -> int:
         """Cancel the chat's jobs, as its delete begins. Call it on the event loop's thread only.
 
@@ -223,7 +243,7 @@ class AttachmentProcessor:
         return len(stranded)
 
     async def requeue_chat(self, chat_id: str) -> int:
-        """Prepare again a chat's ``processing`` attachments, once its delete failed after :meth:`cancel_chat`.
+        """Prepare again a chat's ``processing`` attachments, once its delete or a take-back failed after a cancel.
 
         The chat's cancelled jobs are awaited first, so no attachment has two jobs; a job of the chat that
         was not cancelled goes on as it is. Each new job is requeued as at start (``op=None``). On the event

@@ -1060,3 +1060,183 @@ describe('the reasoning switch', () => {
     expect(await screen.findByText('thinking…')).toBeInTheDocument()
   })
 })
+
+describe('Taking an attachment back', () => {
+  const FILE = `${ATTACHMENTS}/a1`
+  const POLL = `${FILE}?wait=20`
+  const removeButton = (name: string) => within(chip(name)).getByRole('button', { name: `Remove ${name}` })
+
+  function picture(id: string, name: string, fields: Partial<AttachmentOut> = {}): AttachmentOut {
+    return { ...attachment(id, name, 2048), mime: 'image/png', kind: 'image', ...fields }
+  }
+
+  it('deletes a file on the server before it is sent, and then takes it out of view', async () => {
+    const { calls } = openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
+      [`DELETE ${FILE}`]: null,
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+
+    await userEvent.setup().click(removeButton('sales.xlsx'))
+    await waitFor(() => expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument())
+    expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(1)
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+  })
+
+  it('keeps a file whose taking back failed, says so, and takes it back on a second try', async () => {
+    let tries = 0
+    const { calls } = openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
+      [`DELETE ${FILE}`]: () =>
+        ++tries === 1
+          ? json({ detail: 'The file could not be removed from workbench.' }, 502)
+          : new Response(null, { status: 204 }),
+    })
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+
+    await user.click(removeButton('sales.xlsx'))
+    expect(await screen.findByText('sales.xlsx could not be removed.')).toBeInTheDocument()
+    expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+
+    await user.click(removeButton('sales.xlsx'))
+    await waitFor(() => expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument())
+    expect(screen.queryByText('sales.xlsx could not be removed.')).not.toBeInTheDocument()
+    expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(2)
+  })
+
+  it('holds sending while a file is being taken back', async () => {
+    let release!: () => void
+    const held = new Promise<void>((done) => (release = done))
+    openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
+      [`DELETE ${FILE}`]: async () => {
+        await held
+        return new Response(null, { status: 204 })
+      },
+    })
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.type(textbox(), 'Summe')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+
+    await user.click(removeButton('sales.xlsx'))
+    expect(await within(chip('sales.xlsx')).findByLabelText('Removing sales.xlsx…')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(within(chip('sales.xlsx')).queryByRole('button', { name: 'Remove sales.xlsx' })).not.toBeInTheDocument()
+
+    release()
+    await waitFor(() => expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument())
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+  })
+
+  it('takes back a picture the chat lists as being prepared, and follows it no further', async () => {
+    let answerPoll!: () => void
+    const polled = new Promise<void>((done) => (answerPoll = done))
+    let listed: AttachmentOut[] = [picture('a1', 'harbour-photo.png', { status: 'processing' })]
+    const { calls } = openChat(
+      {
+        'GET /ghostwriter/api/chats/c1': () => json({ ...detail([]), pending_attachments: listed }),
+        [`GET ${POLL}`]: async () => {
+          await polled
+          return json({ detail: 'Attachment not found.' }, 404)
+        },
+        [`DELETE ${FILE}`]: () => {
+          listed = []
+          return new Response(null, { status: 204 })
+        },
+      },
+      VISION_CONFIG,
+    )
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    await userEvent.setup().click(removeButton('harbour-photo.png'))
+    await waitFor(() => expect(within(composer()).queryByText('harbour-photo.png')).not.toBeInTheDocument())
+
+    // The follow's answer, a 404 now, brings back no error tile.
+    answerPoll()
+    await new Promise((done) => setTimeout(done, 50))
+    expect(within(composer()).queryByText('harbour-photo.png')).not.toBeInTheDocument()
+    expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(1)
+  })
+
+  it('treats a file the server holds no more as taken back, and keeps the focus in the composer', async () => {
+    openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(attachment('a1', 'sales.xlsx'), 201),
+      [`DELETE ${FILE}`]: () => json({ detail: 'Attachment not found.' }, 404),
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+    await userEvent.setup().click(removeButton('sales.xlsx'))
+    await waitFor(() => expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument())
+    expect(textbox()).toHaveFocus()
+    expect(screen.queryByText('sales.xlsx could not be removed.')).not.toBeInTheDocument()
+  })
+
+  it('never uploads a queued file taken back before its turn', async () => {
+    let store!: () => void
+    const stored = new Promise<void>((done) => (store = done))
+    const { calls } = openChat({
+      [`POST ${ATTACHMENTS}`]: async (call: Call) => {
+        await stored
+        return json(attachment('a1', uploaded(call)), 201)
+      },
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx'), file('wrong.xlsx')])
+    await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(1))
+    await userEvent.setup().click(removeButton('wrong.xlsx'))
+    expect(within(composer()).queryByText('wrong.xlsx')).not.toBeInTheDocument()
+    store()
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done'))
+    expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['sales.xlsx'])
+  })
+
+  it('brings back a file taken back while uploading when the server could not delete it', async () => {
+    let store!: () => void
+    const stored = new Promise<void>((done) => (store = done))
+    openChat({
+      [`POST ${ATTACHMENTS}`]: async () => {
+        await stored
+        return json(attachment('a1', 'sales.xlsx'), 201)
+      },
+      [`DELETE ${FILE}`]: () => json({ detail: 'The file could not be removed from workbench.' }, 502),
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'uploading'))
+    await userEvent.setup().click(removeButton('sales.xlsx'))
+    expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument()
+    store()
+    expect(await screen.findByText('sales.xlsx could not be removed.')).toBeInTheDocument()
+    expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'done')
+  })
+
+  it('takes back a file still uploading: it goes at once, and on the server as soon as it is stored', async () => {
+    let store!: () => void
+    const stored = new Promise<void>((done) => (store = done))
+    const { calls } = openChat({
+      [`POST ${ATTACHMENTS}`]: async () => {
+        await stored
+        return json(attachment('a1', 'sales.xlsx'), 201)
+      },
+      [`DELETE ${FILE}`]: null,
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('sales.xlsx')])
+    await waitFor(() => expect(chip('sales.xlsx')).toHaveAttribute('data-status', 'uploading'))
+
+    await userEvent.setup().click(removeButton('sales.xlsx'))
+    expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument()
+    store()
+    await waitFor(() => expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(1))
+    expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument()
+  })
+})

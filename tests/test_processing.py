@@ -216,6 +216,21 @@ async def test_a_cancelled_job_settles_nothing(env: Env, audit_stream: CapturedA
     assert env.processor.cancel_chat(env.chat_id) == 0
 
 
+async def test_one_attachments_job_is_cancelled_alone(env: Env) -> None:
+    """Taking an attachment back cancels its job only; a second cancel, or one of no job, changes nothing."""
+    env.door.delays["/files/prepare"] = 2.0
+    job = _job(env)
+    env.processor.submit(job)
+    with anyio.fail_after(5):
+        while not _prepares(env.door):
+            await anyio.sleep(0.01)
+    assert not env.processor.cancel("0" * 32)
+    assert env.processor.cancel(job.attachment_id)
+    assert not env.processor.cancel(job.attachment_id)
+    await env.processor.wait(job.attachment_id, 5)
+    assert not env.processor.running(job.attachment_id)
+
+
 async def test_a_manifest_this_client_cannot_read_fails_a_picture_and_leaves_a_document_ready(
     env: Env, audit_stream: CapturedAuditStream
 ) -> None:
