@@ -153,12 +153,18 @@ With Nextext not set, or against a workbench before 0.9.0, a clip is refused 415
 type not taken, and Ghostwriter behaves as 0.5.0 did.
 
 **The offer.** Clips (`.mp4 .mov .m4v .webm .mkv .mp3 .m4a .wav .ogg .opus .flac`) are offered only while
-all three hold: `NEXTEXT_API_KEY` and `NEXTEXT_API_BASE` are set; a background probe of Nextext's `/health`
+all three hold: `NEXTEXT_API_KEY` and `NEXTEXT_API_BASE` are set; a background probe of Nextext's `/ready`
 (HTTP 200 only; start-up never waits for it, and after a failure it asks again after 5 s, doubling to 300 s,
 or at once when a clip's job finds Nextext down; after Nextext refused the key, it also lists the jobs with the
-key, and only a 200 counts) says it is up; and workbench's discovery names 0.9.0 or
-later. `GET /api/config` then lists them as `media_types`, with `media: true`. The probe sees that Nextext
-is up, not that its Whisper is: a clip then fails at Nextext within seconds, `nextext_failed`. Clips need no
+key, and only a 200 counts) says it can transcribe; and workbench's discovery names 0.9.0 or
+later. `GET /api/config` then lists them as `media_types`, with `media: true`. Nextext 1.22 answers `/ready`
+`200` only when it has just transcribed a moment of silence through its Whisper path (it keeps the answer
+for 30 s, and gives the probe 10 s, so Ghostwriter waits 15 s) and `503` otherwise, so while its Whisper is down no
+clip is offered; `/health` stays `200` then, and says only that Nextext is up. A `404` is a Nextext before 1.22,
+without the route: `/health` is asked instead, and then the probe sees that Nextext is up, not that its Whisper
+is, so a clip fails at Nextext within seconds. `/ready` is asked first on every probe, so an upgraded Nextext is
+picked up without a restart. A clip whose job fails `inference_unavailable` (Nextext 1.22 and later: its
+Whisper or its chat model did not answer) turns clips off at once, until the probe passes again. Clips need no
 vision: the transcript is text. The frames reach the model only through `view_file`, so only while it sees.
 The SPA reads `/api/config` once; a clip the server refuses 415 reads it again, so the picker drops the clip
 types. Nextext coming up after the page loaded needs a reload.
@@ -202,13 +208,16 @@ meanwhile is ready within its usual prepare:
    fails the clip with that token; one that timed out (`read_timeout`), with `timeout`.
 
 A clip that cannot go through is `failed` with a token, and an `error` child under the hand-over whose step
-failed ([audit.md](audit.md)): `nextext_unavailable` (Nextext does not answer, times out, fails with a 5xx or
-refuses the key; the probe is told, so clips are not offered until it answers again, and after a refused key,
-which logs one error naming `NEXTEXT_API_KEY`, until a list of the probe's with the key answers 200),
-`nextext_failed` (the job failed, was cancelled or interrupted, is gone, or served nothing), `undecodable_media` (Nextext cannot decode the clip),
+failed ([audit.md](audit.md)): `nextext_unavailable` (Nextext does not answer, times out, fails with a 5xx,
+refuses the key, or its job failed `inference_unavailable`; the probe is told, so clips are not offered until it
+passes again, and after a refused key, which logs one error naming `NEXTEXT_API_KEY`, until a list of the probe's
+with the key answers 200),
+`nextext_failed` (the job failed for any other cause, was cancelled or interrupted, is gone, or served nothing),
+`undecodable_media` (Nextext cannot decode the clip),
 `timeout` (the budget was spent), or workbench's own token. Unlike a document, a clip is never `ready` without
-its round trip: it has nothing to read. A video with no sound track at all fails at Nextext 1.21 as
-`undecodable_media`, so it gets no frames either; that is Nextext's limit.
+its round trip: it has nothing to read. A video with no sound track at all fails `undecodable_media` only at a
+Nextext before 1.22, and then gets no frames either; from 1.22 Nextext skips it (`no_audio_stream`) and returns its
+frames, so the clip is `ready` with no transcript.
 
 **Orphaned jobs.** A job no clip owns is deleted by a reconcile, which lists Ghostwriter's jobs at Nextext and
 records a count before it deletes any: at start, once Nextext passes its probe (every job listed, since no clip

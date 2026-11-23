@@ -4,7 +4,7 @@ The emitter is `ghostwriter` / `backend`: one hash-chained chain per process,
 written to the container's stdout (`AUDIT_OUTPUT=container`), which obs-plane
 collects. Start-up writes `admin` / `config.audit` with the operating mode. Its
 `media` criterion says that video and audio are configured (Nextext's base and
-key are set), not that they are offered: that also needs Nextext's health probe
+key are set), not that they are offered: that also needs Nextext's readiness probe
 to pass and workbench 0.9.0 or later.
 
 - **References only.** Ids, counts, MIME types and sizes; never a title, a
