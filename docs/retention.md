@@ -84,7 +84,7 @@ its own restart drops them too.
 A job no clip owns is deleted by a reconcile, recorded first (`docs/audit.md`):
 
 - A crash or restart while a clip was at Nextext leaves its job until the next
-  start. Once Nextext passes its health probe (within 120 s), the start
+  start. Once Nextext passes its readiness probe (within 120 s), the start
   reconcile deletes every job Nextext lists for Ghostwriter, before any clip
   makes one; the clip left `processing` then goes to Nextext again, for a new
   job.

@@ -603,22 +603,96 @@ async def test_delete_without_a_key_is_false_and_sends_nothing() -> None:
 # --- health ------------------------------------------------------------------
 
 
-async def test_health_is_200_only() -> None:
-    """Only a 200 is healthy; a refusal and a transport failure are not, and the key is never sent."""
+def _routes(fake: FakeNextext) -> list[str]:
+    return [r.url.path.removeprefix("/api/v1") for r in fake.requests]
+
+
+async def test_ready_is_200_only() -> None:
+    """Only a 200 of /ready is healthy; any other answer and a transport failure are not, and the key is never sent."""
     fake = FakeNextext()
+    client = _client(fake)
+    assert await client.healthy() is True
+    fake.ready = 503
+    assert await client.healthy() is False
+    fake.ready = 204
+    assert await client.healthy() is False
+    fake.ready = 500
+    assert await client.healthy() is False
+    fake.ready = 200
+    fake.raises = httpx.ConnectError("refused")
+    assert await client.healthy() is False
+    fake.raises = httpx.ReadTimeout("slow")
+    assert await client.healthy() is False
+    assert [(r.method, r.url.path) for r in fake.requests] == [("GET", "/api/v1/ready")] * 6
+    assert not [r for r in fake.requests if "authorization" in r.headers or "x-audit-purpose" in r.headers]
+    assert all(r.headers["accept-encoding"] == "identity" for r in fake.requests)
+
+
+async def test_a_ready_nextext_is_not_asked_its_health() -> None:
+    """/ready answers 200: Nextext can transcribe, and /health is not asked."""
+    fake = FakeNextext()
+    fake.ready = 200
+    assert await _client(fake).healthy() is True
+    assert _routes(fake) == ["/ready"]
+
+
+async def test_a_nextext_that_is_not_ready_is_not_healthy_though_it_is_alive() -> None:
+    """/ready answers 503 while /health answers 200 (Whisper down): not healthy, and /health is not asked."""
+    fake = FakeNextext()
+    fake.health, fake.ready = 200, 503
+    assert await _client(fake).healthy() is False
+    assert _routes(fake) == ["/ready"]
+
+
+async def test_a_nextext_without_the_ready_route_is_asked_its_health() -> None:
+    """A 404 of /ready is a Nextext before 1.22: /health decides, as before; /ready is asked first every time."""
+    fake = FakeNextext()
+    fake.ready = 404
     client = _client(fake)
     assert await client.healthy() is True
     fake.health = 503
     assert await client.healthy() is False
     fake.health = 204
     assert await client.healthy() is False
-    fake.health = 200
+    assert _routes(fake) == ["/ready", "/health"] * 3
+
+
+async def test_an_upgraded_nextext_is_picked_up_without_a_restart() -> None:
+    """No fallback is remembered: once /ready exists, it decides, even over a /health that says up."""
+    fake = FakeNextext()
+    fake.ready = 404
+    client = _client(fake)
+    assert await client.healthy() is True
+    fake.ready = 503
+    assert await client.healthy() is False
+    assert _routes(fake) == ["/ready", "/health", "/ready"]
+
+
+async def test_a_failure_to_answer_ready_is_not_healthy_and_asks_no_health() -> None:
+    """A transport error on /ready is False, never an exception; /health is only for a 404."""
+    fake = FakeNextext()
     fake.raises = httpx.ConnectError("refused")
-    assert await client.healthy() is False
-    fake.raises = httpx.ReadTimeout("slow")
-    assert await client.healthy() is False
-    assert [(r.method, r.url.path) for r in fake.requests] == [("GET", "/api/v1/health")] * 5
-    assert not [r for r in fake.requests if "authorization" in r.headers or "x-audit-purpose" in r.headers]
+    assert await _client(fake).healthy() is False
+    assert _routes(fake) == ["/ready"]
+
+
+async def test_the_probes_have_their_own_deadlines(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/ready waits READY_S (above Nextext's own 60 s probe timeout), /health HEALTH_S."""
+    assert (nextext.READY_S, nextext.HEALTH_S) == (75.0, 5.0)
+    assert nextext.READY_S > 60.0
+    fake = FakeNextext()
+    fake.ready = 404
+    client = _client(fake)
+    deadlines: list[float] = []
+    real = client._http
+
+    def http(read_s: float) -> httpx.AsyncClient:
+        deadlines.append(read_s)
+        return real(read_s)
+
+    monkeypatch.setattr(client, "_http", http)
+    assert await client.healthy() is True
+    assert deadlines == [75.0, 5.0]
 
 
 async def test_authorized_is_a_keyed_list_that_answers_200() -> None:
@@ -699,7 +773,7 @@ async def test_the_probe_marks_nextext_healthy_on_200(running: list[asyncio.Task
     await _checked(health)
     assert health.healthy is True
     await asyncio.sleep(0.05)
-    assert [(r.method, r.url.path) for r in fake.requests] == [("GET", "/api/v1/health")]
+    assert [(r.method, r.url.path) for r in fake.requests] == [("GET", "/api/v1/ready")]
 
 
 async def test_a_probe_that_is_refused_is_not_healthy(running: list[asyncio.Task[None]]) -> None:
@@ -736,7 +810,7 @@ async def test_a_failed_probe_tries_again_with_backoff(
     assert waits == [5, 10, 20, 40, 80, 160, 300, 300, 300]
     assert (PROBE_FIRST_S, PROBE_MAX_S) == (5.0, 300.0)
     assert health.healthy is False
-    assert len([r for r in fake.requests if r.url.path.endswith("/health")]) == 9
+    assert len([r for r in fake.requests if r.url.path.endswith("/ready")]) == 9
 
 
 async def test_a_healthy_probe_starts_the_backoff_over(
@@ -790,7 +864,7 @@ async def test_a_failure_wakes_the_probe(running: list[asyncio.Task[None]]) -> N
     assert health.healthy is False
     await _checked(health)
     assert health.healthy is False
-    assert len([r for r in fake.requests if r.url.path.endswith("/health")]) == 2
+    assert len([r for r in fake.requests if r.url.path.endswith("/ready")]) == 2
 
 
 async def test_a_failure_while_nextext_still_answers_is_probed_and_offered_again(
@@ -811,14 +885,14 @@ async def test_a_failure_while_nextext_still_answers_is_probed_and_offered_again
 async def test_after_a_refused_key_only_a_keyed_list_makes_nextext_healthy(
     monkeypatch: pytest.MonkeyPatch, running: list[asyncio.Task[None]], loguru_caplog: pytest.LogCaptureFixture
 ) -> None:
-    """/health still answers 200, so after a refused key the probe also lists the jobs with it; one error in all."""
+    """/ready still answers 200, so after a refused key the probe also lists the jobs with it; one error in all."""
     monkeypatch.setattr(nextext, "PROBE_FIRST_S", 0.02)
     fake = FakeNextext(key="another-service-token-0123456789abcdef")
     health = NextextHealth(_client(fake))
     _start(health, running)
     await _checked(health)
     assert (health.healthy, health.key_refused) == (True, False)
-    assert [r.url.path for r in fake.requests] == ["/api/v1/health"]
+    assert [r.url.path for r in fake.requests] == ["/api/v1/ready"]
     health.checked.clear()
     health.refused("http:401")
     health.refused("http:401")
@@ -838,7 +912,7 @@ async def test_after_a_refused_key_only_a_keyed_list_makes_nextext_healthy(
     health.checked.clear()
     health.failed()
     await _checked(health)
-    assert fake.requests[-1].url.path == "/api/v1/health" and health.healthy is True
+    assert fake.requests[-1].url.path == "/api/v1/ready" and health.healthy is True
 
 
 async def test_wait_healthy_returns_at_once_when_healthy_and_waits_for_the_probe_otherwise(

@@ -45,18 +45,19 @@ or recorded. Else it records its hand-over,
 ``disclose`` / ``chat.attachment`` (:data:`NEXTEXT_RECIPIENT`, its kind and size), then streams the clip from
 workbench's view into Nextext's create chunk by chunk, as ``media.<ext>``, and polls the job through Nextext's list
 within ``nextext_timeout_s`` (upload, queue, run and downloads), riding out :data:`POLL_TOLERATED` failed polls in a
-row. A completed job, also one skipped for no speech,
-records the hand-over to workbench (:data:`PREPARE_RECIPIENT`, a child of the same operation) and streams its
-transcript and its frames into workbench as derived files of the clip; an artifact Nextext did not make is left out,
+row. A completed job, also one skipped for no speech or for no sound track (``no_audio_stream``, Nextext 1.22 and
+later), records the hand-over to workbench (:data:`PREPARE_RECIPIENT`, a child of the same operation) and streams
+its transcript and its frames into workbench as derived files of the clip; an artifact Nextext did not make is left out,
 and so is one past its cap. A completed job that was not skipped and served neither is polled once more and fails
 the clip ``nextext_failed``, gone or not: a clip with speech always has a transcript. In a shielded ``finally`` the
 job is deleted at Nextext, also when the clip was cancelled,
 and that delete is recorded, ``delete`` / ``chat.nextext`` (the job's id, ``deleted``): it is the one record a cancelled
 job still writes. Then the clip is prepared on a prepare slot as any file, and is ``ready`` with its manifest. A clip
 that cannot go through is ``failed``, with an ``error`` child and one of the tokens ``nextext_unavailable`` (Nextext
-does not answer, fails with a ``5xx``, or refuses the key; the probe is told, so clips are not offered until it
-answers its probe again, and after a refused key, which logs one error naming ``NEXTEXT_API_KEY``, until a keyed
-list of the probe's passes), ``nextext_failed``, ``undecodable_media``, ``timeout`` or workbench's own token, its
+does not answer, fails with a ``5xx``, refuses the key, or its job failed ``inference_unavailable``, as Nextext 1.22
+names a job that could not reach its inference; the probe is told, so clips are not offered until it passes its
+probe again, and after a refused key, which logs one error naming ``NEXTEXT_API_KEY``, until a keyed list of the
+probe's passes), ``nextext_failed``, ``undecodable_media``, ``timeout`` or workbench's own token, its
 ``error`` child under the hand-over whose step failed (a budget spent while an artifact goes into workbench is
 workbench's). While a job runs its id is :meth:`AttachmentProcessor.owned_jobs`', which no reconcile deletes.
 
@@ -318,12 +319,15 @@ def _ended_as(job: NextextJob) -> str | None:
 
     Returns:
         ``None`` when it completed, also when it was skipped; ``undecodable_media`` when it failed on a clip Nextext
-        cannot decode; else ``nextext_failed``, a job that is gone included.
+        cannot decode; ``nextext_unavailable`` when it failed because Nextext could not reach its inference
+        (``inference_unavailable``, Nextext 1.22 and later); else ``nextext_failed``, a job that is gone included.
     """
     if job.status == "completed":
         return None
     if job.status == "failed" and job.error_code == "undecodable_media":
         return "undecodable_media"
+    if job.status == "failed" and job.error_code == "inference_unavailable":
+        return "nextext_unavailable"
     return "nextext_failed"
 
 
@@ -950,6 +954,8 @@ class AttachmentProcessor:
                 ended.error_code or "no code",
                 token,
             )
+            if token == "nextext_unavailable" and self._health is not None:
+                self._health.failed()
             return _Failure(token, NEXTEXT_RECIPIENT)
         if ended.skipped:
             logger.info(

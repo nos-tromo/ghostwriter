@@ -10,6 +10,7 @@ requests start over then (``tests/test_reconcile.py`` covers the reconcile). Eve
 import logging
 from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass, field
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -27,7 +28,7 @@ from ghostwriter.audit import Operation, RequestContext, open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment
-from ghostwriter.nextext import ARTIFACT_CAPS, JOB_OPTIONS, JSONL, KEYFRAMES, NextextClient, NextextHealth
+from ghostwriter.nextext import ARTIFACT_CAPS, JOB_OPTIONS, JSONL, KEYFRAMES, NextextClient, NextextHealth, NextextJob
 from ghostwriter.processing import (
     ATTACHMENT,
     MEDIA_SLOTS,
@@ -404,6 +405,7 @@ async def test_audio_has_no_keyframes(env: Env) -> None:
     [
         ({"statuses": ["running", "failed"], "error_code": "undecodable_media"}, "undecodable_media", True),
         ({"statuses": ["failed"], "error_code": "internal"}, "nextext_failed", True),
+        ({"statuses": ["failed"], "error_code": "inference_unavailable"}, "nextext_unavailable", True),
         ({"statuses": ["interrupted"]}, "nextext_failed", True),
         ({"statuses": ["cancelled"]}, "nextext_failed", True),
         ({"create_status": 503}, "nextext_unavailable", False),
@@ -415,6 +417,7 @@ async def test_audio_has_no_keyframes(env: Env) -> None:
     ids=[
         "undecodable",
         "internal",
+        "inference-unavailable",
         "interrupted",
         "cancelled",
         "create-503",
@@ -442,6 +445,87 @@ async def test_nextext_failures_settle_the_clip_failed(
     assert _prepares(env.door) == [] and env.door.derived == []
     assert env.health.healthy is (token != "nextext_unavailable")
     assert env.processor.owned_jobs() == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("job", "token"),
+    [
+        (("failed", "inference_unavailable"), "nextext_unavailable"),
+        (("failed", "undecodable_media"), "undecodable_media"),
+        (("failed", "internal"), "nextext_failed"),
+        (("failed", "timeout"), "nextext_failed"),
+        (("failed", None), "nextext_failed"),
+        (("interrupted", "inference_unavailable"), "nextext_failed"),
+        (("gone", None), "nextext_failed"),
+        (("completed", None), None),
+    ],
+)
+def test_a_job_ends_as_its_status_and_code_say(job: tuple[str, str | None], token: str | None) -> None:
+    """Only a failed job names its cause: inference not reached, or a clip not decodable; any other end is a failure."""
+    status, code = job
+    ended = NextextJob(JOB_ID, status, code, False, None, datetime(2026, 11, 22, tzinfo=UTC))
+    assert processing._ended_as(ended) == token
+
+
+def _spy_on_failed(env: Env, monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Count the calls to the probe's ``failed``, which still runs; return the list each call appends to."""
+    calls: list[str] = []
+    real = env.health.failed
+
+    def failed() -> None:
+        calls.append("failed")
+        real()
+
+    monkeypatch.setattr(env.health, "failed", failed)
+    return calls
+
+
+async def test_a_job_that_failed_on_inference_turns_clips_off_until_the_probe_passes(
+    env: Env, audit_stream: CapturedAuditStream, log_lines: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nextext's job failed inference_unavailable: the clip is nextext_unavailable, and the probe is told at once."""
+    env.fake.statuses, env.fake.error_code = ["running", "failed"], "inference_unavailable"
+    probed = _spy_on_failed(env, monkeypatch)
+    job = _clip(env)
+    before = len(events(audit_stream))
+    await _run(env.processor, job)
+    assert _status(env, job) == ("failed", "nextext_unavailable")
+    assert probed == ["failed"] and env.health.healthy is False
+    [failed] = [row for row in _rows(audit_stream, before) if row[4] == "error"]
+    assert failed == ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"reason": "nextext_unavailable"}, "error")
+    assert env.fake.deleted == [JOB_ID]
+    assert any(
+        "ended failed (inference_unavailable): nextext_unavailable" in line and job.attachment_id in line
+        for line in log_lines
+    )
+    assert not [line for line in log_lines if FAILURE_TEXT in line or NEXTEXT_KEY in line]
+
+
+async def test_a_failed_job_of_another_cause_leaves_the_probe_alone(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
+    """A job that failed internal or undecodable_media says nothing of Nextext's inference: the probe is not told."""
+    probed = _spy_on_failed(env, monkeypatch)
+    for code in ("internal", "undecodable_media"):
+        env.fake.statuses, env.fake.error_code = ["failed"], code
+        await _run(env.processor, _clip(env))
+    assert probed == [] and env.health.healthy is True
+
+
+async def test_a_video_without_a_sound_track_is_ready_with_its_frames(
+    env: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """Nextext 1.22 skips it (no_audio_stream) with keyframes.zip alone: the zip goes to workbench, it is ready."""
+    env.fake.skipped, env.fake.skip_reason_code = True, "no_audio_stream"
+    env.fake.artifacts[JSONL] = 404
+    job = _clip(env)
+    await _run(env.processor, job)
+    assert _status(env, job) == ("ready", None)
+    assert env.door.derived == [(job.path, "nextext_zip", env.fake.artifacts[KEYFRAMES])]
+    found = env.store.find_attachment("user-a", env.chat_id, job.attachment_id)
+    assert found is not None and found.manifest is not None
+    assert (found.manifest["transcript"], found.manifest["total"]) == (False, 3)
+    assert env.fake.events == ["create", "list", f"delete:{JOB_ID}"] and env.fake.deleted == [JOB_ID]
+    assert env.health.healthy is True
+    assert [e for e in events(audit_stream) if e["outcome"] == "error"] == []
 
 
 async def test_a_vanished_job_fails_at_the_next_poll(env: Env, audit_stream: CapturedAuditStream) -> None:

@@ -1,6 +1,6 @@
 [project]
 name = "ghostwriter"
-version = "0.6.0"
+version = "0.6.1"
 description = "Ghostwriter: the federation's chat assistant. Talk to it, or attach a document and download the result in the chat."
 authors = [
   { name = "nos-tromo" }

@@ -15,8 +15,9 @@ artifacts, the transcript (:data:`JSONL`) and the frames (:data:`KEYFRAMES`), st
 its artifacts are taken (:meth:`NextextClient.delete`), which never raises.
 
 Clips are offered only while Nextext is up and workbench takes them (:class:`NextextHealth`): a background probe of
-``GET /health`` that start-up never waits for, and after Nextext refused the key also a keyed ``GET /jobs``
-(:meth:`NextextClient.authorized`), and the version workbench names itself (:func:`serves_media`).
+``GET /ready`` (``GET /health`` for a Nextext before 1.22, which has no such route) that start-up never waits for,
+and after Nextext refused the key also a keyed ``GET /jobs`` (:meth:`NextextClient.authorized`), and the version
+workbench names itself (:func:`serves_media`).
 
 The log holds statuses, counts and tokens, never a file name, a transcript line, Nextext's error text or the key.
 """
@@ -65,8 +66,12 @@ CREATE_READ_S: Final = 120.0
 CALL_S: Final = 10.0
 #: How long one read of an artifact may wait, in seconds.
 ARTIFACT_READ_S: Final = 60.0
-#: The deadline of the health probe, in seconds.
+#: The deadline of the liveness probe (``/health``), in seconds.
 HEALTH_S: Final = 5.0
+#: The deadline of the readiness probe (``/ready``), in seconds: above the 60 s Nextext gives its own transcription of
+#: a moment of silence, so a Whisper that is slow but working is not read as down. A Whisper on a CPU pads every input
+#: to 30 s, so one probe takes 10 to 20 s there, and it ends sooner on a GPU.
+READY_S: Final = 75.0
 #: The most bytes the job list may have.
 LIST_MAX_BYTES: Final = 1024 * 1024
 #: The first workbench that takes a clip, as ``(major, minor)``: 0.9.
@@ -344,7 +349,7 @@ class NextextClient:
         )
 
     def _headers(self, headers: Mapping[str, str]) -> dict[str, str]:
-        """Return the headers every call but the health probe carries.
+        """Return the headers every call but the readiness probe carries.
 
         Args:
             headers: The operation's headers; only its purpose and request id are sent on.
@@ -545,22 +550,43 @@ class NextextClient:
         return True
 
     async def healthy(self) -> bool:
-        """Ask ``GET /health``, without the key. It never raises, a cancellation apart.
+        """Ask ``GET /ready``, without the key: whether Nextext can transcribe. It never raises, a cancellation apart.
+
+        Nextext 1.22 answers ``200`` only when it transcribed a moment of silence through its Whisper path just now
+        (or within the last 30 s) and ``503`` otherwise. ``/health`` stays ``200`` while the Whisper is down, so it
+        says Nextext is up, not that a clip will transcribe. A ``404`` is a Nextext before 1.22, without the route:
+        ``GET /health`` is asked instead, as before. ``/ready`` is asked first on every probe, so an upgraded
+        Nextext is picked up without a restart.
 
         Returns:
-            ``True`` only for ``200``: Nextext answers it while its Whisper is down, so it says Nextext is up, not
-            that a clip will transcribe.
+            ``True`` only for ``200`` of ``/ready``, or, for a Nextext that has no such route, of ``/health``;
+            ``False`` for any other status and for a failure, logged by its token at debug level.
+        """
+        status = await self._probe("/ready", READY_S)
+        if status == 404:
+            status = await self._probe("/health", HEALTH_S)
+        return status == 200
+
+    async def _probe(self, route: str, deadline_s: float) -> int | None:
+        """Ask one unkeyed route of Nextext's readiness, and say how it answered; never raises, a cancel apart.
+
+        Args:
+            route: ``/ready`` or ``/health``, relative to the base.
+            deadline_s: The whole call's deadline, in seconds.
+
+        Returns:
+            The status, logged by its token when it is not ``200``; ``None`` for a failure to answer, logged by its
+            exception's name.
         """
         try:
-            async with self._http(HEALTH_S) as client:
-                response = await client.get("/health", headers={"Accept-Encoding": "identity"})
+            async with self._http(deadline_s) as client:
+                response = await client.get(route, headers={"Accept-Encoding": "identity"})
         except Exception as exc:
-            logger.debug("nextext health: {}", type(exc).__name__)
-            return False
+            logger.debug("nextext probe {}: {}", route, type(exc).__name__)
+            return None
         if response.status_code != 200:
-            logger.debug("nextext health: http:{}", response.status_code)
-            return False
-        return True
+            logger.debug("nextext probe {}: http:{}", route, response.status_code)
+        return response.status_code
 
 
 def serves_media(version: str) -> bool:
@@ -583,7 +609,7 @@ class NextextHealth:
     :meth:`run` asks :meth:`NextextClient.healthy` once, then waits until a clip's job reports Nextext failing
     (:meth:`failed`) and asks again; while Nextext does not answer ``200`` it asks again after
     :data:`PROBE_FIRST_S`, doubling to :data:`PROBE_MAX_S`. Start-up never waits for it: until the first probe
-    has answered, Nextext is not healthy and no clip is offered. ``/health`` answers without the key, so once a call
+    has answered, Nextext is not healthy and no clip is offered. ``/ready`` answers without the key, so once a call
     finds the key refused (:meth:`refused`) a probe also asks :meth:`NextextClient.authorized`, and Nextext is healthy
     again only when that passes.
 
@@ -635,9 +661,9 @@ class NextextHealth:
             if up != known:
                 known = up
                 if up:
-                    logger.info("Nextext answers its health probe; video and audio are offered with workbench 0.9.")
+                    logger.info("Nextext passes its readiness probe; video and audio are offered with workbench 0.9.")
                 elif not self.key_refused:
-                    logger.warning("Nextext does not answer its health probe; video and audio are not offered.")
+                    logger.warning("Nextext does not pass its readiness probe; video and audio are not offered.")
             if up:
                 delay = PROBE_FIRST_S
                 await self._failed.wait()

@@ -1242,10 +1242,10 @@ async def parse_job_upload(upload: NextextUpload) -> JobUpload:
 
 
 class FakeNextext:
-    """Nextext 1.21's ``/api/v1`` as Ghostwriter's service token reaches it, for ``httpx.MockTransport``.
+    """Nextext 1.22's ``/api/v1`` as Ghostwriter's service token reaches it, for ``httpx.MockTransport``.
 
-    It refuses a wrong key (401, ``/health`` apart), a list without ``X-Audit-Purpose`` (428, as Nextext's
-    default does) and any other route (404). A create answers ``201 {job_id, status, created_at}``; each job
+    It refuses a wrong key (401, ``/health`` and ``/ready`` apart), a list without ``X-Audit-Purpose`` (428, as
+    Nextext's default does) and any other route (404). A create answers ``201 {job_id, status, created_at}``; each job
     then answers every ``GET /jobs`` with the next of :attr:`statuses`, the last repeated, until it is deleted or
     has left the list after :attr:`vanish_after` polls. A list item has the keys Nextext 1.21 serves, and the list
     holds no job of another caller but those in :attr:`listed`. An artifact answers ``200`` with the
@@ -1266,6 +1266,9 @@ class FakeNextext:
         list_status: The status ``GET /jobs`` answers.
         delete_status: A status every ``DELETE`` answers with, instead of ``204`` or ``404``.
         health: The status ``GET /health`` answers.
+        ready: The status ``GET /ready`` answers; ``None`` follows :attr:`health`, as a Nextext whose liveness fails
+            cannot transcribe: ``200`` while it answers ``200``, else ``503``; ``404`` is a Nextext before 1.22,
+            without the route.
         vanish_after: The polls a job is listed for before it leaves the list (Nextext restarted); ``None`` never.
         listed: Other jobs, as list items.
         raises: An exception to raise on every request, as a connection that fails does.
@@ -1300,6 +1303,7 @@ class FakeNextext:
         self.list_status = 200
         self.delete_status: int | None = None
         self.health = 200
+        self.ready: int | None = None
         self.vanish_after: int | None = None
         self.listed: list[Any] = []
         self.raises: Exception | None = None
@@ -1372,6 +1376,8 @@ class FakeNextext:
         route = path.removeprefix(_NEXTEXT_PATH)
         if (request.method, route) == ("GET", "/health"):
             return httpx.Response(self.health, json={"status": "ok", "inference": True})
+        if (request.method, route) == ("GET", "/ready"):
+            return self._ready()
         if request.headers.get("authorization") != f"Bearer {self.key}":
             return httpx.Response(401, json={"detail": "unauthorized"})
         if (request.method, route) == ("POST", "/jobs"):
@@ -1383,6 +1389,19 @@ class FakeNextext:
         if (found := _JOB_PATH.fullmatch(route)) and request.method == "DELETE":
             return self._delete(found["job"])
         return httpx.Response(404, json=NOT_FOUND)
+
+    def _ready(self) -> httpx.Response:
+        """Answer ``GET /ready`` as Nextext 1.22 does: ``200`` when it can transcribe, else ``503``, or as scripted.
+
+        Returns:
+            The answer, from :attr:`ready` or, when that is ``None``, from :attr:`health`.
+        """
+        status = self.ready if self.ready is not None else (200 if self.health == 200 else 503)
+        if status == 404:
+            return httpx.Response(404, json=NOT_FOUND)
+        ready = status == 200
+        body = {"status": "ready" if ready else "unavailable", "inference": ready, "transcription": ready}
+        return httpx.Response(status, json={**body, "version": "1.22.0"})
 
     def _create(self, request: httpx.Request) -> httpx.Response:
         self.events.append("create")
