@@ -62,7 +62,7 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_RESULTS_PER_MESSAGE` | 20 | Cards a message shows |
 | `INLINE_IMAGE_BYTES` | 10 MiB | The largest image shown inline (png, jpeg, gif, webp) |
 | `MAX_RECORDING_S` / `MAX_RECORDING_BYTES` | 120 s / 10 MiB | A recording (`inference.py`) |
-| `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment (`workbench.py`) |
+| `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment, a video or audio clip included (`workbench.py`) |
 | `MAX_RENDITION_BYTES` | 768 KiB | A render of a page or picture fetched must be smaller (`workbench.py`) |
 | `MAX_IMAGE_BYTES` / `MAX_IMAGES_BYTES` / `MAX_TOOL_IMAGES` | 1 MiB / 3 MiB / 8 | The pictures kept from one tool answer: each, all together, and how many (`workbench.py`) |
 | `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`). A prepare whose file another call is still making waits for that call first, up to 120 s more, and then usually finds the manifest made; the rare one that waits it out and then converts the file itself can pass 390 s and is cut, and the file reads as text |
@@ -72,6 +72,15 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
 | `PREPARE_SLOTS` | 2 | Attachments prepared at once, in the one process (`processing.py`) |
 | `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). From workbench 0.8.1 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
+| `MEDIA_SLOTS` | 2 | Clips at Nextext at once, in the one process; a clip there holds none of the `PREPARE_SLOTS`, so a picture is ready as fast as without clips (`processing.py`) |
+| `POLL_S` / `POLL_SLOW_S` / `POLL_SLOW_AFTER_S` | 2 s / 5 s / 60 s | Between two polls of a clip's job at Nextext, and the age of the job from which the longer wait holds (`processing.py`) |
+| `START_WAIT_S` | 120 s | The longest the start reconcile waits for Nextext's probe. A clip waits for that reconcile this and `RECONCILE_EXTRA_S` longer, and 5 s of slack, and past it makes no job (`processing.py`) |
+| `RECONCILE_EXTRA_S` | 60 s | The longest the start reconcile takes once the probe has passed, and the sweep's reconcile in all; also what the sweep's grace adds to `NEXTEXT_TIMEOUT` (`processing.py`, `retention.py`) |
+| `ORPHAN_GRACE_S` / `ORPHAN_RECONCILE_S` | 180 s / 240 s | The reconcile after a create whose answer was lost: it runs 240 s after it and spares jobs younger than 180 s (`processing.py`) |
+| `ARTIFACT_CAPS` | 8 MiB / 32 MiB | The transcript (`docint.jsonl`) and the frames (`keyframes.zip`) of a clip; one over its cap is left out (`nextext.py`) |
+| `JOB_OPTIONS["keyframes_max"]` / `["keyframes_per_minute"]` | 19 / 20 | The frames of a video: at most 19, since workbench keeps 19 (`MEDIA_FRAMES_MAX`), at 20 a minute; Nextext's own default of 4 a minute would give a 30 s clip 2 frames (`nextext.py`) |
+| `CREATE_READ_S` / `CALL_S` / `ARTIFACT_READ_S` / `HEALTH_S` | 120 s / 10 s / 60 s / 5 s | Each wait on Nextext: its answer to a create once the clip is sent, a list or a delete, one read of an artifact, the health probe. The probe asks again after 5 s, doubling to 300 s, while Nextext does not answer (`nextext.py`) |
+| `DERIVED_TIMEOUT_S` | 150 | Seconds workbench is waited for once it holds a whole artifact: the clip's lock for up to 120 s, and the work (`workbench.py`) |
 | `MAX_WAIT_S` | 20 | The longest `?wait=` of an attachment's status long poll (`processing.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
 | `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |

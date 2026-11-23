@@ -4,8 +4,8 @@
 |---|---|---|
 | A chat: its messages, steps, attachments and results | `GHOSTWRITER_CHAT_RETENTION_DAYS` (90) after it started | the daily sweep deletes it |
 | Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
-| An attachment's manifest (its page count, the pages without text, the sizes of its renders) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
-| The files, and the renders workbench made of them | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
+| An attachment's manifest (its page count, the pages without text, the sizes of its renders; a clip's length, frame count and whether it has a transcript) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
+| The files, and the renders workbench made of them (a clip's transcript and frames are derived files of the clip) | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
 | A clip's copy at Nextext, and what Nextext made of it | one job: until its transcript and frames are in workbench, it failed, or `NEXTEXT_TIMEOUT` (900 s) is spent | Ghostwriter deletes the job at once; one a crash left goes at the next start, or with the daily sweep |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
@@ -52,7 +52,8 @@ so and nothing is fetched.
 1. Hold the chat's turn: while an answer runs, the owner's delete gets 409 and
    the sweep leaves the chat to its next run.
 2. Record the `delete` event.
-3. Cancel the jobs that prepare the chat's attachments, then delete the chat's
+3. Cancel the jobs that prepare the chat's attachments (a clip's job at Nextext is
+   still deleted, [below](#clips-at-nextext)), then delete the chat's
    folder in workbench (`DELETE /files/chat`), and record what went. A chat that
    never used workbench is not sent. A delete that fails after the cancel keeps the
    chat, and its `processing` attachments are prepared again.
