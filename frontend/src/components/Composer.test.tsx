@@ -1076,7 +1076,10 @@ describe('Composer clips', () => {
   })
 
   it('opens no lightbox for a clip', async () => {
-    const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4'), 201) }, MEDIA_CONFIG)
+    const { calls } = openChat(
+      { [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4'), 201) },
+      MEDIA_CONFIG,
+    )
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
     drop(textbox(), [video('harbour-tour.mp4')])
@@ -1117,15 +1120,53 @@ describe('Composer clips', () => {
     expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
   })
 
+  it('shows a ready clip the chat lists after a reload as a video tile, and asks no preview', async () => {
+    const sse = sseStream()
+    const waiting = { ...detail([]), pending_attachments: [clip('a1', 'harbour-tour.mp4')] }
+    const { calls } = openChat(
+      { 'GET /ghostwriter/api/chats/c1': waiting, [`POST ${MESSAGES}`]: () => sse.response() },
+      MEDIA_CONFIG,
+    )
+    await waitFor(() => expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'done'))
+    expect(kindOf('harbour-tour.mp4')).toBe('video')
+    expect(composer().querySelector('li img')).toBeNull()
+    expect(within(chip('harbour-tour.mp4')).queryByRole('button', { name: 'harbour-tour.mp4' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+
+    // It is sent as it is, and still no preview is asked.
+    await userEvent.setup().click(screen.getByRole('button', { name: 'Send' }))
+    expect(callsTo(calls, 'POST', MESSAGES).map((c) => c.body)).toEqual([
+      { content: '', attachment_ids: ['a1'], reasoning: false },
+    ])
+    expect(callsTo(calls, 'GET', POLL)).toHaveLength(0)
+    expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
+  })
+
   it('takes a clip back while it is transcribed', async () => {
-    let answered!: () => void
-    const held = new Promise<void>((done) => (answered = done))
+    let answer!: () => void
+    const held = new Promise<void>((done) => (answer = done))
+    // The follow's late answer, a 404 now; `read` says its body was pulled, that is, the follow is reading it.
+    let read = false
+    const lateAnswer = () =>
+      new Response(
+        new ReadableStream<Uint8Array>(
+          {
+            pull(stream) {
+              read = true
+              stream.enqueue(new TextEncoder().encode(JSON.stringify({ detail: 'Attachment not found.' })))
+              stream.close()
+            },
+          },
+          { highWaterMark: 0 },
+        ),
+        { status: 404, headers: { 'content-type': 'application/json' } },
+      )
     const { calls } = openChat(
       {
         [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4', { status: 'processing' }), 201),
         [`GET ${POLL}`]: async () => {
           await held
-          return json({ detail: 'Attachment not found.' }, 404)
+          return lateAnswer()
         },
         [`DELETE ${FILE}`]: null,
       },
@@ -1143,8 +1184,9 @@ describe('Composer clips', () => {
     // Send stays as without it: nothing to send, and the follow's late answer brings no error tile back.
     expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
     expect(screen.queryByText(hint)).not.toBeInTheDocument()
-    answered()
-    await new Promise((done) => setTimeout(done, 50))
+    answer()
+    await waitFor(() => expect(read).toBe(true))
+    await act(async () => {})
     expect(within(composer()).queryByText('harbour-tour.mp4')).not.toBeInTheDocument()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })

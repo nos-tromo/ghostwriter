@@ -108,13 +108,19 @@ function refusalOf(error: unknown, name: string, config: AppConfig): PendingErro
   return isPurposeRefusal(error) ? 'purpose' : 'upload'
 }
 
+/** What a stored attachment is to the composer: the server says `media` for a clip, which its suffix tells apart. */
+function kindOfAttachment(attachment: AttachmentOut): PendingFile['kind'] {
+  if (attachment.kind === 'media') return clipKind(attachment.name)
+  return attachment.kind === 'image' ? 'image' : 'document'
+}
+
 /** A file attached earlier, still waiting in the chat for a message. */
 function waiting(attachment: AttachmentOut): PendingFile {
   return {
     key: attachment.id,
     name: attachment.name,
     size: attachment.size,
-    kind: attachment.kind === 'media' ? clipKind(attachment.name) : attachment.kind === 'image' ? 'image' : 'document',
+    kind: kindOfAttachment(attachment),
     status: attachment.status === 'processing' ? 'processing' : 'done',
     attachment,
   }

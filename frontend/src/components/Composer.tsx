@@ -65,11 +65,10 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  * the paperclip, a paste or a drop on the conversation; dictation into the
  * text; the reasoning switch; send, or stop while an answer streams.
  *
- * Enter sends and Shift+Enter starts a new line. Send waits while a file
- * uploads or a picture is prepared or a clip transcribed, and needs text or an attached file. A transcript goes in at the
- * cursor and is never sent by itself; one still running when the composer
- * goes is aborted. A message the server refuses comes back into the composer
- * with its files, as it was.
+ * Enter sends and Shift+Enter starts a new line. Send waits while a file uploads, a picture is prepared or a
+ * clip is transcribed, and needs text or an attached file. A transcript goes in at the cursor and is never
+ * sent by itself; one still running when the composer goes is aborted. A message the server refuses comes back
+ * into the composer with its files, as it was.
  *
  * The chat's stream, its attachments and the reasoning switch are the
  * `ChatPane`'s, so the conversation above shows the same answer this sends.

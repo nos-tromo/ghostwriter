@@ -101,8 +101,8 @@ function FetchedTile({ chatId, attachment, ...props }: TileProps & { attachment:
  * The files the next message sends, one tile each: a picture shows itself (from the file in hand
  * at once, else from the server's rendition) and opens full size; every other file, a video or audio
  * clip included, shows its kind, name and size. A tile says where its file stands: being attached, being
- * prepared (a clip, being transcribed), refused or unreadable, expired, being taken back. Any file can be taken back before it is sent: the X on its tile.
- * One whose taking back failed says so below the row, and stays.
+ * prepared (a clip, being transcribed), refused or unreadable, expired, being taken back. Any file can be
+ * taken back before it is sent: the X on its tile. One whose taking back failed says so below the row, and stays.
  *
  * The row sits above the composer's pill, never inside it. The refusals are said below it, each by
  * the reason the server gave; so is the cap on pictures, once more wait than go to the model.

@@ -65,8 +65,7 @@ export const de: Strings = {
   'composer.removing': '{name} wird entfernt…',
   'composer.error_remove': '{name} konnte nicht entfernt werden.',
   'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
-  'composer.transcribing_hint':
-    'Video und Audio dauern länger, weil sie vor dem Senden transkribiert werden.',
+  'composer.transcribing_hint': 'Video und Audio dauern länger, weil sie vor dem Senden transkribiert werden.',
   'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
   'composer.images_cap':
     'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',
