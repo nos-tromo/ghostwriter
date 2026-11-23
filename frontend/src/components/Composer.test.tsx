@@ -3,11 +3,13 @@ import { act, createEvent, fireEvent, screen, waitFor, within } from '@testing-l
 import userEvent from '@testing-library/user-event'
 import { PURPOSE_HEADER, PurposeBar, clearAllPurposes, setPurpose } from '@infra/ui'
 import type { AppConfig, AttachmentOut } from '../api/types'
+import { useConfig } from '../hooks/useConfig'
 import { LanguageContext } from '../i18n/LanguageContext'
 import { ChatPane } from './ChatPane'
 import {
   CHAT,
   CONFIG,
+  MEDIA_CONFIG,
   VISION_CONFIG,
   callsTo,
   detail,
@@ -988,6 +990,208 @@ describe('Composer pictures', () => {
     fireEvent(textbox(), office)
     expect(office.defaultPrevented).toBe(false)
     await waitFor(() => expect(callsTo(calls, 'POST', ATTACHMENTS).map(uploaded)).toEqual(['sales.csv']))
+  })
+})
+
+describe('Composer clips', () => {
+  const FILE = `${ATTACHMENTS}/a1`
+  const POLL = `${FILE}?wait=20`
+  const hint = 'Video and audio take longer: they are transcribed before they are sent.'
+
+  function clip(id: string, name: string, fields: Partial<AttachmentOut> = {}): AttachmentOut {
+    const mime = name.endsWith('.mp4') ? 'video/mp4' : 'audio/mp4'
+    return { ...attachment(id, name, 4_194_304), mime, kind: 'media', ...fields }
+  }
+
+  const video = (name: string) => new File(['mp4'], name, { type: 'video/mp4' })
+  const audio = (name: string) => new File(['m4a'], name, { type: 'audio/mp4' })
+  const kindOf = (name: string) => chip(name).querySelector('[data-kind]')?.getAttribute('data-kind')
+
+  /** The composer under a config the page reads itself, as the app does; `config` answers `GET /config`. */
+  function Page({ chatId }: { chatId: string }) {
+    const { data: config } = useConfig()
+    return config ? <ChatPane chatId={chatId} config={config} /> : null
+  }
+
+  it('shows a dropped clip as a video tile while it is transcribed, and sends once it is ready', async () => {
+    let ready!: () => void
+    const held = new Promise<void>((done) => (ready = done))
+    const sse = sseStream()
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: async () => {
+          await held
+          return json(clip('a1', 'harbour-tour.mp4'))
+        },
+        [`POST ${MESSAGES}`]: () => sse.response(),
+      },
+      MEDIA_CONFIG,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.type(textbox(), 'Was wird gesagt?')
+
+    drop(textbox(), [video('harbour-tour.mp4')])
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    // No picture of it, now or later: the tile's icon only, and no preview is asked.
+    expect(kindOf('harbour-tour.mp4')).toBe('video')
+    expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'processing')
+    expect(composer().querySelector('li img')).toBeNull()
+    expect(within(chip('harbour-tour.mp4')).getByLabelText('Transcribing harbour-tour.mp4…')).toBeInTheDocument()
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.queryByText('Sending waits until the attached files are ready.')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    await user.click(textbox())
+    await user.keyboard('{Enter}')
+    expect(callsTo(calls, 'POST', MESSAGES)).toHaveLength(0)
+
+    ready()
+    await waitFor(() => expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'done'))
+    expect(kindOf('harbour-tour.mp4')).toBe('video')
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    expect(composer().querySelector('li img')).toBeNull()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    await user.keyboard('{Enter}')
+    expect(callsTo(calls, 'POST', MESSAGES).map((c) => c.body)).toEqual([
+      { content: 'Was wird gesagt?', attachment_ids: ['a1'], reasoning: false },
+    ])
+    expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
+  })
+
+  it('shows an audio file as an audio tile', async () => {
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'voice-memo.m4a', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: () => json(clip('a1', 'voice-memo.m4a')),
+      },
+      MEDIA_CONFIG,
+    )
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [audio('voice-memo.M4A')])
+    expect(kindOf('voice-memo.M4A')).toBe('audio')
+    await waitFor(() => expect(chip('voice-memo.m4a')).toHaveAttribute('data-status', 'done'))
+    expect(kindOf('voice-memo.m4a')).toBe('audio')
+    expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
+  })
+
+  it('opens no lightbox for a clip', async () => {
+    const { calls } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4'), 201) }, MEDIA_CONFIG)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [video('harbour-tour.mp4')])
+    await waitFor(() => expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'done'))
+
+    // Its face is no button, and a click on it opens nothing.
+    expect(within(chip('harbour-tour.mp4')).queryByRole('button', { name: 'harbour-tour.mp4' })).not.toBeInTheDocument()
+    await user.click(screen.getByText('harbour-tour.mp4'))
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
+  })
+
+  it('follows a clip the chat lists as processing', async () => {
+    let ready!: () => void
+    const held = new Promise<void>((done) => (ready = done))
+    const waiting = { ...detail([]), pending_attachments: [clip('a1', 'harbour-tour.mp4', { status: 'processing' })] }
+    const { calls } = openChat(
+      {
+        'GET /ghostwriter/api/chats/c1': waiting,
+        [`GET ${POLL}`]: async () => {
+          await held
+          return json(clip('a1', 'harbour-tour.mp4'))
+        },
+      },
+      MEDIA_CONFIG,
+    )
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(0)
+    expect(kindOf('harbour-tour.mp4')).toBe('video')
+    expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'processing')
+    expect(screen.getByText(hint)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+
+    ready()
+    await waitFor(() => expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'done'))
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    expect(calls.filter((c) => c.url.includes('/preview'))).toEqual([])
+  })
+
+  it('takes a clip back while it is transcribed', async () => {
+    let answered!: () => void
+    const held = new Promise<void>((done) => (answered = done))
+    const { calls } = openChat(
+      {
+        [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4', { status: 'processing' }), 201),
+        [`GET ${POLL}`]: async () => {
+          await held
+          return json({ detail: 'Attachment not found.' }, 404)
+        },
+        [`DELETE ${FILE}`]: null,
+      },
+      MEDIA_CONFIG,
+    )
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [video('harbour-tour.mp4')])
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'processing')
+
+    await user.click(within(chip('harbour-tour.mp4')).getByRole('button', { name: 'Remove harbour-tour.mp4' }))
+    await waitFor(() => expect(within(composer()).queryByText('harbour-tour.mp4')).not.toBeInTheDocument())
+    expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(1)
+    // Send stays as without it: nothing to send, and the follow's late answer brings no error tile back.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeDisabled()
+    expect(screen.queryByText(hint)).not.toBeInTheDocument()
+    answered()
+    await new Promise((done) => setTimeout(done, 50))
+    expect(within(composer()).queryByText('harbour-tour.mp4')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('offers no clips without Nextext', async () => {
+    const { calls, container } = openChat({ [`POST ${ATTACHMENTS}`]: () => json(clip('a1', 'harbour-tour.mp4'), 201) })
+    await screen.findByText('Ask anything, or attach a document.')
+    const picker = container.querySelector('input[type="file"]') as HTMLInputElement
+    expect(picker.getAttribute('accept')?.split(',')).not.toContain('.mp4')
+
+    drop(textbox(), [video('harbour-tour.mp4')])
+    expect(await screen.findByText('harbour-tour.mp4: this file type is not supported.')).toBeInTheDocument()
+    expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'error')
+    expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(0)
+  })
+
+  it('says a clip cannot be attached now when the server refuses it, and reads the offer again', async () => {
+    let offered = true
+    const calls = serve({
+      'GET /ghostwriter/api/chats/c1': detail([]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'GET /ghostwriter/api/config': () => json(offered ? MEDIA_CONFIG : CONFIG),
+      [`POST ${ATTACHMENTS}`]: () => {
+        // Nextext went down since the page read the config.
+        offered = false
+        return json({ detail: 'This file type is not supported.' }, 415)
+      },
+    })
+    const { container } = renderWithClient(<Page chatId="c1" />)
+    await screen.findByText('Ask anything, or attach a document.')
+    const picker = () => container.querySelector('input[type="file"]') as HTMLInputElement
+    expect(picker().getAttribute('accept')?.split(',')).toContain('.mp4')
+    expect(callsTo(calls, 'GET', '/ghostwriter/api/config')).toHaveLength(1)
+
+    drop(textbox(), [video('harbour-tour.mp4')])
+    expect(
+      await screen.findByText('harbour-tour.mp4 cannot be attached now: video and audio are not available.'),
+    ).toBeInTheDocument()
+    expect(chip('harbour-tour.mp4')).toHaveAttribute('data-status', 'error')
+    // The offer is read again, and the picker drops the clip types.
+    await waitFor(() => expect(callsTo(calls, 'GET', '/ghostwriter/api/config')).toHaveLength(2))
+    await waitFor(() => expect(picker().getAttribute('accept')?.split(',')).not.toContain('.mp4'))
+
+    // Any other file refused with a 415 keeps the plain reason, and the offer is not read again.
+    drop(textbox(), [file('sales.csv')])
+    expect(await screen.findByText('sales.csv could not be attached.')).toBeInTheDocument()
+    expect(callsTo(calls, 'GET', '/ghostwriter/api/config')).toHaveLength(2)
   })
 })
 

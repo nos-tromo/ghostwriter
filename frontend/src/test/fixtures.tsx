@@ -16,6 +16,8 @@ export const CONFIG: AppConfig = {
   attachments: true,
   attachment_types: ['.csv', '.pdf', '.xlsx'],
   image_types: [],
+  media_types: [],
+  media: false,
   max_images: 8,
   vision: false,
   max_attachment_bytes: 50 * 1024 * 1024,
@@ -32,6 +34,14 @@ export const VISION_CONFIG: AppConfig = {
   attachment_types: [...CONFIG.attachment_types, '.png', '.jpg', '.heic'],
   image_types: ['.png', '.jpg', '.heic'],
   vision: true,
+}
+
+/** A deployment that transcribes clips: `.mp4`, `.m4a` and `.webm` can be attached. */
+export const MEDIA_CONFIG: AppConfig = {
+  ...CONFIG,
+  attachment_types: [...CONFIG.attachment_types, '.mp4', '.m4a', '.webm'],
+  media_types: ['.mp4', '.m4a', '.webm'],
+  media: true,
 }
 
 export const CHAT: ChatOut = {

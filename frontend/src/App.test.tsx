@@ -13,6 +13,8 @@ const CONFIG: AppConfig = {
   attachments: true,
   attachment_types: ['.csv', '.pdf', '.xlsx'],
   image_types: [],
+  media_types: [],
+  media: false,
   max_images: 8,
   vision: false,
   max_attachment_bytes: 50 * 1024 * 1024,
