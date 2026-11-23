@@ -2,8 +2,9 @@
 
 A store, a :class:`~ghostwriter.workbench.WorkbenchClient` over :class:`~tests.fakes.FakeDoor` (workbench 0.9.0), a
 :class:`~ghostwriter.nextext.NextextClient` over :class:`~tests.fakes.FakeNextext` and an emitter on
-:class:`~tests.conftest.CapturedAuditStream`; ``POLL_S`` and ``PREPARE_RETRY_S`` are 0.01 s. Every name, id and value
-here is invented.
+:class:`~tests.conftest.CapturedAuditStream`; ``POLL_S`` and ``PREPARE_RETRY_S`` are 0.01 s. A processor whose gate
+opens at once has run its start reconcile, which found nothing to delete, before a test begins, and the fake's
+requests start over then (``tests/test_reconcile.py`` covers the reconcile). Every name, id and value here is invented.
 """
 
 import logging
@@ -66,7 +67,7 @@ class Env:
         health: Nextext's health, healthy.
         emitter: The audit chain.
         chat_id: The chat the clips go to.
-        processor: The processor over all of them, its gate open.
+        processor: The processor over all of them, its start reconcile run and its gate open.
         made: Every processor the test built, closed at teardown.
     """
 
@@ -82,7 +83,7 @@ class Env:
     processor: AttachmentProcessor = field(init=False)
     made: list[AttachmentProcessor] = field(default_factory=list)
 
-    def make(
+    async def make(
         self,
         *,
         client: NextextClient | None | bool = True,
@@ -95,7 +96,8 @@ class Env:
         Args:
             client: The Nextext client; ``True`` for :attr:`nextext`, ``None`` for none (and no health).
             timeout_s: The clip budget.
-            start: Whether its gate opens at once (:meth:`~AttachmentProcessor.start_media`).
+            start: Whether its start reconcile runs at once (:meth:`~AttachmentProcessor.start_media`); with a client,
+                its list is awaited and then the fake's requests and events start over.
             workbench: The workbench client; one over :attr:`door` when ``None``.
 
         Returns:
@@ -110,9 +112,13 @@ class Env:
             health=self.health if reached is not None else None,
             nextext_timeout_s=timeout_s,
         )
+        self.made.append(processor)
         if start:
             processor.start_media()
-        self.made.append(processor)
+            if reached is not None:
+                await _until(lambda: "list" in self.fake.events)
+                self.fake.events.clear()
+                self.fake.requests.clear()
         return processor
 
 
@@ -142,7 +148,7 @@ async def env(tmp_path: Path, audit_stream: CapturedAuditStream, monkeypatch: py
         emitter,
         store.create_chat("user-a").id,
     )
-    built.processor = built.make()
+    built.processor = await built.make()
     try:
         yield built
     finally:
@@ -352,7 +358,7 @@ async def test_the_clip_passes_through_chunk_by_chunk(env: Env) -> None:
         return httpx.Response(200, content=body(), headers={"Content-Type": "video/mp4"})
 
     env.door.answers["/files/view"] = view
-    processor = env.make(client=NextextClient(env.settings, transport=_Arriving(env.fake, log)))
+    processor = await env.make(client=NextextClient(env.settings, transport=_Arriving(env.fake, log)))
     job = _clip(env)
     await _run(processor, job)
     assert log == [entry for i in range(1, 9) for entry in (f"view:{i}", f"nextext:{i}")]
@@ -470,7 +476,7 @@ async def test_a_delete_nextext_refuses_is_recorded_as_an_error(
 async def test_the_budget_ends_a_slow_job(env: Env, audit_stream: CapturedAuditStream) -> None:
     """A job still running when the budget is spent fails the clip with timeout, and the job is deleted."""
     env.fake.statuses = ["running"]
-    processor = env.make(timeout_s=0.2)
+    processor = await env.make(timeout_s=0.2)
     job = _clip(env)
     before = len(events(audit_stream))
     with anyio.fail_after(5):
@@ -479,6 +485,22 @@ async def test_the_budget_ends_a_slow_job(env: Env, audit_stream: CapturedAuditS
     assert env.fake.deleted == [JOB_ID] and env.fake.jobs[JOB_ID] > 1
     [failed] = [row for row in _rows(audit_stream, before) if row[4] == "error"]
     assert failed == ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"reason": "timeout"}, "error")
+
+
+async def test_a_budget_spent_in_workbench_is_recorded_under_workbench(
+    env: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """The budget runs out while the transcript streams into workbench: the error child is workbench's hand-over's."""
+    env.door.delays["/files/derived"] = 5.0
+    processor = await env.make(timeout_s=0.3)
+    job = _clip(env)
+    before = len(events(audit_stream))
+    with anyio.fail_after(5):
+        await _run(processor, job)
+    assert _status(env, job) == ("failed", "timeout")
+    assert env.fake.deleted == [JOB_ID] and env.fake.served == [JSONL]
+    [failed] = [row for row in _rows(audit_stream, before) if row[4] == "error"]
+    assert failed == ("disclose", ATTACHMENT, "workbench:prepare", {"reason": "timeout"}, "error")
 
 
 async def test_an_oversized_keyframes_zip_is_left_out(env: Env, log_lines: list[str]) -> None:
@@ -719,8 +741,11 @@ async def test_a_picture_is_prepared_while_clips_transcribe(env: Env) -> None:
     assert all(env.processor.running(job.attachment_id) for job in clips)
 
 
-async def test_at_most_two_clips_are_at_nextext_at_once(env: Env) -> None:
-    """A third clip waits for a media slot, and takes the one a cancelled clip leaves."""
+async def test_at_most_two_clips_are_at_nextext_at_once(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """A third clip waits for a media slot, and takes the one a cancelled clip leaves.
+
+    The first two make their jobs in either order, so the cancelled clip's job is read from its own delete's record.
+    """
     env.fake.statuses = ["running"]
     first, second, third = (_clip(env, f"harbour-tour-{n}.mp4") for n in range(3))
     for job in (first, second, third):
@@ -730,7 +755,14 @@ async def test_at_most_two_clips_are_at_nextext_at_once(env: Env) -> None:
     assert len(env.fake.jobs) == 2 and len(env.fake.uploads) == 2
     assert env.processor.cancel(first.attachment_id)
     await _until(lambda: len(env.fake.jobs) == 3)
-    assert env.fake.deleted == [JOB_ID]
+    assert first.op is not None
+    [own] = [
+        e
+        for e in events(audit_stream)
+        if e["operation"] == NEXTEXT_OPERATION and e.get("parent_event_id") == first.op.event_id
+    ]
+    assert own["target"]["ids"] in ([JOB_ID], [SECOND_JOB])
+    assert env.fake.deleted == own["target"]["ids"]
 
 
 async def test_a_requeued_clip_runs_again(env: Env, audit_stream: CapturedAuditStream) -> None:
@@ -754,7 +786,7 @@ async def test_a_requeued_clip_runs_again(env: Env, audit_stream: CapturedAuditS
 
 async def test_without_nextext_a_clip_fails_as_unavailable(env: Env, audit_stream: CapturedAuditStream) -> None:
     """Without a Nextext client the clip fails as unavailable, with its error child; nothing is read or sent."""
-    processor = env.make(client=None)
+    processor = await env.make(client=None)
     job = _clip(env)
     before = len(events(audit_stream))
     await _run(processor, job)
@@ -768,7 +800,7 @@ async def test_without_nextext_a_clip_fails_as_unavailable(env: Env, audit_strea
 
 async def test_no_job_is_made_before_the_gate_opens(env: Env) -> None:
     """A clip waits for start_media before its create; once the gate opens, it goes on."""
-    processor = env.make(start=False)
+    processor = await env.make(start=False)
     job = _clip(env)
     processor.submit(job)
     await anyio.sleep(0.2)
@@ -779,9 +811,10 @@ async def test_no_job_is_made_before_the_gate_opens(env: Env) -> None:
 
 
 async def test_a_gate_that_never_opens_fails_the_clip(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Past START_WAIT_S without the start reconcile, nothing goes to Nextext, and the clip fails as unavailable."""
+    """Past START_WAIT_S and RECONCILE_EXTRA_S without the start reconcile, nothing goes to Nextext: unavailable."""
     monkeypatch.setattr(processing, "START_WAIT_S", 0.05)
-    processor = env.make(start=False)
+    monkeypatch.setattr(processing, "RECONCILE_EXTRA_S", 0.05)
+    processor = await env.make(start=False)
     job = _clip(env)
     await _run(processor, job)
     assert _status(env, job) == ("failed", "nextext_unavailable")

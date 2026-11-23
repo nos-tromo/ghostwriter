@@ -6,6 +6,7 @@
 | Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
 | An attachment's manifest (its page count, the pages without text, the sizes of its renders) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
 | The files, and the renders workbench made of them | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
+| A clip's copy at Nextext, and what Nextext made of it | one job: until its transcript and frames are in workbench, it failed, or `NEXTEXT_TIMEOUT` (900 s) is spent | Ghostwriter deletes the job at once; one a crash left goes at the next start, or with the daily sweep |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
 after start, then daily (`ghostwriter/retention.py`). A line under the composer
@@ -66,6 +67,32 @@ A file attached by mistake is taken back before it is sent: the X on its tile
 deletes it in workbench with its renders (workbench 0.8.1), and then its row; a
 job preparing it is cancelled. A sent file stays with its message until the chat
 is deleted or its 7 days are over.
+
+## Clips at Nextext
+
+A video or audio clip goes to Nextext for one job, and Ghostwriter deletes that
+job as soon as its transcript and frames are in workbench, it failed, or its
+budget was spent, also when the clip is taken back or its chat deleted
+meanwhile. Nextext's `DELETE` of a running job drops it from Nextext's list at
+once, but its pipeline runs on and keeps Nextext's one queue slot, and Nextext
+removes the job's upload when the pipeline ends (in the spike, about 85 s
+later). So a clip taken back, or whose chat is deleted, while it is transcribed
+stays at Nextext until its job ends there. Nextext holds its jobs in memory, so
+its own restart drops them too.
+
+A job no clip owns is deleted by a reconcile, recorded first (`docs/audit.md`):
+
+- A crash or restart while a clip was at Nextext leaves its job until the next
+  start. Once Nextext passes its health probe (within 120 s), the start
+  reconcile deletes every job Nextext lists for Ghostwriter, before any clip
+  makes one; the clip left `processing` then goes to Nextext again, for a new
+  job. If the probe does not pass in time, the daily sweep deletes it.
+- A create whose answer was lost (it timed out or did not read, or the clip was
+  cancelled meanwhile) may leave a job whose id never came back. A reconcile 3
+  minutes later deletes it, sparing jobs younger than that (another clip's
+  create may still be answering); else the next daily sweep does.
+- The daily sweep deletes every job no clip owns that is older than
+  `NEXTEXT_TIMEOUT` and 60 s: no clip's job lives that long.
 
 ## The dry run
 

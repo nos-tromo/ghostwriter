@@ -1250,8 +1250,8 @@ class FakeNextext:
     has left the list after :attr:`vanish_after` polls. A list item has the keys Nextext 1.21 serves, and the list
     holds no job of another caller but those in :attr:`listed`. An artifact answers ``200`` with the
     ``Content-Length`` Nextext's in-memory render has, or its scripted status; a job that is gone (deleted, or out of
-    the list after :attr:`vanish_after` polls, as after a restart) answers ``404``. A ``DELETE`` answers ``204``, or
-    ``404`` for a job that is not there.
+    the list after :attr:`vanish_after` polls, as after a restart) answers ``404``. A ``DELETE`` answers ``204`` for a
+    job created or in :attr:`listed`, which then leaves the list, or ``404`` for a job that is not there.
 
     Attributes:
         key: The service token the fake accepts.
@@ -1442,6 +1442,11 @@ class FakeNextext:
         self.events.append(f"delete:{job_id}")
         if self.delete_status is not None:
             return httpx.Response(self.delete_status, json={"detail": "refused"})
+        kept = [item for item in self.listed if not (isinstance(item, dict) and item.get("job_id") == job_id)]
+        if len(kept) < len(self.listed):
+            self.listed = kept
+            self.deleted.append(job_id)
+            return httpx.Response(204)
         if self._gone(job_id):
             return httpx.Response(404, json=NOT_FOUND)
         self.deleted.append(job_id)

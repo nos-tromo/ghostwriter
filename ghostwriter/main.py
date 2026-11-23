@@ -18,9 +18,10 @@ which the lifespan runs a minute after start and then daily, and cancels at
 shutdown. ``app.state.processor`` is the attachment processor (:mod:`ghostwriter.processing`), ``None``
 while workbench is off: at start it prepares again what the last process left ``processing``, or, without
 workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes. It takes a
-video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it; a clip requeued at start
-waits for its gate (:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which the lifespan opens
-right after the requeue.
+video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it. Right after the requeue the
+lifespan starts its start reconcile (:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which
+start-up never waits for: once Nextext's probe passes, it deletes every job Nextext lists for Ghostwriter, then opens
+the gate every clip, a requeued one too, waits for before it makes its job.
 ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
 waits for, and cancels it at shutdown. ``app.state.nextext`` is the Nextext client and ``app.state.media`` the
