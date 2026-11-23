@@ -159,7 +159,8 @@ or at once when a clip's job finds Nextext down; after Nextext refused the key, 
 key, and only a 200 counts) says it can transcribe; and workbench's discovery names 0.9.0 or
 later. `GET /api/config` then lists them as `media_types`, with `media: true`. Nextext 1.22 answers `/ready`
 `200` only when it has just transcribed a moment of silence through its Whisper path (it keeps the answer
-for 30 s, and gives the probe 10 s, so Ghostwriter waits 15 s) and `503` otherwise, so while its Whisper is down no
+for 30 s, and gives the probe 60 s, since a Whisper on a CPU pads every input to 30 s and one probe takes 10 to
+20 s there, so Ghostwriter waits 75 s) and `503` otherwise, so while its Whisper is down no
 clip is offered; `/health` stays `200` then, and says only that Nextext is up. A `404` is a Nextext before 1.22,
 without the route: `/health` is asked instead, and then the probe sees that Nextext is up, not that its Whisper
 is, so a clip fails at Nextext within seconds. `/ready` is asked first on every probe, so an upgraded Nextext is

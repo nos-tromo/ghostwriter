@@ -677,8 +677,9 @@ async def test_a_failure_to_answer_ready_is_not_healthy_and_asks_no_health() -> 
 
 
 async def test_the_probes_have_their_own_deadlines(monkeypatch: pytest.MonkeyPatch) -> None:
-    """/ready waits READY_S (above Nextext's own 10 s probe), /health HEALTH_S."""
-    assert (nextext.READY_S, nextext.HEALTH_S) == (15.0, 5.0)
+    """/ready waits READY_S (above Nextext's own 60 s probe timeout), /health HEALTH_S."""
+    assert (nextext.READY_S, nextext.HEALTH_S) == (75.0, 5.0)
+    assert nextext.READY_S > 60.0
     fake = FakeNextext()
     fake.ready = 404
     client = _client(fake)
@@ -691,7 +692,7 @@ async def test_the_probes_have_their_own_deadlines(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(client, "_http", http)
     assert await client.healthy() is True
-    assert deadlines == [15.0, 5.0]
+    assert deadlines == [75.0, 5.0]
 
 
 async def test_authorized_is_a_keyed_list_that_answers_200() -> None:

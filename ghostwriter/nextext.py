@@ -68,9 +68,10 @@ CALL_S: Final = 10.0
 ARTIFACT_READ_S: Final = 60.0
 #: The deadline of the liveness probe (``/health``), in seconds.
 HEALTH_S: Final = 5.0
-#: The deadline of the readiness probe (``/ready``), in seconds: above the 10 s Nextext gives its own transcription of
-#: a moment of silence, so a Whisper that is slow but working is not read as down.
-READY_S: Final = 15.0
+#: The deadline of the readiness probe (``/ready``), in seconds: above the 60 s Nextext gives its own transcription of
+#: a moment of silence, so a Whisper that is slow but working is not read as down. A Whisper on a CPU pads every input
+#: to 30 s, so one probe takes 10 to 20 s there, and it ends sooner on a GPU.
+READY_S: Final = 75.0
 #: The most bytes the job list may have.
 LIST_MAX_BYTES: Final = 1024 * 1024
 #: The first workbench that takes a clip, as ``(major, minor)``: 0.9.
