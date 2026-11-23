@@ -30,7 +30,8 @@ from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
 from ghostwriter.models import Attachment, Chat, Result, ToolStep
-from ghostwriter.processing import AttachmentProcessor, PrepareJob
+from ghostwriter.nextext import NextextClient
+from ghostwriter.processing import NEXTEXT_OPERATION, AttachmentProcessor, PrepareJob
 from ghostwriter.retention import (
     FIRST_SWEEP_DELAY_S,
     SWEEP_BATCH,
@@ -47,8 +48,16 @@ from ghostwriter.turns import TurnRegistry
 from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError
 from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import WorkbenchClient, chat_folder, session_pseudonym, user_pseudonym
-from tests.conftest import KEY, CapturedAuditStream, events, make_settings, unrecorded_child
-from tests.fakes import FakeDoor, stock_manifest
+from tests.conftest import (
+    KEY,
+    NEXTEXT_BASE,
+    NEXTEXT_KEY,
+    CapturedAuditStream,
+    events,
+    make_settings,
+    unrecorded_child,
+)
+from tests.fakes import FakeDoor, FakeNextext, stock_manifest
 
 DAY = timedelta(days=1)
 SECOND = timedelta(seconds=1)
@@ -473,6 +482,115 @@ async def test_a_failed_sweep_batch_prepares_its_chats_pictures_again(
         assert len([r for r, _ in env.door.requests if r.url.path == "/files/prepare"]) == 2
     finally:
         await processor.aclose()
+
+
+async def test_the_sweep_reconciles_before_it_deletes_chats(
+    settled: Env, audit_stream: CapturedAuditStream, tmp_path: Path
+) -> None:
+    """First the Nextext jobs no clip owns: a job left 2 h ago is deleted, recorded before the chats' records."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+    fake = FakeNextext()
+    made = (datetime.now(UTC) - timedelta(hours=2)).isoformat().replace("+00:00", "Z")
+    fake.listed.append(fake.item("4e5f60718293a4b5c6d7e8f90a1b2c3d", "completed", created_at=made))
+    reached = make_settings(tmp_path, nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY)
+    processor = AttachmentProcessor(
+        env.store, env.workbench, env.emitter, nextext=NextextClient(reached, transport=httpx.MockTransport(fake))
+    )
+    sweeper = Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+    before = len(events(audit_stream))
+    try:
+        report = await sweeper.sweep()
+    finally:
+        await processor.aclose()
+    assert report == SweepReport(chats=1, nextext_jobs=1)
+    assert fake.deleted == ["4e5f60718293a4b5c6d7e8f90a1b2c3d"] and not env.has_rows(cid)
+    operations = [e["operation"] for e in events(audit_stream)[before:]]
+    assert operations[:3] == [NEXTEXT_OPERATION, "retention.chat", WORKBENCH_DELETE]
+    reconciled = events(audit_stream)[before]
+    assert (reconciled["actor"], reconciled["target"], reconciled["criteria"]) == (
+        SYSTEM,
+        {"kind": "job", "count": 1},
+        {"listed": 1, "at_start": False},
+    )
+
+
+def _reconciling_sweeper(env: Env, processor: AttachmentProcessor) -> Sweeper:
+    """Return a sweeper over the test's store and workbench whose processor reconciles Nextext's jobs."""
+    return Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "logged"),
+    [
+        (RuntimeError("synthetic failure"), "Nextext's jobs failed: RuntimeError"),
+        (AuditWriteError("synthetic audit stream failure"), "could not be recorded; no job was deleted"),
+    ],
+    ids=["bug", "audit"],
+)
+async def test_a_failing_reconcile_never_stops_the_chats_sweep(
+    settled: Env,
+    loguru_caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    logged: str,
+) -> None:
+    """A reconcile that raises, even unrecorded, is logged by its type; the due chat goes all the same."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+
+    async def failing(self: AttachmentProcessor, *, grace_s: float | None) -> int:
+        raise error
+
+    monkeypatch.setattr(AttachmentProcessor, "reconcile", failing)
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    try:
+        report = await _reconciling_sweeper(env, processor).sweep()
+    finally:
+        await processor.aclose()
+    assert report == SweepReport(chats=1) and not env.has_rows(cid)
+    assert any(logged in record.getMessage() for record in loguru_caplog.records)
+
+
+async def test_a_hung_reconcile_is_cut_off_and_the_chats_go(
+    settled: Env, audit_stream: CapturedAuditStream, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Nextext that never answers its list holds the sweep up no longer than the limit; the due chat goes."""
+    monkeypatch.setattr("ghostwriter.retention.RECONCILE_EXTRA_S", 0.2)
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    reached = make_settings(tmp_path, nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY)
+    processor = AttachmentProcessor(
+        env.store, env.workbench, env.emitter, nextext=NextextClient(reached, transport=httpx.MockTransport(hang))
+    )
+    try:
+        with anyio.fail_after(5):
+            report = await _reconciling_sweeper(env, processor).sweep()
+    finally:
+        await processor.aclose()
+    assert report == SweepReport(chats=1) and not env.has_rows(cid)
+    assert [e for e in events(audit_stream) if e["operation"] == NEXTEXT_OPERATION] == []
 
 
 async def test_the_sweep_names_the_chat_and_the_system_reason_to_workbench(

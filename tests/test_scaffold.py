@@ -65,6 +65,10 @@ def test_compose_matches_the_contract() -> None:
     assert "AUDIT_REQUIRE_PURPOSE: ${AUDIT_REQUIRE_PURPOSE-}" in backend and "AUDIT_OUTPUT: container" in backend
     assert "GHOSTWRITER_EDGE_SECRET: ${GHOSTWRITER_EDGE_SECRET:-}" in backend
     assert "WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}" in backend
+    # Colon-less, so an empty value in .env turns video and audio off.
+    assert "NEXTEXT_API_BASE: ${NEXTEXT_API_BASE-http://nextext-backend:8000/api/v1}" in backend
+    assert "NEXTEXT_API_KEY: ${NEXTEXT_API_KEY:-}" in backend
+    assert "NEXTEXT_TIMEOUT: ${NEXTEXT_TIMEOUT:-900}" in backend
     assert "GHOSTWRITER_VISION: ${GHOSTWRITER_VISION:-on}" in backend
     assert "GHOSTWRITER_MAX_IMAGES: ${GHOSTWRITER_MAX_IMAGES:-8}" in backend
     assert "GHOSTWRITER_IMAGE_CONTEXT_TOKENS: ${GHOSTWRITER_IMAGE_CONTEXT_TOKENS:-}" in backend
@@ -186,3 +190,16 @@ def test_env_example_documents_vision() -> None:
     lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
     for line in ("# GHOSTWRITER_VISION=on", "# GHOSTWRITER_MAX_IMAGES=8", "# GHOSTWRITER_IMAGE_CONTEXT_TOKENS="):
         assert line in lines
+
+
+def test_env_example_documents_nextext() -> None:
+    """The three Nextext settings are there, the key with the tag deploy's env-sync reads."""
+    lines = (ROOT / ".env.example").read_text(encoding="utf-8").splitlines()
+    for line in (
+        "# [secret] [shared: Nextext NEXTEXT_SERVICE_TOKENS]",
+        "# NEXTEXT_API_KEY=",
+        "# NEXTEXT_API_BASE=http://nextext-backend:8000/api/v1",
+        "# NEXTEXT_TIMEOUT=900",
+    ):
+        assert line in lines
+    assert lines[lines.index("# NEXTEXT_API_KEY=") - 1] == "# [secret] [shared: Nextext NEXTEXT_SERVICE_TOKENS]"

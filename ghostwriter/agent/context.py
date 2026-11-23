@@ -42,7 +42,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeGuard
 
 from loguru import logger
 
@@ -70,6 +70,7 @@ from ghostwriter.agent.images import (
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, HISTORY_ARGUMENT_CHARS, HISTORY_RESULT_CHARS, PROMPT_TOKENS
 from ghostwriter.agent.tools import CUT_MARK, compact, cut, echoed_arguments, parse_arguments
 from ghostwriter.schemas import AttachmentOut
+from ghostwriter.upload import media_kind
 
 #: What a current tool result reads once it was cleared to make room.
 CLEARED: Final = "[cleared to make room; call the tool again if you need it]"
@@ -180,14 +181,15 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
         kind: The attachment's kind: ``document``, ``image`` or ``media``.
         manifest: Its manifest as the chat keeps it, or ``None``.
         seen: Whether the turn sees images.
-        name: The attachment's name, whose suffix says an Office file's format.
+        name: The attachment's name, whose suffix says an Office file's format and whether a clip is video or
+            audio.
 
     Returns:
         For a picture ``image`` and its first rendition's size, followed by :data:`UNSEEN_PICTURE`
         when not ``seen``; for a PDF its pages, for an Office file (``PowerPoint``, ``Word document`` or
         ``OpenDocument text``) its slides or pages as the manifest's ``unit`` says, and for either those
-        without text (:func:`_pages_told`), whether ``seen`` or not; else ``None``, which a manifest of
-        kind ``none`` also gives.
+        without text (:func:`_pages_told`), whether ``seen`` or not; for a clip (``media``) its length,
+        frames and transcript (:func:`_clip_told`); else ``None``, which a manifest of kind ``none`` also gives.
     """
     if kind == "image":
         size = rendition_size(manifest)
@@ -195,6 +197,8 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
         return facts if seen else f"{facts}; {UNSEEN_PICTURE}"
     if manifest is None:
         return None
+    if kind == "media":
+        return _clip_told(manifest, name, seen=seen)
     if manifest.get("kind") == "pdf":
         return _pages_told(manifest, "PDF", "page")
     if manifest.get("kind") == "office":
@@ -203,6 +207,59 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
             return None
         return _pages_told(manifest, office, "slide" if manifest.get("unit") == "slide" else "page")
     return None
+
+
+def _is_length(value: object) -> TypeGuard[int | float]:
+    """Tell whether a manifest's value is a clip's length in seconds.
+
+    Args:
+        value: The value.
+
+    Returns:
+        ``True`` for a finite number of zero or more that is no ``bool``; ``False`` for any other, an integer too
+        large for a float included.
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
+def _clip_told(manifest: Mapping[str, Any], name: str, *, seen: bool) -> str | None:
+    """Say what a video or audio clip holds: its length, its frames and its transcript.
+
+    Args:
+        manifest: Its manifest as the chat keeps it.
+        name: The clip's name, whose suffix says video or audio.
+        seen: Whether the turn sees images, which a video's frames are shown to.
+
+    Returns:
+        ``video 02:14, 8 frames; transcript``: ``video`` or ``audio``, then its length as ``mm:ss``
+        (``h:mm:ss`` from one hour; whole seconds, cut) when the manifest has one, then for a video its frames
+        (``, 1 frame``, ``, no frames``), followed by :data:`UNSEEN_PICTURE` when it has some and the turn is not
+        ``seen``, and last ``; transcript`` or ``; no speech``. A figure that is not a number is left out.
+        ``None`` for a manifest that is not a clip's.
+    """
+    if manifest.get("kind") != "media":
+        return None
+    clip = media_kind(name)
+    facts = clip
+    duration = manifest.get("duration_s")
+    if _is_length(duration):
+        seconds = int(duration)
+        hours, rest = divmod(seconds, 3600)
+        clock = f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else f"{rest // 60:02d}:{rest % 60:02d}"
+        facts = f"{facts} {clock}"
+    total = manifest.get("total")
+    if clip == "video" and isinstance(total, int) and not isinstance(total, bool) and total >= 0:
+        if total == 0:
+            facts = f"{facts}, no frames"
+        else:
+            facts = f"{facts}, {total} frame" if total == 1 else f"{facts}, {total} frames"
+            facts = facts if seen else f"{facts} {UNSEEN_PICTURE}"
+    return f"{facts}; transcript" if manifest.get("transcript") is True else f"{facts}; no speech"
 
 
 def _pages_told(manifest: Mapping[str, Any], format_name: str, unit: str) -> str | None:

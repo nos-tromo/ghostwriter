@@ -481,22 +481,34 @@ def test_a_message_waits_for_its_attachments(
         kind="image",
         status="processing",
     )
+    clip = store.add_attachment(
+        cid,
+        file_id="3" * 32,
+        path=f"{chat_folder(KEY, cid)}/harbour-tour.mp4",
+        name="harbour-tour.mp4",
+        size=208,
+        mime="video/mp4",
+        kind="media",
+        status="processing",
+    )
     sheet = _attach(client, cid, file_id="2" * 32)
     before = len(events(audit_stream))
-    r = _send(client, cid, attachment_ids=[sheet.id, photo.id])
-    assert (r.status_code, r.json()) == (
-        409,
-        {"detail": "Wait until the attached files are ready.", "code": "attachment_processing"},
-    )
+    for waiting in ([sheet.id, photo.id, clip.id], [sheet.id, clip.id]):
+        r = _send(client, cid, attachment_ids=waiting)
+        assert (r.status_code, r.json()) == (
+            409,
+            {"detail": "Wait until the attached files are ready.", "code": "attachment_processing"},
+        )
     assert events(audit_stream)[before:] == [] and fake_openai.calls == []
     assert not _state(client).turns.running(cid)
     assert _detail(client, cid)["messages"] == []
 
     assert store.settle_attachment(photo.id, status="failed", manifest=None, failure="unreadable_file")
+    assert store.settle_attachment(clip.id, status="failed", manifest=None, failure="nextext_failed")
     fake_openai.script = [ANSWER]
-    assert _send(client, cid, attachment_ids=[sheet.id, photo.id]).status_code == 200
+    assert _send(client, cid, attachment_ids=[sheet.id, photo.id, clip.id]).status_code == 200
     [question, _] = _detail(client, cid)["messages"]
-    assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id])
+    assert sorted(a["id"] for a in question["attachments"]) == sorted([sheet.id, photo.id, clip.id])
 
 
 def _prompt_users(call: dict[str, Any]) -> list[str]:

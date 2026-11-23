@@ -26,6 +26,8 @@ from ghostwriter.utils.audit_event import Actor
 from ghostwriter.utils.audit_runtime import encode_purpose
 from ghostwriter.workbench import (
     ACCEPT_IMAGES,
+    DERIVED_TIMEOUT_S,
+    DERIVED_TYPES,
     MAX_ATTACHMENT_BYTES,
     MAX_IMAGE_BYTES,
     MAX_RENDITION_BYTES,
@@ -59,6 +61,7 @@ from ghostwriter.workbench import (
 from tests.conftest import KEY, make_settings
 from tests.fakes import (
     CONTRACT_TOOLS,
+    DERIVED_ID,
     NOT_FOUND,
     OUTPUT_ID,
     READ_DOCUMENT_TEXT,
@@ -132,6 +135,12 @@ def _tool_names(found: Any) -> list[str]:
 
 PDF = f"{FOLDER}/quay-scan.pdf"
 PHOTO = f"{FOLDER}/harbour-photo.jpg"
+CLIP = f"{FOLDER}/harbour-tour.mp4"
+#: What a clip starts with: a few bytes of an MP4 header, then nothing the door reads.
+CLIP_BYTES = b"\x00\x00\x00\x18ftypmp42" + bytes(200)
+TRANSCRIPT = (
+    b'{"start": 0.0, "end": 4.5, "text": "welcome aboard"}\n{"start": 5.0, "end": 91.0, "text": "mind the gap"}\n'
+)
 
 
 def _shown(n: int, **changes: Any) -> dict[str, Any]:
@@ -409,13 +418,24 @@ def test_a_call_asks_for_images_only_when_told_to() -> None:
 
 @pytest.mark.parametrize(
     "operation",
-    ["discover", "call_tool", "upload", "view", "delete_chat", "delete_upload", "prepare", "fetch_renditions"],
+    [
+        "discover",
+        "call_tool",
+        "upload",
+        "view",
+        "delete_chat",
+        "delete_upload",
+        "prepare",
+        "derived",
+        "fetch_renditions",
+    ],
 )
 async def test_every_request_carries_the_session_purpose_and_request_id(operation: str) -> None:
     """Discovery, tools/call and the file routes each carry the chat, the user, the purpose and the request id."""
     door = FakeDoor()
     door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
     door.files[PDF] = (b"%PDF", "application/pdf")
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
     client = _client(door)
     if operation == "discover":
         client.discover(call=CALL, images=True)
@@ -428,6 +448,10 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
             pass
     elif operation == "prepare":
         await client.prepare(call=CALL, path=PDF)
+    elif operation == "derived":
+        assert (
+            await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT)) == DERIVED_ID
+        )
     elif operation == "fetch_renditions":
         assert (
             _renditions(client, RenditionRequest(PDF, 1), RenditionRequest(PDF, 2)) == [("image/jpeg", TINY_JPEG)] * 2
@@ -890,6 +914,8 @@ async def test_prepare_answers_the_manifest() -> None:
         "renditions": [{"n": n, "width": 1131, "height": 1600, "mime": "image/jpeg"} for n in (1, 2, 3)],
         "frames": None,
         "unit": "page",
+        "duration_s": None,
+        "transcript": False,
     }
     assert json.loads(json.dumps(stored)) == stored
 
@@ -1074,6 +1100,309 @@ async def test_prepare_never_asks_outside_the_chat() -> None:
         with pytest.raises(WorkbenchNotFound):
             await _client(door).prepare(call=CALL, path=path)
     assert door.requests == []
+
+
+async def test_derived_streams_an_artifact_into_the_clips_folder() -> None:
+    """The artifact goes as the raw body, typed by its role, to the clip's source, for the chat's session."""
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    client = _client(door)
+    got = await client.derived(
+        call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT[:20], TRANSCRIPT[20:])
+    )
+    assert got == DERIVED_ID
+    req = door.last("/files/derived")
+    assert req.method == "POST" and dict(req.url.params) == {"source": CLIP, "role": "nextext_jsonl"}
+    assert req.headers["content-type"] == "application/x-ndjson" == DERIVED_TYPES["nextext_jsonl"]
+    assert req.headers["accept-encoding"] == "identity" and "content-length" not in req.headers
+    assert req.headers["x-session-id"] == session_pseudonym(KEY, CHAT)
+    assert req.extensions["timeout"]["read"] == DERIVED_TIMEOUT_S == 150.0
+    assert door.derived == [(CLIP, "nextext_jsonl", TRANSCRIPT)]
+    frames = b"PK\x03\x04" + bytes(64)
+    assert await client.derived(call=CALL, source=CLIP, role="nextext_zip", chunks=_chunks(frames)) == DERIVED_ID
+    req = door.last("/files/derived")
+    assert dict(req.url.params) == {"source": CLIP, "role": "nextext_zip"}
+    assert req.headers["content-type"] == "application/zip" == DERIVED_TYPES["nextext_zip"]
+    assert door.derived[-1] == (CLIP, "nextext_zip", frames)
+
+
+@pytest.mark.parametrize(
+    ("answer", "error", "token"),
+    [
+        (httpx.Response(404, json=NOT_FOUND), WorkbenchNotFound, "not_found"),
+        (httpx.Response(413, json={"detail": "file too large"}), WorkbenchUnavailable, "http:413"),
+        (
+            httpx.Response(422, json={"detail": "unreadable_file: the artifact is empty"}),
+            WorkbenchUnavailable,
+            "unreadable_file",
+        ),
+        (
+            httpx.Response(422, json={"detail": "unreadable_file: the artifact is not what its role says"}),
+            WorkbenchUnavailable,
+            "unreadable_file",
+        ),
+        (httpx.Response(422, json={"detail": "unsupported_format: .mp4"}), WorkbenchUnavailable, "unsupported_format"),
+        (httpx.Response(422, json={"detail": [{"loc": ["query", "role"]}]}), WorkbenchUnavailable, "http:422"),
+        (httpx.Response(400, json={"detail": "invalid session"}), WorkbenchUnavailable, "http:400"),
+        (httpx.Response(428, json={"detail": "purpose"}), WorkbenchUnavailable, "http:428"),
+        (httpx.Response(503, json={"detail": "busy, retry later"}), WorkbenchUnavailable, "http:503"),
+        (httpx.Response(507, json={"detail": "storage full"}), StorageFull, None),
+        (httpx.ConnectError("connection refused"), WorkbenchUnavailable, "unreachable"),
+        (httpx.ReadTimeout("slow"), WorkbenchUnavailable, "timeout"),
+    ],
+    ids=[
+        "not_found",
+        "too_large",
+        "empty",
+        "not_its_role",
+        "unsupported",
+        "validation_list",
+        "bad_session",
+        "no_purpose",
+        "busy",
+        "storage_full",
+        "unreachable",
+        "timeout",
+    ],
+)
+async def test_derived_maps_refusals(answer: object, error: type[Exception], token: str | None) -> None:
+    """404 is not found, 413 and any status without a token http:<status>, a 422's token the text before its colon.
+
+    A busy workbench (503, the clip's lock held past 120 s) is http:503, as every other route maps it; the media step
+    asks once more.
+    """
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    door.answers["/files/derived"] = answer
+    with pytest.raises(error) as raised:
+        await _client(door).derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT))
+    assert type(raised.value) is error
+    assert token is None or getattr(raised.value, "token", None) == token
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        {"role": "nextext_jsonl", "bytes": 4, "replaced": None},
+        {"id": "xyz", "role": "nextext_jsonl", "bytes": 4, "replaced": None},
+        {"id": "A" * 32, "role": "nextext_jsonl", "bytes": 4, "replaced": None},
+        {"id": 7, "role": "nextext_jsonl", "bytes": 4, "replaced": None},
+        ["id", DERIVED_ID],
+        httpx.Response(200, text="stored"),
+    ],
+    ids=["no_id", "id_not_32_hex", "id_upper_case", "id_not_text", "not_an_object", "not_json"],
+)
+async def test_a_derived_answer_without_an_id_is_refused(answer: object) -> None:
+    """Only an object with a 32-hex ``id`` is an answer; anything else is unavailable, never not found."""
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    door.answers["/files/derived"] = answer
+    with pytest.raises(WorkbenchUnavailable) as raised:
+        await _client(door).derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT))
+    assert not isinstance(raised.value, WorkbenchNotFound)
+
+
+async def test_derived_never_asks_outside_the_chat() -> None:
+    """A source outside the chat's folder is not found, and nothing is sent."""
+    door = FakeDoor()
+    for source in ("/workspace/other/x.mp4", f"{FOLDER}/../x.mp4", FOLDER):
+        with pytest.raises(WorkbenchNotFound):
+            await _client(door).derived(call=CALL, source=source, role="nextext_zip", chunks=_chunks(b"PK"))
+    assert door.requests == []
+
+
+async def test_derived_closes_the_callers_stream() -> None:
+    """The artifact's iterator is closed when the call ends: after an answer, a refusal and a source left unsent."""
+    closed: list[str] = []
+
+    class Stream:
+        """One chunk, then the end; says when it is closed, whether it was read or not."""
+
+        def __init__(self, label: str) -> None:
+            self.label, self.sent = label, False
+
+        def __aiter__(self) -> "Stream":
+            return self
+
+        async def __anext__(self) -> bytes:
+            if self.sent:
+                raise StopAsyncIteration
+            self.sent = True
+            return TRANSCRIPT
+
+        async def aclose(self) -> None:
+            closed.append(self.label)
+
+    def stream(label: str) -> AsyncIterator[bytes]:
+        return Stream(label)
+
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    client = _client(door)
+    await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=stream("answered"))
+    door.answers["/files/derived"] = httpx.Response(503, json={"detail": "busy, retry later"})
+    with pytest.raises(WorkbenchUnavailable):
+        await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=stream("refused"))
+    with pytest.raises(WorkbenchNotFound):
+        await client.derived(call=CALL, source="/workspace/other/x.mp4", role="nextext_jsonl", chunks=stream("unsent"))
+    assert closed == ["answered", "refused", "unsent"]
+
+
+class ArtifactBroke(Exception):
+    """An invented failure of the stream an artifact comes in, as Nextext's own types are for the media step."""
+
+
+@pytest.mark.parametrize("exception", [ArtifactBroke, ValueError], ids=["artifact_broke", "value_error"])
+async def test_derived_hands_on_an_artifact_stream_that_fails_mid_body(
+    exception: type[Exception],
+) -> None:
+    """A stream that breaks while it is sent reaches the caller as itself; the clip gets no derived file.
+
+    workbench drops a body that ends early; the client reports no success and wraps nothing, so the media step
+    sees Nextext's own failure (an artifact past its cap, Nextext gone) and its own token.
+    """
+    closed: list[bool] = []
+
+    async def chunks() -> AsyncIterator[bytes]:
+        try:
+            yield TRANSCRIPT
+            raise exception("the artifact broke off")
+        finally:
+            closed.append(True)
+
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    with pytest.raises(exception) as raised:
+        await _client(door).derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=chunks())
+    assert type(raised.value) is exception and not isinstance(raised.value, WorkbenchUnavailable)
+    assert closed == [True] and door.derived == []
+
+
+async def test_a_media_manifest_is_read() -> None:
+    """A clip is kind media and counts frames; the transcript and the duration are read and kept in the stored form."""
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    client = _client(door)
+    bare = await client.prepare(call=CALL, path=CLIP)
+    assert bare == Manifest("media", 0, (), (), None, "frame", None, False)
+    await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT))
+    await client.derived(call=CALL, source=CLIP, role="nextext_zip", chunks=_chunks(b"PK\x03\x04"))
+    got = await client.prepare(call=CALL, path=CLIP)
+    assert (got.kind, got.unit, got.total, got.frames) == ("media", "frame", 3, None)
+    assert (got.duration_s, got.transcript, got.pages_without_text) == (91.0, True, ())
+    assert got.renditions == tuple(Rendition(n, 1280, 720, "image/jpeg") for n in (1, 2, 3))
+    stored = got.as_stored()
+    assert tuple(stored) == STORED_MANIFEST_KEYS
+    assert (stored["kind"], stored["unit"], stored["duration_s"], stored["transcript"]) == (
+        "media",
+        "frame",
+        91.0,
+        True,
+    )
+    assert json.loads(json.dumps(stored)) == stored
+
+
+async def test_a_clip_without_speech_keeps_the_duration_its_frames_give() -> None:
+    """The frames alone are a manifest: no transcript, and the last frame's time as the duration, a float.
+
+    As workbench writes it, a duration is ``null`` only for a clip with neither speech nor frames; a whole number
+    reads as a float.
+    """
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    client = _client(door)
+    await client.derived(call=CALL, source=CLIP, role="nextext_zip", chunks=_chunks(b"PK\x03\x04"))
+    silent = await client.prepare(call=CALL, path=CLIP)
+    assert (silent.total, silent.transcript, silent.duration_s) == (3, False, 8.0)
+    door.manifests[CLIP] = {**stock_manifest(CLIP), "duration_s": 40}
+    whole = await client.prepare(call=CALL, path=CLIP)
+    assert (whole.total, whole.duration_s) == (0, 40.0) and isinstance(whole.duration_s, float)
+    door.manifests[CLIP] = {**stock_manifest(CLIP), "duration_s": None}
+    assert (await client.prepare(call=CALL, path=CLIP)).duration_s is None
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"duration_s": "x"},
+        {"duration_s": "91.0"},
+        {"duration_s": -1},
+        {"duration_s": -0.5},
+        {"duration_s": True},
+        {"duration_s": [91.0]},
+        {"transcript": 1},
+        {"transcript": "yes"},
+        {"transcript": None},
+        {"unit": "page"},
+        {"unit": "slide"},
+        {"unit": None},
+    ],
+    ids=[
+        "duration_text",
+        "duration_numeral",
+        "duration_negative_int",
+        "duration_negative_float",
+        "duration_bool",
+        "duration_list",
+        "transcript_int",
+        "transcript_text",
+        "transcript_null",
+        "media_unit_page",
+        "media_unit_slide",
+        "media_unit_null",
+    ],
+)
+async def test_a_bad_media_manifest_is_bad_answer(change: dict[str, Any]) -> None:
+    """A clip's manifest whose duration, transcript or unit is not what the contract says is refused whole."""
+    door = FakeDoor()
+    door.answers["/files/prepare"] = {**stock_manifest(CLIP), **change}
+    with pytest.raises(WorkbenchUnavailable) as raised:
+        await _client(door).prepare(call=CALL, path=CLIP)
+    assert raised.value.token == "bad_answer" and not isinstance(raised.value, WorkbenchNotFound)
+
+
+async def test_a_media_manifest_without_its_unit_is_a_bad_answer() -> None:
+    """Workbench 0.9 names the unit of a clip; an answer that leaves it out would read as pages, so it is refused."""
+    door = FakeDoor()
+    door.answers["/files/prepare"] = {key: value for key, value in stock_manifest(CLIP).items() if key != "unit"}
+    with pytest.raises(WorkbenchUnavailable) as raised:
+        await _client(door).prepare(call=CALL, path=CLIP)
+    assert raised.value.token == "bad_answer"
+
+
+@pytest.mark.parametrize(
+    "duration",
+    [float("inf"), float("-inf"), float("nan"), 10**400, -(10**400)],
+    ids=["inf", "minus_inf", "nan", "too_large_for_a_float", "too_small_for_a_float"],
+)
+async def test_a_duration_that_is_not_a_finite_number_is_a_bad_answer(duration: float) -> None:
+    """Python's JSON reads ``Infinity``, ``NaN`` and integers of any size; none of them is a duration.
+
+    An integer too large for a float must end as ``bad_answer`` as any other bad value does, never as an
+    ``OverflowError``.
+    """
+    door = FakeDoor()
+    text = json.dumps({**stock_manifest(CLIP), "duration_s": duration})
+    door.answers["/files/prepare"] = httpx.Response(
+        200, content=text.encode(), headers={"Content-Type": "application/json"}
+    )
+    with pytest.raises(WorkbenchUnavailable) as raised:
+        await _client(door).prepare(call=CALL, path=CLIP)
+    assert raised.value.token == "bad_answer"
+
+
+async def test_an_older_manifest_reads_with_the_defaults() -> None:
+    """Workbench 0.8's eight keys (no duration, no transcript) read as no duration and no transcript."""
+    door = FakeDoor()
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    door.manifests[PDF] = {
+        key: value for key, value in stock_manifest(PDF).items() if key not in ("duration_s", "transcript")
+    }
+    got = await _client(door).prepare(call=CALL, path=PDF)
+    assert (got.kind, got.total, got.duration_s, got.transcript) == ("pdf", 3, None, False)
+    stored = got.as_stored()
+    assert (stored["duration_s"], stored["transcript"]) == (None, False)
+    assert tuple(stored) == STORED_MANIFEST_KEYS
 
 
 async def test_a_rendition_view_carries_its_parameters() -> None:

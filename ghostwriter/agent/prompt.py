@@ -23,6 +23,12 @@ VISION: Final = (
     "when the user asks whether you can see one, or how it looks, look at it with view_file instead of saying you "
     "cannot."
 )
+#: How the model takes a video or audio clip the user attached, given only while it sees, has the tools and clips are
+#: offered: the transcript is text, the frames are pictures, which only ``view_file`` shows.
+MEDIA: Final = (
+    "A video or audio file the user attached comes with a transcript: read it with read_document. A video's frames "
+    "are pictures of it over time: look at them with view_file ('frame 3', 'frames 2-5', 'at 01:24')."
+)
 #: How the model checks and restyles a deck it built, given only while it sees and write_presentation is offered:
 #: it looks at the slides it wrote and mends what is broken without changing what the user agreed to, and a better
 #: look the user asks for is made with the tools it has, not declined.
@@ -43,6 +49,7 @@ def system_prompt(
     expired: bool,
     presentations: bool = False,
     vision: bool = False,
+    media: bool = False,
 ) -> str:
     """Return the system prompt of a message.
 
@@ -56,6 +63,8 @@ def system_prompt(
         vision: Whether the model sees images and is offered ``view_file``; :data:`VISION` follows the
             sentences on the chat's folder only then, and only when tools are offered. With ``presentations``
             too, :data:`DECK_CHECK` follows the outline-first rule.
+        media: Whether video and audio are offered; :data:`MEDIA` follows :data:`VISION` only then, and only
+            with ``vision``, since a clip's frames are looked at with ``view_file``.
 
     Returns:
         The prompt, its sentences joined by single spaces.
@@ -75,6 +84,8 @@ def system_prompt(
         )
         if vision:
             parts.append(VISION)
+            if media:
+                parts.append(MEDIA)
         if presentations:
             parts.append(PRESENTATIONS)
             if vision:

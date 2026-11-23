@@ -57,7 +57,16 @@ FILES_STORE: Final = "files"
 #: The longest title the first message gives a chat.
 TITLE_CHARS: Final = 60
 #: What a manifest keeps of what workbench reports: counts, kinds and sizes, never a path, a hint or bytes.
-STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames", "unit")
+STORED_MANIFEST_KEYS: Final = (
+    "kind",
+    "total",
+    "pages_without_text",
+    "renditions",
+    "frames",
+    "unit",
+    "duration_s",
+    "transcript",
+)
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
 
@@ -1319,11 +1328,11 @@ class ChatStore:
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.
 
-        A picture cannot be seen unprepared and goes ``failed`` with the token; any other
-        file is read as it was before preparing, and goes ``ready``.
+        A picture cannot be seen unprepared, and a clip has nothing to read without its transcript: both go
+        ``failed`` with the token. Any other file is read as it was before preparing, and goes ``ready``.
 
         Args:
-            failure: The token a picture fails with.
+            failure: The token a picture or a clip fails with.
 
         Returns:
             How many rows were settled.
@@ -1333,7 +1342,7 @@ class ChatStore:
                 "CursorResult[Any]",
                 s.execute(
                     update(Attachment)
-                    .where(Attachment.status == "processing", Attachment.kind == "image")
+                    .where(Attachment.status == "processing", Attachment.kind.in_(("image", "media")))
                     .values(status="failed", failure=failure)
                 ),
             )

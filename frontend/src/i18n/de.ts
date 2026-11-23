@@ -59,10 +59,13 @@ export const de: Strings = {
   'composer.error_purpose':
     '{name} wurde nicht angehängt: Für das Anhängen von Dateien muss ein Zweck angegeben werden.',
   'composer.error_too_many_pending': 'Senden Sie zuerst die angehängten Dateien.',
+  'composer.error_clip': '{name} kann gerade nicht angehängt werden: Video und Audio sind nicht verfügbar.',
   'composer.processing': '{name} wird vorbereitet…',
+  'composer.transcribing': '{name} wird transkribiert…',
   'composer.removing': '{name} wird entfernt…',
   'composer.error_remove': '{name} konnte nicht entfernt werden.',
   'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
+  'composer.transcribing_hint': 'Video und Audio dauern länger, weil sie vor dem Senden transkribiert werden.',
   'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
   'composer.images_cap':
     'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',

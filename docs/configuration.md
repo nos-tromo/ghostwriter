@@ -25,6 +25,9 @@ cannot work stops startup and names the variable, never its value
 | `WORKBENCH_API_KEY` | unset | workbench's `GHOSTWRITER_WORKBENCH_KEY`. Unset: no tools and no attachments, chats work. Shorter than 32 characters stops startup. Rotating it renames every chat's folder (the pseudonyms are keyed with it), so earlier files read as expired. |
 | `WORKBENCH_API_BASE` | `http://workbench-api:8000` | workbench on `workbench-net`. |
 | `WORKBENCH_TIMEOUT` | `150` | Seconds one tool call may take. A call starts only while this much of the message's wall is left. |
+| `NEXTEXT_API_KEY` | unset | Ghostwriter's service token at Nextext: the same value as its entry in Nextext's `NEXTEXT_SERVICE_TOKENS` (`ghostwriter=<token>`); `make env` fills both in. Unset: video and audio are not offered, and nothing else changes. Shorter than 32 characters stops startup. One entry per Ghostwriter: Nextext keeps a service's jobs under its entry's name (`service:ghostwriter`), not its token, and a start deletes every job of that owner, so a second Ghostwriter needs an entry of its own name and its own token; under the same name, even with another token, it would delete this one's jobs. A key Nextext refuses (401 or 403) logs one error naming `NEXTEXT_API_KEY`, never its value, and clips are not offered until a list of the probe's with the key answers 200. |
+| `NEXTEXT_API_BASE` | `http://nextext-backend:8000/api/v1` (set by compose) | Nextext's API on `inference-net`. Empty turns video and audio off. Clips also need workbench 0.9.0 or later; against an earlier workbench they are not offered either. |
+| `NEXTEXT_TIMEOUT` | `900` | Seconds one clip may take at Nextext, 60–86,400: the upload, the wait behind other jobs, the transcription and the downloads. Nextext runs one job at a time (its `NEXTEXT_JOB_CONCURRENCY`, 1), so a clip queues behind docint's ingest within this budget. Whisper on CPU runs at about real time, so a CPU-only host needs a larger budget for long recordings; 900 s suits a GPU. |
 | `AUDIT_REQUIRE_PURPOSE` | empty | Audit actions that need a stated purpose (428 without one); an unknown action stops startup. |
 | `GHOSTWRITER_CHAT_RETENTION_DAYS` | `90` | Days a chat is kept after it started (1–3650); `off` keeps chats, for development only. |
 | `RETENTION_NOTICE_DAYS` | `30` | Days a new or shorter chat period waits before it deletes (0–365). |
@@ -59,7 +62,7 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_RESULTS_PER_MESSAGE` | 20 | Cards a message shows |
 | `INLINE_IMAGE_BYTES` | 10 MiB | The largest image shown inline (png, jpeg, gif, webp) |
 | `MAX_RECORDING_S` / `MAX_RECORDING_BYTES` | 120 s / 10 MiB | A recording (`inference.py`) |
-| `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment (`workbench.py`) |
+| `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment, a video or audio clip included (`workbench.py`) |
 | `MAX_RENDITION_BYTES` | 768 KiB | A render of a page or picture fetched must be smaller (`workbench.py`) |
 | `MAX_IMAGE_BYTES` / `MAX_IMAGES_BYTES` / `MAX_TOOL_IMAGES` | 1 MiB / 3 MiB / 8 | The pictures kept from one tool answer: each, all together, and how many (`workbench.py`) |
 | `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`). A prepare whose file another call is still making waits for that call first, up to 120 s more, and then usually finds the manifest made; the rare one that waits it out and then converts the file itself can pass 390 s and is cut, and the file reads as text |
@@ -69,6 +72,16 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
 | `PREPARE_SLOTS` | 2 | Attachments prepared at once, in the one process (`processing.py`) |
 | `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). From workbench 0.8.1 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
+| `MEDIA_SLOTS` | 2 | Clips at Nextext at once, in the one process; a clip there holds none of the `PREPARE_SLOTS`, so a picture is ready as fast as without clips (`processing.py`) |
+| `POLL_S` / `POLL_SLOW_S` / `POLL_SLOW_AFTER_S` | 2 s / 5 s / 60 s | Between two polls of a clip's job at Nextext, and the age of the job from which the longer wait holds (`processing.py`) |
+| `POLL_TOLERATED` | 3 | Failed polls in a row a clip rides out within its budget; a fourth in a row fails it `nextext_unavailable`. A job that is gone fails it at once (`processing.py`) |
+| `START_WAIT_S` | 120 s | The longest the start reconcile waits for Nextext's probe. A clip waits for that reconcile this and `RECONCILE_EXTRA_S` longer, and 5 s of slack, and past it makes no job (`processing.py`) |
+| `RECONCILE_EXTRA_S` | 60 s | The longest the start reconcile takes once the probe has passed, and the sweep's reconcile in all; also what the sweep's grace adds to `NEXTEXT_TIMEOUT` (`processing.py`, `retention.py`) |
+| `ORPHAN_GRACE_S` / `ORPHAN_RECONCILE_S` | 180 s / 240 s | The reconcile after a create whose answer was lost, or a clip's own delete that failed: it runs 240 s after it and spares jobs younger than 180 s (`processing.py`) |
+| `ARTIFACT_CAPS` | 8 MiB / 32 MiB | The transcript (`docint.jsonl`) and the frames (`keyframes.zip`) of a clip; one over its cap is left out (`nextext.py`) |
+| `JOB_OPTIONS["keyframes_max"]` / `["keyframes_per_minute"]` | 19 / 20 | The frames of a video: at most 19, since workbench keeps 19 (`MEDIA_FRAMES_MAX`), at 20 a minute; Nextext's own default of 4 a minute would give a 30 s clip 2 frames (`nextext.py`) |
+| `CREATE_READ_S` / `CALL_S` / `ARTIFACT_READ_S` / `HEALTH_S` | 120 s / 10 s / 60 s / 5 s | Each wait on Nextext: its answer to a create once the clip is sent, a list or a delete, one read of an artifact, the health probe. The probe asks again after 5 s, doubling to 300 s, while Nextext does not answer (`nextext.py`) |
+| `DERIVED_TIMEOUT_S` | 150 | Seconds workbench is waited for once it holds a whole artifact: the clip's lock for up to 120 s, and the work (`workbench.py`) |
 | `MAX_WAIT_S` | 20 | The longest `?wait=` of an attachment's status long poll (`processing.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
 | `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |

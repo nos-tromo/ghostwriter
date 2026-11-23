@@ -17,10 +17,17 @@ its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retenti
 which the lifespan runs a minute after start and then daily, and cancels at
 shutdown. ``app.state.processor`` is the attachment processor (:mod:`ghostwriter.processing`), ``None``
 while workbench is off: at start it prepares again what the last process left ``processing``, or, without
-workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes.
+workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes. It takes a
+video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it. Right after the requeue the
+lifespan starts its start reconcile (:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which
+start-up never waits for: once Nextext's probe passes, it deletes every job Nextext lists for Ghostwriter, then opens
+the gate every clip, a requeued one too, waits for before it makes its job.
 ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
-waits for, and cancels it at shutdown. Every request body is capped per route
+waits for, and cancels it at shutdown. ``app.state.nextext`` is the Nextext client and ``app.state.media`` the
+probe of its health, which decides with workbench's version whether video and audio are offered
+(:mod:`ghostwriter.nextext`); both are ``None`` while Nextext is off (no base, or no key). The lifespan runs
+the probe, which start-up never waits for, and cancels it at shutdown. Every request body is capped per route
 (:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
@@ -51,6 +58,7 @@ from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.inference import SPEECH_THREADS, ModelClient
 from ghostwriter.log_cfg import setup_logger
+from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.retention import FIRST_SWEEP_DELAY_S, SWEEP_INTERVAL_S, Sweeper
 from ghostwriter.retention_rule import run_retention_loop
@@ -73,6 +81,7 @@ def create_app(
     workbench_transport: httpx.AsyncBaseTransport | None = None,
     model: ModelClient | None = None,
     inference_transport: httpx.AsyncBaseTransport | None = None,
+    nextext_transport: httpx.AsyncBaseTransport | None = None,
     now: Callable[[], datetime] = utcnow,
 ) -> FastAPI:
     """Build the application.
@@ -85,6 +94,8 @@ def create_app(
         model: The chat model (tests pass one over a fake router); the router of the
             settings when omitted.
         inference_transport: The transport of the Ollama probe (tests pass an ``httpx.MockTransport``);
+            ``None`` uses httpx's own.
+        nextext_transport: The transport to Nextext (tests pass an ``httpx.MockTransport``);
             ``None`` uses httpx's own.
         now: The store's clock (tests pass one set by hand).
 
@@ -105,8 +116,8 @@ def create_app(
         The store's schema is brought to this release's version and the
         configured periods are put in force before the first request; attachments
         left ``processing`` are prepared again, or settled without workbench; then
-        the retention sweep starts, and the Ollama probe where it applies (start-up
-        does not wait for it); both are cancelled first at shutdown, then the
+        the retention sweep starts, the Ollama probe where it applies and Nextext's health probe while Nextext is
+        on (start-up waits for neither); all are cancelled first at shutdown, then the
         attachment jobs, before the database goes.
 
         Args:
@@ -119,6 +130,7 @@ def create_app(
         engine: Engine | None = None
         sweeps: asyncio.Task[None] | None = None
         probe: asyncio.Task[None] | None = None
+        media_probe: asyncio.Task[None] | None = None
         processor: AttachmentProcessor | None = None
         try:
             start_chain(app, emitter)
@@ -129,13 +141,27 @@ def create_app(
             store.apply_periods(settings.chat_days)
             workbench: WorkbenchClient | None = app.state.workbench
             if workbench is not None:
-                processor = AttachmentProcessor(store, workbench, emitter, image_tokens=settings.image_tokens)
+                processor = AttachmentProcessor(
+                    store,
+                    workbench,
+                    emitter,
+                    image_tokens=settings.image_tokens,
+                    nextext=app.state.nextext,
+                    health=app.state.media,
+                    nextext_timeout_s=settings.nextext_timeout_s,
+                )
                 processor.requeue()
+                processor.start_media()
             elif settled := store.settle_processing("unavailable"):
                 logger.info("{} attachments left processing were settled without workbench.", settled)
             app.state.processor = processor
             app.state.agent = AgentLoop(
-                model=chat_model, workbench=app.state.workbench, store=store, settings=settings, vision=app.state.vision
+                model=chat_model,
+                workbench=app.state.workbench,
+                store=store,
+                settings=settings,
+                vision=app.state.vision,
+                media=app.state.media,
             )
             app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
             app.state.speech_threads = anyio.CapacityLimiter(SPEECH_THREADS)
@@ -153,9 +179,12 @@ def create_app(
             )
             if settings.vision and settings.inference_provider == "ollama":
                 probe = asyncio.create_task(app.state.vision.probe(transport=inference_transport))
+            media: NextextHealth | None = app.state.media
+            if media is not None:
+                media_probe = asyncio.create_task(media.run())
             yield
         finally:
-            for task in (probe, sweeps):
+            for task in (media_probe, probe, sweeps):
                 if task is not None:
                     task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -184,6 +213,9 @@ def create_app(
     )
     app.state.turns = TurnRegistry()
     app.state.vision = Vision(settings)
+    nextext = NextextClient(settings, transport=nextext_transport) if settings.nextext_enabled else None
+    app.state.nextext = nextext
+    app.state.media = NextextHealth(nextext) if nextext is not None else None
 
     @app.exception_handler(AuditWriteError)
     async def refuse_unrecorded(request: Request, exc: AuditWriteError) -> JSONResponse:

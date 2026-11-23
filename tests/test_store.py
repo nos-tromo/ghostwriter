@@ -609,6 +609,8 @@ MANIFEST: dict[str, Any] = {
     "frames": [],
     "unit": "page",
     "hint": "two pages carry no text",
+    "duration_s": None,
+    "transcript": False,
 }
 
 
@@ -687,6 +689,61 @@ def test_a_settled_manifest_keeps_its_unit(store: ChatStore) -> None:
     ref = store.find_attachment("user-a", chat.id, older.id)
     assert ref is not None and ref.manifest is not None
     assert ref.manifest == stored_by_0_3_0 and "unit" not in ref.manifest
+
+
+def test_a_settled_media_manifest_keeps_its_facts(store: ChatStore, engine: Engine) -> None:
+    """A clip's manifest keeps its unit, its duration and whether it has a transcript; a 0.8 one has neither key."""
+    chat = store.create_chat("user-a")
+    clip = _picture(store, chat.id, kind="media")
+    manifest: dict[str, Any] = {
+        "path": "/workspace/s/harbour-tour.mp4",
+        "kind": "media",
+        "unit": "frame",
+        "total": 3,
+        "pages_without_text": [],
+        "renditions": [
+            {
+                "n": n,
+                "width": 1280,
+                "height": 720,
+                "mime": "image/jpeg",
+                "bytes": 48213,
+                "path": f"/workspace/s/f{n}.jpg",
+            }
+            for n in (1, 2, 3)
+        ],
+        "frames": None,
+        "hint": "frames come from view_file",
+        "duration_s": 134.0,
+        "transcript": True,
+    }
+    assert store.settle_attachment(clip.id, status="ready", manifest=manifest, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, clip.id)
+    assert ref is not None and ref.manifest is not None and ref.status == "ready"
+    assert list(ref.manifest) == list(STORED_MANIFEST_KEYS)
+    assert (ref.manifest["kind"], ref.manifest["unit"], ref.manifest["total"]) == ("media", "frame", 3)
+    assert (ref.manifest["duration_s"], ref.manifest["transcript"]) == (134.0, True)
+    _, render, failure = _raw_attachment(engine, clip.id)
+    assert failure is None and render is not None
+    assert all(word not in render for word in ("/workspace", "hint", "bytes", "tour"))
+    silent = _picture(store, chat.id, kind="media")
+    quiet = {**manifest, "duration_s": None, "transcript": False}
+    assert store.settle_attachment(silent.id, status="ready", manifest=quiet, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, silent.id)
+    assert ref is not None and ref.manifest is not None
+    assert (ref.manifest["duration_s"], ref.manifest["transcript"]) == (None, False)
+    older = _picture(store, chat.id, kind="document")
+    stored_by_0_8: dict[str, Any] = {
+        "kind": "pdf",
+        "total": 3,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "unit": "page",
+    }
+    assert store.settle_attachment(older.id, status="ready", manifest=stored_by_0_8, failure=None) is True
+    ref = store.find_attachment("user-a", chat.id, older.id)
+    assert ref is not None and ref.manifest == stored_by_0_8
 
 
 def test_a_manifest_without_some_keys_keeps_those_it_has(store: ChatStore) -> None:
@@ -810,16 +867,18 @@ def test_processing_attachments_are_listed_across_chats_with_their_owner(store: 
 
 
 def test_stranded_processing_rows_settle(store: ChatStore, engine: Engine) -> None:
-    """A restart finds rows nothing will settle: a picture fails with the token, a document is taken as ready."""
+    """A restart finds rows nothing will settle: a picture or a clip fails with the token, a document is ready."""
     chat = store.create_chat("user-a")
     picture = _picture(store, chat.id)
     pdf = _picture(store, chat.id, kind="document")
+    clip = _picture(store, chat.id, kind="media")
     ready = _attach(store, chat.id)
     failed = _picture(store, chat.id)
     store.settle_attachment(failed.id, status="failed", manifest=None, failure="unreadable")
-    assert store.settle_processing("interrupted") == 2
+    assert store.settle_processing("interrupted") == 3
     assert _raw_attachment(engine, picture.id) == ("failed", None, "interrupted")
     assert _raw_attachment(engine, pdf.id) == ("ready", None, None)
+    assert _raw_attachment(engine, clip.id) == ("failed", None, "interrupted")
     assert _raw_attachment(engine, ready.id) == ("ready", None, None)
     assert _raw_attachment(engine, failed.id) == ("failed", None, "unreadable")
     assert store.processing_attachments() == []

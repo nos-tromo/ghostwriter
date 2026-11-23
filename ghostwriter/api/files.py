@@ -10,8 +10,10 @@ While pictures are offered (:meth:`~ghostwriter.vision.Vision.images_offered`), 
 is stored ``processing`` and its upload answers at once; the attachment processor
 (:mod:`ghostwriter.processing`) has workbench prepare it. A Word, PowerPoint or OpenDocument text file
 (:func:`~ghostwriter.upload.prepared_later`) is stored ``ready`` and prepared after it, as a background job
-that only adds its facts. The SPA follows a ``processing`` status by long-poll
-(``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds; a ``ready``
+that only adds its facts. While clips are offered (:meth:`~ghostwriter.nextext.NextextHealth.offered`: Nextext
+healthy, workbench 0.9.0 or later), a video or audio clip is stored ``processing`` of the kind ``media``, its job
+carrying its size; without them it is refused 415 as any type not taken. The SPA follows a ``processing`` status
+by long-poll (``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds; a ``ready``
 one is answered at once), and shows a page or the picture through the preview route, a render streamed from
 workbench's view route with the same hardening.
 
@@ -49,6 +51,7 @@ from ghostwriter.api.messages import PROCESSING_CODE
 from ghostwriter.audit import Operation, audited, forward_headers
 from ghostwriter.body_limit import FILE_TOO_LARGE, TOO_LARGE_CODE
 from ghostwriter.identity import Principal, resolve_principal
+from ghostwriter.nextext import NextextHealth
 from ghostwriter.processing import ATTACHMENT, MAX_WAIT_S, AttachmentProcessor, PrepareJob
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.store import ChatNotFound, ChatStore, TooManyPending
@@ -133,18 +136,34 @@ def _processor(request: Request) -> AttachmentProcessor | None:
     return processor
 
 
-def _checked_name(raw: str, *, images: bool) -> tuple[str, str] | JSONResponse:
+def _media_offered(request: Request) -> bool:
+    """Say whether clips are offered, from the probe's last answer and workbench's cached discovery.
+
+    Reads the cached discovery, which may block once per cache window: call it on a pool thread.
+
+    Args:
+        request: The request.
+
+    Returns:
+        Whether Nextext is healthy and workbench is 0.9.0 or later; ``False`` while Nextext is off.
+    """
+    health: NextextHealth | None = request.app.state.media
+    return health is not None and health.offered(request.app.state.workbench)
+
+
+def _checked_name(raw: str, *, images: bool, media: bool) -> tuple[str, str] | JSONResponse:
     """Return an attachment's name and MIME type, or the refusal.
 
     Args:
         raw: The file name sent.
         images: Whether pictures are offered, and so taken.
+        media: Whether clips are offered, and so taken.
 
     Returns:
         The safe name and its type; or 415 for a type not taken, 422 for a name workbench refuses.
     """
     name = safe_filename(raw)
-    mime = None if name is None else attachment_type(name, images=images)
+    mime = None if name is None else attachment_type(name, images=images, media=media)
     if name is None or mime is None:
         return _refused(status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, UNSUPPORTED)
     problem = name_problem(name)
@@ -255,6 +274,7 @@ async def attach_file(
         return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING, TOO_MANY_PENDING_CODE)
     vision: Vision = request.app.state.vision
     offered = await run_in_threadpool(vision.images_offered, workbench)
+    media = await run_in_threadpool(_media_offered, request)
     try:
         part = await read_file_part(request, max_bytes=MAX_ATTACHMENT_BYTES)
     except TooLarge:
@@ -262,7 +282,7 @@ async def attach_file(
     except BadUpload:
         return _refused(status.HTTP_400_BAD_REQUEST, UNREADABLE)
     try:
-        checked = _checked_name(part.filename, images=offered)
+        checked = _checked_name(part.filename, images=offered, media=media)
         if isinstance(checked, JSONResponse):
             return checked
         name, mime = checked
@@ -282,7 +302,7 @@ async def attach_file(
     if isinstance(stored, JSONResponse):
         return stored
     kind = attachment_kind(name)
-    prepared = offered and needs_prepare(name)
+    prepared = kind == "media" or (offered and needs_prepare(name))
     later = offered and prepared_later(name)
     try:
         attachment = await run_in_threadpool(
@@ -304,7 +324,8 @@ async def attach_file(
         await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
     if prepared or later:
-        processor.submit(PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op, background=later))
+        job = PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op, background=later, size=stored.size)
+        processor.submit(job)
     return attachment
 
 

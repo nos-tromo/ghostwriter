@@ -56,10 +56,13 @@ export const en = {
     'Your files fill the space workbench allows; delete a chat or wait for files to expire.',
   'composer.error_purpose': '{name} was not attached: attaching files needs a stated purpose.',
   'composer.error_too_many_pending': 'Send the attached files before adding more.',
+  'composer.error_clip': '{name} cannot be attached now: video and audio are not available.',
   'composer.processing': 'Preparing {name}…',
+  'composer.transcribing': 'Transcribing {name}…',
   'composer.removing': 'Removing {name}…',
   'composer.error_remove': '{name} could not be removed.',
   'composer.processing_hint': 'Sending waits until the attached files are ready.',
+  'composer.transcribing_hint': 'Video and audio take longer: they are transcribed before they are sent.',
   'composer.unreadable': '{name} could not be read; the model will be told.',
   'composer.images_cap':
     'At most {max} images go to the model with one message; the others are only named.',

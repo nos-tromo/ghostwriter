@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { AttachmentTile, ImageLightbox, type AttachmentTileStatus } from '@infra/ui'
 import type { AttachmentOut } from '../api/types'
-import type { PendingError, PendingFile } from '../hooks/useAttachments'
+import { isClip, type PendingError, type PendingFile } from '../hooks/useAttachments'
 import { usePreview } from '../hooks/usePreview'
 import type { Strings } from '../i18n'
 import { useLang, useT } from '../i18n/LanguageContext'
@@ -14,6 +14,7 @@ const ERROR_KEYS: Record<PendingError, keyof Strings> = {
   storage_full: 'composer.error_storage_full',
   too_many_pending: 'composer.error_too_many_pending',
   purpose: 'composer.error_purpose',
+  clip: 'composer.error_clip',
 }
 
 /** Where a file stands, as its tile says it: refused or unreadable files are `failed`; one being
@@ -43,7 +44,8 @@ interface TileProps {
   onRemove: (key: string) => void
 }
 
-/** One file as a tile, with its picture (when it has one) opening in the lightbox. */
+/** One file as a tile, with its picture (when it has one) opening in the lightbox. A clip shows its kind's
+ *  icon only: it has no picture to draw, and nothing to open. */
 function Tile({ file, picture, onRemove }: Omit<TileProps, 'chatId'> & { picture: string | undefined }) {
   const t = useT()
   const lang = useLang()
@@ -53,7 +55,7 @@ function Tile({ file, picture, onRemove }: Omit<TileProps, 'chatId'> & { picture
     uploading: t('composer.uploading', { name: file.name }),
     processing: file.removing
       ? t('composer.removing', { name: file.name })
-      : t('composer.processing', { name: file.name }),
+      : t(isClip(file) ? 'composer.transcribing' : 'composer.processing', { name: file.name }),
     failed: file.error
       ? t(ERROR_KEYS[file.error], { name: file.name })
       : t('composer.unreadable', { name: file.name }),
@@ -97,10 +99,10 @@ function FetchedTile({ chatId, attachment, ...props }: TileProps & { attachment:
 
 /**
  * The files the next message sends, one tile each: a picture shows itself (from the file in hand
- * at once, else from the server's rendition) and opens full size; every other file shows its kind,
- * name and size. A tile says where its file stands: being attached, being prepared, refused or
- * unreadable, expired, being taken back. Any file can be taken back before it is sent: the X on its tile.
- * One whose taking back failed says so below the row, and stays.
+ * at once, else from the server's rendition) and opens full size; every other file, a video or audio
+ * clip included, shows its kind, name and size. A tile says where its file stands: being attached, being
+ * prepared (a clip, being transcribed), refused or unreadable, expired, being taken back. Any file can be
+ * taken back before it is sent: the X on its tile. One whose taking back failed says so below the row, and stays.
  *
  * The row sits above the composer's pill, never inside it. The refusals are said below it, each by
  * the reason the server gave; so is the cap on pictures, once more wait than go to the model.

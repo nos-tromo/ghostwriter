@@ -7,7 +7,15 @@ recorded first, by reference, as the system: a record that cannot be written rai
 anything of its batch is deleted, and the next sweep tries again. A batch names at most
 :data:`SWEEP_BATCH` ids, the most one event holds.
 
-Each batch of chats:
+First, Ghostwriter's jobs at Nextext that no clip owns and that are older than ``NEXTEXT_TIMEOUT`` and
+:data:`~ghostwriter.processing.RECONCILE_EXTRA_S` are deleted, recorded first (``delete`` / ``chat.nextext``, by
+count): :meth:`~ghostwriter.processing.AttachmentProcessor.reconcile`. A clip's job lives no longer than that; an
+older one was left by a process that ended, by a create whose answer never came back, or by a delete Nextext
+refused. That step takes at most :data:`~ghostwriter.processing.RECONCILE_EXTRA_S`, and nothing in it stops the
+chats' sweep: a record it cannot write deletes nothing at Nextext, and that, a Nextext that hangs or any other
+failure is logged by its type, then the chats are swept.
+
+Then each batch of chats:
 
 1. holds each chat's turn (:class:`~ghostwriter.turns.TurnRegistry`); a chat whose turn is held,
    by an answer or by its owner's delete, is left to the next sweep. Holding the turns, the sweep
@@ -54,11 +62,11 @@ from loguru import logger
 from ghostwriter.audit import Operation, forward_headers, system_operation
 from ghostwriter.config import MAX_DAYS, Settings, load_settings
 from ghostwriter.db import utcnow
-from ghostwriter.processing import AttachmentProcessor
+from ghostwriter.processing import RECONCILE_EXTRA_S, AttachmentProcessor
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, is_due, next_period_state
 from ghostwriter.store import CHATS_STORE, ChatStore
 from ghostwriter.turns import TurnRegistry
-from ghostwriter.utils.audit_event import AuditEmitter, Target
+from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError, Target
 from ghostwriter.workbench import CallFor, WorkbenchClient, WorkbenchUnavailable
 
 #: Seconds between sweeps.
@@ -85,6 +93,7 @@ class SweepReport:
         previews: Table previews emptied.
         manifests: Attachment manifests emptied.
         workbench_failed: Chats whose folder workbench could not delete; their rows went all the same.
+        nextext_jobs: Jobs at Nextext that no clip owned, deleted.
     """
 
     chats: int = 0
@@ -92,6 +101,7 @@ class SweepReport:
     previews: int = 0
     manifests: int = 0
     workbench_failed: int = 0
+    nextext_jobs: int = 0
 
 
 def _iso(moment: datetime) -> str:
@@ -109,7 +119,8 @@ class Sweeper:
         turns: The process's turn registry, whose turns the sweep holds while it deletes.
         now: The clock.
         processor: The attachment processor, whose jobs of a due chat are cancelled before its
-            folder goes; ``None`` while workbench is off.
+            folder goes, and whose reconcile deletes the Nextext jobs no clip owns, first; ``None`` while
+            workbench is off.
     """
 
     def __init__(
@@ -134,23 +145,27 @@ class Sweeper:
         self._workbench_timed_out = False
 
     async def sweep(self) -> SweepReport:
-        """Delete the due chats, empty the expired contents, then checkpoint the log.
+        """Delete the Nextext jobs no clip owns, the due chats, empty the expired contents, then checkpoint the log.
 
         Returns:
             What was deleted and emptied.
 
         Raises:
-            AuditWriteError: When a record cannot be written; nothing of its batch is deleted.
+            AuditWriteError: When a chat's or a content's record cannot be written; nothing of its batch is deleted.
+                The reconcile's is logged, and the chats are swept all the same.
         """
         now = self._now()
         report = SweepReport()
         self._workbench_timed_out = False
+        if self._processor is not None:
+            report.nextext_jobs = await self._reconcile(self._processor)
         busy = await self._sweep_chats(now, report)
         await self._sweep_contents(now, report)
         await anyio.to_thread.run_sync(self._store.checkpoint)
         logger.info(
-            "Retention sweep: {} chats deleted, {} left while busy; {} tool steps, {} previews and {} manifests "
-            "emptied; workbench failed {}.",
+            "Retention sweep: {} Nextext jobs no clip owned deleted; {} chats deleted, {} left while busy; {} tool "
+            "steps, {} previews and {} manifests emptied; workbench failed {}.",
+            report.nextext_jobs,
             report.chats,
             busy,
             report.steps,
@@ -159,6 +174,31 @@ class Sweeper:
             report.workbench_failed,
         )
         return report
+
+    async def _reconcile(self, processor: AttachmentProcessor) -> int:
+        """Delete the Nextext jobs no clip owns, within :data:`~ghostwriter.processing.RECONCILE_EXTRA_S`.
+
+        Nothing here stops the sweep: a record that cannot be written (nothing is deleted at Nextext), a reconcile cut
+        off by the limit (what it left gets its ``error`` child) and any other failure are logged by their type.
+
+        Args:
+            processor: The attachment processor, whose jobs a reconcile spares.
+
+        Returns:
+            How many jobs were deleted; 0 when the reconcile failed or was cut off.
+        """
+        grace_s = self._settings.nextext_timeout_s + RECONCILE_EXTRA_S
+        deleted = 0
+        try:
+            with anyio.move_on_after(RECONCILE_EXTRA_S) as bound:
+                deleted = await processor.reconcile(grace_s=grace_s)
+            if bound.cancelled_caught:
+                logger.warning("The sweep's reconcile took over {} s; the next one tries again.", RECONCILE_EXTRA_S)
+        except AuditWriteError:
+            logger.error("The sweep's reconcile could not be recorded; no job was deleted at Nextext.")
+        except Exception as exc:
+            logger.error("The sweep's reconcile of Nextext's jobs failed: {}", type(exc).__name__)
+        return deleted
 
     async def _sweep_chats(self, now: datetime, report: SweepReport) -> int:
         """Delete the due chats batch by batch, each while holding its chats' turns.

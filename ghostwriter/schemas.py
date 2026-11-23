@@ -39,7 +39,7 @@ class AttachmentOut(BaseModel):
         name: The file name.
         size: Its size in bytes.
         mime: Its MIME type.
-        kind: ``document``, ``image`` or ``media`` (reserved).
+        kind: ``document``, ``image`` or ``media`` (a video or audio clip).
         status: ``processing`` while workbench prepares it, then ``ready`` or ``failed``.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.

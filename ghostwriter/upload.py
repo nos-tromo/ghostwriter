@@ -8,13 +8,15 @@ body that is no such form, or ends inside the part, is :class:`BadUpload`. The f
 as a browser writes it, its ``%22``, ``%0A`` and ``%0D`` undone.
 
 An attachment's type is decided by its extension alone, in any case, through
-:data:`ATTACHMENT_TYPES` to the MIME type sent on, and through :data:`IMAGE_TYPES` for a picture
-while pictures are offered; its name is :func:`safe_filename`'s, and :func:`name_problem` refuses
-what workbench would. :func:`attachment_kind` says whether a name is a picture, and
+:data:`ATTACHMENT_TYPES` to the MIME type sent on, through :data:`IMAGE_TYPES` for a picture
+while pictures are offered, and through :data:`MEDIA_TYPES` for a video or audio clip while clips are
+offered; its name is :func:`safe_filename`'s, and :func:`name_problem` refuses
+what workbench would. :func:`attachment_kind` says whether a name is a picture, a clip or a document, and
 :func:`needs_prepare` whether workbench prepares it (renders its pages or its picture) once
 it is stored, before the attachment is ready. A Word, PowerPoint or OpenDocument text file
 (:data:`OFFICE_SUFFIXES`) is ready at once and prepared after it (:func:`prepared_later`): its
-pages are an addition, never a wait.
+pages are an addition, never a wait. A clip is never in either: it is ``processing`` from its upload on,
+for the transcript and the frames Nextext makes of it (:mod:`ghostwriter.processing`).
 """
 
 import re
@@ -65,6 +67,23 @@ IMAGE_TYPES: Final[dict[str, str]] = {
     ".heic": "image/heic",
     ".heif": "image/heif",
 }
+#: The video and audio clips, by extension, and the type each is sent on as: the types of workbench's
+#: ``renders.MEDIA_TYPES``. Attachable only while clips are offered (:class:`~ghostwriter.nextext.NextextHealth`).
+MEDIA_TYPES: Final[dict[str, str]] = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".m4v": "video/x-m4v",
+    ".webm": "video/webm",
+    ".mkv": "video/x-matroska",
+    ".mp3": "audio/mpeg",
+    ".m4a": "audio/mp4",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".opus": "audio/opus",
+    ".flac": "audio/flac",
+}
+#: The clips that are audio; the other :data:`MEDIA_TYPES` are video.
+AUDIO_SUFFIXES: Final = frozenset({".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac"})
 #: The extensions workbench prepares once a file is stored: a pdf and every picture.
 PREPARED_SUFFIXES: Final = frozenset({".pdf", *IMAGE_TYPES})
 #: The Office extensions workbench converts and draws, and the attachment is ready before that: Word, PowerPoint
@@ -158,31 +177,52 @@ def _suffix(name: str) -> str:
     return f".{extension.lower()}" if dot and stem else ""
 
 
-def attachment_type(name: str, *, images: bool = False) -> str | None:
+def attachment_type(name: str, *, images: bool = False, media: bool = False) -> str | None:
     """Return the MIME type an attachment of this name is sent on as, by its extension in any case.
 
     Args:
         name: A name :func:`safe_filename` returned.
         images: Whether pictures are offered, so that :data:`IMAGE_TYPES` count too.
+        media: Whether clips are offered, so that :data:`MEDIA_TYPES` count too.
 
     Returns:
         The type, or ``None`` when the extension is not in :data:`ATTACHMENT_TYPES` or, while ``images``
-        is off, in :data:`IMAGE_TYPES`.
+        is off, in :data:`IMAGE_TYPES`, or, while ``media`` is off, in :data:`MEDIA_TYPES`.
     """
     suffix = _suffix(name)
-    return ATTACHMENT_TYPES.get(suffix) or (IMAGE_TYPES.get(suffix) if images else None)
+    return (
+        ATTACHMENT_TYPES.get(suffix)
+        or (IMAGE_TYPES.get(suffix) if images else None)
+        or (MEDIA_TYPES.get(suffix) if media else None)
+    )
 
 
-def attachment_kind(name: str) -> Literal["document", "image"]:
-    """Say whether a name is a picture or a document, by its extension in any case.
+def attachment_kind(name: str) -> Literal["document", "image", "media"]:
+    """Say whether a name is a picture, a clip or a document, by its extension in any case.
 
     Args:
         name: A name :func:`safe_filename` returned.
 
     Returns:
-        ``image`` for an extension of :data:`IMAGE_TYPES`, else ``document``.
+        ``image`` for an extension of :data:`IMAGE_TYPES`, ``media`` for one of :data:`MEDIA_TYPES`, else
+        ``document``.
     """
-    return "image" if _suffix(name) in IMAGE_TYPES else "document"
+    suffix = _suffix(name)
+    if suffix in IMAGE_TYPES:
+        return "image"
+    return "media" if suffix in MEDIA_TYPES else "document"
+
+
+def media_kind(name: str) -> Literal["video", "audio"]:
+    """Say whether a clip is video or audio, by its extension in any case.
+
+    Args:
+        name: The name of a clip.
+
+    Returns:
+        ``audio`` for an extension of :data:`AUDIO_SUFFIXES`, else ``video``.
+    """
+    return "audio" if _suffix(name) in AUDIO_SUFFIXES else "video"
 
 
 def needs_prepare(name: str) -> bool:

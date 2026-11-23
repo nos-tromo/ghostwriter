@@ -4,21 +4,25 @@ import { getPurpose, requestPurpose } from '@infra/ui'
 import { deleteAttachment, getAttachment, uploadAttachment } from '../api/chats'
 import { ApiError, PURPOSE_SCOPE, isPurposeRefusal } from '../api/client'
 import type { AppConfig, AttachmentOut } from '../api/types'
+import { extensionOf, clipKind } from '../lib/format'
 import { chatKey, nextMark, readMarkOf, useChat } from './useChats'
+import { CONFIG_KEY } from './useConfig'
 
 /** Why a file is not attached: its type, its size, the upload, workbench's
- *  space, the files already waiting, or a purpose the user did not state. */
-export type PendingError = 'type' | 'size' | 'upload' | 'storage_full' | 'too_many_pending' | 'purpose'
+ *  space, the files already waiting, a purpose the user did not state, or a
+ *  clip the server no longer takes (video and audio went away since the page read the config). */
+export type PendingError = 'type' | 'size' | 'upload' | 'storage_full' | 'too_many_pending' | 'purpose' | 'clip'
 
 /** A file in the composer, from the drop or the pick until a message sends it.
- *  `processing` is a stored picture still being prepared; `done` a file that can
+ *  `processing` is a stored picture still being prepared, or a clip being transcribed; `done` a file that can
  *  be sent, also one the server could not read (its `attachment.status` is `failed`). */
 export interface PendingFile {
   key: string
   name: string
   size: number
-  /** A picture, by the deployment's `image_types`; every other file is a document. */
-  kind: 'document' | 'image'
+  /** A picture, by the deployment's `image_types`; a clip, by its `media_types` (`video` or `audio`, by its
+   *  suffix); every other file is a document. A clip has no picture, no local one and no preview. */
+  kind: 'document' | 'image' | 'video' | 'audio'
   status: 'uploading' | 'processing' | 'done' | 'error'
   attachment?: AttachmentOut
   error?: PendingError
@@ -63,16 +67,27 @@ const RETRY_MS = 2_000
  *  (a proxy that drops `?wait`): the long poll never turns into a loop. */
 const PROCESSING_FLOOR_MS = 500
 
-/** A name's extension as the backend reads it (`.pdf`), lower-cased; a dot-file has none. */
-function extensionOf(name: string): string {
-  const dot = name.lastIndexOf('.')
-  return dot > 0 ? name.slice(dot).toLowerCase() : ''
-}
-
 /** Whether a file of this name is a picture, by the deployment's picture types, in any case. */
 export function isImageName(name: string, config: AppConfig): boolean {
   const extension = extensionOf(name)
   return extension !== '' && config.image_types.some((type) => type.toLowerCase() === extension)
+}
+
+/** Whether a file of this name is a video or audio clip, by the deployment's clip types, in any case. */
+export function isClipName(name: string, config: AppConfig): boolean {
+  const extension = extensionOf(name)
+  return extension !== '' && config.media_types.some((type) => type.toLowerCase() === extension)
+}
+
+/** Whether a file is a clip, being or having been transcribed. */
+export function isClip(file: Pick<PendingFile, 'kind'>): boolean {
+  return file.kind === 'video' || file.kind === 'audio'
+}
+
+/** What a file of this name is to the composer: a clip, a picture or a document. */
+function kindOf(name: string, config: AppConfig): PendingFile['kind'] {
+  if (isClipName(name, config)) return clipKind(name)
+  return isImageName(name, config) ? 'image' : 'document'
 }
 
 /** Whether a file of this name is of a type the deployment takes, in any case. */
@@ -81,14 +96,22 @@ export function isAttachable(name: string, config: AppConfig): boolean {
   return extension !== '' && config.attachment_types.some((type) => type.toLowerCase() === extension)
 }
 
-/** Why the server refused a file, by its code, never by the status alone. */
-function refusalOf(error: unknown): PendingError {
+/** Why the server refused a file, by its code, never by the status alone; a clip it answers 415, a type not
+ *  taken, is one that is no longer offered. */
+function refusalOf(error: unknown, name: string, config: AppConfig): PendingError {
   if (error instanceof ApiError) {
+    if (error.status === 415 && isClipName(name, config)) return 'clip'
     if (error.code === 'too_large') return 'size'
     if (error.code === 'storage_full') return 'storage_full'
     if (error.code === 'too_many_pending') return 'too_many_pending'
   }
   return isPurposeRefusal(error) ? 'purpose' : 'upload'
+}
+
+/** What a stored attachment is to the composer: the server says `media` for a clip, which its suffix tells apart. */
+function kindOfAttachment(attachment: AttachmentOut): PendingFile['kind'] {
+  if (attachment.kind === 'media') return clipKind(attachment.name)
+  return attachment.kind === 'image' ? 'image' : 'document'
 }
 
 /** A file attached earlier, still waiting in the chat for a message. */
@@ -97,7 +120,7 @@ function waiting(attachment: AttachmentOut): PendingFile {
     key: attachment.id,
     name: attachment.name,
     size: attachment.size,
-    kind: attachment.kind === 'image' ? 'image' : 'document',
+    kind: kindOfAttachment(attachment),
     status: attachment.status === 'processing' ? 'processing' : 'done',
     attachment,
   }
@@ -136,7 +159,9 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * Where a purpose is required for attaching and none is stated, the purpose
  * prompt opens before the upload starts, so a large body is never sent only
  * to be refused unread. A file the server refuses says why, by the refusal's
- * code (`too_large`, `storage_full`).
+ * code (`too_large`, `storage_full`). A clip it refuses with a 415 is one it no longer offers (Nextext went
+ * down since the config was read): its error says so, and the config is read again, so the picker drops
+ * the clip types.
  *
  * Files attached earlier and not sent yet, as the chat lists them, are shown
  * and sent too, so leaving a chat and coming back loses none. An attached
@@ -144,9 +169,10 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * another tab: its tile goes.
  *
  * A picture is prepared on the server after it is stored, and only a prepared
- * one can be sent. Each one still being prepared, uploaded here or listed by
- * the chat, is followed once, by requests that wait on the server until its
- * preparation ends (20 s at most, then asked again): it becomes `done`, with
+ * one can be sent; so is a video or audio clip, which is transcribed first and takes longer (a `video` or
+ * `audio` file by its suffix, never drawn from the file in hand, never asked for a preview). Each one
+ * still being prepared, uploaded here or listed by the chat, is followed once, by requests that wait on
+ * the server until its preparation ends (20 s at most, then asked again): it becomes `done`, with
  * the attachment as it then is, a `failed` one included. A `processing` answer
  * is asked again no sooner than 500 ms after its request began. A request that
  * does not get through, or a server error, is tried again after 2 s; any other
@@ -254,8 +280,7 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
             // It could not be deleted: it comes back, said to be so, to be sent or taken back again.
             removedRef.current.delete(attachment.id)
             if (aliveRef.current) {
-              const kind = isImageName(attachment.name, config) ? ('image' as const) : ('document' as const)
-              setLocal((files) => [...files, { key: next.key, kind, ...stored }])
+              setLocal((files) => [...files, { key: next.key, kind: kindOf(attachment.name, config), ...stored }])
               setRemoveFailed((keys) => new Set(keys).add(next.key))
             }
             continue
@@ -263,7 +288,10 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
           if (aliveRef.current) settle(new Set([next.key]), stored)
         } catch (error) {
           if (abandonedRef.current.delete(next.key)) continue
-          if (aliveRef.current) settle(new Set([next.key]), { status: 'error', error: refusalOf(error) })
+          const refusal = refusalOf(error, next.file.name, config)
+          // The clip offer is stale (Nextext went down): it is read again, and the picker drops the clip types.
+          if (refusal === 'clip') void queryClient.invalidateQueries({ queryKey: CONFIG_KEY })
+          if (aliveRef.current) settle(new Set([next.key]), { status: 'error', error: refusal })
         }
       }
     } finally {
@@ -277,7 +305,7 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
       const added: PendingFile[] = []
       for (const file of files) {
         const key = `file-${++seqRef.current}`
-        const kind = isImageName(file.name, config) ? ('image' as const) : ('document' as const)
+        const kind = kindOf(file.name, config)
         const base = { key, name: file.name, size: file.size, kind }
         if (!isAttachable(file.name, config)) added.push({ ...base, status: 'error', error: 'type' })
         else if (file.size > config.max_attachment_bytes) added.push({ ...base, status: 'error', error: 'size' })

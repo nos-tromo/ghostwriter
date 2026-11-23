@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { screenshotName } from './format'
+import { clipKind, screenshotName } from './format'
 
 describe('screenshotName', () => {
   const at = new Date(2026, 10, 20, 9, 5, 7)
@@ -18,5 +18,14 @@ describe('screenshotName', () => {
 
   it('pads single digits of every part', () => {
     expect(screenshotName(new Date(2026, 0, 2, 3, 4, 5), new Set())).toBe('screenshot-20260102-030405.png')
+  })
+})
+
+describe('clipKind', () => {
+  it('calls an audio suffix audio, in any case, and every other clip video', () => {
+    expect(clipKind('voice-memo.M4A')).toBe('audio')
+    expect(clipKind('voice-memo.opus')).toBe('audio')
+    expect(clipKind('harbour-tour.mkv')).toBe('video')
+    expect(clipKind('harbour-tour.WEBM')).toBe('video')
   })
 })

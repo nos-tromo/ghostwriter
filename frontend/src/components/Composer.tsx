@@ -11,7 +11,7 @@ import {
 } from '@infra/ui'
 import { transcribe } from '../api/chats'
 import type { AppConfig } from '../api/types'
-import { isAttachable, isImageName, type Attachments } from '../hooks/useAttachments'
+import { isAttachable, isClip, isImageName, type Attachments } from '../hooks/useAttachments'
 import type { ChatStream } from '../hooks/useChatStream'
 import { useRecorder } from '../hooks/useRecorder'
 import { useT } from '../i18n/LanguageContext'
@@ -65,11 +65,10 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  * the paperclip, a paste or a drop on the conversation; dictation into the
  * text; the reasoning switch; send, or stop while an answer streams.
  *
- * Enter sends and Shift+Enter starts a new line. Send waits while a file
- * uploads or a picture is prepared, and needs text or an attached file. A transcript goes in at the
- * cursor and is never sent by itself; one still running when the composer
- * goes is aborted. A message the server refuses comes back into the composer
- * with its files, as it was.
+ * Enter sends and Shift+Enter starts a new line. Send waits while a file uploads, a picture is prepared or a
+ * clip is transcribed, and needs text or an attached file. A transcript goes in at the cursor and is never
+ * sent by itself; one still running when the composer goes is aborted. A message the server refuses comes back
+ * into the composer with its files, as it was.
  *
  * The chat's stream, its attachments and the reasoning switch are the
  * `ChatPane`'s, so the conversation above shows the same answer this sends.
@@ -142,6 +141,8 @@ export function Composer({
 
   const done = attachments.pending.filter((f) => f.status === 'done' && f.attachment)
   const processing = attachments.pending.some((f) => f.status === 'processing')
+  // A clip is transcribed before it is sent, which takes longer than preparing a picture: the hint says so.
+  const clipProcessing = attachments.pending.some((f) => f.status === 'processing' && isClip(f))
   const busy = processing || attachments.pending.some((f) => f.status === 'uploading' || f.removing)
   const content = text.trim()
   const canSend = !stream.streaming && !busy && (content !== '' || done.length > 0)
@@ -217,7 +218,11 @@ export function Composer({
             textRef.current?.focus()
           }}
         />
-        {processing && <p className="text-xs text-muted-foreground">{t('composer.processing_hint')}</p>}
+        {processing && (
+          <p className="text-xs text-muted-foreground">
+            {t(clipProcessing ? 'composer.transcribing_hint' : 'composer.processing_hint')}
+          </p>
+        )}
         <ChatComposer
           ref={textRef}
           value={text}

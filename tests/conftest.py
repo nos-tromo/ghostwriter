@@ -29,13 +29,19 @@ from ghostwriter.utils.audit_event import AuditWriteError, verify_chain
 SECRET = "s" * 32
 #: Ghostwriter's workbench key in tests.
 KEY = "k" * 32
+#: Ghostwriter's service token at Nextext in tests, as long as the backend requires.
+NEXTEXT_KEY = "n" * 32
+#: Nextext's API base in tests.
+NEXTEXT_BASE = "http://nextext.test/api/v1"
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
     """Build the settings of one test: the edge secret, the workbench key, vision off and a throwaway database.
 
     Vision is off unless a test passes ``vision=True``, so every test that does not
-    care about pictures keeps the behaviour of a model without them.
+    care about pictures keeps the behaviour of a model without them. Nextext is off
+    too (no key in the environment); a test of video or audio passes
+    ``nextext_api_base`` and ``nextext_api_key``.
 
     Args:
         tmp_path: The test's temporary directory, which holds the database.
@@ -43,8 +49,8 @@ def make_settings(tmp_path: Path, **overrides: Any) -> Settings:
 
     Returns:
         Settings: The defaults of :func:`~ghostwriter.config.load_settings`
-        with ``SECRET``, ``KEY``, ``vision=False``, a ``db_path`` under ``tmp_path``
-        and the overrides.
+        with ``SECRET``, ``KEY``, ``vision=False``, Nextext off, a ``db_path`` under
+        ``tmp_path`` and the overrides.
     """
     settings = load_settings({"GHOSTWRITER_EDGE_SECRET": SECRET, "WORKBENCH_API_KEY": KEY})
     fields: dict[str, Any] = {"vision": False, "db_path": str(tmp_path / "ghostwriter.sqlite3"), **overrides}

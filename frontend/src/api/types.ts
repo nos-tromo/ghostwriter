@@ -95,6 +95,10 @@ export interface AppConfig {
   attachment_types: string[]
   /** The picture types among `attachment_types`; empty while none can be attached. */
   image_types: string[]
+  /** The video and audio types among `attachment_types`; empty while clips are not offered. */
+  media_types: string[]
+  /** Whether video and audio can be attached: Nextext is reachable and workbench is new enough. */
+  media: boolean
   /** The most pictures one message may carry. */
   max_images: number
   /** Whether the model can see pictures. */

@@ -1,18 +1,20 @@
 """Stand-ins for Ghostwriter's neighbours, built from the shared contract alone.
 
 :class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
-REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``.
+REST routes ``/files/upload``, ``/files/prepare``, ``/files/derived``, ``/files/view`` and ``/files/chat``.
 :class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
 builders :func:`text_chunk`, :func:`reasoning_chunk`, :func:`call_chunk` and
 :func:`usage_chunk`. :class:`FakeWorkbench` and :class:`RecordingAudit` are workbench
-and a turn's audit as the agent loop reaches them. Every name, id and value here is
+and a turn's audit as the agent loop reaches them. :class:`FakeNextext` is Nextext's
+``/api/v1`` as Ghostwriter's service token reaches it. Every name, id and value here is
 invented.
 """
 
 import base64
 import dataclasses
 import json
-from collections.abc import Callable, Iterator, Mapping, Sequence
+import re
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Final, cast
@@ -38,14 +40,18 @@ from ghostwriter.workbench import (
     ToolResult,
     WorkbenchClient,
 )
-from tests.conftest import KEY
+from tests.conftest import KEY, NEXTEXT_KEY
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": "0.3.0"}}
+#: The version the fakes' workbench names itself, unless a test sets another.
+SERVER_VERSION = "0.3.0"
+SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": SERVER_VERSION}}
 #: The id workbench gives the output of :func:`call_result`.
 OUTPUT_ID = "0" * 32
 #: The id the door gives every upload, unless a test sets another.
 UPLOAD_ID = "1" * 32
+#: The id the door gives every derived file, unless a test scripts another answer.
+DERIVED_ID = "2" * 32
 NOT_FOUND = {"detail": "not found"}
 #: Bytes that pass the signature check of a jpeg and of a png, and no more.
 TINY_JPEG = b"\xff\xd8\xff\xe0" + bytes(60)
@@ -53,6 +59,9 @@ TINY_PNG = b"\x89PNG\r\n\x1a\n" + bytes(56)
 #: The header workbench 0.7 lists ``view_file`` and attaches images for.
 ACCEPT_IMAGES_HEADER = "x-accept-images"
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
+_MEDIA_SUFFIXES = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac")
+#: The roles workbench 0.9 takes a derived file for: a clip's transcript and its keyframes.
+_DERIVED_ROLES = frozenset({"nextext_jsonl", "nextext_zip"})
 
 #: What workbench 0.7 tells a call that takes no images of ``read_document``: 0.6's text, which promises none.
 READ_DOCUMENT_TEXT = "Read a document as text, from its text layer only."
@@ -86,6 +95,7 @@ _ROUTES = frozenset(
         ("POST", "/files/upload"),
         ("DELETE", "/files/upload"),
         ("POST", "/files/prepare"),
+        ("POST", "/files/derived"),
         ("GET", "/files/view"),
         ("DELETE", "/files/chat"),
     }
@@ -125,8 +135,11 @@ class Upload:
     data: bytes
 
 
-def discover_result() -> dict[str, Any]:
+def discover_result(server_version: str = SERVER_VERSION) -> dict[str, Any]:
     """Return workbench's ``server/discover`` result.
+
+    Args:
+        server_version: The version workbench names itself.
 
     Returns:
         The result, serving 2026-07-28 for an hour.
@@ -137,7 +150,7 @@ def discover_result() -> dict[str, Any]:
         "ttlMs": 3600000,
         "cacheScope": "private",
         "resultType": "complete",
-        "_meta": SERVER_META,
+        "_meta": {META_SERVER_INFO: {"name": "workbench", "version": server_version}},
     }
 
 
@@ -269,18 +282,23 @@ def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str,
     }
 
 
-def stock_manifest(path: str) -> dict[str, Any]:
-    """Return the manifest the door gives a stored file, by its suffix: workbench 0.8's eight keys.
+def stock_manifest(path: str, roles: Collection[str] = ()) -> dict[str, Any]:
+    """Return the manifest the door gives a stored file, by its suffix: workbench 0.9's ten keys.
 
     Args:
         path: The file's path.
+        roles: The roles of the derived files posted for it; read for a clip only.
 
     Returns:
         A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
         text. A deck (``.pptx``, ``.potx``): kind ``office``, unit ``slide``, three slides drawn
         as a pdf's pages are, the second without text. A Word or OpenDocument text file (``.docx``,
-        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. Anything else: kind
-        ``none``. The unit is ``page`` for every kind but a deck.
+        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. A clip (the 11 media
+        suffixes): kind ``media``, unit ``frame``, and from what was posted for it: a ``nextext_jsonl``
+        gives ``transcript`` true and a ``duration_s`` of 91.0, a ``nextext_zip`` three frames of 1280 x 720
+        at 0, 4 and 8 s and a ``duration_s`` of 8.0 (the later of the two when both were posted), neither no
+        frames and a ``duration_s`` of ``None``. Anything else: kind ``none``. The unit is ``page`` for every kind
+        but a deck and a clip, and ``duration_s`` is ``None`` and ``transcript`` false for every kind but a clip.
     """
     lower = path.lower()
     manifest: dict[str, Any] = {
@@ -292,7 +310,23 @@ def stock_manifest(path: str) -> dict[str, Any]:
         "frames": None,
         "unit": "page",
         "hint": None,
+        "duration_s": None,
+        "transcript": False,
     }
+    if lower.endswith(_MEDIA_SUFFIXES):
+        frames = [{"n": n, "width": 1280, "height": 720, "mime": "image/jpeg", "bytes": 48213} for n in (1, 2, 3)]
+        spoken, framed = "nextext_jsonl" in roles, "nextext_zip" in roles
+        # As workbench writes it: the later of the last speech's end and the last frame's time (frames at 0, 4 and 8 s).
+        times = [*([91.0] if spoken else []), *([8.0] if framed else [])]
+        return {
+            **manifest,
+            "kind": "media",
+            "unit": "frame",
+            "total": 3 if framed else 0,
+            "renditions": frames if framed else [],
+            "duration_s": max(times) if times else None,
+            "transcript": spoken,
+        }
     if lower.endswith(_IMAGE_SUFFIXES):
         rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
         return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
@@ -347,11 +381,13 @@ class FakeDoor:
     no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
-    folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare`` and
-    ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
+    folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare``,
+    ``/files/derived`` and ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
     with its path, size and :attr:`upload_id`; a take-back deletes a stored file of the chat (404 for none); a
-    prepare answers the file's manifest; a view serves a stored file of the chat, or with ``rendition`` one of its
-    renders.
+    prepare answers the file's manifest, a clip's from the derived files posted for it
+    (:func:`stock_manifest`); a derived file is recorded in :attr:`derived` and answered with its id, role and size
+    (404 for a source the chat does not hold, 422 for another role or an empty body); a view serves a stored file
+    of the chat, or with ``rendition`` one of its renders.
 
     As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
     ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
@@ -363,32 +399,36 @@ class FakeDoor:
         answers: The scripted answers, by MCP method or REST path.
         delays: Seconds to wait before answering, by MCP method or REST path.
         files: The stored files, by path: their bytes and media type.
+        derived: The derived files posted, in order: the source's path, the role and the body.
         manifests: The manifest to answer for a path, instead of :func:`stock_manifest`'s.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
         on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
     """
 
-    def __init__(self, key: str = KEY) -> None:
+    def __init__(self, key: str = KEY, *, server_version: str = SERVER_VERSION) -> None:
         """Answer as a healthy workbench does, without delay.
 
         Args:
             key: The key the door accepts.
+            server_version: The version it names itself in ``server/discover``.
         """
         self.key = key
         self.requests: list[tuple[httpx.Request, Any]] = []
         self.answers: dict[str, object] = {
-            "server/discover": discover_result(),
+            "server/discover": discover_result(server_version),
             "tools/list": tools_result(),
             "tools/call": call_result,
             "/files/upload": None,
             TAKE_BACK: None,
             "/files/prepare": None,
+            "/files/derived": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
         }
         self.delays: dict[str, float] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.derived: list[tuple[str, str, bytes]] = []
         self.manifests: dict[str, dict[str, Any]] = {}
         self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
@@ -451,6 +491,8 @@ class FakeDoor:
             return self._store(request, body, folder)
         if answer is None and path == "/files/prepare":
             return self._prepare(request, folder)
+        if answer is None and path == "/files/derived":
+            return self._derive(request, folder)
         if answer is None and path == "/files/view":
             return self._serve(request, folder)
         return httpx.Response(200, json=answer)
@@ -526,7 +568,9 @@ class FakeDoor:
             return None
         if path in self.manifests:
             return self.manifests[path]
-        return stock_manifest(path) if path in self.files else None
+        if path not in self.files:
+            return None
+        return stock_manifest(path, [role for source, role, _ in self.derived if source == path])
 
     def _prepare(self, request: httpx.Request, folder: str) -> httpx.Response:
         """Answer a prepare with the file's manifest.
@@ -540,6 +584,29 @@ class FakeDoor:
         """
         manifest = self._manifest_of(request.url.params.get("path", ""), folder)
         return httpx.Response(404, json=NOT_FOUND) if manifest is None else httpx.Response(200, json=manifest)
+
+    def _derive(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Take a derived file of a stored file of the chat, as workbench 0.9 does for Ghostwriter.
+
+        Args:
+            request: The post: ``source`` and ``role`` query parameters, the artifact as the raw body.
+            folder: The chat's folder.
+
+        Returns:
+            ``id``, ``role``, ``bytes`` and ``replaced`` (``None``); 404 for a source the chat does not hold, 422
+            for a role it does not know and for an empty body.
+        """
+        source, role = request.url.params.get("source", ""), request.url.params.get("role", "")
+        if not source.startswith(f"{folder}/") or source not in self.files:
+            return httpx.Response(404, json=NOT_FOUND)
+        if role not in _DERIVED_ROLES:
+            return httpx.Response(422, json={"detail": [{"loc": ["query", "role"], "msg": "unknown role"}]})
+        if not request.content:
+            return httpx.Response(422, json={"detail": "unreadable_file: the artifact is empty"})
+        self.derived.append((source, role, request.content))
+        return httpx.Response(
+            200, json={"id": DERIVED_ID, "role": role, "bytes": len(request.content), "replaced": None}
+        )
 
     def _render(self, request: httpx.Request, path: str, folder: str) -> httpx.Response:
         """Serve one render of a file of the chat: a page, a picture or one of its strips.
@@ -1033,7 +1100,7 @@ class FakeWorkbench:
             audit: The audit whose log :attr:`sent_after` reads.
         """
         found = contract_tools() if tools is None else tuple(tools)
-        self.discovery: Discovery | None = Discovery(tools=found, server_version="0.3.0") if found else None
+        self.discovery: Discovery | None = Discovery(tools=found, server_version=SERVER_VERSION) if found else None
         self.answers: list[Answer] = list(answers)
         self.calls: list[SentCall] = []
         self.discoveries: list[tuple[CallFor, bool]] = []
@@ -1102,3 +1169,288 @@ class FakeWorkbench:
         """
         self.fetched.append(tuple(wanted))
         return [None if item.path in self.missing else ("image/jpeg", TINY_JPEG) for item in wanted]
+
+
+# --- Nextext -----------------------------------------------------------------
+
+#: The id of the first job a :class:`FakeNextext` creates.
+JOB_ID = "3f9c1d2e7a4b4c58b1e60d93a7f20c14"
+#: When every job of the fake was created, as Nextext writes it.
+JOB_CREATED_AT = "2026-11-22T22:54:00.912174Z"
+#: The error text a failed job of the fake carries: the client must never log it.
+FAILURE_TEXT = "The speech endpoint refused the clip at 00:12"
+_NEXTEXT_PATH = "/api/v1"
+_ARTIFACT_PATH = re.compile(r"/jobs/(?P<job>[^/]+)/artifacts/(?P<name>[^/]+)")
+_JOB_PATH = re.compile(r"/jobs/(?P<job>[^/]+)")
+_ARTIFACT_CHUNK = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class NextextUpload:
+    """What a create sent, for assertions only.
+
+    Attributes:
+        headers: The request's headers.
+        body: The whole body.
+    """
+
+    headers: httpx.Headers
+    body: bytes
+
+
+@dataclass(frozen=True)
+class JobUpload:
+    """A create's multipart body, parsed as Nextext's route (Starlette on python-multipart) reads it.
+
+    Attributes:
+        options: The decoded ``options`` field.
+        filename: The ``file`` part's file name.
+        content_type: Its media type.
+        data: Its bytes.
+    """
+
+    options: dict[str, Any]
+    filename: str
+    content_type: str
+    data: bytes
+
+
+async def parse_job_upload(upload: NextextUpload) -> JobUpload:
+    """Parse the body of a create.
+
+    Args:
+        upload: What the fake recorded.
+
+    Returns:
+        The options, and the file part.
+
+    Raises:
+        AssertionError: When the body holds no ``options`` text or no ``file`` part.
+    """
+
+    async def body() -> Any:
+        yield upload.body
+
+    headers = Headers({"content-type": upload.headers["content-type"]})
+    form = await MultiPartParser(headers, body()).parse()
+    try:
+        options, part = form.get("options"), form.get("file")
+        assert isinstance(options, str) and isinstance(part, UploadFile)
+        return JobUpload(json.loads(options), part.filename or "", part.content_type or "", await part.read())
+    finally:
+        await form.close()
+
+
+class FakeNextext:
+    """Nextext 1.21's ``/api/v1`` as Ghostwriter's service token reaches it, for ``httpx.MockTransport``.
+
+    It refuses a wrong key (401, ``/health`` apart), a list without ``X-Audit-Purpose`` (428, as Nextext's
+    default does) and any other route (404). A create answers ``201 {job_id, status, created_at}``; each job
+    then answers every ``GET /jobs`` with the next of :attr:`statuses`, the last repeated, until it is deleted or
+    has left the list after :attr:`vanish_after` polls. A list item has the keys Nextext 1.21 serves, and the list
+    holds no job of another caller but those in :attr:`listed`. An artifact answers ``200`` with the
+    ``Content-Length`` Nextext's in-memory render has, or its scripted status; a job that is gone (deleted, or out of
+    the list after :attr:`vanish_after` polls, as after a restart) answers ``404``. A ``DELETE`` answers ``204`` for a
+    job created or in :attr:`listed`, which then leaves the list, or ``404`` for a job that is not there.
+
+    Attributes:
+        key: The service token the fake accepts.
+        statuses: The status of a job at each poll, in order; the last one repeats.
+        error_code: The ``error_code`` of a list item.
+        skipped: The ``skipped`` flag of a list item.
+        skip_reason_code: The ``skip_reason_code`` of a list item.
+        artifacts: By artifact name, the bytes served, or an ``int`` that is the status answered instead.
+        declared: By artifact name, the ``Content-Length`` to claim; ``None`` claims none (a chunked body).
+        create_status: The status a create answers; ``201`` creates a job.
+        create_body: A body to answer a create with instead of the job's, with ``201``.
+        list_status: The status ``GET /jobs`` answers.
+        delete_status: A status every ``DELETE`` answers with, instead of ``204`` or ``404``.
+        health: The status ``GET /health`` answers.
+        vanish_after: The polls a job is listed for before it leaves the list (Nextext restarted); ``None`` never.
+        listed: Other jobs, as list items.
+        raises: An exception to raise on every request, as a connection that fails does.
+        requests: Every request, in order.
+        uploads: Every create's headers and body.
+        deleted: The ids of the jobs a ``DELETE`` removed, in order.
+        events: ``"create"``, ``"list"`` and ``"delete:<id>"``, in order.
+        served: The names of the artifacts whose body the fake started to send.
+        jobs: The jobs created, by id: how many times each was polled.
+        created: The ``created_at`` a created job is listed with, by id; :data:`JOB_CREATED_AT`, a day before, for one
+            not named.
+    """
+
+    def __init__(self, key: str = NEXTEXT_KEY) -> None:
+        """Answer as a healthy Nextext does: one job that completes at its first poll, with both artifacts.
+
+        Args:
+            key: The service token the fake accepts.
+        """
+        self.key = key
+        self.statuses: list[str] = ["completed"]
+        self.error_code: str | None = None
+        self.skipped = False
+        self.skip_reason_code: str | None = None
+        self.artifacts: dict[str, bytes | int] = {
+            "docint.jsonl": b'{"text": "hello"}\n',
+            "keyframes.zip": b"PK\x03\x04",
+        }
+        self.declared: dict[str, int | None] = {}
+        self.create_status = 201
+        self.create_body: dict[str, Any] | None = None
+        self.list_status = 200
+        self.delete_status: int | None = None
+        self.health = 200
+        self.vanish_after: int | None = None
+        self.listed: list[Any] = []
+        self.raises: Exception | None = None
+        self.requests: list[httpx.Request] = []
+        self.uploads: list[NextextUpload] = []
+        self.deleted: list[str] = []
+        self.events: list[str] = []
+        self.served: list[str] = []
+        self.jobs: dict[str, int] = {}
+        self.created: dict[str, str] = {}
+
+    def _status(self, polls: int) -> str:
+        """Return a job's status at its poll number ``polls``, counted from 0.
+
+        Args:
+            polls: How many times the job was listed before.
+
+        Returns:
+            The scripted status; the last repeats.
+        """
+        return self.statuses[min(polls, len(self.statuses) - 1)]
+
+    def item(self, job_id: str, status: str, **changes: Any) -> dict[str, Any]:
+        """Build a list item, with the keys Nextext 1.21 serves.
+
+        Args:
+            job_id: The job.
+            status: Its status.
+            **changes: Keys to set.
+
+        Returns:
+            The item.
+        """
+        failed = status == "failed"
+        item: dict[str, Any] = {
+            "created_at": JOB_CREATED_AT,
+            "error": FAILURE_TEXT if failed else None,
+            "error_code": self.error_code,
+            "file_name": "media.mp4",
+            "finished_at": None if status in ("queued", "running") else JOB_CREATED_AT,
+            "job_id": job_id,
+            "progress": 1.0 if status == "completed" else 0.0,
+            "skip_reason_code": self.skip_reason_code,
+            "skipped": self.skipped,
+            "stage": None,
+            "started_at": None if status == "queued" else JOB_CREATED_AT,
+            "status": status,
+            "task": "transcribe",
+        }
+        return {**item, **changes}
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer it.
+
+        Args:
+            request: The request the client sent, its body read.
+
+        Returns:
+            The answer.
+
+        Raises:
+            Exception: :attr:`raises`, when it is set.
+        """
+        self.requests.append(request)
+        if self.raises is not None:
+            raise self.raises
+        path = request.url.path
+        if not path.startswith(_NEXTEXT_PATH + "/"):
+            return httpx.Response(404, json=NOT_FOUND)
+        route = path.removeprefix(_NEXTEXT_PATH)
+        if (request.method, route) == ("GET", "/health"):
+            return httpx.Response(self.health, json={"status": "ok", "inference": True})
+        if request.headers.get("authorization") != f"Bearer {self.key}":
+            return httpx.Response(401, json={"detail": "unauthorized"})
+        if (request.method, route) == ("POST", "/jobs"):
+            return self._create(request)
+        if (request.method, route) == ("GET", "/jobs"):
+            return self._list(request)
+        if (found := _ARTIFACT_PATH.fullmatch(route)) and request.method == "GET":
+            return self._artifact(found["job"], found["name"])
+        if (found := _JOB_PATH.fullmatch(route)) and request.method == "DELETE":
+            return self._delete(found["job"])
+        return httpx.Response(404, json=NOT_FOUND)
+
+    def _create(self, request: httpx.Request) -> httpx.Response:
+        self.events.append("create")
+        self.uploads.append(NextextUpload(request.headers, request.content))
+        if self.create_status != 201:
+            return httpx.Response(self.create_status, json={"detail": "refused"})
+        if self.create_body is not None:
+            return httpx.Response(201, json=self.create_body)
+        job_id = JOB_ID if not self.jobs else f"{JOB_ID[:-4]}{len(self.jobs):04x}"
+        self.jobs[job_id] = 0
+        return httpx.Response(201, json={"job_id": job_id, "status": "queued", "created_at": JOB_CREATED_AT})
+
+    def _list(self, request: httpx.Request) -> httpx.Response:
+        self.events.append("list")
+        if "x-audit-purpose" not in request.headers:
+            return httpx.Response(428, json={"detail": "purpose required"})
+        if self.list_status != 200:
+            return httpx.Response(self.list_status, json={"detail": "refused"})
+        jobs: list[dict[str, Any]] = []
+        for job_id, polls in list(self.jobs.items()):
+            if job_id in self.deleted:
+                continue
+            self.jobs[job_id] = polls + 1
+            if self.vanish_after is not None and polls >= self.vanish_after:
+                continue
+            jobs.append(self.item(job_id, self._status(polls), created_at=self.created.get(job_id, JOB_CREATED_AT)))
+        return httpx.Response(200, json={"jobs": [*jobs, *self.listed]})
+
+    def _gone(self, job_id: str) -> bool:
+        """Tell whether a job is not there: never created, deleted, or out of the list (Nextext restarted).
+
+        Args:
+            job_id: The job.
+
+        Returns:
+            Whether Nextext holds it no more.
+        """
+        polls = self.jobs.get(job_id)
+        return polls is None or job_id in self.deleted or (self.vanish_after is not None and polls > self.vanish_after)
+
+    def _artifact(self, job_id: str, name: str) -> httpx.Response:
+        if self._gone(job_id):
+            return httpx.Response(404, json=NOT_FOUND)
+        served = self.artifacts.get(name, 404)
+        if isinstance(served, int):
+            return httpx.Response(served, json={"detail": "no such artifact"} if served == 404 else {})
+        headers: dict[str, str] = {"Content-Type": "application/octet-stream"}
+        declared = self.declared.get(name, len(served))
+        if declared is not None:
+            headers["Content-Length"] = str(declared)
+
+        async def body() -> Any:
+            self.served.append(name)
+            for start in range(0, len(served), _ARTIFACT_CHUNK):
+                yield served[start : start + _ARTIFACT_CHUNK]
+
+        return httpx.Response(200, headers=headers, content=body())
+
+    def _delete(self, job_id: str) -> httpx.Response:
+        self.events.append(f"delete:{job_id}")
+        if self.delete_status is not None:
+            return httpx.Response(self.delete_status, json={"detail": "refused"})
+        kept = [item for item in self.listed if not (isinstance(item, dict) and item.get("job_id") == job_id)]
+        if len(kept) < len(self.listed):
+            self.listed = kept
+            self.deleted.append(job_id)
+            return httpx.Response(204)
+        if self._gone(job_id):
+            return httpx.Response(404, json=NOT_FOUND)
+        self.deleted.append(job_id)
+        return httpx.Response(204)

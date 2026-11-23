@@ -14,6 +14,20 @@ export function formatSize(bytes: number, lang: Lang): string {
   return `${new Intl.NumberFormat(lang, { maximumFractionDigits: digits }).format(value)} ${UNITS[unit]}`
 }
 
+/** A name's extension as the backend reads it (`.pdf`), lower-cased; a dot-file has none. */
+export function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot > 0 ? name.slice(dot).toLowerCase() : ''
+}
+
+/** The clip suffixes that are audio (the backend's `upload.AUDIO_SUFFIXES`); every other clip is video. */
+export const AUDIO_EXTENSIONS: ReadonlySet<string> = new Set(['.mp3', '.m4a', '.wav', '.ogg', '.opus', '.flac'])
+
+/** What a clip of this name is, by its suffix in any case: `audio` or `video`. */
+export function clipKind(name: string): 'video' | 'audio' {
+  return AUDIO_EXTENSIONS.has(extensionOf(name)) ? 'audio' : 'video'
+}
+
 const pad = (n: number) => String(n).padStart(2, '0')
 
 /** The name of a pasted screenshot: `screenshot-YYYYMMDD-HHMMSS.png` in the
