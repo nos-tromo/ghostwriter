@@ -867,16 +867,18 @@ def test_processing_attachments_are_listed_across_chats_with_their_owner(store: 
 
 
 def test_stranded_processing_rows_settle(store: ChatStore, engine: Engine) -> None:
-    """A restart finds rows nothing will settle: a picture fails with the token, a document is taken as ready."""
+    """A restart finds rows nothing will settle: a picture or a clip fails with the token, a document is ready."""
     chat = store.create_chat("user-a")
     picture = _picture(store, chat.id)
     pdf = _picture(store, chat.id, kind="document")
+    clip = _picture(store, chat.id, kind="media")
     ready = _attach(store, chat.id)
     failed = _picture(store, chat.id)
     store.settle_attachment(failed.id, status="failed", manifest=None, failure="unreadable")
-    assert store.settle_processing("interrupted") == 2
+    assert store.settle_processing("interrupted") == 3
     assert _raw_attachment(engine, picture.id) == ("failed", None, "interrupted")
     assert _raw_attachment(engine, pdf.id) == ("ready", None, None)
+    assert _raw_attachment(engine, clip.id) == ("failed", None, "interrupted")
     assert _raw_attachment(engine, ready.id) == ("ready", None, None)
     assert _raw_attachment(engine, failed.id) == ("failed", None, "unreadable")
     assert store.processing_attachments() == []

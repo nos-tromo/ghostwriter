@@ -17,7 +17,10 @@ its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retenti
 which the lifespan runs a minute after start and then daily, and cancels at
 shutdown. ``app.state.processor`` is the attachment processor (:mod:`ghostwriter.processing`), ``None``
 while workbench is off: at start it prepares again what the last process left ``processing``, or, without
-workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes.
+workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes. It takes a
+video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it; a clip requeued at start
+waits for its gate (:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which the lifespan opens
+right after the requeue.
 ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
 waits for, and cancels it at shutdown. ``app.state.nextext`` is the Nextext client and ``app.state.media`` the
@@ -137,8 +140,17 @@ def create_app(
             store.apply_periods(settings.chat_days)
             workbench: WorkbenchClient | None = app.state.workbench
             if workbench is not None:
-                processor = AttachmentProcessor(store, workbench, emitter, image_tokens=settings.image_tokens)
+                processor = AttachmentProcessor(
+                    store,
+                    workbench,
+                    emitter,
+                    image_tokens=settings.image_tokens,
+                    nextext=app.state.nextext,
+                    health=app.state.media,
+                    nextext_timeout_s=settings.nextext_timeout_s,
+                )
                 processor.requeue()
+                processor.start_media()
             elif settled := store.settle_processing("unavailable"):
                 logger.info("{} attachments left processing were settled without workbench.", settled)
             app.state.processor = processor

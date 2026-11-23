@@ -37,7 +37,7 @@ from tests.conftest import (
     make_settings,
     unrecorded_child,
 )
-from tests.fakes import TAKE_BACK, TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, FakeNextext, stock_manifest
+from tests.fakes import JOB_ID, TAKE_BACK, TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, FakeNextext, stock_manifest
 
 MIB = 1024 * 1024
 TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
@@ -1475,3 +1475,84 @@ def test_a_document_attached_with_clips_offered_is_as_before(
         sheet = _attach(client, cid).json()
     assert (sheet["kind"], sheet["status"]) == ("document", "ready")
     assert submitted == []
+
+
+# --- clips: the round trip through Nextext ---------------------------------------
+
+
+@pytest.fixture
+def fast_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Poll a clip's job every 10 ms."""
+    monkeypatch.setattr(processing, "POLL_S", 0.01)
+
+
+@pytest.mark.usefixtures("fast_polls")
+def test_a_clip_goes_to_nextext_and_is_ready(tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock) -> None:
+    """The lifespan wires Nextext into the processor and opens its gate: the clip is transcribed, its job deleted."""
+    door, fake = FakeDoor(server_version="0.9.0"), FakeNextext()
+    app = _clips_app(tmp_path, audit_stream, door, clock, fake)
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        before = len(events(audit_stream))
+        aid = _attach(client, cid, CLIP, CLIP_BYTES).json()["id"]
+        assert _settled(client, cid, aid) == "ready"
+        found = _state(client).store.find_attachment("user-a", cid, aid)
+        assert found is not None and found.manifest is not None and found.manifest["transcript"] is True
+    assert fake.deleted == [JOB_ID]
+    assert [role for _, role, _ in door.derived] == ["nextext_jsonl", "nextext_zip"]
+    rows = [(e["action"], e["operation"], e.get("recipient")) for e in _since(audit_stream, before)]
+    assert rows[:5] == [
+        ("collect", "chat.attachment", None),
+        ("disclose", "chat.attachment", "workbench:upload"),
+        ("disclose", "chat.attachment", "nextext:transcribe"),
+        ("disclose", "chat.attachment", "workbench:prepare"),
+        ("delete", "chat.nextext", None),
+    ]
+
+
+@pytest.mark.usefixtures("fast_polls")
+def test_a_clip_taken_back_while_at_nextext_deletes_its_job(
+    tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """The take-back cancels the clip at Nextext: its job is still deleted and that recorded, and its row goes."""
+    door, fake = FakeDoor(server_version="0.9.0"), FakeNextext()
+    fake.statuses = ["running"]
+    app = _clips_app(tmp_path, audit_stream, door, clock, fake)
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        aid = _attach(client, cid, CLIP, CLIP_BYTES).json()["id"]
+        _wait_until(lambda: fake.jobs.get(JOB_ID, 0) >= 1)
+        before = len(events(audit_stream))
+        assert _remove(client, cid, aid).status_code == 204
+        _wait_until(lambda: fake.deleted == [JOB_ID] and not _state(client).processor.running(aid))
+        assert _state(client).store.find_attachment("user-a", cid, aid) is None
+        assert _state(client).processor.owned_jobs() == frozenset()
+        rows = sorted((e["action"], e["operation"], e["outcome"]) for e in _since(audit_stream, before))
+    assert rows == [
+        ("delete", "chat.attachment", "ok"),
+        ("delete", "chat.nextext", "ok"),
+        ("delete", "chat.workbench", "ok"),
+    ]
+    assert [record for record in loguru_caplog.records if record.levelno >= logging.ERROR] == []
+
+
+@pytest.mark.usefixtures("fast_polls")
+def test_a_clip_kept_by_a_failed_take_back_goes_to_nextext_again(
+    tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock
+) -> None:
+    """The take-back could not delete the clip in workbench: it stays, is requeued, makes a new job, and is ready."""
+    door, fake = FakeDoor(server_version="0.9.0"), FakeNextext()
+    fake.statuses = ["running"]
+    app = _clips_app(tmp_path, audit_stream, door, clock, fake)
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        aid = _attach(client, cid, CLIP, CLIP_BYTES).json()["id"]
+        _wait_until(lambda: fake.jobs.get(JOB_ID, 0) >= 1)
+        door.answers[TAKE_BACK] = httpx.Response(503, json={"detail": "busy, retry later"})
+        assert _remove(client, cid, aid).status_code == 502
+        fake.statuses = ["completed"]
+        assert _settled(client, cid, aid) == "ready"
+    assert len(fake.uploads) == 2 and fake.deleted == [JOB_ID, f"{JOB_ID[:-4]}0001"]

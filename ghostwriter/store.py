@@ -1328,11 +1328,11 @@ class ChatStore:
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.
 
-        A picture cannot be seen unprepared and goes ``failed`` with the token; any other
-        file is read as it was before preparing, and goes ``ready``.
+        A picture cannot be seen unprepared, and a clip has nothing to read without its transcript: both go
+        ``failed`` with the token. Any other file is read as it was before preparing, and goes ``ready``.
 
         Args:
-            failure: The token a picture fails with.
+            failure: The token a picture or a clip fails with.
 
         Returns:
             How many rows were settled.
@@ -1342,7 +1342,7 @@ class ChatStore:
                 "CursorResult[Any]",
                 s.execute(
                     update(Attachment)
-                    .where(Attachment.status == "processing", Attachment.kind == "image")
+                    .where(Attachment.status == "processing", Attachment.kind.in_(("image", "media")))
                     .values(status="failed", failure=failure)
                 ),
             )

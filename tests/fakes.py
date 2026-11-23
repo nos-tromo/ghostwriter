@@ -1249,8 +1249,9 @@ class FakeNextext:
     then answers every ``GET /jobs`` with the next of :attr:`statuses`, the last repeated, until it is deleted or
     has left the list after :attr:`vanish_after` polls. A list item has the keys Nextext 1.21 serves, and the list
     holds no job of another caller but those in :attr:`listed`. An artifact answers ``200`` with the
-    ``Content-Length`` Nextext's in-memory render has, or its scripted status; a job that is gone answers
-    ``404``. A ``DELETE`` answers ``204``, or ``404`` for a job that is not there.
+    ``Content-Length`` Nextext's in-memory render has, or its scripted status; a job that is gone (deleted, or out of
+    the list after :attr:`vanish_after` polls, as after a restart) answers ``404``. A ``DELETE`` answers ``204``, or
+    ``404`` for a job that is not there.
 
     Attributes:
         key: The service token the fake accepts.
@@ -1407,8 +1408,20 @@ class FakeNextext:
             jobs.append(self.item(job_id, self._status(polls)))
         return httpx.Response(200, json={"jobs": [*jobs, *self.listed]})
 
+    def _gone(self, job_id: str) -> bool:
+        """Tell whether a job is not there: never created, deleted, or out of the list (Nextext restarted).
+
+        Args:
+            job_id: The job.
+
+        Returns:
+            Whether Nextext holds it no more.
+        """
+        polls = self.jobs.get(job_id)
+        return polls is None or job_id in self.deleted or (self.vanish_after is not None and polls > self.vanish_after)
+
     def _artifact(self, job_id: str, name: str) -> httpx.Response:
-        if job_id not in self.jobs or job_id in self.deleted:
+        if self._gone(job_id):
             return httpx.Response(404, json=NOT_FOUND)
         served = self.artifacts.get(name, 404)
         if isinstance(served, int):
@@ -1429,7 +1442,7 @@ class FakeNextext:
         self.events.append(f"delete:{job_id}")
         if self.delete_status is not None:
             return httpx.Response(self.delete_status, json={"detail": "refused"})
-        if job_id not in self.jobs or job_id in self.deleted:
+        if self._gone(job_id):
             return httpx.Response(404, json=NOT_FOUND)
         self.deleted.append(job_id)
         return httpx.Response(204)
