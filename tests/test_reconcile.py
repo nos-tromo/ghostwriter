@@ -25,7 +25,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from ghostwriter import __version__, nextext, processing
-from ghostwriter.audit import open_emitter
+from ghostwriter.audit import Operation, open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
@@ -142,7 +142,7 @@ class Env:
             made: When Nextext made it.
             status: Its status.
         """
-        self.fake.listed.append(self.fake.item(job_id, status, created_at=made.isoformat().replace("+00:00", "Z")))
+        self.fake.listed.append(self.fake.item(job_id, status, created_at=_iso(made)))
 
 
 @pytest.fixture
@@ -189,6 +189,11 @@ def _reconciles(stream: CapturedAuditStream, before: int = 0) -> list[dict[str, 
         for e in events(stream)[before:]
         if e["operation"] == NEXTEXT_OPERATION and e["actor"] == SYSTEM and "ids" not in e["target"]
     ]
+
+
+def _iso(moment: datetime) -> str:
+    """Return a time as Nextext writes it."""
+    return moment.isoformat().replace("+00:00", "Z")
 
 
 def _row(event: dict[str, Any]) -> tuple[Any, ...]:
@@ -300,8 +305,7 @@ async def test_the_start_reconcile_waits_for_the_probe(env: Env, monkeypatch: py
     processor.start_media()
     probe = asyncio.create_task(health.run())
     try:
-        await _until(health.checked.is_set)
-        await anyio.sleep(0.1)
+        await _until(lambda: sum(r.url.path.endswith("/health") for r in env.fake.requests) >= 3)
         assert "list" not in env.fake.events
         env.fake.health = 200
         await _until(lambda: env.fake.deleted == [ORPHAN])
@@ -377,6 +381,47 @@ async def test_a_start_reconcile_past_its_time_opens_the_gate(
     assert _row(primary) == ("delete", {"kind": "job", "count": 2}, {"listed": 2, "at_start": True}, "ok")
     assert _row(child) == ("delete", {"kind": "job", "count": 2}, None, "error")
     assert child["parent_event_id"] == primary["event_id"]
+
+
+async def test_a_clip_waits_out_a_start_reconcile_at_both_its_limits(
+    env: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The probe passes at START_WAIT_S, the deletes take all of RECONCILE_EXTRA_S, the record is slow: clips go on.
+
+    The clip that waited all along waits longer than all of that, so the gate's opening never races its own limit.
+    """
+    monkeypatch.setattr(processing, "START_WAIT_S", 0.2)
+    monkeypatch.setattr(processing, "RECONCILE_EXTRA_S", 0.2)
+
+    async def at_the_limit(self: NextextHealth, timeout_s: float) -> bool:
+        await anyio.sleep(timeout_s)
+        return True
+
+    monkeypatch.setattr(NextextHealth, "wait_healthy", at_the_limit)
+    original = Operation.child
+
+    def slow_count(self: Operation, action: str, name: str, **fields: Any) -> str:
+        target = fields.get("target")
+        if name == NEXTEXT_OPERATION and target is not None and not target.ids:
+            time.sleep(0.1)
+        return original(self, action, name, **fields)
+
+    monkeypatch.setattr(Operation, "child", slow_count)
+    env.listed(ORPHAN, datetime.now(UTC) - timedelta(hours=1))
+
+    async def hung_delete(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE" and request.url.path.endswith(ORPHAN):
+            await anyio.sleep(5)
+        return await env.fake(request)
+
+    job = env.clip()
+    processor = env.make(client=env.client(hung_delete))
+    assert processor.requeue() == 1
+    processor.start_media()
+    await _settle(processor, job)
+    assert _status(env, job) == ("ready", None)
+    primary, child = _reconciles(audit_stream)
+    assert (_row(primary)[3], _row(child)[3]) == ("ok", "error")
 
 
 async def test_an_unrecorded_start_reconcile_deletes_nothing_and_opens_the_gate(
@@ -462,16 +507,37 @@ async def test_jobs_nextext_does_not_delete_are_recorded_as_an_error(
     assert _row(child) == ("delete", {"kind": "job", "count": 2}, None, "error")
 
 
+async def test_reconciles_run_one_at_a_time(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """Two reconciles at once: the second waits for the first, lists anew, and neither counts the orphan twice."""
+    env.listed(ORPHAN, datetime.now(UTC) - timedelta(hours=2))
+
+    async def slow_first_list(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET" and request.url.path.endswith("/jobs") and "list" not in env.fake.events:
+            await anyio.sleep(0.1)
+        return await env.fake(request)
+
+    processor = env.make(client=env.client(slow_first_list))
+    grace_s = env.settings.nextext_timeout_s + RECONCILE_EXTRA_S
+    first = asyncio.create_task(processor.reconcile(grace_s=grace_s))
+    second = asyncio.create_task(processor.reconcile(grace_s=grace_s))
+    assert await asyncio.gather(first, second) == [1, 0]
+    assert env.fake.events == ["list", f"delete:{ORPHAN}", "list"]
+    [event] = _reconciles(audit_stream)
+    assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 1, "at_start": False}, "ok")
+
+
 # --- after a create whose answer was lost ---------------------------------------------
 
 
-def _losing(env: Env, lose: Callable[[], bool], *, hang: bool = False) -> NextextClient:
+def _losing(env: Env, lose: Callable[[], bool], *, hang: bool = False, late: timedelta | None = None) -> NextextClient:
     """Return a client whose creates reach Nextext, which makes the job, but whose answer is lost while ``lose()``.
 
     Args:
         env: The test's env.
         lose: Whether the next create's answer is lost.
         hang: Whether a lost answer never comes, rather than timing out.
+        late: Stamp the lost job this long after the moment its answer is lost, as Nextext does once it has stored
+            the upload; ``None`` leaves the fake's stamp, a day before.
 
     Returns:
         The client.
@@ -480,6 +546,8 @@ def _losing(env: Env, lose: Callable[[], bool], *, hang: bool = False) -> Nextex
     async def handler(request: httpx.Request) -> httpx.Response:
         response = await env.fake(request)
         if request.method == "POST" and lose():
+            if late is not None:
+                env.fake.created[response.json()["job_id"]] = _iso(datetime.now(UTC) + late)
             if hang:
                 await anyio.sleep_forever()
             raise httpx.ReadTimeout("the answer did not come")
@@ -492,7 +560,8 @@ async def test_a_create_whose_answer_was_lost_is_reconciled_later(
     env: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """G16: the create timed out after Nextext made the job; the reconcile after the wait deletes it, sparing others."""
-    monkeypatch.setattr(processing, "ORPHAN_RECONCILE_S", 0.3)
+    monkeypatch.setattr(processing, "ORPHAN_GRACE_S", 0.3)
+    monkeypatch.setattr(processing, "ORPHAN_RECONCILE_S", 0.6)
     env.fake.statuses = ["running"]
     lose = False
     processor = env.make(client=_losing(env, lambda: lose))
@@ -511,6 +580,29 @@ async def test_a_create_whose_answer_was_lost_is_reconciled_later(
     assert processor.owned_jobs() == frozenset({JOB_ID}) and processor.running(owner.attachment_id)
     [event] = _reconciles(audit_stream)
     assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 3, "at_start": False}, "ok")
+
+
+def test_the_reconcile_after_a_lost_create_waits_past_its_grace() -> None:
+    """The grace spares another clip's create in flight (at most CREATE_READ_S old) and skew; the wait is 60 s more."""
+    assert processing.ORPHAN_GRACE_S == nextext.CREATE_READ_S + RECONCILE_EXTRA_S == 180
+    assert processing.ORPHAN_RECONCILE_S == processing.ORPHAN_GRACE_S + RECONCILE_EXTRA_S == 240
+
+
+async def test_a_lost_job_nextext_stamped_after_the_failure_is_deleted_by_the_first_run(
+    env: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Nextext stamps the lost job 50 ms after the create gave up; the run after the wait is past its grace already."""
+    monkeypatch.setattr(processing, "ORPHAN_GRACE_S", 0.3)
+    monkeypatch.setattr(processing, "ORPHAN_RECONCILE_S", 0.6)
+    processor = env.make(client=_losing(env, lambda: True, late=timedelta(milliseconds=50)))
+    processor.start_media()
+    job = env.clip()
+    processor.submit(job)
+    await _settle(processor, job)
+    assert _status(env, job) == ("failed", "nextext_unavailable") and env.fake.deleted == []
+    await _until(lambda: env.fake.deleted == [JOB_ID])
+    [event] = _reconciles(audit_stream)
+    assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 1, "at_start": False}, "ok")
 
 
 async def test_a_clip_cancelled_during_its_create_leaves_no_job(
@@ -544,9 +636,10 @@ async def test_one_reconcile_waits_for_lost_creates_at_a_time(
     for job in jobs:
         await _settle(processor, job)
     assert [_status(env, job) for job in jobs] == [("failed", "nextext_unavailable")] * 3
-    await _until(lambda: len(env.fake.deleted) == 3)
-    started = time.monotonic()
-    await _until(lambda: env.fake.events.count("list") == 3 or time.monotonic() - started > 0.6)
+    pending = processor._orphans
+    assert pending is not None
+    with anyio.fail_after(5):
+        await pending.task
     assert sorted(env.fake.deleted) == sorted([JOB_ID, SECOND_JOB, THIRD_JOB])
     assert env.fake.events.count("list") == 3
     [event] = _reconciles(audit_stream)
@@ -562,6 +655,7 @@ async def test_a_waiting_reconcile_is_cancelled_at_shutdown(env: Env, monkeypatc
     processor.submit(job)
     await _settle(processor, job)
     lists = env.fake.events.count("list")
+    pending = processor._orphans
+    assert pending is not None and not pending.task.done()
     await processor.aclose()
-    await anyio.sleep(0.4)
-    assert env.fake.events.count("list") == lists and env.fake.deleted == []
+    assert pending.task.done() and env.fake.events.count("list") == lists and env.fake.deleted == []

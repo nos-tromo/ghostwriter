@@ -811,9 +811,10 @@ async def test_no_job_is_made_before_the_gate_opens(env: Env) -> None:
 
 
 async def test_a_gate_that_never_opens_fails_the_clip(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Past START_WAIT_S and RECONCILE_EXTRA_S without the start reconcile, nothing goes to Nextext: unavailable."""
+    """Past the gate's whole wait without the start reconcile, nothing goes to Nextext, and the clip is unavailable."""
     monkeypatch.setattr(processing, "START_WAIT_S", 0.05)
     monkeypatch.setattr(processing, "RECONCILE_EXTRA_S", 0.05)
+    monkeypatch.setattr(processing, "_GATE_SLACK_S", 0.05)
     processor = await env.make(start=False)
     job = _clip(env)
     await _run(processor, job)

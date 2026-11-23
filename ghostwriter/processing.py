@@ -61,8 +61,10 @@ came back (its read timed out, it did not read, or the clip was cancelled meanwh
 first, as the system, by count only: ``delete`` / ``chat.nextext``; unrecorded, it deletes nothing. It runs at start
 (:meth:`AttachmentProcessor.start_media`), once Nextext's probe has passed and before any clip may make a job, so
 it deletes every job listed; :data:`ORPHAN_RECONCILE_S` after a create whose answer was not read, sparing the jobs
-younger than that; and in the daily sweep (:mod:`ghostwriter.retention`), sparing those younger than
-``nextext_timeout_s`` and :data:`RECONCILE_EXTRA_S`.
+younger than :data:`ORPHAN_GRACE_S`; and in the daily sweep (:mod:`ghostwriter.retention`), sparing those younger
+than ``nextext_timeout_s`` and :data:`RECONCILE_EXTRA_S`. One reconcile runs at a time, so none counts a job another
+deleted. A probe that does not pass at start, or a clip's own delete that Nextext refuses, leaves its job to the daily
+sweep.
 
 A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and so does the sweep's. Each
 job runs in its own cancel scope, and a store or audit call in progress finishes on its worker thread
@@ -149,9 +151,15 @@ START_WAIT_S: Final = 120.0
 #: Seconds a reconcile's grace adds to the longest a running clip's job may go unowned or live, for a create whose
 #: answer is on its way and for clock skew; also the longest the start reconcile may take once the probe has passed.
 RECONCILE_EXTRA_S: Final = 60.0
-#: Seconds after a create whose answer was not read before Nextext's jobs are reconciled, and that reconcile's grace:
-#: a job younger than this may be another clip's, whose create has not answered yet.
-ORPHAN_RECONCILE_S: Final = CREATE_READ_S + RECONCILE_EXTRA_S
+#: The grace of the reconcile after a create whose answer was not read, in seconds: a job younger than this may be
+#: another clip's, whose create has not answered yet (at most :data:`~ghostwriter.nextext.CREATE_READ_S` old).
+ORPHAN_GRACE_S: Final = CREATE_READ_S + RECONCILE_EXTRA_S
+#: Seconds after a create whose answer was not read before Nextext's jobs are reconciled: the grace and
+#: :data:`RECONCILE_EXTRA_S` more, so the lost job is past the grace by then. Nextext stamps a job once it has stored
+#: the upload, which may be after Ghostwriter gave up on the answer.
+ORPHAN_RECONCILE_S: Final = ORPHAN_GRACE_S + RECONCILE_EXTRA_S
+#: How much longer a clip waits for the gate than the start reconcile may take (probe, reconcile, its last record).
+_GATE_SLACK_S: Final = 5.0
 #: Nextext's tokens that say it is down or refuses Ghostwriter's key, rather than that one clip failed; any
 #: ``http:5xx`` too.
 _NEXTEXT_DOWN: Final = frozenset({"unreachable", "timeout", "http:401", "http:403", "not_configured"})
@@ -349,6 +357,7 @@ class AttachmentProcessor:
         self._start: _Chore | None = None
         self._orphans: _Chore | None = None
         self._orphans_due: float | None = None
+        self._reconciling = asyncio.Lock()
         self._closed = False
 
     def start_media(self) -> None:
@@ -394,7 +403,8 @@ class AttachmentProcessor:
         is spared, and with a grace so is every job Nextext made less than ``grace_s`` ago: a create whose answer has
         not come back may have made it. The deletes are recorded first, as the system, by count only: ``delete`` /
         ``chat.nextext``, target ``job`` (count), criteria ``listed`` and ``at_start``; the jobs Nextext did not delete,
-        also those a cancel left, get an ``error`` child (count), best effort. On the event loop.
+        also those a cancel left, get an ``error`` child (count), best effort. One reconcile runs at a time; another
+        waits for it, then lists anew. On the event loop.
 
         Args:
             grace_s: Spare the jobs younger than this, in seconds; ``None`` at start, where no clip of this process
@@ -411,6 +421,22 @@ class AttachmentProcessor:
         nextext = self._nextext
         if nextext is None:
             return 0
+        async with self._reconciling:
+            return await self._reconcile(nextext, grace_s)
+
+    async def _reconcile(self, nextext: NextextClient, grace_s: float | None) -> int:
+        """Run one reconcile (:meth:`reconcile`), holding the processor's one reconcile lock.
+
+        Args:
+            nextext: The client.
+            grace_s: As for :meth:`reconcile`.
+
+        Returns:
+            How many jobs were deleted.
+
+        Raises:
+            AuditWriteError: When the record cannot be written; nothing is deleted.
+        """
         op = system_operation(self._emitter, "delete", NEXTEXT_OPERATION)
         headers = forward_headers(op.context)
         try:
@@ -461,6 +487,9 @@ class AttachmentProcessor:
     def _reconcile_later(self) -> None:
         """Have Nextext's jobs reconciled :data:`ORPHAN_RECONCILE_S` from now, a create's answer having gone unread.
 
+        The lost job is then older than :data:`ORPHAN_GRACE_S` by :data:`RECONCILE_EXTRA_S`, also when Nextext made it
+        a little after the create gave up, or its clock runs that much ahead.
+
         At most one such reconcile waits at a time. A create that fails while it does moves the next one: once a
         reconcile has run, another follows the latest failure's wait, so each orphan is deleted within two waits.
         """
@@ -471,12 +500,12 @@ class AttachmentProcessor:
             self._orphans = self._chore(self._reconcile_orphans)
 
     async def _reconcile_orphans(self) -> None:
-        """Reconcile once each wait after a lost create is over, sparing the jobs younger than the wait."""
+        """Reconcile once each wait after a lost create is over, sparing jobs younger than :data:`ORPHAN_GRACE_S`."""
         ran: float | None = None
         while (due := self._orphans_due) is not None and due != ran:
             await anyio.sleep(max(0.0, due - anyio.current_time()))
             try:
-                await self.reconcile(grace_s=ORPHAN_RECONCILE_S)
+                await self.reconcile(grace_s=ORPHAN_GRACE_S)
             except AuditWriteError:
                 logger.error("A reconcile after a lost create could not be recorded; no job was deleted at Nextext.")
             ran = due
@@ -807,16 +836,17 @@ class AttachmentProcessor:
         await self._settle_failed(job, failure.token)
 
     async def _wait_reconciled(self) -> bool:
-        """Wait for the clips' gate (:meth:`start_media`), at most :data:`START_WAIT_S` and :data:`RECONCILE_EXTRA_S`.
+        """Wait for the clips' gate (:meth:`start_media`), longer than the start reconcile may take.
 
-        That is as long as the start reconcile may wait for the probe and then take, so a clip waiting at start is
-        failed only when the gate never opened.
+        That is :data:`START_WAIT_S` for the probe, :data:`RECONCILE_EXTRA_S` for the reconcile, and
+        :data:`_GATE_SLACK_S` for its last record, so a clip waiting at start is failed only when the gate never
+        opened.
 
         Returns:
             Whether it is open; a clip makes no job while it is not.
         """
         if not self._reconciled.is_set():
-            with anyio.move_on_after(START_WAIT_S + RECONCILE_EXTRA_S):
+            with anyio.move_on_after(START_WAIT_S + RECONCILE_EXTRA_S + _GATE_SLACK_S):
                 await self._reconciled.wait()
         return self._reconciled.is_set()
 

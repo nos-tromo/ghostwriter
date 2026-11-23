@@ -523,6 +523,76 @@ async def test_the_sweep_reconciles_before_it_deletes_chats(
     )
 
 
+def _reconciling_sweeper(env: Env, processor: AttachmentProcessor) -> Sweeper:
+    """Return a sweeper over the test's store and workbench whose processor reconciles Nextext's jobs."""
+    return Sweeper(
+        store=env.store,
+        workbench=env.workbench,
+        emitter=env.emitter,
+        settings=env.settings,
+        turns=env.turns,
+        now=env.clock,
+        processor=processor,
+    )
+
+
+@pytest.mark.parametrize(
+    ("error", "logged"),
+    [
+        (RuntimeError("synthetic failure"), "Nextext's jobs failed: RuntimeError"),
+        (AuditWriteError("synthetic audit stream failure"), "could not be recorded; no job was deleted"),
+    ],
+    ids=["bug", "audit"],
+)
+async def test_a_failing_reconcile_never_stops_the_chats_sweep(
+    settled: Env,
+    loguru_caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+    logged: str,
+) -> None:
+    """A reconcile that raises, even unrecorded, is logged by its type; the due chat goes all the same."""
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+
+    async def failing(self: AttachmentProcessor, *, grace_s: float | None) -> int:
+        raise error
+
+    monkeypatch.setattr(AttachmentProcessor, "reconcile", failing)
+    processor = AttachmentProcessor(env.store, env.workbench, env.emitter)
+    try:
+        report = await _reconciling_sweeper(env, processor).sweep()
+    finally:
+        await processor.aclose()
+    assert report == SweepReport(chats=1) and not env.has_rows(cid)
+    assert any(logged in record.getMessage() for record in loguru_caplog.records)
+
+
+async def test_a_hung_reconcile_is_cut_off_and_the_chats_go(
+    settled: Env, audit_stream: CapturedAuditStream, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Nextext that never answers its list holds the sweep up no longer than the limit; the due chat goes."""
+    monkeypatch.setattr("ghostwriter.retention.RECONCILE_EXTRA_S", 0.2)
+    env = settled
+    cid = env.chat(NOW - 95 * DAY)
+
+    async def hang(request: httpx.Request) -> httpx.Response:
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable")
+
+    reached = make_settings(tmp_path, nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY)
+    processor = AttachmentProcessor(
+        env.store, env.workbench, env.emitter, nextext=NextextClient(reached, transport=httpx.MockTransport(hang))
+    )
+    try:
+        with anyio.fail_after(5):
+            report = await _reconciling_sweeper(env, processor).sweep()
+    finally:
+        await processor.aclose()
+    assert report == SweepReport(chats=1) and not env.has_rows(cid)
+    assert [e for e in events(audit_stream) if e["operation"] == NEXTEXT_OPERATION] == []
+
+
 async def test_the_sweep_names_the_chat_and_the_system_reason_to_workbench(
     settled: Env, audit_stream: CapturedAuditStream
 ) -> None:

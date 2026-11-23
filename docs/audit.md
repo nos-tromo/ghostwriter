@@ -42,7 +42,7 @@ images, sent again without them, is two `chat.answer` events.
 | `GET /api/chats/{id}/files/{file_id}` | `disclose` `file.download` (`download`) | `file` [id] | `error` child on failure |
 | `POST /api/transcribe` | `ai_call` `speech.transcribe` (`inference:asr`) | — | — |
 | start-up, a chat delete that failed, or a take-back that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`; for a clip `nextext:transcribe`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails; for a clip, the same children as an attached clip's |
-| start-up, 3 minutes after a create whose answer was lost, and the sweep: Ghostwriter's jobs at Nextext that no clip owns | `delete` `chat.nextext` as the system, written before the deletes, criteria `listed`, `at_start` | `job` (count) | an `error` one (`job`, count) for the jobs Nextext did not delete |
+| start-up, 4 minutes after a create whose answer was lost, and the sweep: Ghostwriter's jobs at Nextext that no clip owns | `delete` `chat.nextext` as the system, written before the deletes, criteria `listed`, `at_start` | `job` (count) | an `error` one (`job`, count) for the jobs Nextext did not delete |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
 | the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
 
@@ -90,15 +90,17 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
 - A reconcile lists Ghostwriter's jobs at Nextext (`listed`: how many) and
   records how many no clip owns before it deletes any, by count only. At start
   (`at_start: true`) it deletes every job listed: each clip waits for it before
-  it makes a job, so none is this process's. Three minutes after a create whose
+  it makes a job, so none is this process's. Four minutes after a create whose
   answer was lost (it timed out or did not read, or the clip was cancelled
   meanwhile, so Nextext may have made a job whose id never came back) it spares
-  the jobs younger than that, and the sweep's spares those younger than
-  `NEXTEXT_TIMEOUT` and 60 s; both spare every job a running clip owns. With
-  nothing to delete, or a Nextext that cannot list, it records nothing; a
-  reconcile whose record cannot be written deletes nothing (at start, the clips
-  then go on). Its `error` child counts the jobs Nextext did not delete, also
-  those a start reconcile past its 60 s left; the next reconcile lists them again.
+  the jobs younger than 3 minutes, and the sweep's spares those younger than
+  `NEXTEXT_TIMEOUT` and 60 s; both spare every job a running clip owns. One
+  reconcile runs at a time, so no two count the same job. With nothing to
+  delete, or a Nextext that cannot list, it records nothing; a reconcile whose
+  record cannot be written deletes nothing (at start, the clips then go on, and
+  the sweep goes on to the chats). Its `error` child counts the jobs Nextext did
+  not delete, also those a reconcile past its 60 s left; the next reconcile lists
+  them again.
 - A download cut off after its 200 keeps its `ok` event.
 - A sweep event names at most 200 ids. Its `cutoff` is the sweep's own time;
   `period_days` is the configured period, also during a notice.

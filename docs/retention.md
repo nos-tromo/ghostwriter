@@ -86,13 +86,27 @@ A job no clip owns is deleted by a reconcile, recorded first (`docs/audit.md`):
   start. Once Nextext passes its health probe (within 120 s), the start
   reconcile deletes every job Nextext lists for Ghostwriter, before any clip
   makes one; the clip left `processing` then goes to Nextext again, for a new
-  job. If the probe does not pass in time, the daily sweep deletes it.
+  job.
 - A create whose answer was lost (it timed out or did not read, or the clip was
-  cancelled meanwhile) may leave a job whose id never came back. A reconcile 3
-  minutes later deletes it, sparing jobs younger than that (another clip's
-  create may still be answering); else the next daily sweep does.
+  cancelled meanwhile) may leave a job whose id never came back. A reconcile 4
+  minutes later deletes it, sparing jobs younger than 3 minutes (another clip's
+  create may still be answering). Nextext stamps a job once it has stored the
+  upload, which can be after Ghostwriter gave up, so the extra minute lets the
+  lost job be past the grace by then.
 - The daily sweep deletes every job no clip owns that is older than
-  `NEXTEXT_TIMEOUT` and 60 s: no clip's job lives that long.
+  `NEXTEXT_TIMEOUT` and 60 s: no clip's job lives that long. It is what catches
+  the rest, so these leave a job at Nextext until the next daily sweep after it
+  is that old: a probe that does not pass within 120 s of start, a clip's own
+  delete that Nextext refuses, and a lost create's job the reconcile after it did
+  not reach (a Nextext down or slow then).
+
+One reconcile runs at a time, and the sweep's takes at most 60 s; whatever
+happens there, the sweep then goes on to the chats.
+
+All of a Ghostwriter's jobs at Nextext belong to its token, one owner
+(`service:ghostwriter`), and its start deletes every one of them. So each
+Ghostwriter needs a `NEXTEXT_API_KEY` of its own: a second one on the same token
+would delete this one's jobs when it starts.
 
 ## The dry run
 

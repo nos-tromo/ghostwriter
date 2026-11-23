@@ -1275,6 +1275,8 @@ class FakeNextext:
         events: ``"create"``, ``"list"`` and ``"delete:<id>"``, in order.
         served: The names of the artifacts whose body the fake started to send.
         jobs: The jobs created, by id: how many times each was polled.
+        created: The ``created_at`` a created job is listed with, by id; :data:`JOB_CREATED_AT`, a day before, for one
+            not named.
     """
 
     def __init__(self, key: str = NEXTEXT_KEY) -> None:
@@ -1307,6 +1309,7 @@ class FakeNextext:
         self.events: list[str] = []
         self.served: list[str] = []
         self.jobs: dict[str, int] = {}
+        self.created: dict[str, str] = {}
 
     def _status(self, polls: int) -> str:
         """Return a job's status at its poll number ``polls``, counted from 0.
@@ -1405,7 +1408,7 @@ class FakeNextext:
             self.jobs[job_id] = polls + 1
             if self.vanish_after is not None and polls >= self.vanish_after:
                 continue
-            jobs.append(self.item(job_id, self._status(polls)))
+            jobs.append(self.item(job_id, self._status(polls), created_at=self.created.get(job_id, JOB_CREATED_AT)))
         return httpx.Response(200, json={"jobs": [*jobs, *self.listed]})
 
     def _gone(self, job_id: str) -> bool:

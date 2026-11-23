@@ -10,7 +10,10 @@ anything of its batch is deleted, and the next sweep tries again. A batch names 
 First, Ghostwriter's jobs at Nextext that no clip owns and that are older than ``NEXTEXT_TIMEOUT`` and
 :data:`~ghostwriter.processing.RECONCILE_EXTRA_S` are deleted, recorded first (``delete`` / ``chat.nextext``, by
 count): :meth:`~ghostwriter.processing.AttachmentProcessor.reconcile`. A clip's job lives no longer than that; an
-older one was left by a process that ended, or by a create whose answer never came back.
+older one was left by a process that ended, by a create whose answer never came back, or by a delete Nextext
+refused. That step takes at most :data:`~ghostwriter.processing.RECONCILE_EXTRA_S`, and nothing in it stops the
+chats' sweep: a record it cannot write deletes nothing at Nextext, and that, a Nextext that hangs or any other
+failure is logged by its type, then the chats are swept.
 
 Then each batch of chats:
 
@@ -63,7 +66,7 @@ from ghostwriter.processing import RECONCILE_EXTRA_S, AttachmentProcessor
 from ghostwriter.retention_rule import RetentionPeriodState, deadline_under, is_due, next_period_state
 from ghostwriter.store import CHATS_STORE, ChatStore
 from ghostwriter.turns import TurnRegistry
-from ghostwriter.utils.audit_event import AuditEmitter, Target
+from ghostwriter.utils.audit_event import AuditEmitter, AuditWriteError, Target
 from ghostwriter.workbench import CallFor, WorkbenchClient, WorkbenchUnavailable
 
 #: Seconds between sweeps.
@@ -148,14 +151,14 @@ class Sweeper:
             What was deleted and emptied.
 
         Raises:
-            AuditWriteError: When a record cannot be written; nothing of its batch is deleted.
+            AuditWriteError: When a chat's or a content's record cannot be written; nothing of its batch is deleted.
+                The reconcile's is logged, and the chats are swept all the same.
         """
         now = self._now()
         report = SweepReport()
         self._workbench_timed_out = False
         if self._processor is not None:
-            grace_s = self._settings.nextext_timeout_s + RECONCILE_EXTRA_S
-            report.nextext_jobs = await self._processor.reconcile(grace_s=grace_s)
+            report.nextext_jobs = await self._reconcile(self._processor)
         busy = await self._sweep_chats(now, report)
         await self._sweep_contents(now, report)
         await anyio.to_thread.run_sync(self._store.checkpoint)
@@ -171,6 +174,31 @@ class Sweeper:
             report.workbench_failed,
         )
         return report
+
+    async def _reconcile(self, processor: AttachmentProcessor) -> int:
+        """Delete the Nextext jobs no clip owns, within :data:`~ghostwriter.processing.RECONCILE_EXTRA_S`.
+
+        Nothing here stops the sweep: a record that cannot be written (nothing is deleted at Nextext), a reconcile cut
+        off by the limit (what it left gets its ``error`` child) and any other failure are logged by their type.
+
+        Args:
+            processor: The attachment processor, whose jobs a reconcile spares.
+
+        Returns:
+            How many jobs were deleted; 0 when the reconcile failed or was cut off.
+        """
+        grace_s = self._settings.nextext_timeout_s + RECONCILE_EXTRA_S
+        deleted = 0
+        try:
+            with anyio.move_on_after(RECONCILE_EXTRA_S) as bound:
+                deleted = await processor.reconcile(grace_s=grace_s)
+            if bound.cancelled_caught:
+                logger.warning("The sweep's reconcile took over {} s; the next one tries again.", RECONCILE_EXTRA_S)
+        except AuditWriteError:
+            logger.error("The sweep's reconcile could not be recorded; no job was deleted at Nextext.")
+        except Exception as exc:
+            logger.error("The sweep's reconcile of Nextext's jobs failed: {}", type(exc).__name__)
+        return deleted
 
     async def _sweep_chats(self, now: datetime, report: SweepReport) -> int:
         """Delete the due chats batch by batch, each while holding its chats' turns.
