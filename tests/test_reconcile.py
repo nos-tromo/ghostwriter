@@ -8,6 +8,7 @@ here is invented.
 """
 
 import asyncio
+import logging
 import time
 from collections.abc import AsyncIterator, Callable, Coroutine
 from contextlib import suppress
@@ -47,6 +48,8 @@ ORPHAN = "0a1b2c3d4e5f40718293a4b5c6d7e8f9"
 OLD_ORPHAN = "1b2c3d4e5f60718293a4b5c6d7e8f90a"
 #: A job Nextext made a moment ago: another clip's, whose create has not answered yet.
 YOUNG = "2c3d4e5f60718293a4b5c6d7e8f90a1b"
+#: A job a running clip owns.
+OWNED = "3d4e5f60718293a4b5c6d7e8f90a1b2c"
 SYSTEM = {"user": None, "via": "system"}
 Handler = Callable[[httpx.Request], Coroutine[None, None, httpx.Response]]
 
@@ -494,6 +497,41 @@ async def test_the_sweep_spares_owned_and_young_jobs(env: Env, audit_stream: Cap
     assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 3, "at_start": False}, "ok")
 
 
+async def test_a_job_its_clip_deletes_during_the_list_is_spared(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """A clip owns its job as the list goes out and deletes it before the answer: the reconcile leaves it alone."""
+    env.listed(OWNED, datetime.now(UTC) - timedelta(hours=2))
+    made: list[AttachmentProcessor] = []
+
+    async def its_clip_deletes_meanwhile(request: httpx.Request) -> httpx.Response:
+        response = await env.fake(request)
+        if (request.method, request.url.path) == ("GET", "/api/v1/jobs"):
+            made[0]._owned.discard(OWNED)
+        return response
+
+    processor = env.make(client=env.client(its_clip_deletes_meanwhile))
+    made.append(processor)
+    processor._owned.add(OWNED)
+    assert await processor.reconcile(grace_s=None) == 0
+    assert processor.owned_jobs() == frozenset() and env.fake.events == ["list"]
+    assert _reconciles(audit_stream) == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+async def test_a_start_reconcile_whose_key_is_refused_turns_clips_off(
+    env: Env, audit_stream: CapturedAuditStream, loguru_caplog: pytest.LogCaptureFixture, status: int
+) -> None:
+    """The start reconcile's list refuses the key: nothing is deleted or recorded, one error names the setting."""
+    env.fake.list_status = status
+    env.listed(ORPHAN, datetime.now(UTC) - timedelta(hours=1))
+    processor = env.make()
+    processor.start_media()
+    await _until(lambda: env.health.key_refused)
+    assert env.health.healthy is False
+    assert env.fake.events == ["list"] and _reconciles(audit_stream) == []
+    errors = [record.getMessage() for record in loguru_caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "NEXTEXT_API_KEY" in errors[0] and NEXTEXT_KEY not in errors[0]
+
+
 async def test_jobs_nextext_does_not_delete_are_recorded_as_an_error(
     env: Env, audit_stream: CapturedAuditStream
 ) -> None:
@@ -580,6 +618,39 @@ async def test_a_create_whose_answer_was_lost_is_reconciled_later(
     assert processor.owned_jobs() == frozenset({JOB_ID}) and processor.running(owner.attachment_id)
     [event] = _reconciles(audit_stream)
     assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 3, "at_start": False}, "ok")
+
+
+@pytest.mark.parametrize("how", ["refused", "unanswered"])
+async def test_a_clips_own_delete_that_failed_is_reconciled_later(
+    env: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """Nextext refuses the clip's own delete, or does not answer it in time: the reconcile after the wait deletes it."""
+    monkeypatch.setattr(processing, "ORPHAN_GRACE_S", 0.3)
+    monkeypatch.setattr(processing, "ORPHAN_RECONCILE_S", 0.6)
+    monkeypatch.setattr(processing, "CALL_S", 0.1)
+    failed: list[str] = []
+
+    async def first_delete_fails(request: httpx.Request) -> httpx.Response:
+        if request.method == "DELETE" and not failed:
+            failed.append(request.url.path)
+            if how == "refused":
+                return httpx.Response(500, json={"detail": "refused"})
+            await anyio.sleep(5)
+        return await env.fake(request)
+
+    processor = env.make(client=env.client(first_delete_fails))
+    processor.start_media()
+    job = env.clip()
+    processor.submit(job)
+    await _settle(processor, job)
+    assert _status(env, job) == ("ready", None)
+    assert failed == [f"/api/v1/jobs/{JOB_ID}"] and env.fake.deleted == []
+    assert processor.owned_jobs() == frozenset()
+    [own] = [e for e in events(audit_stream) if e["operation"] == NEXTEXT_OPERATION and "ids" in e["target"]]
+    assert (own["target"]["ids"], own["criteria"], own["outcome"]) == ([JOB_ID], {"deleted": False}, "error")
+    await _until(lambda: env.fake.deleted == [JOB_ID])
+    [event] = _reconciles(audit_stream)
+    assert _row(event) == ("delete", {"kind": "job", "count": 1}, {"listed": 1, "at_start": False}, "ok")
 
 
 def test_the_reconcile_after_a_lost_create_waits_past_its_grace() -> None:

@@ -6,7 +6,7 @@
 | Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
 | An attachment's manifest (its page count, the pages without text, the sizes of its renders; a clip's length, frame count and whether it has a transcript) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
 | The files, and the renders workbench made of them (a clip's transcript and frames are derived files of the clip) | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
-| A clip's copy at Nextext, and what Nextext made of it | one job: until its transcript and frames are in workbench, it failed, or `NEXTEXT_TIMEOUT` (900 s) is spent | Ghostwriter deletes the job at once; one a crash left goes at the next start, or with the daily sweep |
+| A clip's copy at Nextext, and what Nextext made of it | one job: until its transcript and frames are in workbench, it failed, or `NEXTEXT_TIMEOUT` (900 s) is spent; a job still running then keeps the upload at Nextext until its pipeline ends | Ghostwriter deletes the job at once; one whose delete failed goes 4 minutes later, one a crash left at the next start, or with the daily sweep |
 
 Using or continuing a chat never extends its period. The sweep runs a minute
 after start, then daily (`ghostwriter/retention.py`). A line under the composer
@@ -77,8 +77,8 @@ budget was spent, also when the clip is taken back or its chat deleted
 meanwhile. Nextext's `DELETE` of a running job drops it from Nextext's list at
 once, but its pipeline runs on and keeps Nextext's one queue slot, and Nextext
 removes the job's upload when the pipeline ends (in the spike, about 85 s
-later). So a clip taken back, or whose chat is deleted, while it is transcribed
-stays at Nextext until its job ends there. Nextext holds its jobs in memory, so
+later). So a clip taken back, whose chat is deleted, or whose budget was spent
+while it is transcribed stays at Nextext until its job ends there. Nextext holds its jobs in memory, so
 its own restart drops them too.
 
 A job no clip owns is deleted by a reconcile, recorded first (`docs/audit.md`):
@@ -94,20 +94,25 @@ A job no clip owns is deleted by a reconcile, recorded first (`docs/audit.md`):
   create may still be answering). Nextext stamps a job once it has stored the
   upload, which can be after Ghostwriter gave up, so the extra minute lets the
   lost job be past the grace by then.
+- A clip's own delete that Nextext refuses, or does not answer within 10 s,
+  leaves its job, which no clip owns any more: the same reconcile 4 minutes
+  later deletes it.
 - The daily sweep deletes every job no clip owns that is older than
   `NEXTEXT_TIMEOUT` and 60 s: no clip's job lives that long. It is what catches
   the rest, so these leave a job at Nextext until the next daily sweep after it
-  is that old: a probe that does not pass within 120 s of start, a clip's own
-  delete that Nextext refuses, and a lost create's job the reconcile after it did
-  not reach (a Nextext down or slow then).
+  is that old: a probe that does not pass within 120 s of start, and a job the
+  reconcile after a lost create or a failed delete did not reach (a Nextext down
+  or slow then).
 
 One reconcile runs at a time, and the sweep's takes at most 60 s; whatever
 happens there, the sweep then goes on to the chats.
 
-All of a Ghostwriter's jobs at Nextext belong to its token, one owner
-(`service:ghostwriter`), and its start deletes every one of them. So each
-Ghostwriter needs a `NEXTEXT_API_KEY` of its own: a second one on the same token
-would delete this one's jobs when it starts.
+Nextext keeps a service's jobs under the name of its entry in
+`NEXTEXT_SERVICE_TOKENS`, not under its token: `ghostwriter=<token>` is the owner
+`service:ghostwriter`. A Ghostwriter's start deletes every job of that owner. So
+a second Ghostwriter needs an entry of its own name and its own token (say
+`ghostwriter-staging=<token>`, that token its `NEXTEXT_API_KEY`): under the same
+name, even with another token, it would delete this one's jobs when it starts.
 
 ## The dry run
 

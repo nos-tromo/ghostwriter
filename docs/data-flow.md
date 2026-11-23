@@ -22,7 +22,10 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 - **File bytes.** Uploads stream through to workbench and downloads stream back.
 - **Clip bytes and Nextext's artifacts.** A clip streams from workbench to Nextext, and its transcript and
   frames stream from Nextext into workbench, chunk by chunk through memory: none is spooled to disk, read
-  whole or kept here. A transcript's lines are never in the database, a log or the audit.
+  whole or kept here. The processor never holds a transcript line, and none is in a log or the audit. Once
+  the model reads a clip with `read_document`, what it read is a tool result like any other
+  (`tool_steps.result`, at most 12,000 characters, until its content deadline within
+  `WORKBENCH_RETENTION_DAYS`).
 - **Image bytes and data URLs.** The renders of a message's pictures and of the
   pages or pictures its tools showed are fetched from workbench and held in
   memory for that one message. A data URL exists only in the request to the
@@ -34,8 +37,9 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
   that always think, or a round cut at `max_tokens` inside a think block, need
   vllm-service's `CHAT_REASONING_PARSER`; otherwise the held reasoning is
   released as text, as in docint.
-- **The purpose.** Only in the audit events and in the header to workbench,
-  which records it too. The browser keeps it for the tab's session.
+- **The purpose.** Only in the audit events and in the headers to workbench and
+  to Nextext (every call: create, poll, artifacts, delete), which record it in
+  their own audit too. The browser keeps it for the tab's session.
 
 Logs hold ids, counts, statuses and tokens only.
 
@@ -151,7 +155,8 @@ type not taken, and Ghostwriter behaves as 0.5.0 did.
 **The offer.** Clips (`.mp4 .mov .m4v .webm .mkv .mp3 .m4a .wav .ogg .opus .flac`) are offered only while
 all three hold: `NEXTEXT_API_KEY` and `NEXTEXT_API_BASE` are set; a background probe of Nextext's `/health`
 (HTTP 200 only; start-up never waits for it, and after a failure it asks again after 5 s, doubling to 300 s,
-or at once when a clip's job finds Nextext down) says it is up; and workbench's discovery names 0.9.0 or
+or at once when a clip's job finds Nextext down; after Nextext refused the key, it also lists the jobs with the
+key, and only a 200 counts) says it is up; and workbench's discovery names 0.9.0 or
 later. `GET /api/config` then lists them as `media_types`, with `media: true`. The probe sees that Nextext
 is up, not that its Whisper is: a clip then fails at Nextext within seconds, `nextext_failed`. Clips need no
 vision: the transcript is text. The frames reach the model only through `view_file`, so only while it sees.
@@ -163,7 +168,8 @@ once, and the processor takes it on `MEDIA_SLOTS` of its own (2), never a prepar
 meanwhile is ready within its usual prepare:
 
 1. It waits for the start reconcile (below), at most `START_WAIT_S` and `RECONCILE_EXTRA_S` (120 s and 60 s) and
-   a few seconds more. A gate that never opened fails the clip `nextext_unavailable`.
+   a few seconds more. A gate that never opened fails the clip `nextext_unavailable`, and so does Nextext
+   turned off since the upload; nothing is sent then, and no hand-over is recorded.
 2. A `disclose` event (`nextext:transcribe`: its kind and size) is written. Unrecorded, nothing is sent
    (`audit`).
 3. The clip is fetched from workbench (`GET /files/view`) and streamed, chunk by chunk, into `POST /jobs` at
@@ -172,28 +178,34 @@ meanwhile is ready within its usual prepare:
    /jobs/{id}`, whose answer holds the whole transcript, which Ghostwriter must not hold. The whole round trip
    (the upload, the queue behind other jobs, the run and the downloads) is within `NEXTEXT_TIMEOUT` (900 s),
    counted from the recorded hand-over. A job the list does not name is gone (Nextext restarted, its jobs
-   living in memory), and so is one whose list item does not read: `nextext_failed`, at the next poll.
+   living in memory), and so is one whose list item does not read: `nextext_failed`, at the next poll. A
+   poll that fails (a list that timed out, a connection reset) is ridden out, up to 3 in a row; a fourth in a
+   row fails the clip `nextext_unavailable`.
 5. A completed job (also one `skipped` for `vad_no_speech`, which is no failure: the clip is ready and its line
    says "no speech") is recorded as a hand-over to workbench (`workbench:prepare`). Then each artifact streams
    from Nextext's `GET /jobs/{id}/artifacts/{name}` straight into workbench's `POST /files/derived`, as a
    derived file of the clip: the transcript `docint.jsonl` (at most 8 MiB) and the frames `keyframes.zip`
    (32 MiB). An artifact Nextext did not make (404: no transcript for a clip without speech, no frames for
    audio) or one over its cap (`artifact_too_large`, logged) is left out, and the clip is ready with what
-   remains. A workbench that answers busy (503: its lock on the clip, held by a prepare of the same clip) is
-   asked once more after 10 s; still busy, the clip fails.
+   remains. A completed job that was not skipped and served neither artifact is polled once more and fails the
+   clip `nextext_failed`, gone (Nextext restarted before the downloads) or still listed: a clip with speech
+   always has a transcript. A workbench that answers busy (503: its lock on the clip, held by a prepare of the
+   same clip) is asked once more after 10 s; still busy, the clip fails.
 6. In a `finally` shielded from a cancel, the job is deleted at Nextext (a job it no longer holds counts as
    deleted) and the delete is recorded (`delete` / `chat.nextext`, the job id only). This also holds for a clip
    taken back, or whose chat is deleted, while it is at Nextext: it is the one record a cancelled job still
-   writes.
+   writes. A delete Nextext refuses, or does not answer within 10 s, is followed by a reconcile four minutes
+   later (below).
 7. workbench prepares the clip (`POST /files/prepare`, on a prepare slot, asked once more after a busy answer)
    and its manifest is kept: the kind `media`, the unit `frame`, the frames (0 for audio), its length and
    whether it has a transcript. The clip is `ready`. A prepare refused as unreadable or unsupported (422)
    fails the clip with that token; one that timed out (`read_timeout`), with `timeout`.
 
 A clip that cannot go through is `failed` with a token, and an `error` child under the hand-over whose step
-failed ([audit.md](audit.md)): `nextext_unavailable` (Nextext does not answer, times out, refuses the key or
-fails with a 5xx; the probe is told, so clips are not offered until it answers again), `nextext_failed` (the job
-failed, was cancelled or interrupted, or is gone), `undecodable_media` (Nextext cannot decode the clip),
+failed ([audit.md](audit.md)): `nextext_unavailable` (Nextext does not answer, times out, fails with a 5xx or
+refuses the key; the probe is told, so clips are not offered until it answers again, and after a refused key,
+which logs one error naming `NEXTEXT_API_KEY`, until a list of the probe's with the key answers 200),
+`nextext_failed` (the job failed, was cancelled or interrupted, is gone, or served nothing), `undecodable_media` (Nextext cannot decode the clip),
 `timeout` (the budget was spent), or workbench's own token. Unlike a document, a clip is never `ready` without
 its round trip: it has nothing to read. A video with no sound track at all fails at Nextext 1.21 as
 `undecodable_media`, so it gets no frames either; that is Nextext's limit.
@@ -201,19 +213,22 @@ its round trip: it has nothing to read. A video with no sound track at all fails
 **Orphaned jobs.** A job no clip owns is deleted by a reconcile, which lists Ghostwriter's jobs at Nextext and
 records a count before it deletes any: at start, once Nextext passes its probe (every job listed, since no clip
 of this process can own one yet, and each clip waits for it before it makes a job); four minutes after a create
-whose answer was lost (sparing jobs younger than 3 minutes); and in the daily sweep (sparing jobs younger than
-`NEXTEXT_TIMEOUT` and 60 s). One reconcile runs at a time; the sweep's is bounded at 60 s and never stops the
+whose answer was lost or a clip's own delete that failed (sparing jobs younger than 3 minutes); and in the daily
+sweep (sparing jobs younger than `NEXTEXT_TIMEOUT` and 60 s). Each spares the jobs a clip owned when its list went
+out or owns when it answers. One reconcile runs at a time; the sweep's is bounded at 60 s and never stops the
 chats' sweep. The rules are in [retention.md](retention.md).
 
 **Taken back, deleted, restarted.** Nextext's `DELETE` of a running job answers 204 and drops it from its list
 at once, but its pipeline runs on and keeps its one queue slot, and Nextext removes the job's upload when the
-pipeline ends. A clip taken back, or whose chat is deleted, mid-transcription therefore stays at Nextext until
-its job ends there ([retention.md](retention.md)). A clip found `processing` at start, or requeued after a
+pipeline ends. A clip taken back, whose chat is deleted, or whose budget is spent mid-transcription therefore
+stays at Nextext until its job ends there ([retention.md](retention.md)). A clip found `processing` at start, or requeued after a
 failed delete or take-back, runs the whole round trip again, and workbench replaces its derived files.
 
 **What the model reads.** The attachment line says `video 02:14, 8 frames; transcript`, `audio 31:07; transcript`
 or `video 00:40, 3 frames; no speech`; while the turn does not see, a video's line adds that its frames are "not shown
-to the model". The model reads the transcript with `read_document` and looks at the frames with `view_file`. workbench
+to the model". It says "no speech" whenever the manifest holds no transcript: also for a transcript left out past its
+cap or one workbench could not read, since the manifest keeps workbench's facts, not why Nextext's transcript is
+missing. The model reads the transcript with `read_document` and looks at the frames with `view_file`. workbench
 0.9 leaves a clip out of `run_python` and `search_files` jobs, so these two tools are the only way to it. The
 transcript is text in a tool result, and so goes to the router like any other. workbench's own
 `docs/data-flow.md` (0.9.0) describes the other end of the derived files.

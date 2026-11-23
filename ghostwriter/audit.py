@@ -364,7 +364,7 @@ def system_operation(emitter: AuditEmitter, action: str, operation: str) -> Oper
 
 
 def forward_headers(context: RequestContext) -> dict[str, str]:
-    """Return the headers that carry an operation's purpose and request id to workbench.
+    """Return the headers that carry an operation's purpose and request id to workbench and to Nextext.
 
     Args:
         context: The operation's context.
@@ -381,7 +381,7 @@ def _request_purpose(request: Request) -> Purpose | None:
     """Read the request's stated purpose.
 
     The purpose is personal data in its own right: it goes into audit events
-    and to workbench only, and is neither logged nor echoed.
+    and to workbench and Nextext only, and is neither logged nor echoed.
 
     Args:
         request: The incoming request.

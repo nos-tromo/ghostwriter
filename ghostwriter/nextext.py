@@ -15,7 +15,8 @@ artifacts, the transcript (:data:`JSONL`) and the frames (:data:`KEYFRAMES`), st
 its artifacts are taken (:meth:`NextextClient.delete`), which never raises.
 
 Clips are offered only while Nextext is up and workbench takes them (:class:`NextextHealth`): a background probe of
-``GET /health`` that start-up never waits for, and the version workbench names itself (:func:`serves_media`).
+``GET /health`` that start-up never waits for, and after Nextext refused the key also a keyed ``GET /jobs``
+(:meth:`NextextClient.authorized`), and the version workbench names itself (:func:`serves_media`).
 
 The log holds statuses, counts and tokens, never a file name, a transcript line, Nextext's error text or the key.
 """
@@ -29,10 +30,12 @@ from collections.abc import AsyncGenerator, AsyncIterator, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Final
+from uuid import uuid4
 
 import httpx
 from loguru import logger
 
+from ghostwriter.audit import SYSTEM_ACTOR, RequestContext, forward_headers
 from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import PURPOSE_HEADER, REQUEST_ID_HEADER
 from ghostwriter.vision import system_call
@@ -525,6 +528,22 @@ class NextextClient:
             return False
         return True
 
+    async def authorized(self) -> bool:
+        """Ask ``GET /jobs`` with the key, as the system: whether Nextext takes it. Never raises, a cancel apart.
+
+        The probe asks it after Nextext refused the key, which :meth:`healthy` cannot see. It carries the purpose
+        ``ghostwriter chat`` and a fresh request id, as the list of a reconcile does; Nextext records the list in its
+        own audit, and Ghostwriter records nothing, as no job is read or deleted.
+
+        Returns:
+            ``True`` only for a ``200`` that reads; ``False`` for a refusal or a failure, logged by its token.
+        """
+        try:
+            await self.list_jobs(headers=forward_headers(RequestContext(SYSTEM_ACTOR, None, uuid4().hex)))
+        except NextextUnavailable:
+            return False
+        return True
+
     async def healthy(self) -> bool:
         """Ask ``GET /health``, without the key. It never raises, a cancellation apart.
 
@@ -564,11 +583,14 @@ class NextextHealth:
     :meth:`run` asks :meth:`NextextClient.healthy` once, then waits until a clip's job reports Nextext failing
     (:meth:`failed`) and asks again; while Nextext does not answer ``200`` it asks again after
     :data:`PROBE_FIRST_S`, doubling to :data:`PROBE_MAX_S`. Start-up never waits for it: until the first probe
-    has answered, Nextext is not healthy and no clip is offered.
+    has answered, Nextext is not healthy and no clip is offered. ``/health`` answers without the key, so once a call
+    finds the key refused (:meth:`refused`) a probe also asks :meth:`NextextClient.authorized`, and Nextext is healthy
+    again only when that passes.
 
     Attributes:
         healthy: Whether the last probe said Nextext is up and no job has failed since; ``False`` at first.
         checked: Set after each probe, whatever it found.
+        key_refused: Whether Nextext refused the key and no keyed list of the probe's has passed since.
     """
 
     def __init__(self, client: NextextClient) -> None:
@@ -579,6 +601,7 @@ class NextextHealth:
         """
         self._client = client
         self.healthy = False
+        self.key_refused = False
         self.checked = asyncio.Event()
         self._up = asyncio.Event()
         self._failed = asyncio.Event()
@@ -602,13 +625,18 @@ class NextextHealth:
         while True:
             self._failed.clear()
             up = await self._client.healthy()
+            if up and self.key_refused:
+                up = await self._client.authorized()
+                if up:
+                    self.key_refused = False
+                    logger.info("Nextext takes NEXTEXT_API_KEY again.")
             self._mark(up)
             self.checked.set()
             if up != known:
                 known = up
                 if up:
                     logger.info("Nextext answers its health probe; video and audio are offered with workbench 0.9.")
-                else:
+                elif not self.key_refused:
                     logger.warning("Nextext does not answer its health probe; video and audio are not offered.")
             if up:
                 delay = PROBE_FIRST_S
@@ -621,6 +649,23 @@ class NextextHealth:
         """Take Nextext as down at once, and have :meth:`run` probe it again; on the event loop."""
         self._mark(False)
         self._failed.set()
+
+    def refused(self, token: str) -> None:
+        """Take Nextext's refusal of the key: down at once, and up again only once a keyed list passes; on the loop.
+
+        The first refusal since the key last passed logs one error naming ``NEXTEXT_API_KEY``, never its value.
+
+        Args:
+            token: ``http:401`` or ``http:403``.
+        """
+        if not self.key_refused:
+            logger.error(
+                "Nextext refuses NEXTEXT_API_KEY ({}): it must be Ghostwriter's token in Nextext's "
+                "NEXTEXT_SERVICE_TOKENS; video and audio are not offered until Nextext takes it.",
+                token,
+            )
+        self.key_refused = True
+        self.failed()
 
     async def wait_healthy(self, timeout_s: float) -> bool:
         """Wait until Nextext is healthy, at most ``timeout_s``.

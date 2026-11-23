@@ -81,8 +81,10 @@ Reference: `docs/`.
   same value as its entry `ghostwriter=<token>` in Nextext's
   `NEXTEXT_SERVICE_TOKENS`; `make env` writes both), the purpose and the request
   id. Clips are offered (`NextextHealth.offered`, `/api/config`'s `media`) only
-  while the base and the key are set, a background probe of `/health` passes and
-  workbench's discovery names 0.9.0 or later; the start-up audit event's `media`
+  while the base and the key are set, a background probe of `/health` passes
+  (after Nextext refused the key, which logs one error naming
+  `NEXTEXT_API_KEY`, also a keyed `GET /jobs`) and workbench's discovery names
+  0.9.0 or later; the start-up audit event's `media`
   criterion means only "configured". One clip is one Nextext job: streamed from
   workbench's `GET /files/view` as `media.<ext>`, polled through `GET /jobs`
   (never `GET /jobs/{id}`, whose answer holds the transcript), its `docint.jsonl`
@@ -91,8 +93,8 @@ Reference: `docs/`.
   manifest (kind `media`, unit `frame`, `duration_s`, `transcript`) and leaves
   the clip out of `run_python` and `search_files`, so the model reaches it only
   through `read_document` and `view_file`. A job no clip owns is deleted by the
-  reconcile: at start, after a create whose answer was lost, and in the daily
-  sweep. A clip taken back, or whose chat is deleted, mid-job still has its
+  reconcile: at start, after a create whose answer was lost or a clip's own
+  delete that failed, and in the daily sweep. A clip taken back, or whose chat is deleted, mid-job still has its
   Nextext job deleted, but Nextext's pipeline runs on until it ends. A video
   with no sound track fails at Nextext 1.21 (`undecodable_media`). Reference:
   `docs/data-flow.md`.
@@ -117,7 +119,7 @@ Reference: `docs/`.
 | `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, prepare, renditions, `derived` (a clip's artifacts in), chat delete; the pseudonyms |
 | `ghostwriter/vision.py` | `Vision.images_offered` (setting, model, `view_file` listed); the Ollama probe; `system_call` |
 | `ghostwriter/nextext.py` | `NextextClient`: create (a streamed multipart), poll through the list, artifact (streamed, capped), delete, list; `NextextHealth`: the `/health` probe and the offer (`offered`, which also needs workbench 0.9); `JOB_OPTIONS` |
-| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), and an Office file after it is `ready`, in the background, one at a time (`BACKGROUND_SLOTS`); the media step of a clip (to Nextext and back on `MEDIA_SLOTS`, then the prepare), the owned job ids, and `reconcile` (Nextext's jobs no clip owns: at start, after a lost create, in the sweep); the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete or an attachment's take-back |
+| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), and an Office file after it is `ready`, in the background, one at a time (`BACKGROUND_SLOTS`); the media step of a clip (to Nextext and back on `MEDIA_SLOTS`, then the prepare), the owned job ids, and `reconcile` (Nextext's jobs no clip owns: at start, after a lost create or a failed delete, in the sweep); the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete or an attachment's take-back |
 | `ghostwriter/retention_rule.py` | the period rule (docint's, verbatim) and the sweep loop |
 | `ghostwriter/retention.py` | the daily sweep (its first step is the Nextext reconcile, bounded, never stopping the chats) and the dry run |
 | `ghostwriter/log_cfg.py` | the stderr sink; quiet HTTP and SDK loggers |

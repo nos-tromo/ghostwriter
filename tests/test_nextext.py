@@ -7,6 +7,7 @@ Every name, id and value here is invented.
 import asyncio
 import dataclasses
 import json
+import logging
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -620,6 +621,26 @@ async def test_health_is_200_only() -> None:
     assert not [r for r in fake.requests if "authorization" in r.headers or "x-audit-purpose" in r.headers]
 
 
+async def test_authorized_is_a_keyed_list_that_answers_200() -> None:
+    """The key check lists the jobs with the key, the default purpose and a request id; only a 200 passes."""
+    fake = FakeNextext()
+    client = _client(fake)
+    assert await client.authorized() is True
+    [listed] = fake.requests
+    assert (listed.method, listed.url.path) == ("GET", "/api/v1/jobs")
+    assert listed.headers["authorization"] == f"Bearer {NEXTEXT_KEY}"
+    assert listed.headers["x-audit-purpose"] == HEADERS["X-Audit-Purpose"] and listed.headers["x-request-id"]
+    fake.key = "another-service-token-0123456789abcdef"
+    assert await client.authorized() is False
+    fake.key, fake.list_status = NEXTEXT_KEY, 503
+    assert await client.authorized() is False
+    fake.list_status, fake.raises = 200, httpx.ConnectError("refused")
+    assert await client.authorized() is False
+    unkeyed = FakeNextext()
+    assert await _client(unkeyed, make_settings(Path("unused"), nextext_api_base=NEXTEXT_BASE)).authorized() is False
+    assert unkeyed.requests == []
+
+
 async def test_health_answers_without_a_key_too() -> None:
     """The probe asks nothing the key is for: it runs against a base alone."""
     fake = FakeNextext()
@@ -785,6 +806,39 @@ async def test_a_failure_while_nextext_still_answers_is_probed_and_offered_again
     assert health.healthy is False
     await _checked(health)
     assert health.healthy is True
+
+
+async def test_after_a_refused_key_only_a_keyed_list_makes_nextext_healthy(
+    monkeypatch: pytest.MonkeyPatch, running: list[asyncio.Task[None]], loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """/health still answers 200, so after a refused key the probe also lists the jobs with it; one error in all."""
+    monkeypatch.setattr(nextext, "PROBE_FIRST_S", 0.02)
+    fake = FakeNextext(key="another-service-token-0123456789abcdef")
+    health = NextextHealth(_client(fake))
+    _start(health, running)
+    await _checked(health)
+    assert (health.healthy, health.key_refused) == (True, False)
+    assert [r.url.path for r in fake.requests] == ["/api/v1/health"]
+    health.checked.clear()
+    health.refused("http:401")
+    health.refused("http:401")
+    assert (health.healthy, health.key_refused) == (False, True)
+    await _checked(health)
+    assert health.healthy is False
+    keyed = [r for r in fake.requests if r.url.path == "/api/v1/jobs"]
+    assert keyed and all(r.headers["authorization"] == f"Bearer {NEXTEXT_KEY}" for r in keyed)
+    fake.key = NEXTEXT_KEY
+    for _ in range(300):
+        if health.healthy:
+            break
+        await asyncio.sleep(0.01)
+    assert (health.healthy, health.key_refused) == (True, False)
+    errors = [record.getMessage() for record in loguru_caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "NEXTEXT_API_KEY" in errors[0] and NEXTEXT_KEY not in errors[0]
+    health.checked.clear()
+    health.failed()
+    await _checked(health)
+    assert fake.requests[-1].url.path == "/api/v1/health" and health.healthy is True
 
 
 async def test_wait_healthy_returns_at_once_when_healthy_and_waits_for_the_probe_otherwise(

@@ -33,6 +33,7 @@ from ghostwriter.processing import (
     MEDIA_SLOTS,
     NEXTEXT_OPERATION,
     NEXTEXT_RECIPIENT,
+    POLL_TOLERATED,
     PREPARE_SLOTS,
     AttachmentProcessor,
     PrepareJob,
@@ -457,6 +458,125 @@ async def test_a_vanished_job_fails_at_the_next_poll(env: Env, audit_stream: Cap
     assert env.health.healthy is True
 
 
+@pytest.mark.parametrize(("vanish_after", "seen"), [(None, "completed"), (1, "gone")], ids=["made-none", "gone"])
+async def test_a_completed_job_that_served_nothing_fails_the_clip(
+    env: Env, audit_stream: CapturedAuditStream, log_lines: list[str], vanish_after: int | None, seen: str
+) -> None:
+    """Not skipped, yet neither artifact came: polled once more, still listed or gone, the clip fails nextext_failed."""
+    env.fake.artifacts = {JSONL: 404, KEYFRAMES: 404}
+    env.fake.vanish_after = vanish_after
+    job = _clip(env)
+    before = len(events(audit_stream))
+    await _run(env.processor, job)
+    assert _status(env, job) == ("failed", "nextext_failed")
+    assert env.fake.events == ["create", "list", "list", f"delete:{JOB_ID}"]
+    assert env.door.derived == [] and _prepares(env.door) == []
+    rows = _rows(audit_stream, before)
+    assert [row for row in rows if row[4] == "error"] == [
+        ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"reason": "nextext_failed"}, "error")
+    ]
+    assert [row for row in rows if row[1] == NEXTEXT_OPERATION] == [
+        ("delete", NEXTEXT_OPERATION, None, {"deleted": True}, "ok")
+    ]
+    assert any(f"({seen}) served no transcript" in line and job.attachment_id in line for line in log_lines)
+    assert env.health.healthy is True
+
+
+async def test_audio_without_speech_is_ready_with_neither_artifact(env: Env) -> None:
+    """Skipped for no speech, audio has no transcript and no frames: no extra poll, and the clip is ready."""
+    env.fake.skipped, env.fake.skip_reason_code = True, "vad_no_speech"
+    env.fake.artifacts = {JSONL: 404, KEYFRAMES: 404}
+    job = _clip(env, "voice-memo.m4a")
+    await _run(env.processor, job)
+    assert _status(env, job) == ("ready", None)
+    assert env.fake.events == ["create", "list", f"delete:{JOB_ID}"] and env.door.derived == []
+
+
+async def test_a_transcript_past_its_cap_counts_as_served(env: Env) -> None:
+    """Audio whose transcript is over 8 MiB: it is left out but was served, so the clip is ready, not failed."""
+    env.fake.declared[JSONL] = ARTIFACT_CAPS[JSONL] + 1
+    env.fake.artifacts[KEYFRAMES] = 404
+    job = _clip(env, "voice-memo.m4a")
+    await _run(env.processor, job)
+    assert _status(env, job) == ("ready", None)
+    assert env.fake.events == ["create", "list", f"delete:{JOB_ID}"] and env.door.derived == []
+
+
+def _flaky(env: Env, script: list[Exception | int | None]) -> NextextClient:
+    """Return a client whose polls, once a job is made, answer each entry of ``script`` in turn, then as the fake.
+
+    Args:
+        env: The test's env.
+        script: An exception to raise, a status to answer, or ``None`` to let the fake answer.
+
+    Returns:
+        The client.
+    """
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        polled = (request.method, request.url.path) == ("GET", "/api/v1/jobs")
+        if polled and "create" in env.fake.events and script:
+            answer = script.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            if answer is not None:
+                return httpx.Response(answer, json={"detail": "refused"})
+        return await env.fake(request)
+
+    return NextextClient(env.settings, transport=httpx.MockTransport(handler))
+
+
+async def test_a_clip_rides_out_failed_polls_short_of_four_in_a_row(
+    env: Env, audit_stream: CapturedAuditStream
+) -> None:
+    """Three failed polls in a row are ridden out, and a poll that passes starts the count over: the clip is ready."""
+    assert POLL_TOLERATED == 3
+    env.fake.statuses = ["running", "completed"]
+    hiccups: list[Exception | int | None] = [httpx.ReadTimeout("slow"), 503, httpx.ConnectError("reset")]
+    processor = await env.make(client=_flaky(env, [*hiccups, None, *hiccups, None]))
+    job = _clip(env)
+    before = len(events(audit_stream))
+    await _run(processor, job)
+    assert _status(env, job) == ("ready", None)
+    assert env.fake.jobs[JOB_ID] == 2 and env.fake.deleted == [JOB_ID]
+    assert env.health.healthy is True
+    assert [row for row in _rows(audit_stream, before) if row[4] == "error"] == []
+
+
+async def test_a_fourth_failed_poll_in_a_row_fails_the_clip(env: Env, audit_stream: CapturedAuditStream) -> None:
+    """Four polls in a row fail: the clip fails nextext_unavailable, the probe is told, and the job is deleted."""
+    env.fake.statuses = ["running"]
+    processor = await env.make(client=_flaky(env, [503] * (POLL_TOLERATED + 1)))
+    job = _clip(env)
+    before = len(events(audit_stream))
+    await _run(processor, job)
+    assert _status(env, job) == ("failed", "nextext_unavailable")
+    assert env.fake.jobs[JOB_ID] == 0
+    assert env.fake.deleted == [JOB_ID] and env.health.healthy is False
+    [failed] = [row for row in _rows(audit_stream, before) if row[4] == "error"]
+    assert failed == ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"reason": "nextext_unavailable"}, "error")
+
+
+@pytest.mark.parametrize(
+    "script",
+    [{"create_status": 401}, {"create_status": 403}, {"list_status": 401}],
+    ids=["create-401", "create-403", "list-401"],
+)
+async def test_a_refused_key_logs_one_error_and_turns_clips_off(
+    env: Env, loguru_caplog: pytest.LogCaptureFixture, script: dict[str, Any]
+) -> None:
+    """Nextext refuses the key for two clips: one error names NEXTEXT_API_KEY, never its value, and clips are off."""
+    for name, value in script.items():
+        setattr(env.fake, name, value)
+    first, second = _clip(env), _clip(env, "quay-walk.mov")
+    await _run(env.processor, first)
+    await _run(env.processor, second)
+    assert [_status(env, job) for job in (first, second)] == [("failed", "nextext_unavailable")] * 2
+    assert (env.health.healthy, env.health.key_refused) == (False, True)
+    errors = [record.getMessage() for record in loguru_caplog.records if record.levelno >= logging.ERROR]
+    assert len(errors) == 1 and "NEXTEXT_API_KEY" in errors[0] and NEXTEXT_KEY not in errors[0]
+
+
 async def test_a_delete_nextext_refuses_is_recorded_as_an_error(
     env: Env, audit_stream: CapturedAuditStream, loguru_caplog: pytest.LogCaptureFixture
 ) -> None:
@@ -785,17 +905,14 @@ async def test_a_requeued_clip_runs_again(env: Env, audit_stream: CapturedAuditS
 
 
 async def test_without_nextext_a_clip_fails_as_unavailable(env: Env, audit_stream: CapturedAuditStream) -> None:
-    """Without a Nextext client the clip fails as unavailable, with its error child; nothing is read or sent."""
+    """Without a Nextext client the clip fails as unavailable; nothing is read or sent, so no hand-over is recorded."""
     processor = await env.make(client=None)
     job = _clip(env)
     before = len(events(audit_stream))
     await _run(processor, job)
     assert _status(env, job) == ("failed", "nextext_unavailable")
     assert env.fake.requests == [] and env.door.requests == []
-    assert _rows(audit_stream, before) == [
-        ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"kind": "media", "bytes": len(CLIP)}, "ok"),
-        ("disclose", ATTACHMENT, NEXTEXT_RECIPIENT, {"reason": "nextext_unavailable"}, "error"),
-    ]
+    assert _rows(audit_stream, before) == []
 
 
 async def test_no_job_is_made_before_the_gate_opens(env: Env) -> None:
@@ -810,16 +927,20 @@ async def test_no_job_is_made_before_the_gate_opens(env: Env) -> None:
     assert _status(env, job) == ("ready", None)
 
 
-async def test_a_gate_that_never_opens_fails_the_clip(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Past the gate's whole wait without the start reconcile, nothing goes to Nextext, and the clip is unavailable."""
+async def test_a_gate_that_never_opens_fails_the_clip(
+    env: Env, audit_stream: CapturedAuditStream, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Past the gate's whole wait without the start reconcile, nothing goes to Nextext, nor is a hand-over recorded."""
     monkeypatch.setattr(processing, "START_WAIT_S", 0.05)
     monkeypatch.setattr(processing, "RECONCILE_EXTRA_S", 0.05)
     monkeypatch.setattr(processing, "_GATE_SLACK_S", 0.05)
     processor = await env.make(start=False)
     job = _clip(env)
+    before = len(events(audit_stream))
     await _run(processor, job)
     assert _status(env, job) == ("failed", "nextext_unavailable")
     assert env.fake.requests == [] and env.door.requests == []
+    assert _rows(audit_stream, before) == []
 
 
 # --- logs ----------------------------------------------------------------------------------------

@@ -40,31 +40,37 @@ again (:meth:`AttachmentProcessor.requeue`); its hand-over is then a primary of 
 A video or audio clip (kind ``media``) first goes to Nextext for one job, on one of :data:`MEDIA_SLOTS`, never a
 prepare slot, so a picture attached meanwhile is ready as fast as without clips. The job waits for the start
 reconcile (:meth:`AttachmentProcessor.start_media`, at most :data:`START_WAIT_S` and :data:`RECONCILE_EXTRA_S`
-more), records its hand-over,
+more); without a Nextext client, or past that wait, it is ``failed`` with ``nextext_unavailable`` and nothing is sent
+or recorded. Else it records its hand-over,
 ``disclose`` / ``chat.attachment`` (:data:`NEXTEXT_RECIPIENT`, its kind and size), then streams the clip from
 workbench's view into Nextext's create chunk by chunk, as ``media.<ext>``, and polls the job through Nextext's list
-within ``nextext_timeout_s`` (upload, queue, run and downloads). A completed job, also one skipped for no speech,
+within ``nextext_timeout_s`` (upload, queue, run and downloads), riding out :data:`POLL_TOLERATED` failed polls in a
+row. A completed job, also one skipped for no speech,
 records the hand-over to workbench (:data:`PREPARE_RECIPIENT`, a child of the same operation) and streams its
 transcript and its frames into workbench as derived files of the clip; an artifact Nextext did not make is left out,
-and so is one past its cap. In a shielded ``finally`` the job is deleted at Nextext, also when the clip was cancelled,
+and so is one past its cap. A completed job that was not skipped and served neither is polled once more and fails
+the clip ``nextext_failed``, gone or not: a clip with speech always has a transcript. In a shielded ``finally`` the
+job is deleted at Nextext, also when the clip was cancelled,
 and that delete is recorded, ``delete`` / ``chat.nextext`` (the job's id, ``deleted``): it is the one record a cancelled
 job still writes. Then the clip is prepared on a prepare slot as any file, and is ``ready`` with its manifest. A clip
 that cannot go through is ``failed``, with an ``error`` child and one of the tokens ``nextext_unavailable`` (Nextext
-does not answer, or refuses the key; the probe is told, so clips are not offered until it answers again),
-``nextext_failed``, ``undecodable_media``, ``timeout`` or workbench's own token, its ``error`` child under the
-hand-over whose step failed (a budget spent while an artifact goes into workbench is workbench's). While a job runs
-its id is :meth:`AttachmentProcessor.owned_jobs`', which no reconcile deletes.
+does not answer, fails with a ``5xx``, or refuses the key; the probe is told, so clips are not offered until it
+answers its probe again, and after a refused key, which logs one error naming ``NEXTEXT_API_KEY``, until a keyed
+list of the probe's passes), ``nextext_failed``, ``undecodable_media``, ``timeout`` or workbench's own token, its
+``error`` child under the hand-over whose step failed (a budget spent while an artifact goes into workbench is
+workbench's). While a job runs its id is :meth:`AttachmentProcessor.owned_jobs`', which no reconcile deletes.
 
-A job no clip owns is an orphan: the last process ended while its clip was at Nextext, or a create's answer never
-came back (its read timed out, it did not read, or the clip was cancelled meanwhile), so its id is not known.
+A job no clip owns is an orphan: the last process ended while its clip was at Nextext, a create's answer never
+came back (its read timed out, it did not read, or the clip was cancelled meanwhile), so its id is not known, or a
+clip's own delete failed (Nextext refused it or did not answer within :data:`~ghostwriter.nextext.CALL_S`).
 :meth:`AttachmentProcessor.reconcile` lists Ghostwriter's jobs at Nextext and deletes those no clip owns, recorded
 first, as the system, by count only: ``delete`` / ``chat.nextext``; unrecorded, it deletes nothing. It runs at start
 (:meth:`AttachmentProcessor.start_media`), once Nextext's probe has passed and before any clip may make a job, so
-it deletes every job listed; :data:`ORPHAN_RECONCILE_S` after a create whose answer was not read, sparing the jobs
-younger than :data:`ORPHAN_GRACE_S`; and in the daily sweep (:mod:`ghostwriter.retention`), sparing those younger
-than ``nextext_timeout_s`` and :data:`RECONCILE_EXTRA_S`. One reconcile runs at a time, so none counts a job another
-deleted. A probe that does not pass at start, or a clip's own delete that Nextext refuses, leaves its job to the daily
-sweep.
+it deletes every job listed; :data:`ORPHAN_RECONCILE_S` after a create whose answer was not read or a clip's own
+delete that failed, sparing the jobs younger than :data:`ORPHAN_GRACE_S`; and in the daily sweep
+(:mod:`ghostwriter.retention`), sparing those younger than ``nextext_timeout_s`` and :data:`RECONCILE_EXTRA_S`. Each
+spares the jobs a clip owned before its list or owns after it. One reconcile runs at a time, so none counts a job
+another deleted. A probe that does not pass at start leaves the last process's jobs to the daily sweep.
 
 A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and so does the sweep's. Each
 job runs in its own cancel scope, and a store or audit call in progress finishes on its worker thread
@@ -79,7 +85,7 @@ a path.
 import asyncio
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import nullcontext, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
 from typing import Final, Literal
@@ -145,6 +151,9 @@ POLL_S: Final = 2.0
 POLL_SLOW_S: Final = 5.0
 #: Seconds after a job's create from which it is polled every :data:`POLL_SLOW_S`.
 POLL_SLOW_AFTER_S: Final = 60.0
+#: The failed polls in a row a clip rides out within its budget (a list that timed out, a connection reset); one more
+#: fails it. A job that is gone fails it at once.
+POLL_TOLERATED: Final = 3
 #: The longest the start reconcile waits for Nextext's probe, in seconds; a clip waits for the start reconcile
 #: :data:`RECONCILE_EXTRA_S` longer, and past that makes no job.
 START_WAIT_S: Final = 120.0
@@ -154,15 +163,16 @@ RECONCILE_EXTRA_S: Final = 60.0
 #: The grace of the reconcile after a create whose answer was not read, in seconds: a job younger than this may be
 #: another clip's, whose create has not answered yet (at most :data:`~ghostwriter.nextext.CREATE_READ_S` old).
 ORPHAN_GRACE_S: Final = CREATE_READ_S + RECONCILE_EXTRA_S
-#: Seconds after a create whose answer was not read before Nextext's jobs are reconciled: the grace and
-#: :data:`RECONCILE_EXTRA_S` more, so the lost job is past the grace by then. Nextext stamps a job once it has stored
-#: the upload, which may be after Ghostwriter gave up on the answer.
+#: Seconds after a create whose answer was not read, or a clip's own delete that failed, before Nextext's jobs are
+#: reconciled: the grace and :data:`RECONCILE_EXTRA_S` more, so the lost job is past the grace by then. Nextext stamps a
+#: job once it has stored the upload, which may be after Ghostwriter gave up on the answer.
 ORPHAN_RECONCILE_S: Final = ORPHAN_GRACE_S + RECONCILE_EXTRA_S
 #: How much longer a clip waits for the gate than the start reconcile may take (probe, reconcile, its last record).
 _GATE_SLACK_S: Final = 5.0
-#: Nextext's tokens that say it is down or refuses Ghostwriter's key, rather than that one clip failed; any
-#: ``http:5xx`` too.
-_NEXTEXT_DOWN: Final = frozenset({"unreachable", "timeout", "http:401", "http:403", "not_configured"})
+#: Nextext's tokens that say it is down, rather than that one clip failed; any ``http:5xx`` too.
+_NEXTEXT_DOWN: Final = frozenset({"unreachable", "timeout", "not_configured"})
+#: Nextext's tokens that say it refuses Ghostwriter's key: :attr:`~ghostwriter.nextext.NextextHealth.key_refused`.
+_KEY_REFUSED: Final = frozenset({"http:401", "http:403"})
 #: The tokens of a create whose answer was not read, after which Nextext may hold a job whose id never came back.
 _UNREAD: Final = frozenset({"timeout", "unreachable", "bad_answer"})
 #: A clip's artifacts, in the order they go to workbench, with the role each has there.
@@ -251,10 +261,12 @@ class _Held:
         job_id: The job the clip made, once ``create`` has answered.
         step: The hand-over in progress, under which a spent budget's ``error`` child goes: :data:`NEXTEXT_RECIPIENT`,
             or :data:`PREPARE_RECIPIENT` while an artifact goes into workbench.
+        served: The artifacts Nextext served, also one left out past its cap; not one it answered ``404`` for.
     """
 
     job_id: str | None = None
     step: str = NEXTEXT_RECIPIENT
+    served: set[str] = field(default_factory=set)
 
 
 def _clip_type(path: str) -> tuple[str, str] | None:
@@ -399,12 +411,14 @@ class AttachmentProcessor:
     async def reconcile(self, *, grace_s: float | None) -> int:
         """Delete Ghostwriter's jobs at Nextext that no clip of this process owns, recorded first.
 
-        Nextext lists only the jobs of Ghostwriter's token. A job a clip owns (:meth:`owned_jobs`, read after the list)
-        is spared, and with a grace so is every job Nextext made less than ``grace_s`` ago: a create whose answer has
-        not come back may have made it. The deletes are recorded first, as the system, by count only: ``delete`` /
-        ``chat.nextext``, target ``job`` (count), criteria ``listed`` and ``at_start``; the jobs Nextext did not delete,
-        also those a cancel left, get an ``error`` child (count), best effort. One reconcile runs at a time; another
-        waits for it, then lists anew. On the event loop.
+        Nextext lists only the jobs of Ghostwriter's token. A job a clip owns (:meth:`owned_jobs`, read before the list
+        and after it, so a clip that deletes its own job meanwhile has it spared) is spared, and with a grace so is
+        every job Nextext made less than ``grace_s`` ago: a create whose answer has not come back may have made it. A
+        list that refuses the key tells the probe (:meth:`~ghostwriter.nextext.NextextHealth.refused`). The deletes
+        are recorded first, as the system, by count only: ``delete`` / ``chat.nextext``, target ``job`` (count),
+        criteria ``listed`` and ``at_start``; the jobs Nextext did not delete, also those a cancel left, get an
+        ``error`` child (count), best effort. One reconcile runs at a time; another waits for it, then lists anew. On
+        the event loop.
 
         Args:
             grace_s: Spare the jobs younger than this, in seconds; ``None`` at start, where no clip of this process
@@ -439,12 +453,15 @@ class AttachmentProcessor:
         """
         op = system_operation(self._emitter, "delete", NEXTEXT_OPERATION)
         headers = forward_headers(op.context)
+        owned_before = self.owned_jobs()
         try:
             jobs = await nextext.list_jobs(headers=headers)
         except NextextUnavailable as exc:
+            if exc.token in _KEY_REFUSED:
+                self._refused_key(exc.token)
             logger.info("Nextext's jobs were not reconciled: {}", exc.token)
             return 0
-        owned = self.owned_jobs()
+        owned = owned_before | self.owned_jobs()
         cutoff = None if grace_s is None else utcnow() - timedelta(seconds=grace_s)
         stale = [j.job_id for j in jobs if j.job_id not in owned and (cutoff is None or j.created_at <= cutoff)]
         if not stale:
@@ -485,13 +502,15 @@ class AttachmentProcessor:
             logger.warning("A reconcile's undeleted jobs were not recorded: {}", type(exc).__name__)
 
     def _reconcile_later(self) -> None:
-        """Have Nextext's jobs reconciled :data:`ORPHAN_RECONCILE_S` from now, a create's answer having gone unread.
+        """Have Nextext's jobs reconciled :data:`ORPHAN_RECONCILE_S` from now, after a lost create or a failed delete.
 
-        The lost job is then older than :data:`ORPHAN_GRACE_S` by :data:`RECONCILE_EXTRA_S`, also when Nextext made it
-        a little after the create gave up, or its clock runs that much ahead.
+        A create's answer went unread, or a clip's own delete failed. The lost job is then older than
+        :data:`ORPHAN_GRACE_S` by :data:`RECONCILE_EXTRA_S`, also when Nextext made it a little after the create gave
+        up, or its clock runs that much ahead; a job whose own delete failed is older still, and no clip owns it any
+        more.
 
-        At most one such reconcile waits at a time. A create that fails while it does moves the next one: once a
-        reconcile has run, another follows the latest failure's wait, so each orphan is deleted within two waits.
+        At most one such reconcile waits at a time. A create or a delete that fails while it does moves the next one:
+        once a reconcile has run, another follows the latest failure's wait, so each orphan is deleted within two waits.
         """
         if self._closed:
             return
@@ -500,14 +519,14 @@ class AttachmentProcessor:
             self._orphans = self._chore(self._reconcile_orphans)
 
     async def _reconcile_orphans(self) -> None:
-        """Reconcile once each wait after a lost create is over, sparing jobs younger than :data:`ORPHAN_GRACE_S`."""
+        """Reconcile once each wait after a lost job is over, sparing jobs younger than :data:`ORPHAN_GRACE_S`."""
         ran: float | None = None
         while (due := self._orphans_due) is not None and due != ran:
             await anyio.sleep(max(0.0, due - anyio.current_time()))
             try:
                 await self.reconcile(grace_s=ORPHAN_GRACE_S)
             except AuditWriteError:
-                logger.error("A reconcile after a lost create could not be recorded; no job was deleted at Nextext.")
+                logger.error("A reconcile after a lost job could not be recorded; no job was deleted at Nextext.")
             ran = due
 
     def _chore(self, work: Callable[[], Awaitable[None]]) -> _Chore:
@@ -803,6 +822,9 @@ class AttachmentProcessor:
     async def _media(self, job: PrepareJob) -> None:
         """Take a clip to Nextext and back on a media slot, then prepare it on a prepare slot, and settle it.
 
+        Without a Nextext client, or when the clips' gate never opened, the clip is ``failed`` with
+        ``nextext_unavailable`` and no hand-over is recorded: nothing is sent.
+
         Args:
             job: The clip.
         """
@@ -813,19 +835,21 @@ class AttachmentProcessor:
             except ChatNotFound:
                 logger.debug("Attachment '{}': its chat is gone; nothing is sent to Nextext.", job.attachment_id)
                 return
-            reconciled = await self._wait_reconciled()
+            nextext = self._nextext
+            if nextext is None or not await self._wait_reconciled():
+                logger.info(
+                    "Attachment '{}' ({}): Nextext is not reached; nothing is sent or recorded.",
+                    job.attachment_id,
+                    job.kind,
+                )
+                await self._settle_failed(job, "nextext_unavailable")
+                return
             criteria: dict[str, object] = {"kind": job.kind, **({"bytes": job.size} if job.size is not None else {})}
             op = await self._hand_over(job, target, recipient=NEXTEXT_RECIPIENT, criteria=criteria)
             if op is None:
                 await self._settle_failed(job, "audit")
                 return
-            failure: _Failure | None = _Failure("nextext_unavailable", NEXTEXT_RECIPIENT)
-            if self._nextext is None or not reconciled:
-                logger.info(
-                    "Attachment '{}' ({}): Nextext is not reached: nextext_unavailable", job.attachment_id, job.kind
-                )
-            else:
-                failure = await self._transcribe(self._nextext, job, op, target)
+            failure = await self._transcribe(nextext, job, op, target)
         if failure is None:
             async with self._slots:
                 token = await self._prepared(job, op)
@@ -909,7 +933,7 @@ class AttachmentProcessor:
                 job_id = await self._create(nextext, response, ext, mime, call.headers)
                 held.job_id = job_id
                 self._owned.add(job_id)
-            ended = await self._finished(nextext, job_id, call.headers)
+            ended = await self._finished(nextext, job, job_id, call.headers)
         except NextextUnavailable as exc:
             return self._unavailable(job, exc.token)
         except WorkbenchUnavailable as exc:
@@ -937,6 +961,8 @@ class AttachmentProcessor:
             failure = await self._take(nextext, job, call, job_id, held, name, role)
             if failure is not None:
                 return failure
+        if not held.served and not ended.skipped:
+            return await self._served_nothing(nextext, job, job_id, call.headers)
         return None
 
     async def _create(
@@ -983,11 +1009,16 @@ class AttachmentProcessor:
                 )
                 self._reconcile_later()
 
-    async def _finished(self, nextext: NextextClient, job_id: str, headers: Mapping[str, str]) -> NextextJob:
+    async def _finished(
+        self, nextext: NextextClient, job: PrepareJob, job_id: str, headers: Mapping[str, str]
+    ) -> NextextJob:
         """Poll a job through Nextext's list until it has ended: every :data:`POLL_S`, then every :data:`POLL_SLOW_S`.
+
+        A poll that fails is ridden out, at most :data:`POLL_TOLERATED` in a row; the next one that fails raises.
 
         Args:
             nextext: The client.
+            job: The clip, for the log.
             job_id: The job.
             headers: The operation's headers.
 
@@ -995,14 +1026,63 @@ class AttachmentProcessor:
             The job in a status of :data:`~ghostwriter.nextext.TERMINAL`, or ``gone``.
 
         Raises:
-            NextextUnavailable: As :meth:`~ghostwriter.nextext.NextextClient.poll` raises it.
+            NextextUnavailable: As :meth:`~ghostwriter.nextext.NextextClient.poll` raises it, once more than
+                :data:`POLL_TOLERATED` polls in a row have failed.
         """
         started = anyio.current_time()
+        failed = 0
         while True:
             await anyio.sleep(POLL_SLOW_S if anyio.current_time() - started >= POLL_SLOW_AFTER_S else POLL_S)
-            polled = await nextext.poll(job_id, headers=headers)
+            try:
+                polled = await nextext.poll(job_id, headers=headers)
+            except NextextUnavailable as exc:
+                failed += 1
+                if failed > POLL_TOLERATED:
+                    raise
+                logger.info(
+                    "Attachment '{}' ({}): a poll of Nextext's job '{}' failed ({}), {} of {} in a row ridden out.",
+                    job.attachment_id,
+                    job.kind,
+                    job_id,
+                    exc.token,
+                    failed,
+                    POLL_TOLERATED,
+                )
+                continue
+            failed = 0
             if polled.status in TERMINAL or polled.status == "gone":
                 return polled
+
+    async def _served_nothing(
+        self, nextext: NextextClient, job: PrepareJob, job_id: str, headers: Mapping[str, str]
+    ) -> _Failure:
+        """Read a completed job, not skipped, that served neither artifact: polled once more, it failed either way.
+
+        A clip with speech always has a transcript, so a job that was not skipped for no speech and served none made
+        none, or is gone since its last poll (Nextext restarted before the downloads): ``nextext_failed``. The poll
+        tells the two apart in the log; a poll that fails is read as any failure of Nextext's.
+
+        Args:
+            nextext: The client.
+            job: The clip.
+            job_id: The job.
+            headers: The operation's headers.
+
+        Returns:
+            ``nextext_failed``; or ``nextext_unavailable`` when the poll finds Nextext down.
+        """
+        try:
+            polled = await nextext.poll(job_id, headers=headers)
+        except NextextUnavailable as exc:
+            return self._unavailable(job, exc.token)
+        logger.info(
+            "Attachment '{}' ({}): Nextext's job '{}' ({}) served no transcript and no frames: nextext_failed",
+            job.attachment_id,
+            job.kind,
+            job_id,
+            polled.status,
+        )
+        return _Failure("nextext_failed", NEXTEXT_RECIPIENT)
 
     async def _handed_to_workbench(self, job: PrepareJob, op: Operation, target: Target) -> bool:
         """Record the hand-over of the clip's artifacts to workbench, a child of the hand-over to Nextext.
@@ -1054,7 +1134,7 @@ class AttachmentProcessor:
             job: The clip.
             call: The chat.
             job_id: The job.
-            held: The clip's step.
+            held: The clip's step, and the artifacts served, to which this adds one left out past its cap.
             name: The artifact at Nextext.
             role: What it is to workbench.
 
@@ -1071,6 +1151,7 @@ class AttachmentProcessor:
                 await asyncio.sleep(PREPARE_RETRY_S)
                 await self._derive(nextext, job, call, job_id, held, name, role)
         except ArtifactTooLarge:
+            held.served.add(name)
             logger.info(
                 "Attachment '{}' ({}): its {} is left out: artifact_too_large", job.attachment_id, job.kind, role
             )
@@ -1101,7 +1182,8 @@ class AttachmentProcessor:
             job: The clip.
             call: The chat.
             job_id: The job.
-            held: The clip's step, which this sets.
+            held: The clip's step, which this sets, and the artifacts served, to which this adds ``name`` when Nextext
+                serves it.
             name: The artifact at Nextext.
             role: What it is to workbench.
 
@@ -1116,6 +1198,7 @@ class AttachmentProcessor:
             if body is None:
                 logger.debug("Attachment '{}' ({}): Nextext made no {}.", job.attachment_id, job.kind, role)
                 return
+            held.served.add(name)
             held.step = PREPARE_RECIPIENT
             await self._workbench.derived(call=call, source=job.path, role=role, chunks=body)
 
@@ -1127,10 +1210,15 @@ class AttachmentProcessor:
             token: :class:`~ghostwriter.nextext.NextextUnavailable`'s token.
 
         Returns:
-            ``nextext_unavailable`` for a Nextext that does not answer, times out, refuses the key or fails with a
-            ``5xx`` (the probe is told, so clips are not offered until it answers again); else ``nextext_failed``.
+            ``nextext_unavailable`` for a Nextext that does not answer, times out or fails with a ``5xx`` (the probe is
+            told, so clips are not offered until it answers its probe again), or that refuses the key (one error
+            names ``NEXTEXT_API_KEY``, and clips are not offered until a keyed list of the probe's passes); else
+            ``nextext_failed``.
         """
-        if token in _NEXTEXT_DOWN or token.startswith("http:5"):
+        if token in _KEY_REFUSED:
+            self._refused_key(token)
+            failure = "nextext_unavailable"
+        elif token in _NEXTEXT_DOWN or token.startswith("http:5"):
             if self._health is not None:
                 self._health.failed()
             failure = "nextext_unavailable"
@@ -1139,10 +1227,24 @@ class AttachmentProcessor:
         logger.info("Attachment '{}' ({}): Nextext failed ({}): {}", job.attachment_id, job.kind, token, failure)
         return _Failure(failure, NEXTEXT_RECIPIENT)
 
+    def _refused_key(self, token: str) -> None:
+        """Tell the probe that Nextext refuses the key, which logs one error naming the setting; on the event loop.
+
+        Args:
+            token: ``http:401`` or ``http:403``.
+        """
+        if self._health is not None:
+            self._health.refused(token)
+        else:
+            logger.error("Nextext refuses NEXTEXT_API_KEY ({}).", token)
+
     async def _delete_job(
         self, nextext: NextextClient, job: PrepareJob, op: Operation, call: CallFor, job_id: str
     ) -> None:
         """Delete a clip's job at Nextext and record that, shielded from a cancel; never raises but a cancel after it.
+
+        A delete Nextext refuses, or does not answer within :data:`~ghostwriter.nextext.CALL_S`, leaves a job no clip
+        owns: it is reconciled :data:`ORPHAN_RECONCILE_S` later (:meth:`_reconcile_later`), as after a lost create.
 
         Args:
             nextext: The client.
@@ -1176,12 +1278,14 @@ class AttachmentProcessor:
                 )
         if deleted:
             logger.debug("Attachment '{}': Nextext's job '{}' is deleted.", job.attachment_id, job_id)
-        else:
-            logger.warning(
-                "Attachment '{}': Nextext's job '{}' could not be deleted; a reconcile deletes it.",
-                job.attachment_id,
-                job_id,
-            )
+            return
+        logger.warning(
+            "Attachment '{}': Nextext's job '{}' could not be deleted; Nextext's jobs are reconciled in {} s.",
+            job.attachment_id,
+            job_id,
+            ORPHAN_RECONCILE_S,
+        )
+        self._reconcile_later()
 
     # --- any attachment ---------------------------------------------------------
 
