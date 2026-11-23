@@ -20,7 +20,10 @@ while workbench is off: at start it prepares again what the last process left ``
 workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes.
 ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
-waits for, and cancels it at shutdown. Every request body is capped per route
+waits for, and cancels it at shutdown. ``app.state.nextext`` is the Nextext client and ``app.state.media`` the
+probe of its health, which decides with workbench's version whether video and audio are offered
+(:mod:`ghostwriter.nextext`); both are ``None`` while Nextext is off (no base, or no key). The lifespan runs
+the probe, which start-up never waits for, and cancels it at shutdown. Every request body is capped per route
 (:mod:`ghostwriter.body_limit`), as nginx caps it.
 """
 
@@ -51,6 +54,7 @@ from ghostwriter.config import Settings, load_settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.inference import SPEECH_THREADS, ModelClient
 from ghostwriter.log_cfg import setup_logger
+from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.processing import AttachmentProcessor
 from ghostwriter.retention import FIRST_SWEEP_DELAY_S, SWEEP_INTERVAL_S, Sweeper
 from ghostwriter.retention_rule import run_retention_loop
@@ -73,6 +77,7 @@ def create_app(
     workbench_transport: httpx.AsyncBaseTransport | None = None,
     model: ModelClient | None = None,
     inference_transport: httpx.AsyncBaseTransport | None = None,
+    nextext_transport: httpx.AsyncBaseTransport | None = None,
     now: Callable[[], datetime] = utcnow,
 ) -> FastAPI:
     """Build the application.
@@ -85,6 +90,8 @@ def create_app(
         model: The chat model (tests pass one over a fake router); the router of the
             settings when omitted.
         inference_transport: The transport of the Ollama probe (tests pass an ``httpx.MockTransport``);
+            ``None`` uses httpx's own.
+        nextext_transport: The transport to Nextext (tests pass an ``httpx.MockTransport``);
             ``None`` uses httpx's own.
         now: The store's clock (tests pass one set by hand).
 
@@ -105,8 +112,8 @@ def create_app(
         The store's schema is brought to this release's version and the
         configured periods are put in force before the first request; attachments
         left ``processing`` are prepared again, or settled without workbench; then
-        the retention sweep starts, and the Ollama probe where it applies (start-up
-        does not wait for it); both are cancelled first at shutdown, then the
+        the retention sweep starts, the Ollama probe where it applies and Nextext's health probe while Nextext is
+        on (start-up waits for neither); all are cancelled first at shutdown, then the
         attachment jobs, before the database goes.
 
         Args:
@@ -119,6 +126,7 @@ def create_app(
         engine: Engine | None = None
         sweeps: asyncio.Task[None] | None = None
         probe: asyncio.Task[None] | None = None
+        media_probe: asyncio.Task[None] | None = None
         processor: AttachmentProcessor | None = None
         try:
             start_chain(app, emitter)
@@ -153,9 +161,12 @@ def create_app(
             )
             if settings.vision and settings.inference_provider == "ollama":
                 probe = asyncio.create_task(app.state.vision.probe(transport=inference_transport))
+            media: NextextHealth | None = app.state.media
+            if media is not None:
+                media_probe = asyncio.create_task(media.run())
             yield
         finally:
-            for task in (probe, sweeps):
+            for task in (media_probe, probe, sweeps):
                 if task is not None:
                     task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -184,6 +195,9 @@ def create_app(
     )
     app.state.turns = TurnRegistry()
     app.state.vision = Vision(settings)
+    nextext = NextextClient(settings, transport=nextext_transport) if settings.nextext_enabled else None
+    app.state.nextext = nextext
+    app.state.media = NextextHealth(nextext) if nextext is not None else None
 
     @app.exception_handler(AuditWriteError)
     async def refuse_unrecorded(request: Request, exc: AuditWriteError) -> JSONResponse:

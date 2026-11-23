@@ -89,21 +89,24 @@ class PrepareJob:
         chat_id: Its chat.
         owner: The chat's owner.
         path: Its file's path in the chat's folder.
-        kind: ``image`` or ``document``: what it settles as when the prepare fails.
+        kind: ``image``, ``document`` or ``media``: what it settles as when the prepare fails.
         op: The upload's operation, its primary written, whose child the hand-over is; ``None`` for a job
             requeued at start, whose hand-over is a system operation's primary.
         background: Whether the attachment is ``ready`` already (an Office file) and the job only adds its facts:
             it takes a :data:`BACKGROUND_SLOTS` slot first, keeps its manifest with
             :meth:`~ghostwriter.store.ChatStore.keep_manifest` and changes no status.
+        size: The file's size in bytes, as workbench stored it, for a clip's hand-over to Nextext; ``None`` for a job
+            requeued at start, which has not been told it.
     """
 
     attachment_id: str
     chat_id: str
     owner: str
     path: str
-    kind: Literal["document", "image"]
+    kind: Literal["document", "image", "media"]
     op: Operation | None
     background: bool = False
+    size: int | None = None
 
 
 def _requeued(ref: AttachmentRef) -> PrepareJob:
@@ -115,8 +118,7 @@ def _requeued(ref: AttachmentRef) -> PrepareJob:
     Returns:
         Its job, with no request's operation.
     """
-    kind: Literal["document", "image"] = "image" if ref.kind == "image" else "document"
-    return PrepareJob(ref.id, ref.chat_id, ref.owner, ref.path, kind, None)
+    return PrepareJob(ref.id, ref.chat_id, ref.owner, ref.path, ref.kind, None)
 
 
 @dataclass(frozen=True)

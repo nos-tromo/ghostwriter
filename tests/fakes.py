@@ -43,7 +43,9 @@ from ghostwriter.workbench import (
 from tests.conftest import KEY, NEXTEXT_KEY
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": "0.3.0"}}
+#: The version the fakes' workbench names itself, unless a test sets another.
+SERVER_VERSION = "0.3.0"
+SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": SERVER_VERSION}}
 #: The id workbench gives the output of :func:`call_result`.
 OUTPUT_ID = "0" * 32
 #: The id the door gives every upload, unless a test sets another.
@@ -127,8 +129,11 @@ class Upload:
     data: bytes
 
 
-def discover_result() -> dict[str, Any]:
+def discover_result(server_version: str = SERVER_VERSION) -> dict[str, Any]:
     """Return workbench's ``server/discover`` result.
+
+    Args:
+        server_version: The version workbench names itself.
 
     Returns:
         The result, serving 2026-07-28 for an hour.
@@ -139,7 +144,7 @@ def discover_result() -> dict[str, Any]:
         "ttlMs": 3600000,
         "cacheScope": "private",
         "resultType": "complete",
-        "_meta": SERVER_META,
+        "_meta": {META_SERVER_INFO: {"name": "workbench", "version": server_version}},
     }
 
 
@@ -371,16 +376,17 @@ class FakeDoor:
         on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
     """
 
-    def __init__(self, key: str = KEY) -> None:
+    def __init__(self, key: str = KEY, *, server_version: str = SERVER_VERSION) -> None:
         """Answer as a healthy workbench does, without delay.
 
         Args:
             key: The key the door accepts.
+            server_version: The version it names itself in ``server/discover``.
         """
         self.key = key
         self.requests: list[tuple[httpx.Request, Any]] = []
         self.answers: dict[str, object] = {
-            "server/discover": discover_result(),
+            "server/discover": discover_result(server_version),
             "tools/list": tools_result(),
             "tools/call": call_result,
             "/files/upload": None,
@@ -1035,7 +1041,7 @@ class FakeWorkbench:
             audit: The audit whose log :attr:`sent_after` reads.
         """
         found = contract_tools() if tools is None else tuple(tools)
-        self.discovery: Discovery | None = Discovery(tools=found, server_version="0.3.0") if found else None
+        self.discovery: Discovery | None = Discovery(tools=found, server_version=SERVER_VERSION) if found else None
         self.answers: list[Answer] = list(answers)
         self.calls: list[SentCall] = []
         self.discoveries: list[tuple[CallFor, bool]] = []

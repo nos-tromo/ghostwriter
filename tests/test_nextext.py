@@ -4,6 +4,8 @@ Nextext is mocked from the contract measured against its 1.21 API alone (:class:
 Every name, id and value here is invented.
 """
 
+import asyncio
+import dataclasses
 import json
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime, timedelta
@@ -14,6 +16,7 @@ import httpx
 import pytest
 from loguru import logger
 
+from ghostwriter import nextext
 from ghostwriter.audit import RequestContext, forward_headers
 from ghostwriter.nextext import (
     ARTIFACT_CAPS,
@@ -22,16 +25,20 @@ from ghostwriter.nextext import (
     KEYFRAMES,
     LIST_MAX_BYTES,
     MEDIA_NAME,
+    PROBE_FIRST_S,
+    PROBE_MAX_S,
     TERMINAL,
     ArtifactTooLarge,
     NextextClient,
+    NextextHealth,
     NextextJob,
     NextextUnavailable,
+    serves_media,
 )
 from ghostwriter.utils.audit_event import Actor
 from ghostwriter.workbench import MAX_ATTACHMENT_BYTES, UploadTooLarge
 from tests.conftest import NEXTEXT_BASE, NEXTEXT_KEY, make_settings
-from tests.fakes import FAILURE_TEXT, JOB_CREATED_AT, JOB_ID, FakeNextext, parse_job_upload
+from tests.fakes import FAILURE_TEXT, JOB_CREATED_AT, JOB_ID, FakeNextext, FakeWorkbench, parse_job_upload
 
 CFG = make_settings(Path("unused"), nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY)
 HEADERS = forward_headers(RequestContext(Actor("user-a", "edge"), None, "req-0001"))
@@ -618,6 +625,226 @@ async def test_health_answers_without_a_key_too() -> None:
     fake = FakeNextext()
     client = _client(fake, make_settings(Path("unused"), nextext_api_base=NEXTEXT_BASE))
     assert await client.healthy() is True
+
+
+# --- when clips are offered ----------------------------------------------------
+
+
+@pytest.mark.parametrize("version", ["0.9.0", "0.9", "0.10.1", "1.0", "1.0.0", "2.3.4.5", "10.0"])
+def test_serves_media(version: str) -> None:
+    """Workbench 0.9 and later takes clips, however its version is written as dotted numbers."""
+    assert serves_media(version) is True
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["0.8.3", "0.8.99", "0.9.x", "", "dev", "0", "v0.9.0", "0.9.0-rc1", "0.9.0+local", "\u0660.\u0669", "9" * 40],
+)
+def test_serves_no_media_before_0_9_or_without_a_version_that_reads(version: str) -> None:
+    """An older workbench, no version, and anything that is not ``X.Y[.Z...]`` of ASCII digits does not."""
+    assert serves_media(version) is False
+
+
+@pytest.fixture
+async def running() -> AsyncIterator[list[asyncio.Task[None]]]:
+    """Hold the probe tasks a test starts, and cancel them when it ends.
+
+    Yields:
+        The list to append each task to.
+    """
+    tasks: list[asyncio.Task[None]] = []
+    yield tasks
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _start(health: NextextHealth, running: list[asyncio.Task[None]]) -> asyncio.Task[None]:
+    task = asyncio.create_task(health.run())
+    running.append(task)
+    return task
+
+
+async def _checked(health: NextextHealth) -> None:
+    await asyncio.wait_for(health.checked.wait(), 5)
+
+
+async def test_the_probe_marks_nextext_healthy_on_200(running: list[asyncio.Task[None]]) -> None:
+    """Healthy is false until a probe says otherwise; a 200 sets it, and the probe then waits for a failure."""
+    fake = FakeNextext()
+    health = NextextHealth(_client(fake))
+    assert health.healthy is False and not health.checked.is_set()
+    _start(health, running)
+    await _checked(health)
+    assert health.healthy is True
+    await asyncio.sleep(0.05)
+    assert [(r.method, r.url.path) for r in fake.requests] == [("GET", "/api/v1/health")]
+
+
+async def test_a_probe_that_is_refused_is_not_healthy(running: list[asyncio.Task[None]]) -> None:
+    """Any answer but a 200 leaves Nextext unhealthy, and ``checked`` says a probe ended."""
+    fake = FakeNextext()
+    fake.health = 503
+    health = NextextHealth(_client(fake))
+    _start(health, running)
+    await _checked(health)
+    assert health.healthy is False
+
+
+async def test_a_failed_probe_tries_again_with_backoff(
+    monkeypatch: pytest.MonkeyPatch, running: list[asyncio.Task[None]]
+) -> None:
+    """The waits between probes are 5 s, doubled each time to 300 s; a healthy probe starts them over."""
+    fake = FakeNextext()
+    fake.health = 503
+    health = NextextHealth(_client(fake))
+    waits: list[float] = []
+    enough = asyncio.Event()
+    real_sleep = asyncio.sleep
+
+    async def sleep(delay: float) -> None:
+        waits.append(delay)
+        if len(waits) == 9:
+            enough.set()
+            await asyncio.Event().wait()
+        await real_sleep(0)
+
+    monkeypatch.setattr(nextext.asyncio, "sleep", sleep)
+    _start(health, running)
+    await asyncio.wait_for(enough.wait(), 5)
+    assert waits == [5, 10, 20, 40, 80, 160, 300, 300, 300]
+    assert (PROBE_FIRST_S, PROBE_MAX_S) == (5.0, 300.0)
+    assert health.healthy is False
+    assert len([r for r in fake.requests if r.url.path.endswith("/health")]) == 9
+
+
+async def test_a_healthy_probe_starts_the_backoff_over(
+    monkeypatch: pytest.MonkeyPatch, running: list[asyncio.Task[None]]
+) -> None:
+    """After Nextext was healthy and fails again, the waits begin at 5 s, not where they stopped."""
+    fake = FakeNextext()
+    fake.health = 503
+    health = NextextHealth(_client(fake))
+    waits: list[float] = []
+    real_sleep = asyncio.sleep
+    gate = asyncio.Event()
+
+    async def sleep(delay: float) -> None:
+        waits.append(delay)
+        if len(waits) == 3:
+            fake.health = 200
+        if len(waits) == 5:
+            await asyncio.Event().wait()
+        await real_sleep(0)
+        if len(waits) == 3:
+            gate.set()
+
+    monkeypatch.setattr(nextext.asyncio, "sleep", sleep)
+    _start(health, running)
+    await asyncio.wait_for(gate.wait(), 5)
+    for _ in range(100):
+        if health.healthy:
+            break
+        await real_sleep(0.01)
+    assert health.healthy is True and waits == [5, 10, 20]
+    fake.health = 503
+    health.failed()
+    for _ in range(100):
+        if len(waits) == 5:
+            break
+        await real_sleep(0.01)
+    assert waits == [5, 10, 20, 5, 10]
+
+
+async def test_a_failure_wakes_the_probe(running: list[asyncio.Task[None]]) -> None:
+    """``failed`` drops the offer at once and has the probe ask again; a 200 then offers clips again."""
+    fake = FakeNextext()
+    health = NextextHealth(_client(fake))
+    _start(health, running)
+    await _checked(health)
+    assert health.healthy is True
+    health.checked.clear()
+    fake.health = 503
+    health.failed()
+    assert health.healthy is False
+    await _checked(health)
+    assert health.healthy is False
+    assert len([r for r in fake.requests if r.url.path.endswith("/health")]) == 2
+
+
+async def test_a_failure_while_nextext_still_answers_is_probed_and_offered_again(
+    running: list[asyncio.Task[None]],
+) -> None:
+    """The probe sees only that Nextext is up: a failed job it can recover from does not keep clips off."""
+    fake = FakeNextext()
+    health = NextextHealth(_client(fake))
+    _start(health, running)
+    await _checked(health)
+    health.checked.clear()
+    health.failed()
+    assert health.healthy is False
+    await _checked(health)
+    assert health.healthy is True
+
+
+async def test_wait_healthy_returns_at_once_when_healthy_and_waits_for_the_probe_otherwise(
+    running: list[asyncio.Task[None]],
+) -> None:
+    """True without a wait while healthy; for a probe that has not answered yet, true as it does, false at the limit."""
+    fake = FakeNextext()
+    fake.health = 503
+    health = NextextHealth(_client(fake))
+    assert await health.wait_healthy(0.05) is False
+    health.healthy = True
+    assert await health.wait_healthy(0.0) is True
+    health.healthy = False
+    waiting = asyncio.create_task(health.wait_healthy(5))
+    await asyncio.sleep(0.01)
+    assert not waiting.done()
+    fake.health = 200
+    _start(health, running)
+    assert await asyncio.wait_for(waiting, 5) is True
+    assert health.healthy is True
+
+
+def _workbench(version: str | None) -> FakeWorkbench:
+    fake = FakeWorkbench()
+    if version is None:
+        fake.discovery = None
+    else:
+        assert fake.discovery is not None
+        fake.discovery = dataclasses.replace(fake.discovery, server_version=version)
+    return fake
+
+
+def test_clips_are_offered_while_nextext_is_healthy_and_workbench_is_0_9() -> None:
+    """Healthy, and a cached discovery that names 0.9 or later; every other state offers none."""
+    health = NextextHealth(_client(FakeNextext()))
+    health.healthy = True
+    assert health.offered(_workbench("0.9.0").as_client()) is True
+    assert health.offered(_workbench("0.10.2").as_client()) is True
+    assert health.offered(_workbench("0.8.3").as_client()) is False
+    assert health.offered(_workbench("").as_client()) is False
+    assert health.offered(_workbench(None).as_client()) is False
+    assert health.offered(None) is False
+
+
+def test_no_clips_are_offered_while_nextext_is_not_healthy_and_workbench_is_not_asked() -> None:
+    """An unhealthy Nextext offers none, without a discovery."""
+    health = NextextHealth(_client(FakeNextext()))
+    workbench = _workbench("0.9.0")
+    assert health.offered(workbench.as_client()) is False
+    assert workbench.discoveries == []
+
+
+def test_the_offer_asks_workbench_for_the_listing_without_images() -> None:
+    """The version is read from the cached discovery of the system's call, which takes no images."""
+    health = NextextHealth(_client(FakeNextext()))
+    health.healthy = True
+    workbench = _workbench("0.9.0")
+    assert health.offered(workbench.as_client()) is True
+    [(call, images)] = workbench.discoveries
+    assert (call.owner, call.chat_id, images) == ("ghostwriter:system", "capability", False)
 
 
 # --- the log -----------------------------------------------------------------

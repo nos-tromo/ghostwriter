@@ -13,13 +13,17 @@ from starlette.types import Message
 from typing_extensions import override
 
 from ghostwriter.upload import (
+    ATTACHMENT_TYPES,
+    AUDIO_SUFFIXES,
     IMAGE_TYPES,
+    MEDIA_TYPES,
     OFFICE_SUFFIXES,
     PREPARED_SUFFIXES,
     BadUpload,
     TooLarge,
     attachment_kind,
     attachment_type,
+    media_kind,
     name_problem,
     needs_prepare,
     prepared_later,
@@ -277,3 +281,44 @@ def test_office_files_are_prepared_later(name: str, later: bool) -> None:
     assert prepared_later(name) is later
     assert needs_prepare(name) is (name in {"harbour-scan.pdf", "pier-photo.png"})
     assert attachment_kind(name) == ("image" if name == "pier-photo.png" else "document")
+
+
+def test_clips_are_attachable_only_when_offered() -> None:
+    """A clip's type is known only while clips are offered, in any case; ``.avi`` is never one."""
+    assert attachment_type("harbour-tour.MP4") is None
+    assert attachment_type("harbour-tour.MP4", media=True) == "video/mp4"
+    assert attachment_type("harbour-tour.MP4", images=True) is None
+    assert attachment_type("voice-memo.opus", media=True) == "audio/opus"
+    assert attachment_type("harbour-tour.avi") is None
+    assert attachment_type("harbour-tour.avi", media=True) is None
+    assert attachment_type(".mp4", media=True) is None
+    assert attachment_type("quay-scan.pdf", media=True) == "application/pdf"
+
+
+def test_the_media_types_are_workbench_s() -> None:
+    """Eleven suffixes on workbench's types: five video, six audio."""
+    assert MEDIA_TYPES == {
+        ".mp4": "video/mp4",
+        ".mov": "video/quicktime",
+        ".m4v": "video/x-m4v",
+        ".webm": "video/webm",
+        ".mkv": "video/x-matroska",
+        ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4",
+        ".wav": "audio/wav",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/opus",
+        ".flac": "audio/flac",
+    }
+    assert AUDIO_SUFFIXES == frozenset({".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac"})
+    assert not set(MEDIA_TYPES) & set(ATTACHMENT_TYPES) and not set(MEDIA_TYPES) & set(IMAGE_TYPES)
+
+
+def test_a_clip_is_media() -> None:
+    """A clip is the ``media`` kind by its suffix, in any case, and neither prepared later nor prepared by workbench."""
+    assert attachment_kind("voice-memo.m4a") == "media"
+    assert attachment_kind("Harbour-Tour.MKV") == "media"
+    assert media_kind("voice-memo.m4a") == "audio"
+    assert media_kind("harbour-tour.webm") == "video"
+    assert media_kind("Voice-Memo.FLAC") == "audio"
+    assert not needs_prepare("harbour-tour.mp4") and not prepared_later("harbour-tour.mp4")

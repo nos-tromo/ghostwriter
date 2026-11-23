@@ -14,9 +14,13 @@ artifacts, the transcript (:data:`JSONL`) and the frames (:data:`KEYFRAMES`), st
 (:data:`ARTIFACT_CAPS`), checked on the declared length first and then on the bytes. A job is deleted as soon as
 its artifacts are taken (:meth:`NextextClient.delete`), which never raises.
 
+Clips are offered only while Nextext is up and workbench takes them (:class:`NextextHealth`): a background probe of
+``GET /health`` that start-up never waits for, and the version workbench names itself (:func:`serves_media`).
+
 The log holds statuses, counts and tokens, never a file name, a transcript line, Nextext's error text or the key.
 """
 
+import asyncio
 import contextlib
 import json
 import re
@@ -31,7 +35,8 @@ from loguru import logger
 
 from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import PURPOSE_HEADER, REQUEST_ID_HEADER
-from ghostwriter.workbench import MAX_ATTACHMENT_BYTES, UploadTooLarge
+from ghostwriter.vision import system_call
+from ghostwriter.workbench import MAX_ATTACHMENT_BYTES, UploadTooLarge, WorkbenchClient
 
 #: The name a clip goes under at Nextext, before its suffix.
 MEDIA_NAME: Final = "media"
@@ -61,6 +66,12 @@ ARTIFACT_READ_S: Final = 60.0
 HEALTH_S: Final = 5.0
 #: The most bytes the job list may have.
 LIST_MAX_BYTES: Final = 1024 * 1024
+#: The first workbench that takes a clip, as ``(major, minor)``: 0.9.
+MEDIA_WORKBENCH: Final = (0, 9)
+#: The wait after the first failed probe, in seconds; it doubles with each failure.
+PROBE_FIRST_S: Final = 5.0
+#: The longest wait between two probes of an unhealthy Nextext, in seconds.
+PROBE_MAX_S: Final = 300.0
 
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,39}")
@@ -69,6 +80,8 @@ _EXT = re.compile(r"\.[a-z0-9]{1,8}")
 _MEDIA_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}")
 # A declared Content-Length: ASCII digits only, so no non-ASCII digit or oversized number reaches int().
 _LENGTH = re.compile(r"[0-9]{1,15}")
+# A version workbench names itself as offered: dotted numbers, at least two, of ASCII digits.
+_RELEASE = re.compile(r"([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})*")
 _STATUSES = frozenset({"queued", "running"} | TERMINAL)
 _FORWARDED = frozenset({PURPOSE_HEADER.lower(), REQUEST_ID_HEADER.lower()})
 _ANSWER_MAX_BYTES = 64 * 1024
@@ -529,3 +542,116 @@ class NextextClient:
             logger.debug("nextext health: http:{}", response.status_code)
             return False
         return True
+
+
+def serves_media(version: str) -> bool:
+    """Say whether a workbench of this version takes clips: 0.9.0 and later.
+
+    Args:
+        version: The version workbench names itself, as its discovery carries it.
+
+    Returns:
+        ``True`` for ``X.Y`` or ``X.Y.Z...`` of ASCII digits with ``(X, Y)`` at :data:`MEDIA_WORKBENCH` or
+        later; ``False`` for an older one, an empty one, and any other text.
+    """
+    found = _RELEASE.fullmatch(version)
+    return found is not None and (int(found[1]), int(found[2])) >= MEDIA_WORKBENCH
+
+
+class NextextHealth:
+    """Whether Nextext is up, probed in the background, and whether clips are offered.
+
+    :meth:`run` asks :meth:`NextextClient.healthy` once, then waits until a clip's job reports Nextext failing
+    (:meth:`failed`) and asks again; while Nextext does not answer ``200`` it asks again after
+    :data:`PROBE_FIRST_S`, doubling to :data:`PROBE_MAX_S`. Start-up never waits for it: until the first probe
+    has answered, Nextext is not healthy and no clip is offered.
+
+    Attributes:
+        healthy: Whether the last probe said Nextext is up and no job has failed since; ``False`` at first.
+        checked: Set after each probe, whatever it found.
+    """
+
+    def __init__(self, client: NextextClient) -> None:
+        """Start unhealthy, with no probe made.
+
+        Args:
+            client: The client whose :meth:`~NextextClient.healthy` is the probe.
+        """
+        self._client = client
+        self.healthy = False
+        self.checked = asyncio.Event()
+        self._up = asyncio.Event()
+        self._failed = asyncio.Event()
+
+    def _mark(self, healthy: bool) -> None:
+        self.healthy = healthy
+        if healthy:
+            self._up.set()
+        else:
+            self._up.clear()
+
+    async def run(self) -> None:
+        """Probe for as long as the process serves; cancelled at shutdown.
+
+        A probe that says healthy is followed by a wait for :meth:`failed`, then by a probe at once; one that does
+        not is followed by a sleep, :data:`PROBE_FIRST_S` at first and doubling to :data:`PROBE_MAX_S`, which a
+        healthy probe starts over.
+        """
+        delay = PROBE_FIRST_S
+        known: bool | None = None
+        while True:
+            self._failed.clear()
+            up = await self._client.healthy()
+            self._mark(up)
+            self.checked.set()
+            if up != known:
+                known = up
+                if up:
+                    logger.info("Nextext answers its health probe; video and audio are offered with workbench 0.9.")
+                else:
+                    logger.warning("Nextext does not answer its health probe; video and audio are not offered.")
+            if up:
+                delay = PROBE_FIRST_S
+                await self._failed.wait()
+                continue
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, PROBE_MAX_S)
+
+    def failed(self) -> None:
+        """Take Nextext as down at once, and have :meth:`run` probe it again; on the event loop."""
+        self._mark(False)
+        self._failed.set()
+
+    async def wait_healthy(self, timeout_s: float) -> bool:
+        """Wait until Nextext is healthy, at most ``timeout_s``.
+
+        Args:
+            timeout_s: The longest wait, in seconds.
+
+        Returns:
+            Whether Nextext is healthy: at once when it is, else once a probe says so, or at the limit.
+        """
+        if self.healthy:
+            return True
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(timeout_s):
+                await self._up.wait()
+        return self.healthy
+
+    def offered(self, workbench: WorkbenchClient | None) -> bool:
+        """Say whether video and audio are offered: Nextext is healthy and the workbench takes clips.
+
+        The version is read from workbench's cached discovery (:func:`~ghostwriter.vision.system_call`, the listing
+        without images), which blocks at most once per cache window: call this from a thread, never on the event
+        loop. An unhealthy Nextext is answered without asking workbench.
+
+        Args:
+            workbench: The workbench client, ``None`` while workbench is off.
+
+        Returns:
+            ``True`` when :attr:`healthy`, there is a workbench, and its version is one that :func:`serves_media`.
+        """
+        if not self.healthy or workbench is None:
+            return False
+        found = workbench.discover(call=system_call(), images=False)
+        return found is not None and serves_media(found.server_version)

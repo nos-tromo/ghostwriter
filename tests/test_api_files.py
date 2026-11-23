@@ -24,11 +24,20 @@ from ghostwriter.api.files import FILE_HEADERS, _read_after_wait
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
-from ghostwriter.processing import AttachmentProcessor
+from ghostwriter.processing import AttachmentProcessor, PrepareJob
 from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
-from tests.conftest import KEY, CapturedAuditStream, as_user, events, make_settings, unrecorded_child
-from tests.fakes import TAKE_BACK, TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, stock_manifest
+from tests.conftest import (
+    KEY,
+    NEXTEXT_BASE,
+    NEXTEXT_KEY,
+    CapturedAuditStream,
+    as_user,
+    events,
+    make_settings,
+    unrecorded_child,
+)
+from tests.fakes import TAKE_BACK, TINY_JPEG, UPLOAD_ID, XLSX, FakeDoor, FakeNextext, stock_manifest
 
 MIB = 1024 * 1024
 TOO_LARGE = {"detail": "The file is larger than 50 MB.", "code": "too_large"}
@@ -1323,3 +1332,146 @@ def test_without_workbench_stranded_rows_settle(tmp_path: Path, audit_stream: Ca
     with TestClient(create_app(settings, audit_stream=audit_stream)) as client:
         assert _state(client).processor is None
         assert [_status(client, cid, aid).json()["status"] for aid in (photo, scan)] == ["failed", "ready"]
+
+
+# --- clips: stored ``processing`` while Nextext is offered --------------------
+
+CLIP = "harbour-tour.mp4"
+CLIP_BYTES = b"\x00\x00\x00\x18ftypmp42" + bytes(200)
+
+
+def _clips_app(
+    tmp_path: Path,
+    audit_stream: CapturedAuditStream,
+    door: FakeDoor,
+    clock: Clock,
+    nextext: FakeNextext,
+    **overrides: Any,
+) -> FastAPI:
+    settings = make_settings(tmp_path, nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY, **overrides)
+    return create_app(
+        settings,
+        audit_stream=audit_stream,
+        workbench_transport=httpx.MockTransport(door),
+        nextext_transport=httpx.MockTransport(nextext),
+        now=clock,
+    )
+
+
+def _probed(app: FastAPI) -> None:
+    deadline = time.monotonic() + 5
+    while not app.state.media.checked.is_set():
+        assert time.monotonic() < deadline, "the probe never ended"
+        time.sleep(0.01)
+
+
+@pytest.fixture
+def submitted(monkeypatch: pytest.MonkeyPatch) -> list[PrepareJob]:
+    """Record the jobs the upload hands the processor, and run none: a clip's row stays ``processing``."""
+    jobs: list[PrepareJob] = []
+    monkeypatch.setattr(AttachmentProcessor, "submit", lambda self, job: jobs.append(job))
+    return jobs
+
+
+def test_a_clip_is_processing_once_attached(
+    tmp_path: Path,
+    audit_stream: CapturedAuditStream,
+    clock: Clock,
+    submitted: list[PrepareJob],
+) -> None:
+    """A clip is stored ``processing`` at once, under its own type, and its job carries its kind and its size."""
+    door = FakeDoor(server_version="0.9.0")
+    app = _clips_app(tmp_path, audit_stream, door, clock, FakeNextext())
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        before = len(events(audit_stream))
+        r = _attach(client, cid, CLIP, CLIP_BYTES)
+        assert r.status_code == 201, r.text
+        clip = r.json()
+        assert (clip["kind"], clip["status"], clip["mime"], clip["name"]) == ("media", "processing", "video/mp4", CLIP)
+        assert door.uploads[-1].content_type == "video/mp4" and door.uploads[-1].data == CLIP_BYTES
+        [job] = submitted
+        assert (job.attachment_id, job.chat_id, job.owner, job.kind, job.background) == (
+            clip["id"],
+            cid,
+            "user-a",
+            "media",
+            False,
+        )
+        assert job.size == len(CLIP_BYTES) and job.op is not None
+        assert job.path == f"{chat_folder(KEY, cid)}/{CLIP}"
+        stored = _state(client).store.find_attachment("user-a", cid, clip["id"])
+        assert stored is not None and (stored.kind, stored.status) == ("media", "processing")
+        collect, upload = _since(audit_stream, before)
+        assert (collect["criteria"], upload["recipient"]) == ({"mime": "video/mp4"}, "workbench:upload")
+
+
+def test_an_audio_clip_is_media_too(
+    tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock, submitted: list[PrepareJob]
+) -> None:
+    """Audio is the same kind, on its own type; vision is not needed."""
+    door = FakeDoor(server_version="0.9.0")
+    app = _clips_app(tmp_path, audit_stream, door, clock, FakeNextext(), vision=False)
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        r = _attach(client, cid, "voice-memo.M4A", b"memo")
+        assert (r.status_code, r.json()["kind"], r.json()["status"], r.json()["mime"]) == (
+            201,
+            "media",
+            "processing",
+            "audio/mp4",
+        )
+        assert [(job.kind, job.size) for job in submitted] == [("media", 4)]
+
+
+def test_a_clip_is_415_without_nextext(
+    client: TestClient, door: FakeDoor, audit_stream: CapturedAuditStream, submitted: list[PrepareJob]
+) -> None:
+    """Without Nextext (as in 0.5.0) a clip is refused before anything is recorded or sent."""
+    cid = _new(client)
+    before = len(events(audit_stream))
+    r = _attach(client, cid, CLIP, CLIP_BYTES)
+    assert (r.status_code, r.json()) == (415, {"detail": "This file type is not supported."})
+    assert door.uploads == [] and _since(audit_stream, before) == [] and submitted == []
+
+
+@pytest.mark.parametrize(
+    ("version", "health"),
+    [("0.8.3", 200), ("0.9.0", 503)],
+    ids=["workbench-before-0.9", "nextext-down"],
+)
+def test_a_clip_is_415_while_it_is_not_offered(
+    tmp_path: Path,
+    audit_stream: CapturedAuditStream,
+    clock: Clock,
+    submitted: list[PrepareJob],
+    version: str,
+    health: int,
+) -> None:
+    """An old workbench, or a Nextext that is down, offers no clip: 415, nothing recorded, nothing sent."""
+    door, fake = FakeDoor(server_version=version), FakeNextext()
+    fake.health = health
+    app = _clips_app(tmp_path, audit_stream, door, clock, fake)
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        before = len(events(audit_stream))
+        r = _attach(client, cid, CLIP, CLIP_BYTES)
+        assert (r.status_code, r.json()) == (415, {"detail": "This file type is not supported."})
+        assert door.uploads == [] and _since(audit_stream, before) == [] and submitted == []
+
+
+def test_a_document_attached_with_clips_offered_is_as_before(
+    tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock, submitted: list[PrepareJob]
+) -> None:
+    """With clips offered and no vision, a sheet is ready at once and no job is submitted, as in 0.5.0."""
+    door = FakeDoor(server_version="0.9.0")
+    app = _clips_app(tmp_path, audit_stream, door, clock, FakeNextext())
+    with TestClient(app) as client:
+        _probed(app)
+        cid = _new(client)
+        sheet = _attach(client, cid).json()
+    assert (sheet["kind"], sheet["status"]) == ("document", "ready")
+    assert submitted == []
