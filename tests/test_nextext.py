@@ -58,6 +58,11 @@ async def _create(client: NextextClient, *parts: bytes) -> str:
     return await client.create(_chunks(*(parts or (CLIP,))), ext=".mp4", mime="video/mp4", headers=HEADERS)
 
 
+def _length(value: str) -> list[tuple[bytes, bytes]]:
+    """Return a Content-Length header as the wire carries it, so a non-ASCII value is not refused by httpx."""
+    return [(b"Content-Length", value.encode("utf-8"))]
+
+
 async def _read(client: NextextClient, job_id: str = JOB_ID, name: str = JSONL) -> list[bytes] | None:
     async with client.artifact(job_id, name, headers=HEADERS) as chunks:
         return None if chunks is None else [chunk async for chunk in chunks]
@@ -181,6 +186,13 @@ async def test_create_past_the_cap_is_cut_off() -> None:
     with pytest.raises(UploadTooLarge):
         await _create(_client(fake), *parts)
     assert fake.requests == [] and fake.events == []
+
+
+async def test_create_accepts_exactly_the_cap() -> None:
+    """A clip of exactly MAX_ATTACHMENT_BYTES goes through whole; the cap cuts off only what passes it."""
+    fake = FakeNextext()
+    assert await _create(_client(fake), *([b"\x00" * MIB] * (MAX_ATTACHMENT_BYTES // MIB))) == JOB_ID
+    assert len((await parse_job_upload(fake.uploads[-1])).data) == MAX_ATTACHMENT_BYTES
 
 
 async def test_the_clips_stream_is_closed_on_a_cut_off() -> None:
@@ -423,6 +435,43 @@ async def test_a_declared_length_under_the_cap_does_not_excuse_a_longer_body() -
     fake.declared[JSONL] = 10
     with pytest.raises(ArtifactTooLarge):
         await _read(client, job_id)
+
+
+@pytest.mark.parametrize("declared", ["\u00b2", "\u0663", "1" * 5000, "9" * 16, "-1", "1e9", " ", "0x10", "12 "])
+async def test_a_declared_length_that_is_not_ascii_digits_counts_as_undeclared(declared: str) -> None:
+    """A Content-Length that is no run of at most 15 ASCII digits is no declaration: no ValueError, the count holds."""
+    body = bytes(ARTIFACT_CAPS[JSONL] + 1)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def chunks() -> AsyncIterator[bytes]:
+            yield b"first"
+            yield body
+
+        return httpx.Response(200, headers=_length(declared), content=chunks())
+
+    with pytest.raises(ArtifactTooLarge):
+        await _read(_client_for(handler))
+
+    def small(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers=_length(declared), content=_chunks(b"abc"))
+
+    assert await _read(_client_for(small)) == [b"abc"]
+
+
+async def test_a_declared_length_of_fifteen_digits_over_the_cap_is_refused_before_the_body() -> None:
+    """The widest declaration read is 15 ASCII digits; one over the cap is refused with the body unstarted."""
+    started: list[bool] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        async def chunks() -> AsyncIterator[bytes]:
+            started.append(True)
+            yield b"never"
+
+        return httpx.Response(200, headers={"Content-Length": "9" * 15}, content=chunks())
+
+    with pytest.raises(ArtifactTooLarge):
+        await _read(_client_for(handler))
+    assert started == []
 
 
 @pytest.mark.parametrize("status", [401, 410, 500, 503])

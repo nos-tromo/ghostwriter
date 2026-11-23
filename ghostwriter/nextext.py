@@ -65,7 +65,10 @@ LIST_MAX_BYTES: Final = 1024 * 1024
 _JOB_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _CODE = re.compile(r"[a-z][a-z0-9_]{0,39}")
 _EXT = re.compile(r"\.[a-z0-9]{1,8}")
+# Mirrors workbench.py's pattern of the same name.
 _MEDIA_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}")
+# A declared Content-Length: ASCII digits only, so no non-ASCII digit or oversized number reaches int().
+_LENGTH = re.compile(r"[0-9]{1,15}")
 _STATUSES = frozenset({"queued", "running"} | TERMINAL)
 _FORWARDED = frozenset({PURPOSE_HEADER.lower(), REQUEST_ID_HEADER.lower()})
 _ANSWER_MAX_BYTES = 64 * 1024
@@ -207,6 +210,8 @@ async def _job_body(boundary: str, ext: str, mime: str, chunks: AsyncIterator[by
 
 async def _json_answer(response: httpx.Response, limit: int) -> object:
     """Read an answer's body as one JSON document of at most ``limit`` bytes.
+
+    Mirrors ``workbench._json_answer``, for the answers of this client: any status is the caller's to check.
 
     Args:
         response: The streamed answer.
@@ -473,7 +478,7 @@ class NextextClient:
                 )
                 if response.status_code == 200:
                     declared = response.headers.get("content-length", "")
-                    if declared.isdigit() and int(declared) > cap:
+                    if _LENGTH.fullmatch(declared) and int(declared) > cap:
                         raise ArtifactTooLarge
                     chunks = await stack.enter_async_context(contextlib.aclosing(_capped(response, cap)))
                 elif response.status_code != 404:
