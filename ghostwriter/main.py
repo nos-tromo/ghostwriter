@@ -156,7 +156,12 @@ def create_app(
                 logger.info("{} attachments left processing were settled without workbench.", settled)
             app.state.processor = processor
             app.state.agent = AgentLoop(
-                model=chat_model, workbench=app.state.workbench, store=store, settings=settings, vision=app.state.vision
+                model=chat_model,
+                workbench=app.state.workbench,
+                store=store,
+                settings=settings,
+                vision=app.state.vision,
+                media=app.state.media,
             )
             app.state.turn_threads = anyio.CapacityLimiter(TURN_THREADS)
             app.state.speech_threads = anyio.CapacityLimiter(SPEECH_THREADS)

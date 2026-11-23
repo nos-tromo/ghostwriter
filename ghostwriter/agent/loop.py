@@ -27,7 +27,8 @@ each call's images and records stay its own.
 A turn sees when the model sees (:class:`~ghostwriter.vision.Vision`) and workbench's listing for a
 call that takes images holds ``view_file``. Then images go with the rounds
 (:mod:`ghostwriter.agent.images`): the rounds are offered that listing, ``view_file`` included, the system
-prompt says how to look, and the turn's calls ask workbench for images. A turn that does not see is
+prompt says how to look (and, while Nextext is up and workbench is 0.9.0 or later, how to take a clip's
+transcript and frames), and the turn's calls ask workbench for images. A turn that does not see is
 offered the listing of a call without images, as workbench 0.6 gave it, which promises no image; so is
 every round after a refusal. The question carries its attached pictures, and a
 follow-up those of earlier questions that fit; their renditions are fetched before the round that
@@ -109,6 +110,7 @@ from ghostwriter.agent.tools import (
 from ghostwriter.config import Settings
 from ghostwriter.db import utcnow
 from ghostwriter.inference import ModelClient, inference_headers
+from ghostwriter.nextext import NextextHealth
 from ghostwriter.schemas import ResultOut, StepOut
 from ghostwriter.store import ChatStore, UserTurn
 from ghostwriter.utils.audit_event import AuditWriteError
@@ -516,6 +518,7 @@ class AgentLoop:
         clock: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = utcnow,
         vision: Vision | None = None,
+        media: NextextHealth | None = None,
     ) -> None:
         """Hold the loop's neighbours.
 
@@ -527,6 +530,8 @@ class AgentLoop:
             clock: The monotonic clock the wall is read from.
             now: The time of day, for the system prompt's date.
             vision: Whether the model sees, read at the start of each message; ``None`` sends no image.
+            media: Whether Nextext is up, which with workbench's version says whether clips are offered, read at
+                the start of each message; ``None`` while Nextext is off.
         """
         self._model = model
         self._workbench = workbench
@@ -535,6 +540,7 @@ class AgentLoop:
         self._clock = clock
         self._now = now
         self._vision = vision
+        self._media = media
 
     def run(self, turn: Turn, audit: TurnAudit) -> Iterator[TurnEvent]:
         """Answer a message.
@@ -615,7 +621,13 @@ class AgentLoop:
             plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
             return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
 
-        seeing = self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today) if sees else None
+        # The offer reads workbench's cached discovery: this runs on a turn thread, where it may block.
+        clips = sees and workbench is not None and self._media is not None and self._media.offered(workbench)
+        seeing = (
+            self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
+            if sees
+            else None
+        )
         attached = [*question.images, *(image for earlier in past for image in earlier.images)]
         sight = _Sight(
             sees=sees,
@@ -672,7 +684,16 @@ class AgentLoop:
             current.extend(answers)
             self._tool_images(current, sight, shown)
 
-    def _offer(self, discovery: Discovery | None, *, seeing: bool, chat_id: str, expired: bool, today: date) -> _Offer:
+    def _offer(
+        self,
+        discovery: Discovery | None,
+        *,
+        seeing: bool,
+        chat_id: str,
+        expired: bool,
+        today: date,
+        media: bool = False,
+    ) -> _Offer:
         """Return what a round offers, with sight or without it.
 
         Args:
@@ -683,6 +704,8 @@ class AgentLoop:
             chat_id: The chat, whose folder the prompt names while a tool is offered.
             expired: Whether files or tool results of earlier messages have expired.
             today: The date the message is answered on.
+            media: Whether clips are offered at this turn; the system prompt says how to read and look at one
+                only while ``seeing`` and ``view_file`` is offered.
 
         Returns:
             The system prompt, and the tools with their names.
@@ -699,6 +722,7 @@ class AgentLoop:
             expired=expired,
             presentations="write_presentation" in names,
             vision=seeing and VIEW_TOOL in names,
+            media=media,
         )
         return _Offer(system, function_tools(found), names)
 

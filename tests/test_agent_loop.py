@@ -42,10 +42,11 @@ from ghostwriter.agent.loop import (
     Turn,
     TurnEvent,
 )
-from ghostwriter.agent.prompt import DECK_CHECK, PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
+from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
 from ghostwriter.vision import Vision
@@ -204,6 +205,7 @@ class LoopEnv:
         workbench: FakeWorkbench | None | str = "default",
         reasoning: bool = False,
         vision: bool = False,
+        media: NextextHealth | None = None,
         attach: Sequence[tuple[str, dict[str, Any]]] = (),
     ) -> list[TurnEvent]:
         """Send a message and run its turn to the end.
@@ -214,8 +216,9 @@ class LoopEnv:
             workbench: workbench, the env's own by default; ``None`` for none at all.
             reasoning: The message's reasoning switch.
             vision: Whether the model sees images.
+            media: Nextext's health, as ``app.state.media`` holds it; ``None`` is Nextext off.
             attach: The files the message sends, by name and manifest, each settled ``ready`` first:
-                a manifest of kind ``image`` makes a picture, any other a document.
+                a manifest of kind ``image`` makes a picture, ``media`` a clip, any other a document.
 
         Returns:
             The turn's events.
@@ -224,15 +227,15 @@ class LoopEnv:
         chosen = self.workbench if workbench == "default" else workbench
         ids: list[str] = []
         for name, manifest in attach:
-            picture = manifest.get("kind") == "image"
+            picture, clip = manifest.get("kind") == "image", manifest.get("kind") == "media"
             attachment = self.store.add_attachment(
                 CHAT,
                 file_id=uuid4().hex,
                 path=f"{FOLDER}/{name}",
                 name=name,
                 size=4_096,
-                mime="image/jpeg" if picture else "application/pdf",
-                kind="image" if picture else "document",
+                mime="image/jpeg" if picture else "video/mp4" if clip else "application/pdf",
+                kind="image" if picture else "media" if clip else "document",
                 status="processing",
             )
             self.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
@@ -247,6 +250,7 @@ class LoopEnv:
             clock=self.clock,
             now=lambda: T0,
             vision=Vision(dataclasses.replace(self.settings, vision=True)) if vision else None,
+            media=media,
         )
         headers = {"X-Request-ID": "req-0001"}
         turn = Turn(
@@ -1280,6 +1284,66 @@ def test_the_prompt_tells_the_model_how_to_look_only_with_vision(loop_env: LoopE
         "Images tools showed earlier are not sent again, and attached pictures only while there is room: "
         "use view_file to see one again."
     ) in VISION
+
+
+def _clips(loop_env: LoopEnv, *, version: str = "0.9.0", healthy: bool = True) -> NextextHealth:
+    """Return Nextext's health as the app holds it, with workbench naming ``version``."""
+    discovery = loop_env.workbench.discovery
+    assert discovery is not None
+    loop_env.workbench.discovery = dataclasses.replace(discovery, server_version=version)
+    health = NextextHealth(NextextClient(loop_env.settings))
+    health.healthy = healthy
+    return health
+
+
+def test_the_prompt_tells_the_model_of_clips_only_with_vision_and_media(loop_env: LoopEnv) -> None:
+    """The clip sentence follows the sight sentence, only with tools, sight and clips offered at the turn.
+
+    Clips are offered while Nextext is healthy and workbench is 0.9.0 or later; the others keep their order.
+    """
+    clips = _clips(loop_env)
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=clips)
+    loop_env.run([text_chunk("Hallo!")], vision=True)
+    loop_env.run([text_chunk("Hallo!")], media=clips)
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=clips, workbench=None)
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(loop_env, healthy=False))
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(loop_env, version="0.8.1"))
+    full, off, blind, toolless, down, old = (call["messages"][0]["content"] for call in loop_env.fake.calls)
+    assert MEDIA in full and full.index(VISION) + len(VISION) + 1 == full.index(MEDIA)
+    assert full.index(VISION) < full.index(MEDIA) < full.index(PRESENTATIONS) < full.index(DECK_CHECK)
+    for prompt in (off, blind, toolless, down, old):
+        assert MEDIA not in prompt
+    assert VISION in off and VISION in down and VISION in old and VISION not in blind
+
+
+def test_view_file_on_a_clip_sends_no_strips(loop_env: LoopEnv) -> None:
+    """At a fixed image cost a clip's calls carry no strips, even a model's own, and its line names its facts."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    clip = f"{FOLDER}/harbour-tour.mp4"
+    manifest: dict[str, Any] = {
+        "kind": "media",
+        "total": 8,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "unit": "frame",
+        "duration_s": 134.2,
+        "transcript": True,
+    }
+    calls = [
+        call_chunk(0, "call_0", "view_file", json.dumps({"path": clip, "part": "at 00:04", "strips": 3})),
+        call_chunk(1, "call_1", "read_document", json.dumps({"path": clip})),
+    ]
+    loop_env.run(
+        calls, [text_chunk("Ok.")], vision=True, media=_clips(loop_env), attach=[("harbour-tour.mp4", manifest)]
+    )
+    assert [call.arguments for call in loop_env.workbench.calls] == [
+        {"path": clip, "part": "at 00:04"},
+        {"path": clip},
+    ]
+    assert f"[Attached: harbour-tour.mp4 ({clip}, 4096 bytes; video 02:14, 8 frames; transcript)]" in json.dumps(
+        loop_env.sent(1)[1]
+    )
 
 
 def test_tool_images_past_the_cap_are_retired(loop_env: LoopEnv) -> None:

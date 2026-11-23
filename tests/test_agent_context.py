@@ -19,6 +19,7 @@ from sqlalchemy import Engine
 from ghostwriter.agent.context import (
     CLEARED,
     OFFICE_FORMATS,
+    UNSEEN_PICTURE,
     PastCall,
     PastTurn,
     attachment_facts,
@@ -52,7 +53,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import DECK_CHECK, PRESENTATIONS, VISION, system_prompt
+from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
     REFUSALS,
     Refusal,
@@ -527,6 +528,30 @@ def test_the_deck_check_comes_with_sight_and_the_tool() -> None:
     assert bare == system_prompt(today=day, folder=None, file_days=7, expired=False)
 
 
+def test_the_media_sentence_comes_with_sight_tools_and_clips() -> None:
+    """How to read and look at a clip follows the sight sentence, only with tools, sight and clips offered.
+
+    The transcript is read with read_document and the frames are looked at with view_file, so without sight no
+    sentence names view_file; the order of the others is as it was.
+    """
+    assert MEDIA == (
+        "A video or audio file the user attached comes with a transcript: read it with read_document. A video's "
+        "frames are pictures of it over time: look at them with view_file ('frame 3', 'frames 2-5', 'at 01:24')."
+    )
+    day = date(2026, 11, 16)
+
+    def prompt(*, folder: str | None = FOLDER, vision: bool = False, media: bool = False, deck: bool = False) -> str:
+        return system_prompt(
+            today=day, folder=folder, file_days=7, expired=False, vision=vision, media=media, presentations=deck
+        )
+
+    assert prompt(vision=True, media=True) == f"{SYSTEM} {VISION} {MEDIA}"
+    assert prompt(vision=True, media=True, deck=True) == f"{SYSTEM} {VISION} {MEDIA} {PRESENTATIONS} {DECK_CHECK}"
+    for vision, media, deck in ((True, False, False), (False, True, False), (False, True, True), (False, False, False)):
+        assert MEDIA not in prompt(vision=vision, media=media, deck=deck)
+    assert prompt(folder=None, vision=True, media=True) == prompt(folder=None)
+
+
 PAGE = ToolImage("quay-scan.pdf, page 2", 1131, 1600, "image/jpeg", TINY_JPEG)
 CHART = ToolImage("plot.png", 640, 480, "image/png", TINY_PNG)
 
@@ -572,6 +597,20 @@ def _office_manifest(unit: str, total: int, blank: list[int]) -> dict[str, Any]:
         "renditions": pages,
         "frames": None,
         "unit": unit,
+    }
+
+
+def _clip_manifest(duration_s: float | None, total: int, *, transcript: bool = True) -> dict[str, Any]:
+    """Return a clip's manifest as the chat stores it (``STORED_MANIFEST_KEYS``)."""
+    return {
+        "kind": "media",
+        "total": total,
+        "pages_without_text": [],
+        "renditions": [],
+        "frames": None,
+        "unit": "frame",
+        "duration_s": duration_s,
+        "transcript": transcript,
     }
 
 
@@ -1025,6 +1064,110 @@ def test_an_office_attachment_without_facts_says_nothing() -> None:
     assert attachment_facts("document", None, seen=True, name="harbour-deck.pptx") is None
     assert attachment_facts("document", _office_manifest("slide", 0, []), seen=True, name="harbour-deck.pptx") is None
     assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.xlsx") is None
+
+
+def test_a_clips_line_says_what_it_holds() -> None:
+    """A clip's line names video or audio by the name, its length, its frames and its transcript.
+
+    A video with no speech still has its frames, and a clip with no manifest says nothing.
+    """
+    tour = "harbour-tour.mp4"
+    assert (
+        attachment_facts("media", _clip_manifest(134.2, 8), seen=True, name=tour) == "video 02:14, 8 frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(40.0, 3, transcript=False), seen=True, name=tour) == (
+        "video 00:40, 3 frames; no speech"
+    )
+    assert attachment_facts("media", _clip_manifest(134.2, 0), seen=True, name=tour) == (
+        "video 02:14, no frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(1867.0, 0), seen=True, name="voice-memo.m4a") == (
+        "audio 31:07; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(3723.0, 0, transcript=False), seen=True, name="long-call.flac") == (
+        "audio 1:02:03; no speech"
+    )
+    assert attachment_facts("media", _clip_manifest(134.2, 8), seen=False, name=tour) == (
+        f"video 02:14, 8 frames {UNSEEN_PICTURE}; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(None, 1), seen=True, name=tour) == "video, 1 frame; transcript"
+    assert attachment_facts("media", None, seen=True, name=tour) is None
+
+
+def test_a_clips_line_reads_its_numbers_and_its_name_strictly() -> None:
+    """A length is whole seconds, cut not rounded, from an hour as h:mm:ss; what is not a number is left out.
+
+    An unseen clip with no frames has none to hide; a suffix in capitals is read as the lower case one; a
+    manifest that is not a clip's gives no line, whatever the attachment's kind.
+    """
+    tour = "harbour-tour.mp4"
+    assert (
+        attachment_facts("media", _clip_manifest(59.9, 2), seen=True, name=tour) == "video 00:59, 2 frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(3599.0, 2), seen=True, name=tour) == (
+        "video 59:59, 2 frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(3600.0, 2), seen=True, name=tour) == (
+        "video 1:00:00, 2 frames; transcript"
+    )
+    assert (
+        attachment_facts("media", _clip_manifest(0.0, 2), seen=True, name=tour) == "video 00:00, 2 frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(134.2, 0), seen=False, name=tour) == (
+        "video 02:14, no frames; transcript"
+    )
+    assert attachment_facts("media", _clip_manifest(12.0, 0), seen=True, name="VOICE-MEMO.M4A") == (
+        "audio 00:12; transcript"
+    )
+    not_lengths: list[Any] = [-1.0, float("nan"), float("inf"), True, "134", [], {}]
+    for odd in not_lengths:
+        manifest = _clip_manifest(None, 2)
+        manifest["duration_s"] = odd
+        assert attachment_facts("media", manifest, seen=True, name=tour) == "video, 2 frames; transcript"
+    not_counts: list[Any] = [-1, True, "8", None, 2.5]
+    for odd in not_counts:
+        manifest = _clip_manifest(134.2, 0)
+        manifest["total"] = odd
+        assert attachment_facts("media", manifest, seen=True, name=tour) == "video 02:14; transcript"
+    manifest = _clip_manifest(134.2, 8)
+    manifest["transcript"] = "yes"
+    assert attachment_facts("media", manifest, seen=True, name=tour) == "video 02:14, 8 frames; no speech"
+    assert attachment_facts("media", _office_manifest("slide", 3, []), seen=True, name=tour) is None
+    none: dict[str, Any] = {"kind": "none", "total": 0, "pages_without_text": [], "renditions": [], "frames": None}
+    assert attachment_facts("media", none, seen=True, name=tour) is None
+    assert attachment_facts("document", _clip_manifest(134.2, 8), seen=True, name=tour) is None
+
+
+def test_a_clip_line_rides_the_attachment_line() -> None:
+    """A clip's facts follow its size inside the brackets, like a document's; an unseen turn says so after the count."""
+    clip = AttachmentOut(
+        id="att-clip",
+        file_id="2" * 32,
+        name="harbour-tour.mp4",
+        size=1234,
+        mime="video/mp4",
+        created_at=T0,
+        kind="media",
+        status="ready",
+        expired=False,
+    )
+    manifest = _clip_manifest(134.2, 8)
+
+    def line(*, seen: bool) -> str:
+        return user_content(
+            "",
+            [clip],
+            path_of=lambda a: f"{FOLDER}/{a.name}",
+            facts_of=lambda a: attachment_facts(a.kind, manifest, seen=seen, name=a.name),
+        )
+
+    assert line(seen=True) == (
+        f"[Attached: harbour-tour.mp4 ({FOLDER}/harbour-tour.mp4, 1234 bytes; video 02:14, 8 frames; transcript)]"
+    )
+    assert line(seen=False) == (
+        f"[Attached: harbour-tour.mp4 ({FOLDER}/harbour-tour.mp4, 1234 bytes; "
+        f"video 02:14, 8 frames {UNSEEN_PICTURE}; transcript)]"
+    )
 
 
 def test_a_long_list_of_pages_without_text_is_cut() -> None:
