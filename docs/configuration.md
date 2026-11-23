@@ -25,6 +25,9 @@ cannot work stops startup and names the variable, never its value
 | `WORKBENCH_API_KEY` | unset | workbench's `GHOSTWRITER_WORKBENCH_KEY`. Unset: no tools and no attachments, chats work. Shorter than 32 characters stops startup. Rotating it renames every chat's folder (the pseudonyms are keyed with it), so earlier files read as expired. |
 | `WORKBENCH_API_BASE` | `http://workbench-api:8000` | workbench on `workbench-net`. |
 | `WORKBENCH_TIMEOUT` | `150` | Seconds one tool call may take. A call starts only while this much of the message's wall is left. |
+| `NEXTEXT_API_KEY` | unset | Ghostwriter's service token at Nextext: the same value as its entry in Nextext's `NEXTEXT_SERVICE_TOKENS` (`ghostwriter=<token>`); `make env` fills both in. Unset: video and audio are not offered, and nothing else changes. Shorter than 32 characters stops startup. |
+| `NEXTEXT_API_BASE` | `http://nextext-backend:8000/api/v1` (set by compose) | Nextext's API on `inference-net`. Empty turns video and audio off. Clips also need workbench 0.9.0 or later; against an earlier workbench they are not offered either. |
+| `NEXTEXT_TIMEOUT` | `900` | Seconds one clip may take at Nextext, 60–86,400: the upload, the wait behind other jobs, the transcription and the downloads. Nextext runs one job at a time (its `NEXTEXT_JOB_CONCURRENCY`, 1), so a clip queues behind docint's ingest within this budget. Whisper on CPU runs at about real time, so a CPU-only host needs a larger budget for long recordings; 900 s suits a GPU. |
 | `AUDIT_REQUIRE_PURPOSE` | empty | Audit actions that need a stated purpose (428 without one); an unknown action stops startup. |
 | `GHOSTWRITER_CHAT_RETENTION_DAYS` | `90` | Days a chat is kept after it started (1–3650); `off` keeps chats, for development only. |
 | `RETENTION_NOTICE_DAYS` | `30` | Days a new or shorter chat period waits before it deletes (0–365). |

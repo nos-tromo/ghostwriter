@@ -87,6 +87,13 @@ services:
       # attachments are off, and plain chat works as before.
       WORKBENCH_API_KEY: ${WORKBENCH_API_KEY:-}
       WORKBENCH_TIMEOUT: ${WORKBENCH_TIMEOUT:-150}
+      # Colon-less on purpose: an empty value in .env turns video and audio
+      # off; unset, Nextext is on inference-net.
+      NEXTEXT_API_BASE: ${NEXTEXT_API_BASE-http://nextext-backend:8000/api/v1}
+      # Same value as Ghostwriter's entry in Nextext's NEXTEXT_SERVICE_TOKENS.
+      # Unset: video and audio are off, and everything else works as before.
+      NEXTEXT_API_KEY: ${NEXTEXT_API_KEY:-}
+      NEXTEXT_TIMEOUT: ${NEXTEXT_TIMEOUT:-900}
       WORKBENCH_RETENTION_DAYS: ${WORKBENCH_RETENTION_DAYS:-7}
       # Shared with the edge gateway, which sends it as X-Edge-Secret. Set:
       # identity headers count only on requests carrying it. Unset: the dev

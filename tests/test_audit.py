@@ -223,8 +223,20 @@ def test_the_chain_opens_with_the_operating_mode(client: TestClient, audit_strea
         "speech_input": True,
         "vision": False,
         "workbench": True,
+        "media": False,
     }
     assert SECRET not in audit_stream.getvalue() and KEY not in audit_stream.getvalue()
+
+
+def test_the_operating_mode_says_whether_media_is_on(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
+    """With Nextext's base and key set the start-up record says media is on; the key itself is never written."""
+    nextext_key = "n" * 32
+    settings = make_settings(tmp_path, nextext_api_base="http://nextext.test/api/v1", nextext_api_key=nextext_key)
+    with TestClient(probe_app(settings, audit_stream)):
+        pass
+    mode = events(audit_stream)[1]
+    assert (mode["operation"], mode["criteria"]["media"]) == ("config.audit", True)
+    assert nextext_key not in audit_stream.getvalue()
 
 
 def test_a_failed_audit_write_refuses_the_request(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:

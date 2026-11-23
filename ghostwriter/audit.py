@@ -291,6 +291,7 @@ def _operating_mode(settings: Settings) -> dict[str, object]:
         "speech_input": settings.speech_input,
         "vision": settings.vision,
         "workbench": settings.workbench_enabled,
+        "media": settings.nextext_enabled,
     }
 
 

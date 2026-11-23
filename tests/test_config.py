@@ -12,6 +12,7 @@ from tests.conftest import KEY, SECRET, make_settings
 
 ENV = {"GHOSTWRITER_EDGE_SECRET": SECRET}
 ROUTER_KEY = "router-key-0001"
+NEXTEXT_KEY = "n" * 32
 
 
 def test_defaults_match_the_contract() -> None:
@@ -27,6 +28,7 @@ def test_defaults_match_the_contract() -> None:
     )
     assert (s.edge_secret, s.default_identity, s.ui_language) == (SECRET, None, "en")
     assert (s.vision, s.max_images, s.image_tokens) == (True, 8, None)
+    assert (s.nextext_api_base, s.nextext_api_key, s.nextext_timeout_s, s.nextext_enabled) == ("", None, 900.0, False)
 
 
 def test_an_unset_edge_secret_is_the_dev_fallback(loguru_caplog: LogCaptureFixture) -> None:
@@ -69,6 +71,37 @@ def test_a_workbench_key_switches_workbench_on() -> None:
     )
     assert (s.workbench_api_key, s.workbench_enabled) == (KEY, True)
     assert (s.workbench_api_base, s.openai_api_base) == ("http://workbench-api:8000", "http://vllm-router:4000/v1")
+
+
+def test_nextext_is_on_with_a_base_and_a_key() -> None:
+    """The base and the key together switch clips on; a trailing slash leaves the base; a short key stops startup."""
+    s = load_settings(
+        {**ENV, "NEXTEXT_API_BASE": "http://nextext-backend:8000/api/v1/", "NEXTEXT_API_KEY": NEXTEXT_KEY}
+    )
+    assert (s.nextext_api_base, s.nextext_api_key, s.nextext_enabled) == (
+        "http://nextext-backend:8000/api/v1",
+        NEXTEXT_KEY,
+        True,
+    )
+    assert NEXTEXT_KEY not in repr(s)
+    only_base = load_settings({**ENV, "NEXTEXT_API_BASE": "http://nextext-backend:8000/api/v1"})
+    assert (only_base.nextext_api_key, only_base.nextext_enabled) == (None, False)
+    only_key = load_settings({**ENV, "NEXTEXT_API_KEY": NEXTEXT_KEY})
+    assert (only_key.nextext_api_base, only_key.nextext_enabled) == ("", False)
+    short = "x" * 31
+    with pytest.raises(ValueError, match=r"NEXTEXT_API_KEY must be at least 32 characters long\.") as raised:
+        load_settings({**ENV, "NEXTEXT_API_KEY": short})
+    assert short not in str(raised.value)
+
+
+def test_nextext_timeout_is_seconds_from_60_to_86400() -> None:
+    """The clip budget is a finite number of seconds from 60 to 86400; anything else stops startup."""
+    assert load_settings({**ENV, "NEXTEXT_TIMEOUT": "1800"}).nextext_timeout_s == 1800.0
+    assert load_settings({**ENV, "NEXTEXT_TIMEOUT": "60"}).nextext_timeout_s == 60.0
+    message = r"NEXTEXT_TIMEOUT must be a number of seconds from 60 to 86400\."
+    for raw in ("59", "x", "inf", "nan", "86401"):
+        with pytest.raises(ValueError, match=message):
+            load_settings({**ENV, "NEXTEXT_TIMEOUT": raw})
 
 
 @pytest.mark.parametrize(("raw", "days"), [("off", None), ("30", 30), (" 90 ", 90)])

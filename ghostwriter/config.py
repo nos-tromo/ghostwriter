@@ -17,7 +17,7 @@ from ghostwriter.agent.limits import CONTEXT_TOKENS, MIN_CONTEXT_TOKENS
 from ghostwriter.utils.audit_event import ACTIONS
 from ghostwriter.utils.audit_runtime import parse_required_actions
 
-#: The shortest edge secret or workbench key the backend accepts.
+#: The shortest edge secret, workbench key or Nextext key the backend accepts.
 KEY_MIN_LENGTH: Final = 32
 #: The SQLite file on the ``ghostwriter-data`` volume.
 DB_PATH: Final = "/var/lib/ghostwriter/ghostwriter.sqlite3"
@@ -26,6 +26,9 @@ EDGE_SECRET_ENV: Final = "GHOSTWRITER_EDGE_SECRET"
 DEFAULT_IDENTITY_ENV: Final = "GHOSTWRITER_DEFAULT_IDENTITY"
 WORKBENCH_KEY_ENV: Final = "WORKBENCH_API_KEY"
 WORKBENCH_TIMEOUT_ENV: Final = "WORKBENCH_TIMEOUT"
+NEXTEXT_BASE_ENV: Final = "NEXTEXT_API_BASE"
+NEXTEXT_KEY_ENV: Final = "NEXTEXT_API_KEY"
+NEXTEXT_TIMEOUT_ENV: Final = "NEXTEXT_TIMEOUT"
 CHAT_DAYS_ENV: Final = "GHOSTWRITER_CHAT_RETENTION_DAYS"
 SPEECH_INPUT_ENV: Final = "GHOSTWRITER_SPEECH_INPUT"
 CONTEXT_TOKENS_ENV: Final = "GHOSTWRITER_CONTEXT_TOKENS"
@@ -40,6 +43,9 @@ MAX_NOTICE_DAYS: Final = 365
 MAX_IMAGES_LIMIT: Final = 32
 #: The most tokens ``GHOSTWRITER_IMAGE_CONTEXT_TOKENS`` may charge for one image.
 IMAGE_TOKENS_LIMIT: Final = 10_000
+#: The shortest and the longest ``NEXTEXT_TIMEOUT`` may be, in seconds.
+NEXTEXT_TIMEOUT_MIN_S: Final = 60
+NEXTEXT_TIMEOUT_MAX_S: Final = 86_400
 
 
 @dataclass(frozen=True)
@@ -66,6 +72,9 @@ class Settings:
         workbench_api_key: Ghostwriter's key at workbench; ``None`` switches
             tools and attachments off.
         workbench_timeout_s: The longest one tool call may take, in seconds.
+        nextext_api_base: Nextext's API base URL, without a trailing ``/``; empty switches video and audio off.
+        nextext_api_key: Ghostwriter's service token at Nextext; ``None`` switches video and audio off.
+        nextext_timeout_s: The longest one clip may take at Nextext, in seconds: upload, queue, run and downloads.
         file_days: How long workbench keeps a chat's files, in days.
         chat_days: How long a chat is kept after it starts, in days; ``None`` keeps chats.
         notice_days: How long a new or shorter chat period waits before it deletes.
@@ -89,6 +98,9 @@ class Settings:
     workbench_api_base: str
     workbench_api_key: str | None = field(repr=False)
     workbench_timeout_s: float
+    nextext_api_base: str
+    nextext_api_key: str | None = field(repr=False)
+    nextext_timeout_s: float
     file_days: int
     chat_days: int | None
     notice_days: int
@@ -101,6 +113,11 @@ class Settings:
     def workbench_enabled(self) -> bool:
         """Whether tools and attachments are on: workbench's key and base are both set."""
         return bool(self.workbench_api_key and self.workbench_api_base)
+
+    @property
+    def nextext_enabled(self) -> bool:
+        """Whether Nextext may be asked to transcribe clips: its key and base are both set."""
+        return bool(self.nextext_api_key and self.nextext_api_base)
 
 
 def _get(environ: Mapping[str, str], name: str) -> str | None:
@@ -216,6 +233,47 @@ def _timeout(environ: Mapping[str, str]) -> float:
     except ValueError:
         raise ValueError(message) from None
     if not math.isfinite(seconds) or seconds <= 0:
+        raise ValueError(message)
+    return seconds
+
+
+def _nextext_base(environ: Mapping[str, str]) -> str:
+    """Return Nextext's base URL without its trailing ``/``.
+
+    There is no default here: compose sets it, and empty turns video and audio off.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        The base URL, or ``""``.
+    """
+    return (_get(environ, NEXTEXT_BASE_ENV) or "").rstrip("/")
+
+
+def _nextext_timeout(environ: Mapping[str, str]) -> float:
+    """Return the clip budget at Nextext in seconds.
+
+    Args:
+        environ: The environment.
+
+    Returns:
+        The budget, 900 seconds while unset.
+
+    Raises:
+        ValueError: If it is not a finite number from 60 to 86400.
+    """
+    raw = _get(environ, NEXTEXT_TIMEOUT_ENV)
+    if raw is None:
+        return 900.0
+    message = (
+        f"{NEXTEXT_TIMEOUT_ENV} must be a number of seconds from {NEXTEXT_TIMEOUT_MIN_S} to {NEXTEXT_TIMEOUT_MAX_S}."
+    )
+    try:
+        seconds = float(raw)
+    except ValueError:
+        raise ValueError(message) from None
+    if not math.isfinite(seconds) or not NEXTEXT_TIMEOUT_MIN_S <= seconds <= NEXTEXT_TIMEOUT_MAX_S:
         raise ValueError(message)
     return seconds
 
@@ -415,6 +473,9 @@ def load_settings(environ: Mapping[str, str] = os.environ) -> Settings:
         workbench_api_base=_base(environ, "WORKBENCH_API_BASE", "http://workbench-api:8000"),
         workbench_api_key=_secret(environ, WORKBENCH_KEY_ENV),
         workbench_timeout_s=_timeout(environ),
+        nextext_api_base=_nextext_base(environ),
+        nextext_api_key=_secret(environ, NEXTEXT_KEY_ENV),
+        nextext_timeout_s=_nextext_timeout(environ),
         file_days=_days(environ, "WORKBENCH_RETENTION_DAYS", 7, 1, MAX_DAYS),
         chat_days=_chat_days(environ),
         notice_days=_days(environ, "RETENTION_NOTICE_DAYS", 30, 0, MAX_NOTICE_DAYS),
