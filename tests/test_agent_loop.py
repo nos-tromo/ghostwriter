@@ -1186,6 +1186,25 @@ def test_after_a_refusal_the_turn_is_offered_the_listing_without_images(loop_env
     assert [sent.images for sent in loop_env.workbench.calls] == [False]
 
 
+def test_after_a_refusal_the_clip_sentence_goes_with_the_images(loop_env: LoopEnv) -> None:
+    """A round refused with images is sent again, and the turn goes on, without the sentence on clips."""
+    workbench = _workbench_of(loop_env)
+    read = [call_chunk(0, "call_0", "read_document", VIEW_SCAN)]
+    loop_env.run(
+        _refused(),
+        read,
+        [text_chunk("Ohne Bild.")],
+        vision=True,
+        media=_clips(),
+        workbench=workbench,
+        attach=[_photo()],
+    )
+    first, again, last = (call["messages"][0]["content"] for call in loop_env.fake.calls)
+    assert MEDIA in first and VISION in first
+    assert MEDIA not in again and VISION not in again and MEDIA not in last and VISION not in last
+    assert [images for _, images in workbench.discoveries] == [True, False]
+
+
 def test_vision_with_a_workbench_that_shows_no_images_has_no_sight(loop_env: LoopEnv) -> None:
     """With vision on and no view_file listed, the turn goes as without vision: no picture, and no note of one.
 
@@ -1286,34 +1305,46 @@ def test_the_prompt_tells_the_model_how_to_look_only_with_vision(loop_env: LoopE
     ) in VISION
 
 
-def _clips(loop_env: LoopEnv, *, version: str = "0.9.0", healthy: bool = True) -> NextextHealth:
-    """Return Nextext's health as the app holds it, with workbench naming ``version``."""
-    discovery = loop_env.workbench.discovery
-    assert discovery is not None
-    loop_env.workbench.discovery = dataclasses.replace(discovery, server_version=version)
-    health = NextextHealth(NextextClient(loop_env.settings))
+def _clips(*, healthy: bool = True) -> NextextHealth:
+    """Return Nextext's health as the app holds it."""
+    health = NextextHealth(NextextClient(make_settings(Path("unused"))))
     health.healthy = healthy
     return health
+
+
+def _workbench_of(loop_env: LoopEnv, version: str = "0.9.0") -> FakeWorkbench:
+    """Return a workbench that names ``version``, apart from the env's own."""
+    found = FakeWorkbench(audit=loop_env.audit)
+    assert found.discovery is not None
+    found.discovery = dataclasses.replace(found.discovery, server_version=version)
+    return found
 
 
 def test_the_prompt_tells_the_model_of_clips_only_with_vision_and_media(loop_env: LoopEnv) -> None:
     """The clip sentence follows the sight sentence, only with tools, sight and clips offered at the turn.
 
-    Clips are offered while Nextext is healthy and workbench is 0.9.0 or later; the others keep their order.
+    Clips are offered while Nextext is healthy and the discovery the turn holds names workbench 0.9.0 or later,
+    which asks workbench for no further listing; the others keep their order.
     """
-    clips = _clips(loop_env)
-    loop_env.run([text_chunk("Hallo!")], vision=True, media=clips)
-    loop_env.run([text_chunk("Hallo!")], vision=True)
-    loop_env.run([text_chunk("Hallo!")], media=clips)
-    loop_env.run([text_chunk("Hallo!")], vision=True, media=clips, workbench=None)
-    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(loop_env, healthy=False))
-    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(loop_env, version="0.8.1"))
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(), workbench=_workbench_of(loop_env))
+    loop_env.run([text_chunk("Hallo!")], vision=True, workbench=_workbench_of(loop_env))
+    loop_env.run([text_chunk("Hallo!")], media=_clips(), workbench=_workbench_of(loop_env))
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(), workbench=None)
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(healthy=False), workbench=_workbench_of(loop_env))
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(), workbench=_workbench_of(loop_env, "0.8.1"))
     full, off, blind, toolless, down, old = (call["messages"][0]["content"] for call in loop_env.fake.calls)
     assert MEDIA in full and full.index(VISION) + len(VISION) + 1 == full.index(MEDIA)
     assert full.index(VISION) < full.index(MEDIA) < full.index(PRESENTATIONS) < full.index(DECK_CHECK)
     for prompt in (off, blind, toolless, down, old):
         assert MEDIA not in prompt
     assert VISION in off and VISION in down and VISION in old and VISION not in blind
+
+
+def test_a_turn_with_clips_asks_workbench_for_no_further_listing(loop_env: LoopEnv) -> None:
+    """The offer comes from the discovery the turn holds: one listing that takes images, as without clips."""
+    workbench = _workbench_of(loop_env)
+    loop_env.run([text_chunk("Hallo!")], vision=True, media=_clips(), workbench=workbench)
+    assert [images for _, images in workbench.discoveries] == [True]
 
 
 def test_view_file_on_a_clip_sends_no_strips(loop_env: LoopEnv) -> None:
@@ -1334,10 +1365,16 @@ def test_view_file_on_a_clip_sends_no_strips(loop_env: LoopEnv) -> None:
         call_chunk(0, "call_0", "view_file", json.dumps({"path": clip, "part": "at 00:04", "strips": 3})),
         call_chunk(1, "call_1", "read_document", json.dumps({"path": clip})),
     ]
+    workbench = _workbench_of(loop_env)
     loop_env.run(
-        calls, [text_chunk("Ok.")], vision=True, media=_clips(loop_env), attach=[("harbour-tour.mp4", manifest)]
+        calls,
+        [text_chunk("Ok.")],
+        vision=True,
+        media=_clips(),
+        workbench=workbench,
+        attach=[("harbour-tour.mp4", manifest)],
     )
-    assert [call.arguments for call in loop_env.workbench.calls] == [
+    assert [call.arguments for call in workbench.calls] == [
         {"path": clip, "part": "at 00:04"},
         {"path": clip},
     ]

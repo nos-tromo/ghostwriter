@@ -42,7 +42,7 @@ import math
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Final, Literal
+from typing import Any, Final, Literal, TypeGuard
 
 from loguru import logger
 
@@ -209,6 +209,24 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
     return None
 
 
+def _is_length(value: object) -> TypeGuard[int | float]:
+    """Tell whether a manifest's value is a clip's length in seconds.
+
+    Args:
+        value: The value.
+
+    Returns:
+        ``True`` for a finite number of zero or more that is no ``bool``; ``False`` for any other, an integer too
+        large for a float included.
+    """
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:
+        return False
+
+
 def _clip_told(manifest: Mapping[str, Any], name: str, *, seen: bool) -> str | None:
     """Say what a video or audio clip holds: its length, its frames and its transcript.
 
@@ -229,12 +247,7 @@ def _clip_told(manifest: Mapping[str, Any], name: str, *, seen: bool) -> str | N
     clip = media_kind(name)
     facts = clip
     duration = manifest.get("duration_s")
-    if (
-        isinstance(duration, int | float)
-        and not isinstance(duration, bool)
-        and math.isfinite(duration)
-        and duration >= 0
-    ):
+    if _is_length(duration):
         seconds = int(duration)
         hours, rest = divmod(seconds, 3600)
         clock = f"{hours}:{rest // 60:02d}:{rest % 60:02d}" if hours else f"{rest // 60:02d}:{rest % 60:02d}"

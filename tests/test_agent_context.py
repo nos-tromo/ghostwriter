@@ -1119,7 +1119,7 @@ def test_a_clips_line_reads_its_numbers_and_its_name_strictly() -> None:
     assert attachment_facts("media", _clip_manifest(12.0, 0), seen=True, name="VOICE-MEMO.M4A") == (
         "audio 00:12; transcript"
     )
-    not_lengths: list[Any] = [-1.0, float("nan"), float("inf"), True, "134", [], {}]
+    not_lengths: list[Any] = [-1.0, float("nan"), float("inf"), 10**400, True, "134", [], {}]
     for odd in not_lengths:
         manifest = _clip_manifest(None, 2)
         manifest["duration_s"] = odd

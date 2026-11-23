@@ -110,7 +110,7 @@ from ghostwriter.agent.tools import (
 from ghostwriter.config import Settings
 from ghostwriter.db import utcnow
 from ghostwriter.inference import ModelClient, inference_headers
-from ghostwriter.nextext import NextextHealth
+from ghostwriter.nextext import NextextHealth, serves_media
 from ghostwriter.schemas import ResultOut, StepOut
 from ghostwriter.store import ChatStore, UserTurn
 from ghostwriter.utils.audit_event import AuditWriteError
@@ -530,8 +530,8 @@ class AgentLoop:
             clock: The monotonic clock the wall is read from.
             now: The time of day, for the system prompt's date.
             vision: Whether the model sees, read at the start of each message; ``None`` sends no image.
-            media: Whether Nextext is up, which with workbench's version says whether clips are offered, read at
-                the start of each message; ``None`` while Nextext is off.
+            media: Whether Nextext is up (its ``healthy``), which with the version of the discovery the turn holds
+                says whether clips are offered, read at the start of each message; ``None`` while Nextext is off.
         """
         self._model = model
         self._workbench = workbench
@@ -621,8 +621,15 @@ class AgentLoop:
             plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
             return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
 
-        # The offer reads workbench's cached discovery: this runs on a turn thread, where it may block.
-        clips = sees and workbench is not None and self._media is not None and self._media.offered(workbench)
+        # Clips are offered as NextextHealth.offered says (Nextext healthy, workbench 0.9.0 or later), but from the
+        # discovery this turn already holds: no second listing is read on the turn thread.
+        clips = (
+            sees
+            and full is not None
+            and self._media is not None
+            and self._media.healthy
+            and serves_media(full.server_version)
+        )
         seeing = (
             self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
             if sees
