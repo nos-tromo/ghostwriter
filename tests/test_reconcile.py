@@ -299,7 +299,7 @@ def test_a_restart_deletes_the_orphan_before_the_requeued_clip_makes_its_job(
 
 
 async def test_the_start_reconcile_waits_for_the_probe(env: Env, monkeypatch: pytest.MonkeyPatch) -> None:
-    """While Nextext's health is not 200 nothing is listed; the list follows the first healthy probe."""
+    """While Nextext is not ready nothing is listed; the list follows the first healthy probe."""
     monkeypatch.setattr(nextext, "PROBE_FIRST_S", 0.02)
     env.fake.health = 503
     env.listed(ORPHAN, datetime.now(UTC) - timedelta(hours=1))
@@ -308,7 +308,7 @@ async def test_the_start_reconcile_waits_for_the_probe(env: Env, monkeypatch: py
     processor.start_media()
     probe = asyncio.create_task(health.run())
     try:
-        await _until(lambda: sum(r.url.path.endswith("/health") for r in env.fake.requests) >= 3)
+        await _until(lambda: sum(r.url.path.endswith("/ready") for r in env.fake.requests) >= 3)
         assert "list" not in env.fake.events
         env.fake.health = 200
         await _until(lambda: env.fake.deleted == [ORPHAN])
@@ -318,7 +318,7 @@ async def test_the_start_reconcile_waits_for_the_probe(env: Env, monkeypatch: py
             await probe
     routes = [(r.method, r.url.path.removeprefix("/api/v1")) for r in env.fake.requests]
     assert routes[-2:] == [("GET", "/jobs"), ("DELETE", f"/jobs/{ORPHAN}")]
-    assert len(routes) >= 4 and set(routes[:-2]) == {("GET", "/health")}
+    assert len(routes) >= 4 and set(routes[:-2]) == {("GET", "/ready")}
 
 
 async def test_a_reconcile_that_ends_after_the_probe_wait_lets_a_waiting_clip_through(
