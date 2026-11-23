@@ -295,9 +295,10 @@ def stock_manifest(path: str, roles: Collection[str] = ()) -> dict[str, Any]:
         as a pdf's pages are, the second without text. A Word or OpenDocument text file (``.docx``,
         ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. A clip (the 11 media
         suffixes): kind ``media``, unit ``frame``, and from what was posted for it: a ``nextext_jsonl``
-        gives ``transcript`` true and ``duration_s`` 91.0, a ``nextext_zip`` three frames of 1280 x 720,
-        neither no frames. Anything else: kind ``none``. The unit is ``page`` for every kind but a deck
-        and a clip, and ``duration_s`` is ``None`` and ``transcript`` false for every kind but a clip.
+        gives ``transcript`` true and a ``duration_s`` of 91.0, a ``nextext_zip`` three frames of 1280 x 720
+        at 0, 4 and 8 s and a ``duration_s`` of 8.0 (the later of the two when both were posted), neither no
+        frames and a ``duration_s`` of ``None``. Anything else: kind ``none``. The unit is ``page`` for every kind
+        but a deck and a clip, and ``duration_s`` is ``None`` and ``transcript`` false for every kind but a clip.
     """
     lower = path.lower()
     manifest: dict[str, Any] = {
@@ -314,14 +315,16 @@ def stock_manifest(path: str, roles: Collection[str] = ()) -> dict[str, Any]:
     }
     if lower.endswith(_MEDIA_SUFFIXES):
         frames = [{"n": n, "width": 1280, "height": 720, "mime": "image/jpeg", "bytes": 48213} for n in (1, 2, 3)]
-        spoken = "nextext_jsonl" in roles
+        spoken, framed = "nextext_jsonl" in roles, "nextext_zip" in roles
+        # As workbench writes it: the later of the last speech's end and the last frame's time (frames at 0, 4 and 8 s).
+        times = [*([91.0] if spoken else []), *([8.0] if framed else [])]
         return {
             **manifest,
             "kind": "media",
             "unit": "frame",
-            "total": 3 if "nextext_zip" in roles else 0,
-            "renditions": frames if "nextext_zip" in roles else [],
-            "duration_s": 91.0 if spoken else None,
+            "total": 3 if framed else 0,
+            "renditions": frames if framed else [],
+            "duration_s": max(times) if times else None,
             "transcript": spoken,
         }
     if lower.endswith(_IMAGE_SUFFIXES):

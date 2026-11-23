@@ -1248,6 +1248,36 @@ async def test_derived_closes_the_callers_stream() -> None:
     assert closed == ["answered", "refused", "unsent"]
 
 
+class ArtifactBroke(Exception):
+    """An invented failure of the stream an artifact comes in, as Nextext's own types are for the media step."""
+
+
+@pytest.mark.parametrize("exception", [ArtifactBroke, ValueError], ids=["artifact_broke", "value_error"])
+async def test_derived_hands_on_an_artifact_stream_that_fails_mid_body(
+    exception: type[Exception],
+) -> None:
+    """A stream that breaks while it is sent reaches the caller as itself; the clip gets no derived file.
+
+    workbench drops a body that ends early; the client reports no success and wraps nothing, so the media step
+    sees Nextext's own failure (an artifact past its cap, Nextext gone) and its own token.
+    """
+    closed: list[bool] = []
+
+    async def chunks() -> AsyncIterator[bytes]:
+        try:
+            yield TRANSCRIPT
+            raise exception("the artifact broke off")
+        finally:
+            closed.append(True)
+
+    door = FakeDoor()
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    with pytest.raises(exception) as raised:
+        await _client(door).derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=chunks())
+    assert type(raised.value) is exception and not isinstance(raised.value, WorkbenchUnavailable)
+    assert closed == [True] and door.derived == []
+
+
 async def test_a_media_manifest_is_read() -> None:
     """A clip is kind media and counts frames; the transcript and the duration are read and kept in the stored form."""
     door = FakeDoor()
@@ -1272,17 +1302,23 @@ async def test_a_media_manifest_is_read() -> None:
     assert json.loads(json.dumps(stored)) == stored
 
 
-async def test_a_clip_without_speech_has_no_transcript_and_may_have_no_duration() -> None:
-    """The frames alone are a manifest: no transcript, and a duration of ``null`` (an audio clip) or a number."""
+async def test_a_clip_without_speech_keeps_the_duration_its_frames_give() -> None:
+    """The frames alone are a manifest: no transcript, and the last frame's time as the duration, a float.
+
+    As workbench writes it, a duration is ``null`` only for a clip with neither speech nor frames; a whole number
+    reads as a float.
+    """
     door = FakeDoor()
     door.files[CLIP] = (CLIP_BYTES, "video/mp4")
     client = _client(door)
     await client.derived(call=CALL, source=CLIP, role="nextext_zip", chunks=_chunks(b"PK\x03\x04"))
     silent = await client.prepare(call=CALL, path=CLIP)
-    assert (silent.total, silent.transcript, silent.duration_s) == (3, False, None)
-    door.manifests[CLIP] = {**stock_manifest(CLIP), "duration_s": 40, "total": 0, "renditions": []}
+    assert (silent.total, silent.transcript, silent.duration_s) == (3, False, 8.0)
+    door.manifests[CLIP] = {**stock_manifest(CLIP), "duration_s": 40}
     whole = await client.prepare(call=CALL, path=CLIP)
     assert (whole.total, whole.duration_s) == (0, 40.0) and isinstance(whole.duration_s, float)
+    door.manifests[CLIP] = {**stock_manifest(CLIP), "duration_s": None}
+    assert (await client.prepare(call=CALL, path=CLIP)).duration_s is None
 
 
 @pytest.mark.parametrize(
@@ -1334,9 +1370,17 @@ async def test_a_media_manifest_without_its_unit_is_a_bad_answer() -> None:
     assert raised.value.token == "bad_answer"
 
 
-@pytest.mark.parametrize("duration", [float("inf"), float("-inf"), float("nan")], ids=["inf", "minus_inf", "nan"])
-async def test_a_duration_that_is_not_finite_is_a_bad_answer(duration: float) -> None:
-    """Python's JSON reads ``Infinity`` and ``NaN``; neither is a duration."""
+@pytest.mark.parametrize(
+    "duration",
+    [float("inf"), float("-inf"), float("nan"), 10**400, -(10**400)],
+    ids=["inf", "minus_inf", "nan", "too_large_for_a_float", "too_small_for_a_float"],
+)
+async def test_a_duration_that_is_not_a_finite_number_is_a_bad_answer(duration: float) -> None:
+    """Python's JSON reads ``Infinity``, ``NaN`` and integers of any size; none of them is a duration.
+
+    An integer too large for a float must end as ``bad_answer`` as any other bad value does, never as an
+    ``OverflowError``.
+    """
     door = FakeDoor()
     text = json.dumps({**stock_manifest(CLIP), "duration_s": duration})
     door.answers["/files/prepare"] = httpx.Response(

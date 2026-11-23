@@ -521,7 +521,12 @@ def _count(value: object) -> int | None:
 
 
 def _seconds(value: object) -> TypeGuard[int | float]:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value) and value >= 0
+    except OverflowError:  # an integer too large for a float is no duration either
+        return False
 
 
 def _ttl_s(result: Mapping[str, Any]) -> float:
