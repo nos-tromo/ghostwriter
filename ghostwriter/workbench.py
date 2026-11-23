@@ -34,8 +34,10 @@ Files. Uploads stream into the chat's folder as multipart, cut off past
 :data:`MAX_ATTACHMENT_BYTES`; views stream back; a chat's folder is deleted whole. A file is
 prepared (:meth:`WorkbenchClient.prepare`: its manifest, and its renders made) and its renders
 are viewed one by one (``view(rendition=...)``) or several at once
-(:meth:`WorkbenchClient.fetch_renditions`, from a thread). The REST routes run on the caller's
-event loop, each over a fresh client that takes no proxy either.
+(:meth:`WorkbenchClient.fetch_renditions`, from a thread). A clip's transcript and keyframes, which
+Nextext made, stream in as derived files of the clip (:meth:`WorkbenchClient.derived`, workbench 0.9),
+and its manifest then counts frames and says whether it has a transcript. The REST routes run on the
+caller's event loop, each over a fresh client that takes no proxy either.
 
 Every request carries the key, the user and the chat as keyed pseudonyms (HMAC-SHA256
 under ``WORKBENCH_API_KEY`` over a label, a NUL byte and the owner or the chat id, as 64
@@ -108,10 +110,22 @@ PREVIEW_COLUMNS = 20
 PREVIEW_ROWS = 5
 PREVIEW_CELL_CHARS = 100
 
-#: What a file is to the tools that show it: a picture, a PDF, an Office file drawn as pages or slides, or none.
-Kind = Literal["image", "pdf", "office", "none"]
-#: What an Office file's renders count: the pages of a document, or the slides of a deck.
-Unit = Literal["page", "slide"]
+#: What a file is to the tools that show it: a picture, a PDF, an Office file drawn as pages or slides, a video or
+#: audio clip shown as its frames, or none.
+Kind = Literal["image", "pdf", "office", "media", "none"]
+#: What a file's renders count: the pages of a document, the slides of a deck, or the frames of a clip.
+Unit = Literal["page", "slide", "frame"]
+#: What Nextext's artifact of a clip is to workbench: its transcript (JSON lines) or its keyframes (a zip).
+DerivedRole = Literal["nextext_jsonl", "nextext_zip"]
+
+#: The media type each role's artifact is sent as.
+DERIVED_TYPES: Final[dict[DerivedRole, str]] = {
+    "nextext_jsonl": "application/x-ndjson",
+    "nextext_zip": "application/zip",
+}
+#: Seconds workbench is waited for once it holds a whole artifact: the clip's lock for up to 120 s (a prepare of the
+#: same clip may hold it) and the work itself. The transfer comes before it and is bounded by the caller's own budget.
+DERIVED_TIMEOUT_S: Final = 150.0
 
 _PATH = "/mcp"
 # A picture's label, as workbench's ``shown`` writes it, and the largest side it names.
@@ -121,8 +135,14 @@ _MAX_SIDE = 4096
 _MAX_IMAGE_BASE64 = (MAX_IMAGE_BYTES + 2) // 3 * 4
 # The most of a refusal's body read for its token.
 _MAX_REFUSAL_BYTES = 16 * 1024
-_KINDS: Final[dict[str, Kind]] = {"image": "image", "pdf": "pdf", "office": "office", "none": "none"}
-_UNITS: Final[dict[str, Unit]] = {"page": "page", "slide": "slide"}
+_KINDS: Final[dict[str, Kind]] = {
+    "image": "image",
+    "pdf": "pdf",
+    "office": "office",
+    "media": "media",
+    "none": "none",
+}
+_UNITS: Final[dict[str, Unit]] = {"page": "page", "slide": "slide", "frame": "frame"}
 _ACCEPT = "application/json, text/event-stream"
 _USER_LABEL = b"workbench-user/v1"
 _SESSION_LABEL = b"workbench-session/v1"
@@ -324,13 +344,18 @@ class Manifest:
 
     Attributes:
         kind: ``image``, ``pdf``, ``office`` for a Word, PowerPoint or OpenDocument text file drawn as pages
-            or slides, or ``none`` for a file that is not shown as pictures.
-        total: The pages of a PDF or an Office file, or its slides; 1 for a picture; 0 for ``none``.
+            or slides, ``media`` for a video or audio clip, or ``none`` for a file that is not shown as pictures.
+        total: The pages of a PDF or an Office file, or its slides, or the frames of a clip (0 for audio); 1 for a
+            picture; 0 for ``none``.
         pages_without_text: The pages or slides with no text of their own, counted from 1.
         renditions: The renders that exist now.
         frames: The frames of a picture that has several, of which only the first is shown; else ``None``.
-        unit: What ``total`` and the renders count: ``slide`` for a deck, else ``page``; an answer of workbench 0.7
-            names none, and reads as ``page``.
+        unit: What ``total`` and the renders count: ``slide`` for a deck, ``frame`` for a clip, else ``page``; an
+            answer of workbench 0.7 names none, and reads as ``page``.
+        duration_s: A clip's length in seconds, when workbench knows it; ``None`` for any other file, and for a
+            manifest of workbench before 0.9.
+        transcript: Whether a clip has a transcript, which ``read_document`` reads; false for any other file, and
+            for a manifest of workbench before 0.9.
     """
 
     kind: Kind
@@ -339,9 +364,11 @@ class Manifest:
     renditions: tuple[Rendition, ...]
     frames: int | None
     unit: Unit = "page"
+    duration_s: float | None = None
+    transcript: bool = False
 
     def as_stored(self) -> dict[str, Any]:
-        """Return what a chat keeps of the manifest: its six counts and kinds, never a path or a hint.
+        """Return what a chat keeps of the manifest: its eight counts and kinds, never a path or a hint.
 
         Returns:
             The keys of ``STORED_MANIFEST_KEYS`` as plain JSON values.
@@ -355,6 +382,8 @@ class Manifest:
             ],
             "frames": self.frames,
             "unit": self.unit,
+            "duration_s": self.duration_s,
+            "transcript": self.transcript,
         }
 
 
@@ -489,6 +518,10 @@ def _is_int(value: object) -> bool:
 
 def _count(value: object) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _seconds(value: object) -> TypeGuard[int | float]:
+    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value) and value >= 0
 
 
 def _ttl_s(result: Mapping[str, Any]) -> float:
@@ -915,17 +948,22 @@ def _manifest(answer: object) -> Manifest | None:
 
     Returns:
         The manifest; ``None`` when it is not an object with a known ``kind``, a count for ``total``,
-        pages counted from 1, renditions of a jpeg or png, a frame count or ``null`` and a ``unit`` of
-        ``page`` or ``slide``, which reads as ``page`` when the answer names none (workbench 0.7). Its
-        ``path`` and ``hint`` are not read.
+        pages counted from 1, renditions of a jpeg or png, a frame count or ``null``, a ``unit`` of
+        ``page``, ``slide`` or ``frame``, which reads as ``page`` when the answer names none (workbench 0.7),
+        a ``duration_s`` that is ``null`` or a finite number from 0 and a ``transcript`` that is a bool (both
+        read as ``None`` and false when the answer names none, as before workbench 0.9). A clip (kind
+        ``media``) counts ``frame`` units. Its ``path`` and ``hint`` are not read.
     """
     if not isinstance(answer, dict):
         return None
     kind, total, frames = answer.get("kind"), _count(answer.get("total")), answer.get("frames")
     pages, listed, unit = answer.get("pages_without_text"), answer.get("renditions"), answer.get("unit", "page")
+    duration, transcript = answer.get("duration_s"), answer.get("transcript", False)
     if not isinstance(kind, str) or kind not in _KINDS or total is None:
         return None
-    if not isinstance(unit, str) or unit not in _UNITS:
+    if not isinstance(unit, str) or unit not in _UNITS or (kind == "media" and unit != "frame"):
+        return None
+    if not (duration is None or _seconds(duration)) or not isinstance(transcript, bool):
         return None
     if (
         not isinstance(pages, list)
@@ -937,7 +975,16 @@ def _manifest(answer: object) -> Manifest | None:
     renditions = tuple(item for item in (_rendition(entry) for entry in listed) if item is not None)
     if len(numbers) < len(pages) or len(renditions) < len(listed):
         return None
-    return Manifest(_KINDS[kind], total, numbers, renditions, frames, _UNITS[unit])
+    return Manifest(
+        _KINDS[kind],
+        total,
+        numbers,
+        renditions,
+        frames,
+        _UNITS[unit],
+        None if duration is None else float(duration),
+        transcript,
+    )
 
 
 def _view_params(path: str, rendition: int | None, strips: int, strip: int | None) -> dict[str, str | int]:
@@ -1429,6 +1476,61 @@ class WorkbenchClient:
             len(manifest.renditions),
         )
         return manifest
+
+    async def derived(self, *, call: CallFor, source: str, role: DerivedRole, chunks: AsyncIterator[bytes]) -> str:
+        """Stream one of Nextext's artifacts into workbench, as a derived file of a clip of the chat (workbench 0.9).
+
+        Args:
+            call: The chat.
+            source: The clip's path in the chat's folder.
+            role: What the artifact is: ``nextext_jsonl`` (the transcript) or ``nextext_zip`` (the keyframes); it
+                is sent as that role's media type.
+            chunks: The artifact's bytes, as they arrive; closed when the call returns or raises.
+
+        Returns:
+            The derived file's id, 32 hex digits.
+
+        Raises:
+            WorkbenchNotFound: When the chat has no such clip, or workbench has none meanwhile; a source outside its
+                folder is not asked for.
+            StorageFull: On workbench's ``507``.
+            WorkbenchUnavailable: On any other failure. Its token is the one a ``422`` names (``unreadable_file``,
+                ``unsupported_format``), ``http:<status>`` (``http:413`` for an artifact too large, ``http:503``
+                for a clip whose lock was not free in time), ``bad_answer`` for an answer without a valid id, or
+                ``timeout`` and ``unreachable``.
+        """
+        try:
+            return await self._derived(call, source, role, chunks)
+        finally:
+            aclose = getattr(chunks, "aclose", None)
+            if aclose is not None:
+                await aclose()
+
+    async def _derived(self, call: CallFor, source: str, role: DerivedRole, chunks: AsyncIterator[bytes]) -> str:
+        with _rest_errors("derived"):
+            key = self._required_key()
+            if _inside(chat_folder(key, call.chat_id), source) is None:
+                raise WorkbenchNotFound("not_found")
+            headers = {**self._headers(key, call), "Accept-Encoding": "identity", "Content-Type": DERIVED_TYPES[role]}
+            # The read limit starts when the whole body is sent, so the call is the transfer plus DERIVED_TIMEOUT_S.
+            async with (
+                self._http(DERIVED_TIMEOUT_S) as client,
+                client.stream(
+                    "POST", "/files/derived", params={"source": source, "role": role}, content=chunks, headers=headers
+                ) as response,
+            ):
+                if response.status_code == 404:
+                    raise WorkbenchNotFound("not_found")
+                if response.status_code == 507:
+                    raise StorageFull
+                if response.status_code == 422:
+                    raise WorkbenchUnavailable(await _refusal_token(response))
+                answer = await _json_answer(response)
+            file_id = answer.get("id") if isinstance(answer, dict) else None
+            if not isinstance(file_id, str) or not FILE_ID.fullmatch(file_id):
+                raise WorkbenchUnavailable("bad_answer")
+        logger.debug("workbench took a derived file '{}' of role {}", file_id, role)
+        return file_id
 
     @contextlib.asynccontextmanager
     async def view(

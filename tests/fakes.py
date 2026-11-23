@@ -1,7 +1,7 @@
 """Stand-ins for Ghostwriter's neighbours, built from the shared contract alone.
 
 :class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
-REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``.
+REST routes ``/files/upload``, ``/files/prepare``, ``/files/derived``, ``/files/view`` and ``/files/chat``.
 :class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
 builders :func:`text_chunk`, :func:`reasoning_chunk`, :func:`call_chunk` and
 :func:`usage_chunk`. :class:`FakeWorkbench` and :class:`RecordingAudit` are workbench
@@ -14,7 +14,7 @@ import base64
 import dataclasses
 import json
 import re
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
 from typing import Any, Final, cast
@@ -50,6 +50,8 @@ SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": SERVER_VERSION
 OUTPUT_ID = "0" * 32
 #: The id the door gives every upload, unless a test sets another.
 UPLOAD_ID = "1" * 32
+#: The id the door gives every derived file, unless a test scripts another answer.
+DERIVED_ID = "2" * 32
 NOT_FOUND = {"detail": "not found"}
 #: Bytes that pass the signature check of a jpeg and of a png, and no more.
 TINY_JPEG = b"\xff\xd8\xff\xe0" + bytes(60)
@@ -57,6 +59,9 @@ TINY_PNG = b"\x89PNG\r\n\x1a\n" + bytes(56)
 #: The header workbench 0.7 lists ``view_file`` and attaches images for.
 ACCEPT_IMAGES_HEADER = "x-accept-images"
 _IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".heif")
+_MEDIA_SUFFIXES = (".mp4", ".mov", ".m4v", ".webm", ".mkv", ".mp3", ".m4a", ".wav", ".ogg", ".opus", ".flac")
+#: The roles workbench 0.9 takes a derived file for: a clip's transcript and its keyframes.
+_DERIVED_ROLES = frozenset({"nextext_jsonl", "nextext_zip"})
 
 #: What workbench 0.7 tells a call that takes no images of ``read_document``: 0.6's text, which promises none.
 READ_DOCUMENT_TEXT = "Read a document as text, from its text layer only."
@@ -90,6 +95,7 @@ _ROUTES = frozenset(
         ("POST", "/files/upload"),
         ("DELETE", "/files/upload"),
         ("POST", "/files/prepare"),
+        ("POST", "/files/derived"),
         ("GET", "/files/view"),
         ("DELETE", "/files/chat"),
     }
@@ -276,18 +282,22 @@ def view_result(folder: str, shown: list[dict[str, Any]], blocks: list[dict[str,
     }
 
 
-def stock_manifest(path: str) -> dict[str, Any]:
-    """Return the manifest the door gives a stored file, by its suffix: workbench 0.8's eight keys.
+def stock_manifest(path: str, roles: Collection[str] = ()) -> dict[str, Any]:
+    """Return the manifest the door gives a stored file, by its suffix: workbench 0.9's ten keys.
 
     Args:
         path: The file's path.
+        roles: The roles of the derived files posted for it; read for a clip only.
 
     Returns:
         A picture: one 64 x 48 rendition. A pdf: three pages of 1131 x 1600, the second without
         text. A deck (``.pptx``, ``.potx``): kind ``office``, unit ``slide``, three slides drawn
         as a pdf's pages are, the second without text. A Word or OpenDocument text file (``.docx``,
-        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. Anything else: kind
-        ``none``. The unit is ``page`` for every kind but a deck.
+        ``.dotx``, ``.odt``): kind ``office``, three pages, none without text. A clip (the 11 media
+        suffixes): kind ``media``, unit ``frame``, and from what was posted for it: a ``nextext_jsonl``
+        gives ``transcript`` true and ``duration_s`` 91.0, a ``nextext_zip`` three frames of 1280 x 720,
+        neither no frames. Anything else: kind ``none``. The unit is ``page`` for every kind but a deck
+        and a clip, and ``duration_s`` is ``None`` and ``transcript`` false for every kind but a clip.
     """
     lower = path.lower()
     manifest: dict[str, Any] = {
@@ -299,7 +309,21 @@ def stock_manifest(path: str) -> dict[str, Any]:
         "frames": None,
         "unit": "page",
         "hint": None,
+        "duration_s": None,
+        "transcript": False,
     }
+    if lower.endswith(_MEDIA_SUFFIXES):
+        frames = [{"n": n, "width": 1280, "height": 720, "mime": "image/jpeg", "bytes": 48213} for n in (1, 2, 3)]
+        spoken = "nextext_jsonl" in roles
+        return {
+            **manifest,
+            "kind": "media",
+            "unit": "frame",
+            "total": 3 if "nextext_zip" in roles else 0,
+            "renditions": frames if "nextext_zip" in roles else [],
+            "duration_s": 91.0 if spoken else None,
+            "transcript": spoken,
+        }
     if lower.endswith(_IMAGE_SUFFIXES):
         rendition = {"n": 1, "width": 64, "height": 48, "mime": "image/jpeg", "bytes": len(TINY_JPEG)}
         return {**manifest, "kind": "image", "total": 1, "renditions": [rendition]}
@@ -354,11 +378,13 @@ class FakeDoor:
     no session. It answers ``/mcp`` by method and the REST
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
-    folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare`` and
-    ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
+    folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare``,
+    ``/files/derived`` and ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
     with its path, size and :attr:`upload_id`; a take-back deletes a stored file of the chat (404 for none); a
-    prepare answers the file's manifest; a view serves a stored file of the chat, or with ``rendition`` one of its
-    renders.
+    prepare answers the file's manifest, a clip's from the derived files posted for it
+    (:func:`stock_manifest`); a derived file is recorded in :attr:`derived` and answered with its id, role and size
+    (404 for a source the chat does not hold, 422 for another role or an empty body); a view serves a stored file
+    of the chat, or with ``rendition`` one of its renders.
 
     As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
     ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
@@ -370,6 +396,7 @@ class FakeDoor:
         answers: The scripted answers, by MCP method or REST path.
         delays: Seconds to wait before answering, by MCP method or REST path.
         files: The stored files, by path: their bytes and media type.
+        derived: The derived files posted, in order: the source's path, the role and the body.
         manifests: The manifest to answer for a path, instead of :func:`stock_manifest`'s.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
@@ -392,11 +419,13 @@ class FakeDoor:
             "/files/upload": None,
             TAKE_BACK: None,
             "/files/prepare": None,
+            "/files/derived": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
         }
         self.delays: dict[str, float] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
+        self.derived: list[tuple[str, str, bytes]] = []
         self.manifests: dict[str, dict[str, Any]] = {}
         self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
@@ -459,6 +488,8 @@ class FakeDoor:
             return self._store(request, body, folder)
         if answer is None and path == "/files/prepare":
             return self._prepare(request, folder)
+        if answer is None and path == "/files/derived":
+            return self._derive(request, folder)
         if answer is None and path == "/files/view":
             return self._serve(request, folder)
         return httpx.Response(200, json=answer)
@@ -534,7 +565,9 @@ class FakeDoor:
             return None
         if path in self.manifests:
             return self.manifests[path]
-        return stock_manifest(path) if path in self.files else None
+        if path not in self.files:
+            return None
+        return stock_manifest(path, [role for source, role, _ in self.derived if source == path])
 
     def _prepare(self, request: httpx.Request, folder: str) -> httpx.Response:
         """Answer a prepare with the file's manifest.
@@ -548,6 +581,29 @@ class FakeDoor:
         """
         manifest = self._manifest_of(request.url.params.get("path", ""), folder)
         return httpx.Response(404, json=NOT_FOUND) if manifest is None else httpx.Response(200, json=manifest)
+
+    def _derive(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Take a derived file of a stored file of the chat, as workbench 0.9 does for Ghostwriter.
+
+        Args:
+            request: The post: ``source`` and ``role`` query parameters, the artifact as the raw body.
+            folder: The chat's folder.
+
+        Returns:
+            ``id``, ``role``, ``bytes`` and ``replaced`` (``None``); 404 for a source the chat does not hold, 422
+            for a role it does not know and for an empty body.
+        """
+        source, role = request.url.params.get("source", ""), request.url.params.get("role", "")
+        if not source.startswith(f"{folder}/") or source not in self.files:
+            return httpx.Response(404, json=NOT_FOUND)
+        if role not in _DERIVED_ROLES:
+            return httpx.Response(422, json={"detail": [{"loc": ["query", "role"], "msg": "unknown role"}]})
+        if not request.content:
+            return httpx.Response(422, json={"detail": "unreadable_file: the artifact is empty"})
+        self.derived.append((source, role, request.content))
+        return httpx.Response(
+            200, json={"id": DERIVED_ID, "role": role, "bytes": len(request.content), "replaced": None}
+        )
 
     def _render(self, request: httpx.Request, path: str, folder: str) -> httpx.Response:
         """Serve one render of a file of the chat: a page, a picture or one of its strips.

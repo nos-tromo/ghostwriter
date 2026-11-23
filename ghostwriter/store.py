@@ -57,7 +57,16 @@ FILES_STORE: Final = "files"
 #: The longest title the first message gives a chat.
 TITLE_CHARS: Final = 60
 #: What a manifest keeps of what workbench reports: counts, kinds and sizes, never a path, a hint or bytes.
-STORED_MANIFEST_KEYS: Final = ("kind", "total", "pages_without_text", "renditions", "frames", "unit")
+STORED_MANIFEST_KEYS: Final = (
+    "kind",
+    "total",
+    "pages_without_text",
+    "renditions",
+    "frames",
+    "unit",
+    "duration_s",
+    "transcript",
+)
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
 
