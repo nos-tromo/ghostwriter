@@ -20,7 +20,17 @@ from ghostwriter.audit import (
 )
 from ghostwriter.utils.audit_event import Actor, AuditWriteError, Purpose
 from ghostwriter.utils.audit_runtime import encode_purpose
-from tests.conftest import KEY, SECRET, CapturedAuditStream, as_user, events, make_settings, probe_app
+from tests.conftest import (
+    KEY,
+    NEXTEXT_BASE,
+    NEXTEXT_KEY,
+    SECRET,
+    CapturedAuditStream,
+    as_user,
+    events,
+    make_settings,
+    probe_app,
+)
 
 ACTOR = Actor("user-a", "edge")
 HEX_ID = re.compile(r"[0-9a-f]{32}")
@@ -230,13 +240,12 @@ def test_the_chain_opens_with_the_operating_mode(client: TestClient, audit_strea
 
 def test_the_operating_mode_says_whether_media_is_on(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:
     """With Nextext's base and key set the start-up record says media is on; the key itself is never written."""
-    nextext_key = "n" * 32
-    settings = make_settings(tmp_path, nextext_api_base="http://nextext.test/api/v1", nextext_api_key=nextext_key)
+    settings = make_settings(tmp_path, nextext_api_base=NEXTEXT_BASE, nextext_api_key=NEXTEXT_KEY)
     with TestClient(probe_app(settings, audit_stream)):
         pass
     mode = events(audit_stream)[1]
     assert (mode["operation"], mode["criteria"]["media"]) == ("config.audit", True)
-    assert nextext_key not in audit_stream.getvalue()
+    assert NEXTEXT_KEY not in audit_stream.getvalue()
 
 
 def test_a_failed_audit_write_refuses_the_request(tmp_path: Path, audit_stream: CapturedAuditStream) -> None:

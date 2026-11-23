@@ -5,13 +5,15 @@ REST routes ``/files/upload``, ``/files/view`` and ``/files/chat``.
 :class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
 builders :func:`text_chunk`, :func:`reasoning_chunk`, :func:`call_chunk` and
 :func:`usage_chunk`. :class:`FakeWorkbench` and :class:`RecordingAudit` are workbench
-and a turn's audit as the agent loop reaches them. Every name, id and value here is
+and a turn's audit as the agent loop reaches them. :class:`FakeNextext` is Nextext's
+``/api/v1`` as Ghostwriter's service token reaches it. Every name, id and value here is
 invented.
 """
 
 import base64
 import dataclasses
 import json
+import re
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -38,7 +40,7 @@ from ghostwriter.workbench import (
     ToolResult,
     WorkbenchClient,
 )
-from tests.conftest import KEY
+from tests.conftest import KEY, NEXTEXT_KEY
 
 XLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 SERVER_META = {META_SERVER_INFO: {"name": "workbench", "version": "0.3.0"}}
@@ -1102,3 +1104,267 @@ class FakeWorkbench:
         """
         self.fetched.append(tuple(wanted))
         return [None if item.path in self.missing else ("image/jpeg", TINY_JPEG) for item in wanted]
+
+
+# --- Nextext -----------------------------------------------------------------
+
+#: The id of the first job a :class:`FakeNextext` creates.
+JOB_ID = "3f9c1d2e7a4b4c58b1e60d93a7f20c14"
+#: When every job of the fake was created, as Nextext writes it.
+JOB_CREATED_AT = "2026-11-22T22:54:00.912174Z"
+#: The error text a failed job of the fake carries: the client must never log it.
+FAILURE_TEXT = "The speech endpoint refused the clip at 00:12"
+_NEXTEXT_PATH = "/api/v1"
+_ARTIFACT_PATH = re.compile(r"/jobs/(?P<job>[^/]+)/artifacts/(?P<name>[^/]+)")
+_JOB_PATH = re.compile(r"/jobs/(?P<job>[^/]+)")
+_ARTIFACT_CHUNK = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class NextextUpload:
+    """What a create sent, for assertions only.
+
+    Attributes:
+        headers: The request's headers.
+        body: The whole body.
+    """
+
+    headers: httpx.Headers
+    body: bytes
+
+
+@dataclass(frozen=True)
+class JobUpload:
+    """A create's multipart body, parsed as Nextext's route (Starlette on python-multipart) reads it.
+
+    Attributes:
+        options: The decoded ``options`` field.
+        filename: The ``file`` part's file name.
+        content_type: Its media type.
+        data: Its bytes.
+    """
+
+    options: dict[str, Any]
+    filename: str
+    content_type: str
+    data: bytes
+
+
+async def parse_job_upload(upload: NextextUpload) -> JobUpload:
+    """Parse the body of a create.
+
+    Args:
+        upload: What the fake recorded.
+
+    Returns:
+        The options, and the file part.
+
+    Raises:
+        AssertionError: When the body holds no ``options`` text or no ``file`` part.
+    """
+
+    async def body() -> Any:
+        yield upload.body
+
+    headers = Headers({"content-type": upload.headers["content-type"]})
+    form = await MultiPartParser(headers, body()).parse()
+    try:
+        options, part = form.get("options"), form.get("file")
+        assert isinstance(options, str) and isinstance(part, UploadFile)
+        return JobUpload(json.loads(options), part.filename or "", part.content_type or "", await part.read())
+    finally:
+        await form.close()
+
+
+class FakeNextext:
+    """Nextext 1.21's ``/api/v1`` as Ghostwriter's service token reaches it, for ``httpx.MockTransport``.
+
+    It refuses a wrong key (401, ``/health`` apart), a list without ``X-Audit-Purpose`` (428, as Nextext's
+    default does) and any other route (404). A create answers ``201 {job_id, status, created_at}``; each job
+    then answers every ``GET /jobs`` with the next of :attr:`statuses`, the last repeated, until it is deleted or
+    has left the list after :attr:`vanish_after` polls. A list item has the keys Nextext 1.21 serves, and the list
+    holds no job of another caller but those in :attr:`listed`. An artifact answers ``200`` with the
+    ``Content-Length`` Nextext's in-memory render has, or its scripted status; a job that is gone answers
+    ``404``. A ``DELETE`` answers ``204``, or ``404`` for a job that is not there.
+
+    Attributes:
+        key: The service token the fake accepts.
+        statuses: The status of a job at each poll, in order; the last one repeats.
+        error_code: The ``error_code`` of a list item.
+        skipped: The ``skipped`` flag of a list item.
+        skip_reason_code: The ``skip_reason_code`` of a list item.
+        artifacts: By artifact name, the bytes served, or an ``int`` that is the status answered instead.
+        declared: By artifact name, the ``Content-Length`` to claim; ``None`` claims none (a chunked body).
+        create_status: The status a create answers; ``201`` creates a job.
+        create_body: A body to answer a create with instead of the job's, with ``201``.
+        list_status: The status ``GET /jobs`` answers.
+        delete_status: A status every ``DELETE`` answers with, instead of ``204`` or ``404``.
+        health: The status ``GET /health`` answers.
+        vanish_after: The polls a job is listed for before it leaves the list (Nextext restarted); ``None`` never.
+        listed: Other jobs, as list items.
+        raises: An exception to raise on every request, as a connection that fails does.
+        requests: Every request, in order.
+        uploads: Every create's headers and body.
+        deleted: The ids of the jobs a ``DELETE`` removed, in order.
+        events: ``"create"``, ``"list"`` and ``"delete:<id>"``, in order.
+        served: The names of the artifacts whose body the fake started to send.
+        jobs: The jobs created, by id: how many times each was polled.
+    """
+
+    def __init__(self, key: str = NEXTEXT_KEY) -> None:
+        """Answer as a healthy Nextext does: one job that completes at its first poll, with both artifacts.
+
+        Args:
+            key: The service token the fake accepts.
+        """
+        self.key = key
+        self.statuses: list[str] = ["completed"]
+        self.error_code: str | None = None
+        self.skipped = False
+        self.skip_reason_code: str | None = None
+        self.artifacts: dict[str, bytes | int] = {
+            "docint.jsonl": b'{"text": "hello"}\n',
+            "keyframes.zip": b"PK\x03\x04",
+        }
+        self.declared: dict[str, int | None] = {}
+        self.create_status = 201
+        self.create_body: dict[str, Any] | None = None
+        self.list_status = 200
+        self.delete_status: int | None = None
+        self.health = 200
+        self.vanish_after: int | None = None
+        self.listed: list[Any] = []
+        self.raises: Exception | None = None
+        self.requests: list[httpx.Request] = []
+        self.uploads: list[NextextUpload] = []
+        self.deleted: list[str] = []
+        self.events: list[str] = []
+        self.served: list[str] = []
+        self.jobs: dict[str, int] = {}
+
+    def _status(self, polls: int) -> str:
+        """Return a job's status at its poll number ``polls``, counted from 0.
+
+        Args:
+            polls: How many times the job was listed before.
+
+        Returns:
+            The scripted status; the last repeats.
+        """
+        return self.statuses[min(polls, len(self.statuses) - 1)]
+
+    def item(self, job_id: str, status: str, **changes: Any) -> dict[str, Any]:
+        """Build a list item, with the keys Nextext 1.21 serves.
+
+        Args:
+            job_id: The job.
+            status: Its status.
+            **changes: Keys to set.
+
+        Returns:
+            The item.
+        """
+        failed = status == "failed"
+        item: dict[str, Any] = {
+            "created_at": JOB_CREATED_AT,
+            "error": FAILURE_TEXT if failed else None,
+            "error_code": self.error_code,
+            "file_name": "media.mp4",
+            "finished_at": None if status in ("queued", "running") else JOB_CREATED_AT,
+            "job_id": job_id,
+            "progress": 1.0 if status == "completed" else 0.0,
+            "skip_reason_code": self.skip_reason_code,
+            "skipped": self.skipped,
+            "stage": None,
+            "started_at": None if status == "queued" else JOB_CREATED_AT,
+            "status": status,
+            "task": "transcribe",
+        }
+        return {**item, **changes}
+
+    async def __call__(self, request: httpx.Request) -> httpx.Response:
+        """Record the request and answer it.
+
+        Args:
+            request: The request the client sent, its body read.
+
+        Returns:
+            The answer.
+
+        Raises:
+            Exception: :attr:`raises`, when it is set.
+        """
+        self.requests.append(request)
+        if self.raises is not None:
+            raise self.raises
+        path = request.url.path
+        if not path.startswith(_NEXTEXT_PATH + "/"):
+            return httpx.Response(404, json=NOT_FOUND)
+        route = path.removeprefix(_NEXTEXT_PATH)
+        if (request.method, route) == ("GET", "/health"):
+            return httpx.Response(self.health, json={"status": "ok", "inference": True})
+        if request.headers.get("authorization") != f"Bearer {self.key}":
+            return httpx.Response(401, json={"detail": "unauthorized"})
+        if (request.method, route) == ("POST", "/jobs"):
+            return self._create(request)
+        if (request.method, route) == ("GET", "/jobs"):
+            return self._list(request)
+        if (found := _ARTIFACT_PATH.fullmatch(route)) and request.method == "GET":
+            return self._artifact(found["job"], found["name"])
+        if (found := _JOB_PATH.fullmatch(route)) and request.method == "DELETE":
+            return self._delete(found["job"])
+        return httpx.Response(404, json=NOT_FOUND)
+
+    def _create(self, request: httpx.Request) -> httpx.Response:
+        self.events.append("create")
+        self.uploads.append(NextextUpload(request.headers, request.content))
+        if self.create_status != 201:
+            return httpx.Response(self.create_status, json={"detail": "refused"})
+        if self.create_body is not None:
+            return httpx.Response(201, json=self.create_body)
+        job_id = JOB_ID if not self.jobs else f"{JOB_ID[:-4]}{len(self.jobs):04x}"
+        self.jobs[job_id] = 0
+        return httpx.Response(201, json={"job_id": job_id, "status": "queued", "created_at": JOB_CREATED_AT})
+
+    def _list(self, request: httpx.Request) -> httpx.Response:
+        self.events.append("list")
+        if "x-audit-purpose" not in request.headers:
+            return httpx.Response(428, json={"detail": "purpose required"})
+        if self.list_status != 200:
+            return httpx.Response(self.list_status, json={"detail": "refused"})
+        jobs: list[dict[str, Any]] = []
+        for job_id, polls in list(self.jobs.items()):
+            if job_id in self.deleted:
+                continue
+            self.jobs[job_id] = polls + 1
+            if self.vanish_after is not None and polls >= self.vanish_after:
+                continue
+            jobs.append(self.item(job_id, self._status(polls)))
+        return httpx.Response(200, json={"jobs": [*jobs, *self.listed]})
+
+    def _artifact(self, job_id: str, name: str) -> httpx.Response:
+        if job_id not in self.jobs or job_id in self.deleted:
+            return httpx.Response(404, json=NOT_FOUND)
+        served = self.artifacts.get(name, 404)
+        if isinstance(served, int):
+            return httpx.Response(served, json={"detail": "no such artifact"} if served == 404 else {})
+        headers: dict[str, str] = {"Content-Type": "application/octet-stream"}
+        declared = self.declared.get(name, len(served))
+        if declared is not None:
+            headers["Content-Length"] = str(declared)
+
+        async def body() -> Any:
+            self.served.append(name)
+            for start in range(0, len(served), _ARTIFACT_CHUNK):
+                yield served[start : start + _ARTIFACT_CHUNK]
+
+        return httpx.Response(200, headers=headers, content=body())
+
+    def _delete(self, job_id: str) -> httpx.Response:
+        self.events.append(f"delete:{job_id}")
+        if self.delete_status is not None:
+            return httpx.Response(self.delete_status, json={"detail": "refused"})
+        if job_id not in self.jobs or job_id in self.deleted:
+            return httpx.Response(404, json=NOT_FOUND)
+        self.deleted.append(job_id)
+        return httpx.Response(204)

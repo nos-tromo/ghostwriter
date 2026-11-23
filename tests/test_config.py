@@ -8,11 +8,10 @@ from fastapi.testclient import TestClient
 
 from ghostwriter.config import load_settings
 from ghostwriter.main import create_app
-from tests.conftest import KEY, SECRET, make_settings
+from tests.conftest import KEY, NEXTEXT_KEY, SECRET, make_settings
 
 ENV = {"GHOSTWRITER_EDGE_SECRET": SECRET}
 ROUTER_KEY = "router-key-0001"
-NEXTEXT_KEY = "n" * 32
 
 
 def test_defaults_match_the_contract() -> None:

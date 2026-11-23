@@ -29,6 +29,10 @@ from ghostwriter.utils.audit_event import AuditWriteError, verify_chain
 SECRET = "s" * 32
 #: Ghostwriter's workbench key in tests.
 KEY = "k" * 32
+#: Ghostwriter's service token at Nextext in tests, as long as the backend requires.
+NEXTEXT_KEY = "n" * 32
+#: Nextext's API base in tests.
+NEXTEXT_BASE = "http://nextext.test/api/v1"
 
 
 def make_settings(tmp_path: Path, **overrides: Any) -> Settings:

@@ -116,7 +116,11 @@ class Settings:
 
     @property
     def nextext_enabled(self) -> bool:
-        """Whether Nextext may be asked to transcribe clips: its key and base are both set."""
+        """Whether Nextext is configured: its key and base are both set.
+
+        This says nothing of whether Nextext answers or workbench can take a clip; media is offered only when
+        the health probe also passes and workbench is 0.9 or later.
+        """
         return bool(self.nextext_api_key and self.nextext_api_base)
 
 
