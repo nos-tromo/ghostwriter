@@ -11,7 +11,7 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 |---|---|---|
 | `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
 | `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at | with the chat |
-| `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 16,384 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
+| `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 16,896 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`, `media`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders; for a clip its frame count, its length and whether it has a transcript), failure (a token), created_at | with the chat, or until its owner takes it back before sending it; `render` until the file period (7 days), then emptied ([retention.md](retention.md)) |
 | `results` | id, message_id, position, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `file_marks` | chat_id, created_at: when the chat's workbench folder may have got a file (an attachment, a hand-over, a tool call, a step or a result) | with the chat |
@@ -24,7 +24,7 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
   frames stream from Nextext into workbench, chunk by chunk through memory: none is spooled to disk, read
   whole or kept here. The processor never holds a transcript line, and none is in a log or the audit. Once
   the model reads a clip with `read_document`, what it read is a tool result like any other
-  (`tool_steps.result`, at most 16,384 characters, until its content deadline within
+  (`tool_steps.result`, at most 16,896 characters, until its content deadline within
   `WORKBENCH_RETENTION_DAYS`).
 - **Image bytes and data URLs.** The renders of a message's pictures and of the
   pages or pictures its tools showed are fetched from workbench and held in

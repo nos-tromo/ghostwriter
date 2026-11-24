@@ -510,12 +510,48 @@ def test_a_part_that_does_not_fit_whole_is_never_trimmed() -> None:
         assert cut_result(text, limit) == expected
 
 
-def test_a_few_dozen_characters_over_the_cap_leave_the_last_part_out_whole() -> None:
-    """The usual case: workbench's text is a little over the cap; the last part goes, no part is trimmed."""
+def _default_size_answer() -> str:
+    """Return the largest answer workbench sends at its 16 KB default, as the door's text carries it.
+
+    workbench measures its answer without the ``None`` fields, which the text then holds: ``next_part``, ``hint``,
+    ``outputs`` and a part's ``units``. The answer measured is exactly 16,384 characters.
+
+    Returns:
+        The text, a few dozen characters longer than that.
+    """
+
+    def answer(filler: int, *, nulls: bool) -> dict[str, Any]:
+        parts = [{"label": f"page {n}", "text": _page_text(n, 3_900), "units": [n, n], "cut": False} for n in (1, 2, 3)]
+        last: dict[str, Any] = {"label": "page 4", "text": "x" * filler, "cut": False}
+        body: dict[str, Any] = {
+            "path": "long-report.pdf",
+            "kind": "pdf",
+            "parts": [*parts, {**last, "units": None} if nulls else last],
+            "total_parts": 4,
+            "pages_without_text": [3, 7],
+            "truncated": False,
+        }
+        return {**body, "next_part": None, "hint": None, "outputs": None} if nulls else body
+
+    filler = 16_384 - len(compact(answer(0, nulls=False)))
+    assert len(compact(answer(filler, nulls=False))) == 16_384
+    return compact(answer(filler, nulls=True))
+
+
+def test_an_answer_of_workbenchs_default_size_is_never_cut() -> None:
+    """At its 16 KB, with the null fields its own measure leaves out, an answer passes as it is."""
+    text = _default_size_answer()
+    assert 16_384 < len(text) <= 16_384 + 512  # over the 16 KB it measured, by the null fields
+    assert len(text) <= TOOL_RESULT_CHARS
+    assert tool_message(ToolResult(text, ())) == text == cut_result(text, TOOL_RESULT_CHARS)
+
+
+def test_an_answer_clearly_over_the_cap_leaves_the_last_part_out_whole() -> None:
+    """Over the cap (workbench's limit raised): the last part goes, and no part is trimmed."""
     text = next(
         candidate
         for candidate in (_read_answer(4, chars) for chars in range(3_500, 4_500))
-        if TOOL_RESULT_CHARS < len(candidate) <= TOOL_RESULT_CHARS + 60
+        if TOOL_RESULT_CHARS + 100 < len(candidate) <= TOOL_RESULT_CHARS + 400
     )
     sent = json.loads(text)
     out = tool_message(ToolResult(text, ()))

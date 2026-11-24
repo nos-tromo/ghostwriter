@@ -53,8 +53,9 @@ TOOL_CUTOFF_S: Final = 10.0
 BUSY_RETRY_S: Final = 2.0
 
 # What the model reads back.
-#: Characters of a tool result the model reads.
-TOOL_RESULT_CHARS: Final = 16_384
+#: Characters of a tool result the model reads: workbench's 16 KB result limit at its default, plus 512 characters for
+#: the null fields its size check leaves out and its text carries, so that a default answer is never cut here.
+TOOL_RESULT_CHARS: Final = 16_896
 #: Characters of an earlier call's arguments replayed in a follow-up.
 HISTORY_ARGUMENT_CHARS: Final = 2_000
 #: Characters of an earlier call's result replayed in a follow-up.
