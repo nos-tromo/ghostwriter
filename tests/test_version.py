@@ -7,6 +7,6 @@ import ghostwriter
 
 
 def test_version_matches_pyproject() -> None:
-    """``ghostwriter.__version__`` equals ``[project].version``, 0.6.1 for this release."""
+    """``ghostwriter.__version__`` equals ``[project].version``, 0.6.2 for this release."""
     data = tomllib.loads((Path(__file__).parents[1] / "pyproject.toml").read_text(encoding="utf-8"))
-    assert ghostwriter.__version__ == data["project"]["version"] == "0.6.1"
+    assert ghostwriter.__version__ == data["project"]["version"] == "0.6.2"
