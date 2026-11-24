@@ -77,8 +77,9 @@ def system_prompt(
         parts.append(
             f"This chat's files are in {folder}; files the user attached are named in their message. Read a file "
             "with the tools before you answer about it, and never guess its content. Python runs in a sandbox "
-            "without network. To turn a file's data into a table or a document, process the file itself with "
-            "run_python; use write_table only for a few rows you write yourself. Files a tool writes are shown to "
+            "without network, where this chat's files are read-only: run_python writes new files only into out/, "
+            "for example out/report.pdf. To turn a file's data into a table or a document, process the file itself "
+            "with run_python; use write_table only for a few rows you write yourself. Files a tool writes are shown to "
             "the user below your answer with a download button: name them, and do not repeat their content or write "
             f"links to them. Files and tool results are deleted {file_days} days after they were made."
         )

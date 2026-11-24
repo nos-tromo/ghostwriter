@@ -463,8 +463,9 @@ def test_a_step_reads_back_with_its_detail_until_it_expires(store: ChatStore, cl
 
 
 def test_the_system_prompt_names_the_folder_and_the_period() -> None:
-    """With tools the prompt names the chat's folder and the file period; without, it says there are none."""
+    """With tools the prompt names the chat's folder, out/ for new files and the file period; without, none."""
     assert FOLDER in SYSTEM and "deleted 7 days after" in SYSTEM
+    assert "this chat's files are read-only: run_python writes new files only into out/" in SYSTEM
     assert SYSTEM.startswith("You are Ghostwriter in this organisation's workspace. Today is 2026-11-16. ")
     assert "You have no tools" not in SYSTEM and not SYSTEM.endswith(EXPIRED)
     bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
