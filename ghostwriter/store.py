@@ -1005,10 +1005,11 @@ class ChatStore:
             message_id: The answer.
             content: Its text.
             notices: Its notices, each as :meth:`~ghostwriter.agent.notices.NoticeEvent.stored` gives it: codes, ids
-                and counts, never a name; none is stored as an empty list.
+                and counts. A ``name`` is dropped from each, whoever the caller is: a file's name is read from its
+                attachment row when the answer is served. None is stored as an empty list.
             context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
-        stored = [dict(notice) for notice in notices]
+        stored = [{key: value for key, value in notice.items() if key != "name"} for notice in notices]
         with self._transaction() as s:
             message = s.scalars(
                 select(Message).where(Message.id == message_id, Message.role == "assistant")

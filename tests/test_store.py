@@ -1032,6 +1032,19 @@ def test_an_answer_keeps_its_notices_and_estimate(store: ChatStore, engine: Engi
     assert "harbour-survey" not in stored and deadline == T0 + 7 * DAY
 
 
+def test_a_notice_is_stored_without_a_name_whoever_the_caller_is(store: ChatStore, engine: Engine) -> None:
+    """A name a caller leaves on a notice is dropped before it is stored; the code and the file id stay."""
+    chat_id, answer = _asked(store)
+    named = {"code": "document_unread", "file_id": SURVEY, "name": "harbour-survey.docx"}
+    store.finish_assistant_message(answer, "Der Bericht", notices=[named])
+    stored, _ = _raw_notices(engine, answer)
+    assert stored is not None and json.loads(stored) == [{"code": "document_unread", "file_id": SURVEY}]
+    assert "harbour-survey" not in stored
+    assert named["name"] == "harbour-survey.docx"
+    reply = store.chat_detail("user-a", chat_id).messages[1]
+    assert reply.notices == [NoticeOut(code="document_unread", file_id=SURVEY, name="harbour-survey.docx")]
+
+
 def test_only_a_notice_about_a_file_sets_a_deadline(store: ChatStore, engine: Engine) -> None:
     """Codes without details set no deadline; no notices are an empty list; a code not known here is left out."""
     chat_id, answer = _asked(store)
