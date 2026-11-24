@@ -15,6 +15,12 @@ shorter. Without a usage count, only the finish reason tells the cap. A call wor
 busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
 Every call is disclosed before it is sent, and every round recorded after it ends.
 
+The user is told what the answer should say of itself (:class:`~ghostwriter.agent.notices.NoticeEvent`),
+and the answer's progress keeps each notice told. The message's first round fills a
+:class:`~ghostwriter.agent.context.FitReport`: when it leaves earlier turns out, ``context_trimmed`` is told
+before that round streams, once per message. The last round, one without calls and not stopped, that ends
+at its cap (:func:`_at_cap`, the reasoning cap for a reasoning message) is followed by ``answer_cut``.
+
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
 ends on a round without calls, on a stop (after the call in flight; no round starts once the
@@ -68,7 +74,7 @@ from uuid import uuid4
 import openai
 from loguru import logger
 
-from ghostwriter.agent.context import PastTurn, fit
+from ghostwriter.agent.context import FitReport, PastTurn, fit
 from ghostwriter.agent.images import (
     UNSEEN,
     ImageBank,
@@ -97,6 +103,7 @@ from ghostwriter.agent.limits import (
     TOOL_CUTOFF_S,
     prompt_tokens,
 )
+from ghostwriter.agent.notices import NoticeEvent
 from ghostwriter.agent.prompt import system_prompt
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.agent.tools import (
@@ -217,17 +224,6 @@ class ResultEvent:
 
 
 @dataclass(frozen=True)
-class NoticeEvent:
-    """Something the user is told while the answer goes on.
-
-    Attributes:
-        code: ``images_dropped``: the model refused the round's images, and the round went again without them.
-    """
-
-    code: Literal["images_dropped"]
-
-
-@dataclass(frozen=True)
 class ErrorEvent:
     """Why the answer ended early.
 
@@ -287,6 +283,7 @@ class _Progress:
         steps: Steps stored so far.
         cards: The ids of the files shown as cards.
         withdrawn: Whether the tools were withdrawn for the rest of the message.
+        notices: Every notice the user was told, in order.
     """
 
     started: float
@@ -294,6 +291,19 @@ class _Progress:
     steps: int = 0
     cards: set[str] = field(default_factory=set)
     withdrawn: bool = False
+    notices: list[NoticeEvent] = field(default_factory=list)
+
+    def told(self, event: NoticeEvent) -> NoticeEvent:
+        """Keep a notice the user is told, for the answer.
+
+        Args:
+            event: The notice.
+
+        Returns:
+            The same notice, to be yielded.
+        """
+        self.notices.append(event)
+        return event
 
 
 @dataclass
@@ -406,7 +416,7 @@ class _Request:
         return self._blind
 
     def fitted(
-        self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool
+        self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool, report: FitReport | None = None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return a round's messages, fitted to the budget, and the tools it offers.
 
@@ -414,6 +424,7 @@ class _Request:
             current: The current turn's messages.
             sight: The turn's images: the offer, and what an image costs.
             tooled: Whether the round may offer tools.
+            report: Filled with the earlier turns there were and those replayed; ``None`` for none.
 
         Returns:
             The messages (:func:`~ghostwriter.agent.context.fit`), their refs still refs; and the tools.
@@ -421,7 +432,14 @@ class _Request:
         offer = self.offer(sight)
         tools = offer.tools if tooled else []
         fitted = fit(
-            offer.system, tools, self.past, current, budget=self.budget, images=sight.budget, view=sight.showing
+            offer.system,
+            tools,
+            self.past,
+            current,
+            budget=self.budget,
+            images=sight.budget,
+            view=sight.showing,
+            report=report,
         )
         return fitted, tools
 
@@ -472,6 +490,22 @@ def _refuses_context(exc: Exception) -> bool:
         return False
     told = f"{exc.message} {exc.body}".lower()
     return any(pattern in told for pattern in CONTEXT_REFUSALS)
+
+
+def _at_cap(done: RoundDone, cap: int) -> bool:
+    """Tell whether a round ended at its token cap.
+
+    vLLM ends a round in which a call's name streamed with ``tool_calls``, at the cap too: the usage tells.
+    Without a usage count, only the finish reason does.
+
+    Args:
+        done: How the round ended.
+        cap: Its ``max_tokens``.
+
+    Returns:
+        Whether its finish reason is ``length``, or its output tokens reached ``cap``.
+    """
+    return done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
 
 
 def _unique(call: ToolCall, used: set[str], round_no: int) -> ToolCall:
@@ -589,8 +623,9 @@ class AgentLoop:
             audit: Where disclosures and model rounds are recorded.
 
         Yields:
-            TurnEvent: Text, steps and cards as they come; an :class:`ErrorEvent` last when
-            the answer ended early.
+            TurnEvent: Text, steps, cards and notices as they come, each notice also kept in the answer's
+            progress; ``answer_cut`` after the last round's text when it ended at its cap; an
+            :class:`ErrorEvent` last when the answer ended early.
 
         Raises:
             AuditWriteError: When a record could not be written; raised after the text is stored.
@@ -695,11 +730,13 @@ class AgentLoop:
             done, tools = yield from self._round(
                 turn, audit, message, sight, request, current, tooled=tooled, round_no=round_no, headers=headers
             )
+            # The last round, one without calls, ending at the cap left the answer cut short.
+            if done is not None and not done.stopped and not done.calls and _at_cap(done, cap):
+                yield message.told(NoticeEvent("answer_cut"))
             if done is None or done.stopped or not done.calls or not tools or workbench is None:
                 return
             names = request.offer(sight).names
-            # vLLM ends a round in which a call's name streamed with "tool_calls", at the cap too: the usage tells.
-            at_cap = done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
+            at_cap = _at_cap(done, cap)
             calls: list[dict[str, Any]] = []
             answers: list[dict[str, Any]] = []
             shown: list[tuple[str, str, tuple[ToolImage, ...]]] = []
@@ -785,6 +822,9 @@ class AgentLoop:
     ) -> Generator[TurnEvent, None, tuple[RoundDone | None, list[dict[str, Any]]]]:
         """Fit one round, stream it with its images and record it; a round refused with images goes once more.
 
+        The message's first round is fitted with a :class:`~ghostwriter.agent.context.FitReport`: when it
+        leaves earlier turns out, ``context_trimmed`` is told before it streams. A later round's trim is
+        not told: the chat was trimmed in the first, and results the model pages past are its own.
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
         with a status of :data:`REFUSED_IMAGE_STATUSES` (a refusal for length among them,
@@ -806,15 +846,19 @@ class AgentLoop:
             headers: The inference headers.
 
         Yields:
-            TurnEvent: The round's text, and a notice when it goes again without images.
+            TurnEvent: ``context_trimmed`` first, when the first round leaves earlier turns out; the round's
+            text; and ``images_dropped`` when it goes again without images.
 
         Returns:
             How the round ended, ``None`` when the turn ends with it as it failed; and the tools it offered.
         """
-        fitted, tools = request.fitted(current, sight, tooled=tooled)
+        report = FitReport() if round_no == 1 else None
+        fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
         if sight.showing:
             self._fetch(turn, sight, fitted)
             _keep_unseen(current, fitted, sight.bank)
+        if report is not None and report.trimmed:
+            yield message.told(NoticeEvent("context_trimmed"))
         while True:
             wire, count = materialise(
                 without_images(fitted) if sight.dropped else fitted, sight.bank, view=sight.showing
@@ -849,7 +893,7 @@ class AgentLoop:
                 if count and not said and not stopped and (for_length or _refuses_images(exc)):
                     logger.info("Model round {} goes again without its {} images", round_no, count)
                     _drop_images(current, sight)
-                    yield NoticeEvent("images_dropped")
+                    yield message.told(NoticeEvent("images_dropped"))
                     fitted, tools = request.fitted(current, sight, tooled=tooled)
                     continue
                 if for_length:

@@ -27,7 +27,8 @@ from typing_extensions import override
 
 from ghostwriter.agent.limits import TURN_THREADS
 from ghostwriter.agent.loop import AgentLoop, TokenEvent, Turn, TurnAudit, TurnEvent
-from ghostwriter.api.messages import TurnStream
+from ghostwriter.agent.notices import NoticeEvent
+from ghostwriter.api.messages import TurnStream, _frame
 from ghostwriter.db import make_engine, utcnow
 from ghostwriter.inference import ModelClient
 from ghostwriter.main import create_app
@@ -1117,6 +1118,77 @@ def test_a_refused_image_round_streams_a_notice(
         ("error", 1, 1),
         ("ok", 1, 0),
     ]
+
+
+def _notice_data(event: NoticeEvent) -> dict[str, Any]:
+    """Return the data of a notice's frame."""
+    [frame] = _read(iter(_frame(event).split("\n")))
+    assert frame.event == "notice"
+    return frame.data
+
+
+def test_a_notice_frame_carries_its_details() -> None:
+    """A live notice carries its code and every detail it has, the name too; what is stored never holds the name."""
+    partial = NoticeEvent("document_partial", file_id="f" * 32, name="long-report.pdf", read=9, total=500, unit="page")
+    assert _notice_data(partial) == {
+        "code": "document_partial",
+        "file_id": "f" * 32,
+        "name": "long-report.pdf",
+        "read": 9,
+        "total": 500,
+        "unit": "page",
+    }
+    assert _notice_data(NoticeEvent("answer_cut")) == {"code": "answer_cut"}
+    assert partial.stored() == {
+        "code": "document_partial",
+        "file_id": "f" * 32,
+        "read": 9,
+        "total": 500,
+        "unit": "page",
+    }
+    unread = NoticeEvent("document_unread", file_id="e" * 32, name="harbour-survey.docx")
+    assert unread.stored() == {"code": "document_unread", "file_id": "e" * 32}
+    assert NoticeEvent.from_stored(partial.stored()) == NoticeEvent(
+        "document_partial", file_id="f" * 32, read=9, total=500, unit="page"
+    )
+    assert NoticeEvent.from_stored({"code": "images_dropped"}) == NoticeEvent("images_dropped")
+    assert NoticeEvent.from_stored({"code": "later_code"}) is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        {},
+        {"code": 7},
+        {"code": "document_partial", "file_id": 7},
+        {"code": "document_partial", "read": "9"},
+        {"code": "document_partial", "read": True},
+        {"code": "document_partial", "total": -1},
+        {"code": "document_partial", "unit": "chapter"},
+        {"code": "document_partial", "unit": ["page"]},
+        ["code", "answer_cut"],
+    ],
+    ids=[
+        "no-code",
+        "code-not-text",
+        "file-id-not-text",
+        "read-not-a-number",
+        "read-a-bool",
+        "total-negative",
+        "unit-not-known",
+        "unit-not-text",
+        "not-a-mapping",
+    ],
+)
+def test_a_malformed_stored_notice_is_none(value: Any) -> None:
+    """A stored notice that is not one this version wrote reads as none, rather than as a wrong one or a raise."""
+    assert NoticeEvent.from_stored(value) is None
+
+
+def test_a_stored_notice_never_reads_a_name_back() -> None:
+    """A name is never stored; one found in a stored value is not served as the notice's."""
+    stored = {"code": "document_unread", "file_id": "e" * 32, "name": "harbour-survey.docx"}
+    assert NoticeEvent.from_stored(stored) == NoticeEvent("document_unread", file_id="e" * 32)
 
 
 def _listings(door: FakeDoor) -> list[httpx.Request]:

@@ -899,6 +899,87 @@ def test_a_smaller_context_fits_every_round_to_what_it_leaves(loop_env: LoopEnv,
     assert len(loop_env.sent(1)) > 3
 
 
+# --- notices: a chat trimmed in the first round, an answer cut at its cap -----
+
+
+def _questions(messages: list[dict[str, Any]]) -> int:
+    """Return how many user messages a round sent, the current question included."""
+    return sum(message["role"] == "user" for message in messages)
+
+
+def test_a_trimmed_chat_is_told_once_in_the_first_round(loop_env: LoopEnv) -> None:
+    """Earlier turns the first round leaves out are told before any text; a later round's trim is not told again."""
+    for n in range(30):
+        loop_env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 700, [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), "Übersicht " * 400)
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    assert [e for e in events if isinstance(e, NoticeEvent)] == [NoticeEvent("context_trimmed")]
+    first_token = next(i for i, e in enumerate(events) if isinstance(e, TokenEvent))
+    assert events.index(NoticeEvent("context_trimmed")) < first_token
+    assert events[0] == NoticeEvent("context_trimmed")
+    assert len(loop_env.fake.calls) == 2
+    assert all(_questions(loop_env.sent(n)) < 31 for n in (1, 2))
+
+
+def test_no_trim_notice_when_every_turn_fits(loop_env: LoopEnv) -> None:
+    """A chat whose earlier turns all fit is told nothing."""
+    for n in range(3):
+        loop_env.store.add_user_message("user-a", CHAT, f"Frage {n}", [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), f"Antwort {n}")
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    assert not any(isinstance(e, NoticeEvent) for e in events)
+    assert _questions(loop_env.sent(1)) == 4
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [[finish_chunk("length")], [usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")]],
+    ids=["length", "usage"],
+)
+def test_an_answer_cut_at_the_cap_says_so(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """The last round, one without calls, ending at the cap is an answer cut: the user is told after its text."""
+    events = loop_env.run([text_chunk("Kapitel 1 …"), *ending])
+    assert events == [TokenEvent("Kapitel 1 …"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 …"
+
+
+@pytest.mark.parametrize(
+    ("completion", "told"),
+    [(4_000, []), (12_000, [NoticeEvent("answer_cut")])],
+    ids=["at-the-plain-cap", "at-its-own-cap"],
+)
+def test_a_reasoning_answer_is_cut_at_its_own_cap(loop_env: LoopEnv, completion: int, told: list[NoticeEvent]) -> None:
+    """A reasoning answer has the larger cap, its thinking included: 4,000 tokens out is no cut there."""
+    events = loop_env.run([text_chunk("Kapitel 1 …"), usage_chunk(900, completion, "served-model")], reasoning=True)
+    assert [e for e in events if isinstance(e, NoticeEvent)] == told
+
+
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_tool_round_at_the_cap_is_no_answer_cut(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """A round with calls at the cap goes on to the next round; only the last round's cap is the answer's."""
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(
+        [call_chunk(0, "call_0", "read_document", READ_SALES), *ending],
+        [text_chunk("Summe: 42"), usage_chunk(900, 12, "served-model")],
+    )
+    assert not any(isinstance(e, NoticeEvent) for e in events) and len(loop_env.fake.calls) == 2
+
+
+def test_a_stopped_round_is_not_cut(loop_env: LoopEnv) -> None:
+    """A round the stop ended says nothing of the cap, though its finish reason came in before the stop."""
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")
+
+    events = loop_env.run([text_chunk("Kapitel 1 …"), finish_chunk("length"), stop])
+    assert events == [TokenEvent("Kapitel 1 …")]
+    stopped = loop_env.audit.rounds[0]
+    assert stopped is not None and stopped.stopped and stopped.finish_reason == "length"
+
+
 # --- images: attached pictures, tool images, strips, the cap and a refusal -----
 
 

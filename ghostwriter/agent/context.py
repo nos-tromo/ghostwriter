@@ -7,7 +7,8 @@ arguments are cut as a replayed call's are. Earlier turns are then added newest
 first, whole, while they fit: each as its question, per round an assistant message with its
 calls and one tool message per call, then its answer. A replayed call's arguments stay a
 JSON object, which chat templates parse, and are cut to ``HISTORY_ARGUMENT_CHARS``; its
-result is cut to ``HISTORY_RESULT_CHARS``.
+result is cut to ``HISTORY_RESULT_CHARS``. A :class:`FitReport` counts the earlier turns and
+those replayed.
 
 With an :class:`~ghostwriter.agent.images.ImageBudget`, an image ref counts as its label's
 characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a request carries
@@ -502,6 +503,24 @@ class _Size:
         self.images += now[2] - images
 
 
+@dataclass
+class FitReport:
+    """How many earlier turns a round's messages replay, as :func:`fit` fills it.
+
+    Attributes:
+        past_turns: The earlier turns there were.
+        replayed_turns: Those replayed, the newest of them.
+    """
+
+    past_turns: int = 0
+    replayed_turns: int = 0
+
+    @property
+    def trimmed(self) -> bool:
+        """Whether earlier turns were left out."""
+        return self.replayed_turns < self.past_turns
+
+
 def fit(
     system: str,
     tools: list[dict[str, Any]],
@@ -511,8 +530,13 @@ def fit(
     budget: int = PROMPT_TOKENS,
     images: ImageBudget | None = None,
     view: bool = True,
+    report: FitReport | None = None,
 ) -> list[dict[str, Any]]:
     """Return the messages of a round, within the budget as far as the current turn allows.
+
+    A report, when given, is filled once the replay ends: how many earlier turns there were and how many
+    were replayed. It changes nothing of the messages. The loop gives one to the message's first round only,
+    whose trim is the chat's (``context_trimmed``).
 
     Args:
         system: The system prompt.
@@ -524,6 +548,7 @@ def fit(
         images: What an image costs and how many a request carries; ``None`` when the model is
             sent no images, and earlier turns are replayed as their text.
         view: Whether the round offers ``view_file``; without it no note names the tool.
+        report: Filled with the earlier turns there were and those replayed; ``None`` for none.
 
     Returns:
         The system message, the earlier turns that fit, and the current turn, in order; their
@@ -593,6 +618,7 @@ def fit(
     if size.tokens() + fixed > budget:
         logger.warning("The current turn alone is over the prompt budget: about {} tokens", size.tokens() + fixed)
     replayed: list[dict[str, Any]] = []
+    taken = 0
     for turn in reversed(past):
         modes: tuple[ReplayMode, ...] = ("none",) if images is None or not turn.images else ("images", "notes")
         for mode in modes:
@@ -607,7 +633,10 @@ def fit(
             size.image_tokens += image_tokens
             size.images += count
             replayed[:0] = messages
+            taken += 1
             break
         else:
             break
+    if report is not None:
+        report.past_turns, report.replayed_turns = len(past), taken
     return [kept[0], *replayed, *kept[1:]]

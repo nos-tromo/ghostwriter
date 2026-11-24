@@ -6,10 +6,14 @@ A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most o
 are ``start`` (the stored question's and answer's ids), always first, then ``token``,
 ``step``, ``result``, ``notice`` and ``error``, and ``final``, which is always last; a quiet
 stream carries a keep-alive comment every 15 s, which is no frame. ``notice`` names by its
-``code`` what the user is told while the answer goes on: ``images_dropped``, the model refused
-a round's images and it went again without them. ``error`` names by its ``code`` why the answer
-ended early: ``model``, ``audit``, ``internal``, or ``context``, the router refused a round as longer
-than the model's context, with no image left to drop. A stop, or
+``code`` what the user is told of the answer, with every detail it has (``file_id``, ``name``,
+``read``, ``total``, ``unit``) and only those, the file's name included
+(:meth:`~ghostwriter.agent.notices.NoticeEvent.frame`): ``context_trimmed``, before any text,
+the first round left earlier turns out; ``images_dropped``, the model refused a round's images
+and it went again without them; ``answer_cut``, after the text, the last round ended at its
+token cap. ``error`` names by its ``code`` why the answer ended early: ``model``, ``audit``,
+``internal``, or ``context``, the router refused a round as longer than the model's context,
+with no image left to drop. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
@@ -40,7 +44,6 @@ from ghostwriter.agent.loop import (
     INTERNAL_ERROR,
     AgentLoop,
     ErrorEvent,
-    NoticeEvent,
     ResultEvent,
     StepEvent,
     TokenEvent,
@@ -48,6 +51,7 @@ from ghostwriter.agent.loop import (
     TurnAudit,
     TurnEvent,
 )
+from ghostwriter.agent.notices import NoticeEvent
 from ghostwriter.agent.stream import RoundDone
 from ghostwriter.api.chats import owned_chat
 from ghostwriter.audit import Operation, audited, forward_headers
@@ -233,7 +237,7 @@ def _frame(event: TurnEvent) -> str:
     if isinstance(event, ResultEvent):
         return sse_frame("result", event.result.model_dump(mode="json"))
     if isinstance(event, NoticeEvent):
-        return sse_frame("notice", {"code": event.code})
+        return sse_frame("notice", event.frame())
     if isinstance(event, ErrorEvent):
         return sse_frame("error", {"code": event.code, "message": event.message})
     raise TypeError(f"not a turn event: {type(event).__name__}")

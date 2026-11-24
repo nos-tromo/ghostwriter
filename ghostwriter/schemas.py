@@ -10,6 +10,11 @@ StepStatus = Literal["running", "ok", "error"]
 ResultKind = Literal["image", "table", "file"]
 AttachmentKind = Literal["document", "image", "media"]
 AttachmentStatus = Literal["processing", "ready", "failed"]
+#: What an answer tells the user of itself: ``answer_cut``, ``document_partial``, ``document_unread`` and
+#: ``images_dropped`` belong to the answer, ``context_trimmed`` to the chat.
+NoticeCode = Literal["answer_cut", "document_partial", "document_unread", "images_dropped", "context_trimmed"]
+#: What a document's length is counted in.
+MeasureUnit = Literal["page", "slide", "paragraph", "row", "line"]
 
 
 class ChatOut(BaseModel):

@@ -20,6 +20,7 @@ from ghostwriter.agent.context import (
     CLEARED,
     OFFICE_FORMATS,
     UNSEEN_PICTURE,
+    FitReport,
     PastCall,
     PastTurn,
     attachment_facts,
@@ -647,6 +648,31 @@ def test_earlier_turns_are_kept_newest_first_without_a_gap() -> None:
     ]
     messages = fit(SYSTEM, TOOLS, past, [_user("Weiter")], budget=3_000)
     assert _past_users(messages) == ["neu"]
+
+
+def _long_past(turns: int) -> list[PastTurn]:
+    """Return earlier turns of about 3,000 tokens each."""
+    return [_past_turn(user=f"{n}: " + "Größe " * 1_000, answer="Übersicht " * 300) for n in range(turns)]
+
+
+def test_fit_reports_the_turns_it_replayed() -> None:
+    """A report counts the earlier turns and those replayed; fewer replayed is a trim, all of them none."""
+    past, current = _long_past(5), [_user("Fasse zusammen")]
+    report = FitReport()
+    replayed = len(_past_users(fit(SYSTEM, TOOLS, past, current, budget=10_000, report=report)))
+    assert 0 < replayed < 5
+    assert (report.past_turns, report.replayed_turns, report.trimmed) == (5, replayed, True)
+    roomy = FitReport()
+    fit(SYSTEM, TOOLS, past, current, budget=100_000, report=roomy)
+    assert (roomy.past_turns, roomy.replayed_turns, roomy.trimmed) == (5, 5, False)
+    assert not FitReport().trimmed
+
+
+def test_fit_without_a_report_is_unchanged() -> None:
+    """A report only watches: the messages are the same with it and without it."""
+    past, current = _long_past(5), [_user("Fasse zusammen")]
+    without = fit(SYSTEM, TOOLS, past, current, budget=10_000)
+    assert fit(SYSTEM, TOOLS, past, current, budget=10_000, report=FitReport()) == without
 
 
 def test_the_tool_schemas_count_against_the_budget() -> None:
