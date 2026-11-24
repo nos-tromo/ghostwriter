@@ -10,14 +10,14 @@ requires-python = ">=3.11,<3.12"
 license = "Apache-2.0"
 dependencies = [
     "anyio>=4.14.2",
-    "fastapi>=0.162.2",
+    "fastapi>=0.163.1",
     "httpx>=0.28.1",
-    "loguru>=0.7.3",
-    "openai>=3.49.0",
+    "loguru>=0.8.0",
+    "openai>=3.52.0",
     "prometheus-fastapi-instrumentator>=8.1.0",
     "pydantic>=2.14.3",
-    "python-multipart>=0.0.33",
-    "sqlalchemy>=2.0",
+    "python-multipart>=0.0.34",
+    "sqlalchemy>=2.1.9",
     "uvicorn>=0.54.0",
 ]
 
@@ -26,11 +26,11 @@ Repository = "https://github.com/nos-tromo/ghostwriter.git"
 
 [dependency-groups]
 dev = [
-    "httpx2>=2.16.0",
+    "httpx2>=2.16.2",
     "pre-commit>=4.7.0",
     "pyrefly==1.1.1",
     "pytest>=9.2.0",
-    "pytest-asyncio>=1.4.0",
+    "pytest-asyncio>=1.5.0",
     "ruff==0.15.14",
 ]
 
