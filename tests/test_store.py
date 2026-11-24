@@ -1,5 +1,6 @@
 """The chat store: ownership, the chat period, contents that expire with their files, and deletion."""
 
+import json
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,7 +15,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, ToolStep
-from ghostwriter.schemas import AttachmentOut, ResultOut, StepOut, TablePreviewOut
+from ghostwriter.schemas import AttachmentOut, NoticeOut, ResultOut, StepOut, TablePreviewOut
 from ghostwriter.store import (
     STORED_MANIFEST_KEYS,
     AttachmentNotPending,
@@ -979,6 +980,148 @@ def test_chats_list_by_their_latest_activity(store: ChatStore, clock: Clock) -> 
     store.add_user_message("user-a", second.id, "Hallo", [])
     assert store.get_chat("user-a", second.id).updated_at == clock.now
     assert [c.id for c in store.list_chats("user-a")] == [second.id, first.id]
+
+
+# --- an answer's notices -----------------------------------------------------
+
+#: workbench's id of the survey the notices are about.
+SURVEY = "c" * 32
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PARTIAL = {"code": "document_partial", "file_id": SURVEY, "read": 9, "total": 500, "unit": "page"}
+
+
+def _asked(store: ChatStore) -> tuple[str, str]:
+    """Start a chat whose question sends the harbour survey, and open its answer.
+
+    Args:
+        store: The store.
+
+    Returns:
+        The chat's and the answer's ids.
+    """
+    chat = store.create_chat("user-a")
+    survey = store.add_attachment(
+        chat.id, file_id=SURVEY, path=f"/workspace/s/{SURVEY}.docx", name="harbour-survey.docx", size=4096, mime=DOCX
+    )
+    store.add_user_message("user-a", chat.id, "Fasse den Bericht zusammen.", [survey.id])
+    return chat.id, store.start_assistant_message(chat.id)
+
+
+def _raw_notices(engine: Engine, message_id: str) -> tuple[str | None, datetime | None]:
+    """Read an answer's notices and their deadline as stored."""
+    with Session(engine) as s:
+        row = s.execute(select(Message.notices, Message.notices_expire_at).where(Message.id == message_id)).one()
+        return row[0], row[1]
+
+
+def test_an_answer_keeps_its_notices_and_estimate(store: ChatStore, engine: Engine) -> None:
+    """The notices come back in order, a file's with its attachment's name, never stored; a question has none."""
+    chat_id, answer = _asked(store)
+    unread = {"code": "document_unread", "file_id": SURVEY}
+    notices = [{"code": "answer_cut"}, unread]
+    store.finish_assistant_message(answer, "Der Bericht", notices=notices, context_estimate=1234)
+    question, reply = store.chat_detail("user-a", chat_id).messages
+    assert reply.notices == [
+        NoticeOut(code="answer_cut"),
+        NoticeOut(code="document_unread", file_id=SURVEY, name="harbour-survey.docx"),
+    ]
+    assert reply.context_estimate == 1234
+    assert (question.notices, question.context_estimate) == (None, None)
+    stored, deadline = _raw_notices(engine, answer)
+    assert stored is not None and json.loads(stored) == notices
+    assert "harbour-survey" not in stored and deadline == T0 + 7 * DAY
+
+
+def test_only_a_notice_about_a_file_sets_a_deadline(store: ChatStore, engine: Engine) -> None:
+    """Codes without details set no deadline; no notices are an empty list; a code not known here is left out."""
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[{"code": "images_dropped"}, {"code": "answer_cut"}])
+    assert _raw_notices(engine, answer)[1] is None
+    later = store.start_assistant_message(chat_id)
+    store.finish_assistant_message(later, "Noch einmal")
+    assert _raw_notices(engine, later) == ("[]", None)
+    assert store.chat_detail("user-a", chat_id).messages[2].notices == []
+    with Session(engine) as s, s.begin():
+        stored = json.dumps([{"code": "later_code"}, ["answer_cut"], {"code": "answer_cut"}])
+        s.execute(update(Message).where(Message.id == later).values(notices=stored))
+    assert store.chat_detail("user-a", chat_id).messages[2].notices == [NoticeOut(code="answer_cut")]
+
+
+def test_notice_details_follow_the_content_deadline(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """The survey sent on day 0 and answered on day 1: its notice's details are served until day 7, then its code alone.
+
+    Before any sweep the details are still stored; past the deadline they are only not served.
+    """
+    chat = store.create_chat("user-a")
+    survey = store.add_attachment(
+        chat.id, file_id=SURVEY, path=f"/workspace/s/{SURVEY}.docx", name="harbour-survey.docx", size=4096, mime=DOCX
+    )
+    store.add_user_message("user-a", chat.id, "Fasse den Bericht zusammen.", [survey.id])
+    clock.now = T0 + DAY
+    answer = store.start_assistant_message(chat.id)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[PARTIAL])
+    assert _raw_notices(engine, answer)[1] == T0 + 7 * DAY
+
+    def served() -> list[NoticeOut] | None:
+        return store.chat_detail("user-a", chat.id).messages[1].notices
+
+    clock.now = T0 + 7 * DAY - timedelta(seconds=1)
+    assert served() == [
+        NoticeOut(code="document_partial", file_id=SURVEY, name="harbour-survey.docx", read=9, total=500, unit="page")
+    ]
+    clock.now = T0 + 7 * DAY
+    assert [notice.model_dump() for notice in served() or []] == [
+        {"code": "document_partial", "file_id": None, "name": None, "read": None, "total": None, "unit": None}
+    ]
+    stored = _raw_notices(engine, answer)[0]
+    assert stored is not None and json.loads(stored) == [PARTIAL]
+
+
+def test_a_continued_write_keeps_the_deadline(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A later write of the answer (Continue) stores its own notices and estimate, and keeps the first one's deadline.
+
+    The later write is made under a 3-day file period, which would set another deadline.
+    """
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[PARTIAL, {"code": "answer_cut"}])
+    assert _raw_notices(engine, answer)[1] == T0 + 7 * DAY
+    clock.now = T0 + DAY
+    later = ChatStore(engine, file_days=3, notice_days=30, now=clock)
+    later.finish_assistant_message(answer, "Der Bericht, weiter.", notices=[PARTIAL], context_estimate=2048)
+    stored, deadline = _raw_notices(engine, answer)
+    assert deadline == T0 + 7 * DAY
+    assert stored is not None and json.loads(stored) == [PARTIAL]
+    reply = store.chat_detail("user-a", chat_id).messages[1]
+    assert (reply.content, reply.context_estimate) == ("Der Bericht, weiter.", 2048)
+
+
+def test_apply_periods_moves_notice_deadlines(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A shorter file period moves a deadline still ahead earlier; one already passed stays, as a step's does."""
+    clock.now = T0 - 10 * DAY
+    store.apply_periods(90)
+    _, passed = _asked(store)
+    store.finish_assistant_message(passed, "Alt", notices=[PARTIAL])
+    clock.now = T0
+    _, live = _asked(store)
+    store.finish_assistant_message(live, "Neu", notices=[PARTIAL])
+    _, plain = _asked(store)
+    store.finish_assistant_message(plain, "Ohne Datei", notices=[{"code": "answer_cut"}])
+    clock.now = T0 + DAY
+    ChatStore(engine, file_days=3, notice_days=30, now=clock).apply_periods(90)
+    assert _raw_notices(engine, passed)[1] == T0 - 3 * DAY
+    assert _raw_notices(engine, live)[1] == T0 + 3 * DAY
+    assert _raw_notices(engine, plain)[1] is None
+
+
+def test_an_answer_from_before_schema_3_has_no_notices(store: ChatStore, engine: Engine) -> None:
+    """An answer 0.6 stored has ``NULL`` notices and estimate: it is served with neither, as before."""
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht")
+    with Session(engine) as s, s.begin():
+        s.execute(update(Message).where(Message.id == answer).values(notices=None, context_estimate=None))
+    question, reply = store.chat_detail("user-a", chat_id).messages
+    assert (reply.content, reply.notices, reply.context_estimate) == ("Der Bericht", None, None)
+    assert (question.notices, question.context_estimate) == (None, None)
 
 
 def test_the_app_opens_the_store_and_applies_the_period(client: TestClient) -> None:

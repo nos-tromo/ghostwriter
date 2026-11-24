@@ -22,6 +22,7 @@ from anyio import CapacityLimiter
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from loguru import logger
+from sqlalchemy import update
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
@@ -32,7 +33,7 @@ from ghostwriter.api.messages import TurnStream, _frame
 from ghostwriter.db import make_engine, utcnow
 from ghostwriter.inference import ModelClient
 from ghostwriter.main import create_app
-from ghostwriter.models import FileMark
+from ghostwriter.models import FileMark, Message
 from ghostwriter.schemas import AttachmentOut, ChatOut
 from ghostwriter.sse import sse_frame
 from ghostwriter.turns import TurnRegistry
@@ -1118,6 +1119,40 @@ def test_a_refused_image_round_streams_a_notice(
         ("error", 1, 1),
         ("ok", 1, 0),
     ]
+
+
+def test_notices_are_stored_with_their_answer(
+    seeing: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """The notice the stream told is the answer's when the chat is read again; the question has none."""
+    cid = _new(seeing)
+    photo = _attach_photo(seeing, cid)
+    fake_openai.script = [_refused(), ANSWER]
+    frames = _frames(_send(seeing, cid, "Was zeigt das Bild?", attachment_ids=[photo]))
+    assert [frame.event for frame in frames] == ["notice", "token", "final"]
+    r = seeing.get(f"/api/chats/{cid}", headers=as_user())
+    assert r.status_code == 200, r.text
+    question, answer = r.json()["messages"]
+    assert (question["notices"], question["context_estimate"]) == (None, None)
+    assert answer["notices"] == [
+        {"code": "images_dropped", "file_id": None, "name": None, "read": None, "total": None, "unit": None}
+    ]
+
+
+def test_an_answer_from_before_notices_is_served_as_before(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """An answer 0.6 stored has ``NULL`` notices and estimate: the chat serves both as ``null``, the text unchanged."""
+    cid = _new(client)
+    fake_openai.script = [ANSWER]
+    _frames(_send(client, cid))
+    engine = make_engine(_state(client).settings.db_path)
+    with Session(engine) as s, s.begin():
+        s.execute(update(Message).where(Message.chat_id == cid).values(notices=None, context_estimate=None))
+    engine.dispose()
+    r = client.get(f"/api/chats/{cid}", headers=as_user())
+    assert r.status_code == 200, r.text
+    question, answer = r.json()["messages"]
+    assert [(m["notices"], m["context_estimate"]) for m in (question, answer)] == [(None, None), (None, None)]
+    assert answer["content"] and answer["role"] == "assistant"
 
 
 def _notice_data(event: NoticeEvent) -> dict[str, Any]:

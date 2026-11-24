@@ -124,6 +124,28 @@ class ResultOut(BaseModel):
     expired: bool
 
 
+class NoticeOut(BaseModel):
+    """What an answer tells the user of itself, as the chat serves it.
+
+    The details of a notice about a file are served until the content deadline; after it, the code alone.
+
+    Attributes:
+        code: The notice (:data:`NoticeCode`).
+        file_id: workbench's id of the file it is about.
+        name: The file's name, read from its attachment.
+        read: How many units of the file were read.
+        total: How many units the file has.
+        unit: What ``read`` and ``total`` count.
+    """
+
+    code: NoticeCode
+    file_id: str | None = None
+    name: str | None = None
+    read: int | None = None
+    total: int | None = None
+    unit: MeasureUnit | None = None
+
+
 class MessageOut(BaseModel):
     """A message with what belongs to it.
 
@@ -135,6 +157,9 @@ class MessageOut(BaseModel):
         attachments: The files a user's message bound.
         steps: An answer's tool steps, in order.
         results: An answer's result cards, in order.
+        notices: An answer's notices, in order; ``None`` for a question, an answer still being written, and one
+            stored before notices were.
+        context_estimate: The estimated tokens of the prompt after this answer; ``None`` when none was stored.
     """
 
     id: str
@@ -144,6 +169,8 @@ class MessageOut(BaseModel):
     attachments: list[AttachmentOut]
     steps: list[StepOut]
     results: list[ResultOut]
+    notices: list[NoticeOut] | None = None
+    context_estimate: int | None = None
 
 
 class ChatDetail(BaseModel):

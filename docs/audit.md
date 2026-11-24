@@ -47,7 +47,7 @@ images, sent again without them, is two `chat.answer` events.
 | start-up, a chat delete that failed, or a take-back that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`; for a clip `nextext:transcribe`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails; for a clip, the same children as an attached clip's |
 | start-up, 4 minutes after a create whose answer was lost or a clip's own delete that failed, and the sweep: Ghostwriter's jobs at Nextext that no clip owns | `delete` `chat.nextext` as the system, written before the deletes, criteria `listed`, `at_start` | `job` (count) | an `error` one (`job`, count) for the jobs Nextext did not delete |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
-| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
+| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) / `message` (an answer's notices, stripped to their codes) | — |
 
 `/api/config`, `/api/whoami`, `/api/health` and `/metrics` are not audited. A
 refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records nothing.

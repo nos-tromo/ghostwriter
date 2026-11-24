@@ -4,6 +4,7 @@ Every name, id and value here is invented.
 """
 
 import asyncio
+import json
 import re
 import subprocess
 import sys
@@ -20,7 +21,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
@@ -29,7 +30,7 @@ from ghostwriter.audit import open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.main import create_app
-from ghostwriter.models import Attachment, Chat, Result, ToolStep
+from ghostwriter.models import Attachment, Chat, Message, Result, ToolStep
 from ghostwriter.nextext import NextextClient
 from ghostwriter.processing import NEXTEXT_OPERATION, AttachmentProcessor, PrepareJob
 from ghostwriter.retention import (
@@ -298,6 +299,34 @@ def _contents(env: Env, made: datetime) -> tuple[str, str]:
     ids = _step(env.store, answer), _result(env.store, answer)
     env.clock.now = NOW
     return ids
+
+
+#: A notice that a file was read in part, as an answer stores it.
+PARTIAL = {"code": "document_partial", "file_id": "c" * 32, "read": 9, "total": 500, "unit": "page"}
+
+
+def _partial(env: Env, made: datetime) -> str:
+    """Start a chat at ``made`` and give it an answer made then that read a file in part.
+
+    Args:
+        env: The test's env.
+        made: When the chat and its answer were made.
+
+    Returns:
+        The answer's id.
+    """
+    chat_id = env.chat(made)
+    env.clock.now = made
+    answer = env.store.start_assistant_message(chat_id)
+    env.store.finish_assistant_message(answer, "Der Bericht", notices=[PARTIAL, {"code": "answer_cut"}])
+    env.clock.now = NOW
+    return answer
+
+
+def _raw_notices(engine: Engine, message_id: str) -> tuple[Any, ...]:
+    with Session(engine) as s:
+        row = s.execute(select(Message.notices, Message.notices_expire_at).where(Message.id == message_id)).one()
+        return tuple(row)
 
 
 # --- chats -------------------------------------------------------------------
@@ -798,6 +827,31 @@ async def test_a_manifest_is_not_emptied_when_its_record_cannot_be_written(
     assert _raw_attachment(env.engine, old)[2] is None
 
 
+async def test_the_sweep_strips_notice_details(settled: Env, audit_stream: CapturedAuditStream) -> None:
+    """Past the content deadline an answer's notices keep their codes alone: recorded first, then stripped."""
+    env = settled
+    old = _partial(env, NOW - 8 * DAY)
+    live = _partial(env, NOW - DAY)
+    audit_stream.writes_left = 0
+    with pytest.raises(AuditWriteError):
+        await env.sweeper.sweep()
+    audit_stream.writes_left = None
+    assert json.loads(_raw_notices(env.engine, old)[0]) == [PARTIAL, {"code": "answer_cut"}]
+    before = len(events(audit_stream))
+    assert await env.sweeper.sweep() == SweepReport(notices=1)
+    emptied = _of(audit_stream, "retention.tool_content")
+    assert [(e["action"], e["actor"], e["target"], e["criteria"]) for e in emptied] == [
+        ("delete", SYSTEM, {"kind": "message", "ids": [old], "count": 1}, {"file_days": 7}),
+    ]
+    assert len(events(audit_stream)) == before + 1
+    stored, deadline = _raw_notices(env.engine, old)
+    assert (json.loads(stored), deadline) == ([{"code": "document_partial"}, {"code": "answer_cut"}], None)
+    assert json.loads(_raw_notices(env.engine, live)[0]) == [PARTIAL, {"code": "answer_cut"}]
+    assert "c" * 32 not in audit_stream.getvalue()
+    assert await env.sweeper.sweep() == SweepReport()
+    assert len(events(audit_stream)) == before + 1
+
+
 def _spin_guard(monkeypatch: pytest.MonkeyPatch, store: ChatStore, name: str) -> None:
     """Fail a sweep that reads what is due more than ten times, instead of letting it spin."""
     read = getattr(store, name)
@@ -953,7 +1007,7 @@ def test_the_dry_run_counts_and_changes_nothing(settled: Env, audit_stream: Capt
     out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
     assert out == (
         "chats due now: 2 (started 95 to 120 days ago; period 90 days, in force since 2026-11-16)\n"
-        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)\n"
+        "tool contents due now: 2 steps, 1 preview, 0 manifests, 0 notices (made 8 to 30 days ago; period 7 days)\n"
         "This run deletes nothing."
     )
     assert "chats due now: 2" in out
@@ -972,8 +1026,8 @@ async def test_the_dry_run_counts_the_manifests_a_sweep_would_empty(settled: Env
     _scan(env, NOW - 100 * DAY)
     files = _files(env)
     out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
-    assert (
-        out.splitlines()[1] == "tool contents due now: 0 steps, 0 previews, 1 manifest (made 8 days ago; period 7 days)"
+    assert out.splitlines()[1] == (
+        "tool contents due now: 0 steps, 0 previews, 1 manifest, 0 notices (made 8 days ago; period 7 days)"
     )
     assert _files(env) == files
     assert (await env.sweeper.sweep()).manifests == 1
@@ -987,7 +1041,43 @@ def test_the_dry_run_reads_a_file_from_before_manifests(settled: Env) -> None:
         conn.exec_driver_sql("ALTER TABLE attachments DROP COLUMN render")
     out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
     assert out.splitlines()[1] == (
-        "tool contents due now: 2 steps, 1 preview, 0 manifests (made 8 to 30 days ago; period 7 days)"
+        "tool contents due now: 2 steps, 1 preview, 0 manifests, 0 notices (made 8 to 30 days ago; period 7 days)"
+    )
+
+
+def test_the_dry_run_counts_notices_and_measures(settled: Env) -> None:
+    """Due notice details and measures of kept chats count, live ones and a due chat's do not; also on schema 2.
+
+    A file of schema 2 has neither ``measure`` nor ``notices_expire_at``: its manifests are counted by ``render``
+    alone, and it has no notice details.
+    """
+    env = settled
+    _scan(env, NOW - 8 * DAY)
+    measured = _scan(env, NOW - 9 * DAY)
+    _partial(env, NOW - 8 * DAY)
+    _partial(env, NOW - DAY)
+    _partial(env, NOW - 100 * DAY)
+    with Session(env.engine) as s, s.begin():
+        measure = json.dumps({"total": 500, "unit": "page", "chars": 900_000, "capped": False})
+        s.execute(update(Attachment).where(Attachment.id == measured).values(render=None, measure=measure))
+    files = _files(env)
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert out.splitlines()[1] == (
+        "tool contents due now: 0 steps, 0 previews, 2 manifests, 1 notice (made 8 to 9 days ago; period 7 days)"
+    )
+    assert _files(env) == files
+    with env.engine.begin() as conn:
+        conn.exec_driver_sql("DROP INDEX ix_messages_notices_expire_at")
+        for table, column in (
+            ("messages", "notices_expire_at"),
+            ("messages", "notices"),
+            ("messages", "context_estimate"),
+            ("attachments", "measure"),
+        ):
+            conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN {column}")
+    out = dry_run(env.settings.db_path, chat_days=90, file_days=7, notice_days=30, now=NOW)
+    assert out.splitlines()[1] == (
+        "tool contents due now: 0 steps, 0 previews, 1 manifest, 0 notices (made 8 days ago; period 7 days)"
     )
 
 
@@ -1005,7 +1095,7 @@ def test_the_dry_run_previews_another_period(settled: Env) -> None:
     out = dry_run(env.settings.db_path, chat_days=None, file_days=7, notice_days=30, now=NOW)
     assert out.splitlines()[:2] == [
         "chats due now: 0 (chat retention is off)",
-        "tool contents due now: 3 steps, 2 previews, 0 manifests (made 8 to 120 days ago; period 7 days)",
+        "tool contents due now: 3 steps, 2 previews, 0 manifests, 0 notices (made 8 to 120 days ago; period 7 days)",
     ]
 
 

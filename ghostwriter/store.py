@@ -10,10 +10,19 @@ result's preview) expires with the earliest file that can still exist then, the
 earliest mark after ``t`` minus the file period, or a file period after ``t``:
 nothing derived from a file outlives it (spec §5.6). An attachment or a result
 itself lives as long as its own file, and so does its manifest (the counts and
-sizes workbench reported of it, kept in ``render``): derived from the file, it is
-not served, and is emptied, once the file's period has passed. A chat without
-marks never used workbench. The retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
-deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`).
+sizes workbench reported of it, kept in ``render``) and its measure (its length,
+kept in ``measure``): derived from the file, they are not served, and are emptied,
+once the file's period has passed. An answer stores its notices
+(:class:`~ghostwriter.agent.notices.NoticeEvent`) when it is written. The details
+of a notice about a file (:data:`PARAM_CODES`: the file's id and how much of it
+was read) are content made with the answer: the first write that holds one sets
+``notices_expire_at``, the content deadline from the answer's start, and a later
+write of the same answer keeps it. Until then they are served, with the file's
+name read from its attachment, never stored; after it only the codes are, and
+the sweep strips the rest. A chat without marks never used workbench. The
+retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
+deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`,
+:meth:`ChatStore.due_notices`).
 """
 
 import json
@@ -31,6 +40,7 @@ from sqlalchemy.orm import Session
 
 from ghostwriter.agent.context import PastCall, PastTurn, attachment_facts, user_content
 from ghostwriter.agent.images import AttachedImage, rendition_size
+from ghostwriter.agent.notices import NoticeEvent
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
@@ -42,6 +52,7 @@ from ghostwriter.schemas import (
     ChatDetail,
     ChatOut,
     MessageOut,
+    NoticeOut,
     ResultKind,
     ResultOut,
     Role,
@@ -69,6 +80,8 @@ STORED_MANIFEST_KEYS: Final = (
 )
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
+#: The notices about a file, whose details (its id and counts) follow the content deadline.
+PARAM_CODES: Final = frozenset({"document_partial", "document_unread"})
 
 
 class ChatNotFound(LookupError):
@@ -162,6 +175,18 @@ def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
     return cast(Mapping[str, Any], manifest) if isinstance(manifest, dict) else None
 
 
+def _dumped(value: object) -> str:
+    """Write a stored value as compact JSON.
+
+    Args:
+        value: The value.
+
+    Returns:
+        Its JSON, non-ASCII kept as it is.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _stored_manifest(manifest: Mapping[str, Any]) -> str:
     """Reduce what workbench reported of a file to what the chat keeps, as JSON.
 
@@ -179,7 +204,68 @@ def _stored_manifest(manifest: Mapping[str, Any]) -> str:
             {key: rendition[key] for key in _RENDITION_KEYS if key in rendition}
             for rendition in cast(list[Mapping[str, Any]], renditions)
         ]
-    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
+    return _dumped(kept)
+
+
+def _loaded_notices(stored: str) -> list[NoticeEvent]:
+    """Read an answer's stored notices.
+
+    Args:
+        stored: The row's ``notices``.
+
+    Returns:
+        Each notice with a code this version knows, in order; none for a value that is not a JSON list.
+    """
+    try:
+        values = json.loads(stored)
+    except ValueError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [event for value in cast(list[Any], values) if (event := NoticeEvent.from_stored(value)) is not None]
+
+
+def _codes_only(stored: str | None) -> str | None:
+    """Strip stored notices to their codes, as the sweep leaves them past their deadline.
+
+    Args:
+        stored: The row's ``notices``.
+
+    Returns:
+        A JSON list of ``{"code"}`` items, a code this version does not know left out; ``None`` for ``None``.
+    """
+    return None if stored is None else _dumped([{"code": event.code} for event in _loaded_notices(stored)])
+
+
+def _notices_out(message: Message, names: Mapping[str, str], now: datetime) -> list[NoticeOut] | None:
+    """Serve an answer's notices, their details only until their deadline.
+
+    Args:
+        message: The row.
+        names: The chat's attachments' names, by workbench's file id.
+        now: The time of the read.
+
+    Returns:
+        The notices in order: with their details and their file's name while ``notices_expire_at`` is ahead, the
+        codes alone after it or without one; ``None`` while none are stored (a question, an answer being written,
+        one stored before schema 3).
+    """
+    if message.notices is None:
+        return None
+    detailed = message.notices_expire_at is not None and message.notices_expire_at > now
+    return [
+        NoticeOut(
+            code=event.code,
+            file_id=event.file_id,
+            name=None if event.file_id is None else names.get(event.file_id),
+            read=event.read,
+            total=event.total,
+            unit=event.unit,
+        )
+        if detailed
+        else NoticeOut(code=event.code)
+        for event in _loaded_notices(message.notices)
+    ]
 
 
 def _title(content: str) -> str | None:
@@ -453,8 +539,9 @@ class ChatStore:
         """Put the configured periods in force, at startup.
 
         Records the chat period's next state and gives every chat its
-        deadline under it. Tool contents and previews whose deadline has not
-        passed get theirs again under the current file period: capped by the
+        deadline under it. Tool contents, previews and notices' details whose
+        deadline has not passed get theirs again under the current file period
+        (a notice's made at its answer's start): capped by the
         files that could still exist when they were made, under the period
         then in force (recorded here too), so a shorter period never moves a
         deadline later. One already passed keeps it, so a longer period
@@ -522,6 +609,17 @@ class ChatStore:
                         for result_id, made, chat_id in results
                     ],
                 )
+            notices = s.execute(
+                select(Message.id, Message.created_at, Message.chat_id).where(Message.notices_expire_at > now)
+            ).all()
+            if notices:
+                s.execute(
+                    update(Message),
+                    [
+                        {"id": message_id, "notices_expire_at": deadline(chat_id, made)}
+                        for message_id, made, chat_id in notices
+                    ],
+                )
         return state
 
     def create_chat(self, owner: str, *, id: str | None = None) -> ChatOut:
@@ -580,14 +678,15 @@ class ChatStore:
             return _chat_out(self._owned(s, owner, chat_id))
 
     def chat_detail(self, owner: str, chat_id: str) -> ChatDetail:
-        """Return an owner's chat with its messages, steps, results and attachments.
+        """Return an owner's chat with its messages, steps, results, attachments and notices.
 
         Args:
             owner: Who asks.
             chat_id: The chat.
 
         Returns:
-            The chat, its messages in order and its pending attachments.
+            The chat, its messages in order and its pending attachments; an answer's notices name their file
+            by its attachment in this chat.
 
         Raises:
             ChatNotFound: If the owner has no chat with that id.
@@ -611,6 +710,7 @@ class ChatStore:
                 .where(Message.chat_id == chat_id)
                 .order_by(Result.message_id, Result.position)
             ).all()
+            names = {a.workbench_file_id: a.name for a in attachments}
             return ChatDetail(
                 chat=_chat_out(chat),
                 messages=[
@@ -622,6 +722,8 @@ class ChatStore:
                         attachments=[self._attachment_out(a, now) for a in attachments if a.message_id == message.id],
                         steps=[_step_out(step, now) for step in steps if step.message_id == message.id],
                         results=[self._result_out(r, now) for r in results if r.message_id == message.id],
+                        notices=_notices_out(message, names, now),
+                        context_estimate=message.context_estimate,
                     )
                     for message in messages
                 ],
@@ -756,6 +858,43 @@ class ChatStore:
             if attachment_ids:
                 s.execute(update(Attachment).where(Attachment.id.in_(attachment_ids)).values(render=None))
 
+    def due_notices(self, now: datetime, limit: int) -> list[str]:
+        """Return the answers whose notices' details have expired and are not yet stripped.
+
+        Args:
+            now: The time of the sweep.
+            limit: The most answers returned.
+
+        Returns:
+            The answers' ids, the earliest deadline first.
+        """
+        with self._transaction() as s:
+            return list(
+                s.scalars(
+                    select(Message.id)
+                    .where(Message.notices_expire_at.is_not(None), Message.notices_expire_at <= now)
+                    .order_by(Message.notices_expire_at, Message.id)
+                    .limit(limit)
+                ).all()
+            )
+
+    def strip_notices(self, message_ids: Sequence[str]) -> None:
+        """Strip answers' notices to their codes and clear their deadline; the answers and their order stay.
+
+        Args:
+            message_ids: The answers.
+        """
+        with self._transaction() as s:
+            rows = s.execute(select(Message.id, Message.notices).where(Message.id.in_(message_ids))).all()
+            if rows:
+                s.execute(
+                    update(Message),
+                    [
+                        {"id": message_id, "notices": _codes_only(stored), "notices_expire_at": None}
+                        for message_id, stored in rows
+                    ],
+                )
+
     def checkpoint(self) -> None:
         """Copy the write-ahead log into the database file and empty it, outside any transaction.
 
@@ -849,17 +988,38 @@ class ChatStore:
             s.add(message)
             return message.id
 
-    def finish_assistant_message(self, message_id: str, content: str) -> None:
-        """Store an answer's text.
+    def finish_assistant_message(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        notices: Sequence[Mapping[str, Any]] = (),
+        context_estimate: int | None = None,
+    ) -> None:
+        """Store an answer's text, its notices and the estimate of the next prompt.
+
+        A notice about a file (:data:`PARAM_CODES`) sets the content deadline of the notices' details, from the
+        answer's start, when none is set yet; a later write of the same answer (a Continue) keeps it.
 
         Args:
             message_id: The answer.
             content: Its text.
+            notices: Its notices, each as :meth:`~ghostwriter.agent.notices.NoticeEvent.stored` gives it: codes, ids
+                and counts, never a name; none is stored as an empty list.
+            context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
+        stored = [dict(notice) for notice in notices]
         with self._transaction() as s:
-            s.execute(
-                update(Message).where(Message.id == message_id, Message.role == "assistant").values(content=content)
-            )
+            message = s.scalars(
+                select(Message).where(Message.id == message_id, Message.role == "assistant")
+            ).one_or_none()
+            if message is None:
+                return
+            message.content = content
+            message.notices = _dumped(stored)
+            message.context_estimate = context_estimate
+            if message.notices_expire_at is None and any(notice.get("code") in PARAM_CODES for notice in stored):
+                message.notices_expire_at = self._content_deadline(s, message.chat_id, message.created_at)
 
     def add_step(
         self,
@@ -957,7 +1117,7 @@ class ChatStore:
                 name=name,
                 mime=mime,
                 size=size,
-                preview=None if preview is None else json.dumps(preview, ensure_ascii=False, separators=(",", ":")),
+                preview=None if preview is None else _dumped(preview),
                 created_at=now,
                 preview_expires_at=self._content_deadline(s, chat_id, now),
             )

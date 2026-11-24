@@ -618,7 +618,7 @@ class AgentLoop:
     def run(self, turn: Turn, audit: TurnAudit) -> Iterator[TurnEvent]:
         """Answer a message.
 
-        The answer's text is stored when the run ends, however it ends.
+        The answer's text and its notices are stored when the run ends, however it ends.
 
         Args:
             turn: The message.
@@ -630,7 +630,7 @@ class AgentLoop:
             :class:`ErrorEvent` last when the answer ended early.
 
         Raises:
-            AuditWriteError: When a record could not be written; raised after the text is stored.
+            AuditWriteError: When a record could not be written; raised after the answer is stored.
         """
         message = _Progress(started=self._clock())
         try:
@@ -642,19 +642,23 @@ class AgentLoop:
                 logger.error("An answer broke off: {}", type(exc).__name__)
                 yield ErrorEvent("internal", INTERNAL_ERROR)
         finally:
-            self._store_text(turn, "".join(message.shown))
+            self._store_answer(turn, message)
 
-    def _store_text(self, turn: Turn, text: str) -> None:
-        """Store the answer's text; a failure is logged, never raised over the turn's own outcome.
+    def _store_answer(self, turn: Turn, message: _Progress) -> None:
+        """Store the answer's text and its notices; a failure is logged, never raised over the turn's own outcome.
 
         Args:
             turn: The message.
-            text: Everything shown.
+            message: The answer: everything shown, and every notice told, stored without its name.
         """
         try:
-            self._store.finish_assistant_message(turn.assistant_message_id, text)
+            self._store.finish_assistant_message(
+                turn.assistant_message_id,
+                "".join(message.shown),
+                notices=[notice.stored() for notice in message.notices],
+            )
         except Exception as exc:
-            logger.error("An answer's text could not be stored: {}", type(exc).__name__)
+            logger.error("An answer could not be stored: {}", type(exc).__name__)
 
     def _left(self, message: _Progress) -> float:
         """Return the seconds left of the message's wall.

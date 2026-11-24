@@ -272,8 +272,9 @@ strict; lines are 120 characters.
   `Makefile`, nginx, Vite's `base` and `.env.example` (its tag comments,
   lines under 80 characters).
 - A setting: `load_settings` in `config.py`, `.env.example`, `docs/configuration.md`.
-- The schema (now version 2: attachments carry `kind`, `status`, `render`,
-  `failure`): raise `SCHEMA_VERSION` in `db.py` and add
+- The schema (now version 3: attachments carry `kind`, `status`, `render`,
+  `failure`, `measure`, `measure_state`; answers `notices`,
+  `context_estimate`, `notices_expire_at`): raise `SCHEMA_VERSION` in `db.py` and add
   `MIGRATIONS[<previous version>]`, one step per version. A file from a newer
   version is refused. `retention.py`'s dry run reads the file directly, so it
   needs the same care for a column it selects.
