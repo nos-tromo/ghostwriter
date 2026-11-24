@@ -55,6 +55,8 @@ BUSY_RETRY_S: Final = 2.0
 # What the model reads back.
 #: Characters of a tool result the model reads.
 TOOL_RESULT_CHARS: Final = 16_384
+#: The least of a part's own text a cut keeps; with room for fewer, the part is left out whole.
+MIN_CUT_PART_CHARS: Final = 200
 #: Characters of an earlier call's arguments replayed in a follow-up.
 HISTORY_ARGUMENT_CHARS: Final = 2_000
 #: Characters of an earlier call's result replayed in a follow-up.

@@ -5,10 +5,10 @@ smaller models write them: nothing is no arguments, a JSON string holding an obj
 once, anything else is refused to the model. What it reads back is bounded: a result's text
 (which workbench writes without the table previews) cut to ``TOOL_RESULT_CHARS``, or a small
 JSON object naming why there is none. A paged answer, ``read_document``'s, is cut by parts so that
-it stays JSON and keeps ``next_part`` and ``truncated``, with the last part kept cut if need be;
-any other text is cut where it falls. A result that showed images says how many it returned,
-or that they could not be shown; which of them went to the model, the note in each one's place
-says. The texts here are the model-facing protocol.
+it stays JSON and keeps ``next_part`` and ``truncated``, with the last part kept cut if need be, and a
+hint that sends the model on at ``next_part``; any other text is cut where it falls. A result that
+showed images says how many it returned, or that they could not be shown; which of them went to the
+model, the note in each one's place says. The texts here are the model-facing protocol.
 
 Ghostwriter sets the arguments of :data:`HIDDEN_ARGUMENTS` itself: their schemas are left out of
 what the model is offered, and whatever it sends for them is dropped.
@@ -16,11 +16,12 @@ what the model is offered, and whatever it sends for them is dropped.
 
 import json
 import posixpath
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, Literal
 
-from ghostwriter.agent.limits import IMAGE_MIMES, INLINE_IMAGE_BYTES, TOOL_RESULT_CHARS
+from ghostwriter.agent.limits import IMAGE_MIMES, INLINE_IMAGE_BYTES, MIN_CUT_PART_CHARS, TOOL_RESULT_CHARS
 from ghostwriter.workbench import McpTool, OutputFile, ToolFailure, ToolResult
 
 #: What the model reads when a call is not run, or workbench was busy.
@@ -43,6 +44,17 @@ BUSY_TOKENS: Final = frozenset({"queue_full", "wait_timeout", "executor_busy"})
 CUT_MARK: Final = "…[cut]"
 #: What ends the ``hint`` of a paged answer Ghostwriter cut: how the model reads on.
 CUT_HINT: Final = "Ghostwriter cut this answer to fit; call read_document again with part set to next_part to read on."
+#: workbench's own advice to read on, as it joins it to a hint: a lead-in sentence (its result limit, or its images
+#: ending the answer) and the call. It names workbench's ``next_part``, which a cut that leaves parts out moves.
+PAGING_ADVICE: Final = re.compile(
+    r'(?:The answer is cut [^.]*\. )?Call read_document again with part=".*?" to continue\. ?'
+)
+#: What ends the ``hint`` when the cut falls in the last part and no part follows it: there is no ``next_part``.
+CUT_END_HINT: Final = (
+    "Ghostwriter cut the last part of this answer to fit, and no part follows it. To read its rest, call "
+    "read_document with a narrower part (fewer lines or rows) if the file allows one; otherwise say that the end "
+    "was cut."
+)
 #: The deepest objects and lists may nest in arguments, as docint allows.
 MAX_ARGUMENT_DEPTH: Final = 32
 #: The longest detail a step shows in the trail.
@@ -121,8 +133,25 @@ def _paged(text: str) -> dict[str, Any] | None:
     return body
 
 
+def _told(hint: str | None, after: Any) -> str:
+    """Return the hint of a cut answer: the hint, then the sentence that says how to read on, or that nothing follows.
+
+    Args:
+        hint: workbench's hint, with its own advice to page on left out if the cut moved ``next_part``; or ``None``.
+        after: The ``next_part`` the cut answer carries.
+
+    Returns:
+        The hint and :data:`CUT_HINT`, or, with no ``next_part``, :data:`CUT_END_HINT`.
+    """
+    return " ".join(sentence for sentence in (hint, CUT_HINT if after else CUT_END_HINT) if sentence)
+
+
 def _by_parts(body: dict[str, Any], limit: int) -> str | None:
     """Rebuild a paged answer from the whole parts that fit and one more cut to the room that is left.
+
+    The cut part keeps at least :data:`MIN_CUT_PART_CHARS` characters of its text; with less room it is left out, and
+    ``next_part`` names it. If ``next_part`` moves, workbench's own advice to page on is taken out of the hint, as it
+    names the part workbench would go on at.
 
     Args:
         body: The answer, as :func:`_paged` read it.
@@ -132,11 +161,14 @@ def _by_parts(body: dict[str, Any], limit: int) -> str | None:
         The JSON, or ``None`` when the fields around the parts leave no room for even the start of one.
     """
     parts: list[dict[str, Any]] = body["parts"]
+    workbench_next = body.get("next_part")
     hint = body.get("hint")
-    told = f"{hint} {CUT_HINT}" if isinstance(hint, str) and hint else CUT_HINT
+    own = hint if isinstance(hint, str) and hint else None
+    moved = PAGING_ADVICE.sub("", own).strip() if own else None  # the hint when ``next_part`` is not workbench's
 
     def shaped(kept: list[dict[str, Any]], first_left_out: int) -> str:
-        after = parts[first_left_out]["label"] if first_left_out < len(parts) else body.get("next_part")
+        after = parts[first_left_out]["label"] if first_left_out < len(parts) else workbench_next
+        told = _told(own if after == workbench_next else moved, after)
         return compact({**body, "parts": kept, "truncated": True, "next_part": after, "hint": told})
 
     kept: list[dict[str, Any]] = []
@@ -146,7 +178,7 @@ def _by_parts(body: dict[str, Any], limit: int) -> str | None:
             continue
         # The most text that fits is searched for, as escaping makes it longer than its characters: by up to six
         # each, so a step of the size of the excess would overshoot and could lose the whole part.
-        low = len(CUT_MARK) + 1
+        low = MIN_CUT_PART_CHARS + len(CUT_MARK)
         high = limit - len(shaped([*kept, {**part, "text": "", "cut": True}], index + 1))
         best: str | None = None
         while low <= high:
@@ -171,8 +203,11 @@ def cut_result(text: str, limit: int) -> str:
 
     A paged answer, ``read_document``'s, is rebuilt from the whole parts that fit and one more cut to the room that
     is left, so it stays JSON: ``truncated`` is true, ``next_part`` names the first part left out (workbench's own
-    when the cut falls in its last part), a part cut carries ``cut: true``, and ``hint`` ends with :data:`CUT_HINT`.
-    The ``limit`` counts the JSON as written, escapes included.
+    when the cut falls in its last part), and a part cut carries ``cut: true`` and keeps at least
+    :data:`MIN_CUT_PART_CHARS` characters, or is left out whole. The ``hint`` ends with :data:`CUT_HINT`; if
+    ``next_part`` moved, workbench's own advice to read on at its old one is taken out first; and if the cut falls
+    in the last part with no part after it, the hint ends with :data:`CUT_END_HINT` instead and ``next_part`` stays
+    null. The ``limit`` counts the JSON as written, escapes included.
 
     Args:
         text: The result's text.

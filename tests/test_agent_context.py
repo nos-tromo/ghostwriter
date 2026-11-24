@@ -49,12 +49,14 @@ from ghostwriter.agent.limits import (
     HISTORY_ARGUMENT_CHARS,
     HISTORY_RESULT_CHARS,
     INLINE_IMAGE_BYTES,
+    MIN_CUT_PART_CHARS,
     PROMPT_TOKENS,
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
 from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
+    CUT_END_HINT,
     CUT_HINT,
     CUT_MARK,
     REFUSALS,
@@ -263,16 +265,19 @@ def _page_text(n: int, chars: int) -> str:
     return (line * (chars // len(line) + 1))[:chars]
 
 
-def _paged_answer(texts: list[str], *, hint: str | None = "Read on with part set to next_part.") -> str:
+def _paged_answer(
+    texts: list[str], *, hint: str | None = "Read on with part set to next_part.", more: bool = True
+) -> str:
     """Return a ``read_document`` answer as workbench writes it: compact JSON, keys in its order.
 
     Args:
         texts: The text of each part, labelled ``page 1`` to ``page N``.
         hint: workbench's hint, if it sent one.
+        more: Whether workbench itself stopped after the parts, with three pages more, so that ``next_part`` is
+            ``page N+1``; otherwise the parts are the end of the document, and ``next_part`` is ``None``.
 
     Returns:
-        The answer; workbench itself stopped after the parts, with three pages more, so ``next_part`` is
-        ``page N+1``.
+        The answer.
     """
     body = {
         "path": "long-report.pdf",
@@ -280,10 +285,10 @@ def _paged_answer(texts: list[str], *, hint: str | None = "Read on with part set
         "parts": [
             {"label": f"page {n}", "text": text, "units": [n, n], "cut": False} for n, text in enumerate(texts, 1)
         ],
-        "total_parts": len(texts) + 3,
+        "total_parts": len(texts) + 3 if more else len(texts),
         "pages_without_text": [3, 7],
-        "truncated": True,
-        "next_part": f"page {len(texts) + 1}",
+        "truncated": more,
+        "next_part": f"page {len(texts) + 1}" if more else None,
         "hint": hint,
     }
     return compact(body)
@@ -429,6 +434,78 @@ def test_a_shell_too_long_alone_falls_back() -> None:
     assert cut_result(text, TOOL_RESULT_CHARS) == cut(text, TOOL_RESULT_CHARS)
 
 
+#: workbench's sentences that tell the model where to read on: when its own limit cut the text, and when its images did.
+WORKBENCH_PAGING = [
+    'The answer is cut at the result limit (16 KB). Call read_document again with part="page 6" to continue.',
+    'The answer is cut before page 6 to keep its images within the limit. Call read_document again with part="page 6" '
+    "to continue.",
+]
+
+
+def _three_whole_parts(text: str, hint: str) -> str:
+    """Return the answer as it is cut to the first three of its parts, the fourth left out."""
+    sent = json.loads(text)
+    return compact({**sent, "parts": sent["parts"][:3], "truncated": True, "next_part": "page 4", "hint": hint})
+
+
+@pytest.mark.parametrize("sentence", WORKBENCH_PAGING, ids=["the result limit", "the images"])
+def test_workbenchs_paging_sentence_gives_way_to_the_next_part_left(sentence: str) -> None:
+    """When parts are left out, the hint no longer sends the model to workbench's page 6; other advice stays."""
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=f"Pages 3 and 7 have no text. {sentence}")
+    expected = _three_whole_parts(text, f"Pages 3 and 7 have no text. {CUT_HINT}")
+    out = cut_result(text, len(expected) + 100)
+    assert out == expected
+    assert "page 6" not in out and json.loads(out)["next_part"] == "page 4"
+
+
+def test_workbenchs_paging_sentence_stays_when_next_part_does_not_move() -> None:
+    """If the cut falls in the last part, workbench's next part is still the next one, and its sentence is true."""
+    sentence = WORKBENCH_PAGING[0].replace("page 6", "page 4")
+    text = _paged_answer([_page_text(n, 7_000) for n in range(1, 4)], hint=f"Pages 3 and 7 have no text. {sentence}")
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    assert body["parts"][-1]["cut"] is True and body["next_part"] == "page 4"
+    assert body["hint"] == f"Pages 3 and 7 have no text. {sentence} {CUT_HINT}"
+
+
+def test_a_hint_that_was_only_workbenchs_paging_sentence_is_replaced() -> None:
+    """With nothing else in the hint, the answer's hint is Ghostwriter's own sentence alone."""
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=WORKBENCH_PAGING[0])
+    out = cut_result(text, len(_three_whole_parts(text, CUT_HINT)) + 100)
+    assert json.loads(out)["hint"] == CUT_HINT
+
+
+def test_a_cut_last_part_with_no_part_after_it_does_not_point_at_next_part() -> None:
+    """With no part to read on at, the hint says the end was cut and what to do, and ``next_part`` stays null."""
+    text = _paged_answer([_page_text(1, 2_000), _page_text(2, 20_000)], hint=None, more=False)
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    assert [part["label"] for part in body["parts"]] == ["page 1", "page 2"]
+    assert body["parts"][-1]["cut"] is True and body["parts"][-1]["text"].endswith(CUT_MARK)
+    assert body["truncated"] is True and body["next_part"] is None
+    assert body["hint"] == CUT_END_HINT
+    assert "next_part" not in body["hint"]
+
+
+def test_a_part_that_would_be_a_sliver_is_left_out_not_sent() -> None:
+    """A part cut to less than the floor is left out whole, and ``next_part`` names it."""
+    hint = "Read on with part set to next_part."
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=hint)
+    sent = json.loads(text)
+    expected = _three_whole_parts(text, f"{hint} {CUT_HINT}")
+    assert cut_result(text, len(expected) + 100) == expected
+    left_out = kept_cut = 0
+    for limit in range(len(expected), len(expected) + 600):
+        body = json.loads(cut_result(text, limit))
+        last = body["parts"][-1]
+        if last["cut"]:
+            kept_cut += 1
+            assert last["label"] == "page 4" and body["next_part"] == "page 5"
+            assert len(last["text"]) - len(CUT_MARK) >= MIN_CUT_PART_CHARS
+        else:
+            left_out += 1
+            assert body["parts"] == sent["parts"][:3] and body["next_part"] == "page 4"
+    assert left_out > 100 and kept_cut > 100
+
+
 def test_a_cut_answer_never_loses_every_part() -> None:
     """At any limit a cut answer holds at least one part, or is cut as any other text: never JSON with none."""
     text = _paged_answer([_page_text(1, 500), _page_text(2, 500)])
@@ -440,6 +517,7 @@ def test_a_cut_answer_never_loses_every_part() -> None:
             assert out == cut(text, limit)
         else:
             assert len(out) <= limit and body["parts"]
+            assert not body["parts"][-1]["cut"] or len(body["parts"][-1]["text"]) - len(CUT_MARK) >= MIN_CUT_PART_CHARS
 
 
 @pytest.mark.parametrize(
