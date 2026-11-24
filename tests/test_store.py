@@ -14,8 +14,9 @@ from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ghostwriter.db import init_db, make_engine
+from ghostwriter.main import create_app
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, ToolStep
-from ghostwriter.schemas import AttachmentOut, NoticeOut, ResultOut, StepOut, TablePreviewOut
+from ghostwriter.schemas import AttachmentOut, LengthOut, MeasureState, NoticeOut, ResultOut, StepOut, TablePreviewOut
 from ghostwriter.store import (
     STORED_MANIFEST_KEYS,
     AttachmentNotPending,
@@ -24,6 +25,7 @@ from ghostwriter.store import (
     FileRef,
     TooManyPending,
 )
+from tests.conftest import CapturedAuditStream, make_settings
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -917,6 +919,148 @@ def test_emptying_a_manifest_leaves_steps_and_results_alone(store: ChatStore, en
     with Session(engine) as s:
         assert s.execute(select(ToolStep.result).where(ToolStep.id == step.id)).scalar_one() == "Umsatz 42"
         assert s.execute(select(Result.preview).where(Result.id == result.id)).scalar_one() is not None
+
+
+MEASURE = {"total": 412, "unit": "page", "chars": 90_000, "capped": False}
+
+
+def _document(
+    store: ChatStore, chat_id: str, *, status: str = "ready", measure_state: MeasureState | None = "pending"
+) -> str:
+    """Add a pending document, its measure in the state given."""
+    file_id = uuid4().hex
+    return store.add_attachment(
+        chat_id,
+        file_id=file_id,
+        path=f"/workspace/s/{file_id}.pdf",
+        name="long-report.pdf",
+        size=4096,
+        mime="application/pdf",
+        status=status,
+        measure_state=measure_state,
+    ).id
+
+
+def _measure_row(engine: Engine, attachment_id: str) -> tuple[str | None, str | None]:
+    """Read an attachment's measure state and measure as stored."""
+    with Session(engine) as s:
+        row = s.execute(
+            select(Attachment.measure_state, Attachment.measure).where(Attachment.id == attachment_id)
+        ).one()
+        return row[0], row[1]
+
+
+def test_a_measure_settles_once(store: ChatStore, engine: Engine) -> None:
+    """Only a pending measure settles: a measure is kept as its four counts, ``None`` is ``none``; nothing twice."""
+    chat = store.create_chat("user-a")
+    report, ledger = _document(store, chat.id), _document(store, chat.id)
+    assert store.settle_measure(report, {**MEASURE, "path": "/workspace/s/x.pdf", "kind": "pdf"}) is True
+    assert store.settle_measure(report, None) is False
+    assert store.settle_measure(ledger, None) is True
+    assert store.settle_measure(ledger, MEASURE) is False
+    assert store.settle_measure(_document(store, chat.id, measure_state=None), MEASURE) is False
+    assert store.settle_measure("0" * 32, MEASURE) is False
+    state, measure = _measure_row(engine, report)
+    assert state == "measured" and measure is not None and json.loads(measure) == MEASURE
+    assert _measure_row(engine, ledger) == ("none", None)
+    out = store.attachment_out("user-a", chat.id, report)
+    assert out is not None and out.length == LengthOut(state="measured", total=412, unit="page", too_long=False)
+    out = store.attachment_out("user-a", chat.id, ledger)
+    assert out is not None and out.length == LengthOut(state="none", total=None, unit=None, too_long=False)
+
+
+def test_a_document_too_long_for_the_prompt(engine: Engine, clock: Clock) -> None:
+    """Too long: more characters than the store's prompt budget in tokens, or a count workbench capped."""
+    store = ChatStore(engine, file_days=7, notice_days=30, prompt_budget=1_000, now=clock)
+    chat = store.create_chat("user-a")
+    cases = {
+        (3_000, False): False,
+        (3_001, False): True,
+        (10, True): True,
+    }
+    for (chars, capped), too_long in cases.items():
+        attachment = _document(store, chat.id)
+        store.settle_measure(attachment, {**MEASURE, "chars": chars, "capped": capped})
+        out = store.attachment_out("user-a", chat.id, attachment)
+        assert out is not None and out.length is not None and out.length.too_long is too_long
+
+
+def test_a_picture_and_a_row_before_measuring_have_no_length(store: ChatStore) -> None:
+    """``NULL`` is never measured: a picture, a clip, or a row from before schema 3; its length is ``None``."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    old = _document(store, chat.id, measure_state=None)
+    assert picture.length is None
+    out = store.attachment_out("user-a", chat.id, old)
+    assert out is not None and out.length is None
+    found = store.find_attachment("user-a", chat.id, old)
+    assert found is not None and found.measure_state is None
+
+
+def test_length_goes_with_the_file(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """Past the file's period a length is not served, and the sweep empties the measure with the manifest."""
+    chat = store.create_chat("user-a")
+    scan = _document(store, chat.id, status="processing")
+    store.settle_attachment(scan, status="ready", manifest=MANIFEST, failure=None)
+    store.settle_measure(scan, MEASURE)
+    notes = _document(store, chat.id)
+    store.settle_measure(notes, MEASURE)
+    clock.now = T0 + 7 * DAY - timedelta(microseconds=1)
+    out = store.attachment_out("user-a", chat.id, scan)
+    assert out is not None and out.length is not None and out.length.state == "measured"
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+    clock.now = T0 + 7 * DAY
+    out = store.attachment_out("user-a", chat.id, scan)
+    assert out is not None and out.expired and out.length is None
+    _, _, due = store.due_contents(clock.now, 10)
+    assert sorted(due) == sorted([scan, notes])
+    store.empty_contents([], [], due)
+    assert _raw_attachment(engine, scan)[1] is None
+    assert [_measure_row(engine, attachment)[1] for attachment in (scan, notes)] == [None, None]
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+
+
+def test_pending_measures_are_the_ready_rows_still_pending(store: ChatStore) -> None:
+    """A processing row is the prepare's to requeue, a settled measure is no one's; a ready pending row is listed."""
+    chat = store.create_chat("user-a")
+    ready = _document(store, chat.id)
+    _document(store, chat.id, status="processing")
+    measured = _document(store, chat.id)
+    store.settle_measure(measured, MEASURE)
+    assert [(ref.id, ref.owner, ref.measure_state) for ref in store.pending_measures()] == [
+        (ready, "user-a", "pending")
+    ]
+
+
+def test_settle_pending_measures_at_start_without_workbench(
+    tmp_path: Path, engine: Engine, audit_stream: CapturedAuditStream
+) -> None:
+    """Without workbench nothing will measure them: every pending measure is ``none`` once the app has started."""
+    store = ChatStore(engine, file_days=7, notice_days=30)
+    chat = store.create_chat("user-a")
+    ready, processing = _document(store, chat.id), _document(store, chat.id, status="processing")
+    measured = _document(store, chat.id)
+    store.settle_measure(measured, MEASURE)
+    assert store.settle_pending_measures() == 2
+    assert store.settle_pending_measures() == 0
+    assert [_measure_row(engine, attachment)[0] for attachment in (ready, processing, measured)] == [
+        "none",
+        "none",
+        "measured",
+    ]
+    settings = make_settings(tmp_path, workbench_api_key=None, db_path=str(tmp_path / "start.sqlite3"))
+    started = make_engine(settings.db_path)
+    init_db(started)
+    try:
+        earlier = ChatStore(started, file_days=7, notice_days=30)
+        left = _document(earlier, earlier.create_chat("user-a").id)
+    finally:
+        started.dispose()
+    with TestClient(create_app(settings, audit_stream=audit_stream)) as client:
+        app_store = cast(FastAPI, client.app).state.store
+        assert cast(FastAPI, client.app).state.processor is None
+        [pending] = app_store.chat_detail("user-a", app_store.list_chats("user-a")[0].id).pending_attachments
+        assert pending.id == left and pending.length == LengthOut(state="none", total=None, unit=None, too_long=False)
 
 
 def test_an_attachment_for_a_chat_deleted_meanwhile_is_refused(store: ChatStore) -> None:

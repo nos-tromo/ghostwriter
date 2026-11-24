@@ -12,7 +12,11 @@ nothing derived from a file outlives it (spec §5.6). An attachment or a result
 itself lives as long as its own file, and so does its manifest (the counts and
 sizes workbench reported of it, kept in ``render``) and its measure (its length,
 kept in ``measure``): derived from the file, they are not served, and are emptied,
-once the file's period has passed. An answer stores its notices
+once the file's period has passed. The measure's state is a column of its own
+(``measure_state``): ``pending`` until workbench has measured the document, then
+``measured`` or ``none``; ``NULL`` for a picture, a clip, or a row from before
+measures. A measured document is ``too_long`` when its count was capped or its
+characters, over ``CHARS_PER_TOKEN``, pass the prompt budget. An answer stores its notices
 (:class:`~ghostwriter.agent.notices.NoticeEvent`) when it is written. The details
 of a notice about a file (:data:`PARAM_CODES`: the file's id and how much of it
 was read) are content made with the answer: the first write that holds one sets
@@ -40,7 +44,8 @@ from sqlalchemy.orm import Session
 
 from ghostwriter.agent.context import PastCall, PastTurn, attachment_facts, user_content
 from ghostwriter.agent.images import AttachedImage, rendition_size
-from ghostwriter.agent.notices import NoticeEvent
+from ghostwriter.agent.limits import CHARS_PER_TOKEN, PROMPT_TOKENS
+from ghostwriter.agent.notices import MEASURE_UNITS, NoticeEvent
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
@@ -51,6 +56,9 @@ from ghostwriter.schemas import (
     AttachmentStatus,
     ChatDetail,
     ChatOut,
+    LengthOut,
+    MeasureState,
+    MeasureUnit,
     MessageOut,
     NoticeOut,
     ResultKind,
@@ -80,6 +88,8 @@ STORED_MANIFEST_KEYS: Final = (
 )
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
+#: What a measure keeps of what workbench reports: its units, what they are, its characters and whether it was capped.
+MEASURE_KEYS: Final = ("total", "unit", "chars", "capped")
 #: The notices about a file, whose details (its id and counts) follow the content deadline.
 PARAM_CODES: Final = frozenset({"document_partial", "document_unread"})
 
@@ -126,6 +136,7 @@ class AttachmentRef:
             without one, and once the file's period has passed.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.
+        measure_state: Where its measure is (``pending``, ``measured`` or ``none``); ``None`` for one never measured.
     """
 
     id: str
@@ -139,6 +150,7 @@ class AttachmentRef:
     manifest: Mapping[str, Any] | None
     created_at: datetime
     expired: bool
+    measure_state: MeasureState | None
 
 
 @dataclass(frozen=True)
@@ -173,6 +185,31 @@ def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
     except ValueError:
         return None
     return cast(Mapping[str, Any], manifest) if isinstance(manifest, dict) else None
+
+
+def _count(value: object) -> int | None:
+    """Read a stored count.
+
+    Args:
+        value: The value.
+
+    Returns:
+        It, when it is an int from 0 and no bool; else ``None``.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _loaded_measure(stored: str | None) -> Mapping[str, Any] | None:
+    """Read a stored measure.
+
+    Args:
+        stored: The row's ``measure``.
+
+    Returns:
+        The measure (``total``, ``unit``, ``chars``, ``capped``), or ``None`` without one or for one that is not a
+        JSON object.
+    """
+    return _loaded_manifest(stored)
 
 
 def _dumped(value: object) -> str:
@@ -332,16 +369,24 @@ class ChatStore:
         engine: The database, with its schema (:func:`ghostwriter.db.init_db`).
         file_days: How long workbench keeps a chat's files; tool contents and previews follow it.
         notice_days: How long a new or shorter chat period waits before it deletes.
+        prompt_budget: The most a round's prompt holds, in tokens; a document measured longer is ``too_long``.
         now: The clock.
     """
 
     def __init__(
-        self, engine: Engine, *, file_days: int, notice_days: int, now: Callable[[], datetime] = utcnow
+        self,
+        engine: Engine,
+        *,
+        file_days: int,
+        notice_days: int,
+        prompt_budget: int = PROMPT_TOKENS,
+        now: Callable[[], datetime] = utcnow,
     ) -> None:
-        """Keep the engine, the periods and the clock."""
+        """Keep the engine, the periods, the prompt budget and the clock."""
         self._engine = engine
         self._file_period = timedelta(days=file_days)
         self._notice_days = notice_days
+        self._prompt_budget = prompt_budget
         self._now = now
 
     @contextmanager
@@ -366,6 +411,47 @@ class ChatStore:
         """
         return created_at + self._file_period <= now
 
+    def _too_long(self, attachment: Attachment) -> bool:
+        """Tell whether a measured document is longer than one prompt holds, so it is read only in parts.
+
+        Args:
+            attachment: The row.
+
+        Returns:
+            Whether it is ``measured`` and its count was capped, or its characters over ``CHARS_PER_TOKEN`` are more
+            than the prompt budget; ``False`` for any other row, and for a measure that does not read.
+        """
+        measure = _loaded_measure(attachment.measure) if attachment.measure_state == "measured" else None
+        if measure is None:
+            return False
+        chars = _count(measure.get("chars"))
+        return measure.get("capped") is True or (chars is not None and chars / CHARS_PER_TOKEN > self._prompt_budget)
+
+    def _length_out(self, attachment: Attachment, expired: bool) -> LengthOut | None:
+        """Serve an attachment's measure.
+
+        Args:
+            attachment: The row.
+            expired: Whether its file's period has passed.
+
+        Returns:
+            ``None`` once the file has expired or for one never measured (``NULL``); else its state, with its total,
+            unit and ``too_long`` once ``measured`` (``None``, ``None`` and ``False`` while ``pending`` or ``none``).
+        """
+        state = cast(MeasureState | None, attachment.measure_state)
+        if expired or state is None:
+            return None
+        if state != "measured":
+            return LengthOut(state=state, total=None, unit=None, too_long=False)
+        measure = _loaded_measure(attachment.measure) or {}
+        unit = measure.get("unit")
+        return LengthOut(
+            state=state,
+            total=_count(measure.get("total")),
+            unit=cast(MeasureUnit, unit) if isinstance(unit, str) and unit in MEASURE_UNITS else None,
+            too_long=self._too_long(attachment),
+        )
+
     def _attachment_out(self, attachment: Attachment, now: datetime) -> AttachmentOut:
         """Serve an attachment row.
 
@@ -374,8 +460,9 @@ class ChatStore:
             now: The time of the read.
 
         Returns:
-            The attachment, expired once workbench's period for it has passed.
+            The attachment, expired once workbench's period for it has passed, with its length while it is not.
         """
+        expired = self._gone(attachment.created_at, now)
         return AttachmentOut(
             id=attachment.id,
             file_id=attachment.workbench_file_id,
@@ -385,7 +472,8 @@ class ChatStore:
             kind=cast(AttachmentKind, attachment.kind),
             status=cast(AttachmentStatus, attachment.status),
             created_at=attachment.created_at,
-            expired=self._gone(attachment.created_at, now),
+            expired=expired,
+            length=self._length_out(attachment, expired),
         )
 
     def _attachment_ref(self, attachment: Attachment, owner: str, now: datetime) -> AttachmentRef:
@@ -413,6 +501,7 @@ class ChatStore:
             manifest=None if expired else _loaded_manifest(attachment.render),
             created_at=attachment.created_at,
             expired=expired,
+            measure_state=cast(MeasureState | None, attachment.measure_state),
         )
 
     def _result_out(self, result: Result, now: datetime) -> ResultOut:
@@ -803,7 +892,7 @@ class ChatStore:
     def due_contents(self, now: datetime, limit: int) -> tuple[list[str], list[str], list[str]]:
         """Return the tool steps, results and attachments whose content has expired and is not yet emptied.
 
-        An attachment's content is its manifest, derived from its file: it is due once the
+        An attachment's content is its manifest and its measure, derived from its file: they are due once the
         file's period has passed.
 
         Args:
@@ -811,7 +900,7 @@ class ChatStore:
             limit: The most steps, the most results and the most attachments returned.
 
         Returns:
-            The steps' ids, the results' ids and the ids of the attachments whose manifest is
+            The steps' ids, the results' ids and the ids of the attachments whose manifest or measure is
             due, the earliest deadline first.
         """
         with self._transaction() as s:
@@ -832,7 +921,10 @@ class ChatStore:
             ).all()
             attachments = s.scalars(
                 select(Attachment.id)
-                .where(Attachment.created_at <= now - self._file_period, Attachment.render.is_not(None))
+                .where(
+                    Attachment.created_at <= now - self._file_period,
+                    or_(Attachment.render.is_not(None), Attachment.measure.is_not(None)),
+                )
                 .order_by(Attachment.created_at, Attachment.id)
                 .limit(limit)
             ).all()
@@ -841,9 +933,9 @@ class ChatStore:
     def empty_contents(
         self, step_ids: Sequence[str], result_ids: Sequence[str], attachment_ids: Sequence[str] = ()
     ) -> None:
-        """Empty steps' arguments and results, results' previews and attachments' manifests.
+        """Empty steps' arguments and results, results' previews and attachments' manifests and measures.
 
-        The tool, status, name, size and type stay; so does the attachment itself.
+        The tool, status, name, size and type stay; so does the attachment itself, and its measure's state.
 
         Args:
             step_ids: The steps.
@@ -856,7 +948,7 @@ class ChatStore:
             if result_ids:
                 s.execute(update(Result).where(Result.id.in_(result_ids)).values(preview=None))
             if attachment_ids:
-                s.execute(update(Attachment).where(Attachment.id.in_(attachment_ids)).values(render=None))
+                s.execute(update(Attachment).where(Attachment.id.in_(attachment_ids)).values(render=None, measure=None))
 
     def due_notices(self, now: datetime, limit: int) -> list[str]:
         """Return the answers whose notices' details have expired and are not yet stripped.
@@ -1139,6 +1231,7 @@ class ChatStore:
         status: str = "ready",
         id: str | None = None,
         max_pending: int | None = None,
+        measure_state: MeasureState | None = None,
     ) -> AttachmentOut:
         """Store a file handed to workbench, by reference, pending until a message sends it; it leaves a file mark.
 
@@ -1155,6 +1248,8 @@ class ChatStore:
             max_pending: The most attachments the chat may hold waiting, counted under the write
                 lock, so parallel uploads cannot pass it, and expired ones not counted; ``None``
                 counts nothing.
+            measure_state: ``pending`` for a document workbench measures, ``none`` for one it does not (before
+                0.10); ``None`` for a picture or a clip, which are never measured.
 
         Returns:
             The attachment.
@@ -1181,6 +1276,7 @@ class ChatStore:
                 kind=kind,
                 status=status,
                 created_at=now,
+                measure_state=measure_state,
             )
             s.add(attachment)
             self._mark(s, chat_id, now)
@@ -1485,6 +1581,62 @@ class ChatStore:
                 ),
             )
             return kept.rowcount == 1
+
+    def settle_measure(self, attachment_id: str, measure: Mapping[str, Any] | None) -> bool:
+        """Settle a document's measure, once.
+
+        Only a ``pending`` row changes, so a second settle and a settle of a row deleted meanwhile change nothing.
+
+        Args:
+            attachment_id: The attachment.
+            measure: What workbench measured, stored ``measured`` as its four counts (``total``, ``unit``,
+                ``chars``, ``capped``); ``None`` stores ``none``: it could not be measured.
+
+        Returns:
+            Whether the row changed: ``False`` when it is gone, never measured or settled already.
+        """
+        kept = None if measure is None else _dumped({key: measure[key] for key in MEASURE_KEYS if key in measure})
+        with self._transaction() as s:
+            settled = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    update(Attachment)
+                    .where(Attachment.id == attachment_id, Attachment.measure_state == "pending")
+                    .values(measure_state="none" if kept is None else "measured", measure=kept)
+                ),
+            )
+            return settled.rowcount == 1
+
+    def pending_measures(self) -> list[AttachmentRef]:
+        """Return every ``ready`` attachment whose measure is still ``pending``, across chats.
+
+        A ``processing`` one is :meth:`processing_attachments`', whose job measures it after its prepare.
+
+        Returns:
+            The attachments, each with the owner of its chat, the oldest first.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            rows = s.execute(
+                select(Attachment, Chat.owner)
+                .join(Chat, Attachment.chat_id == Chat.id)
+                .where(Attachment.status == "ready", Attachment.measure_state == "pending")
+                .order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            return [self._attachment_ref(attachment, owner, now) for attachment, owner in rows]
+
+    def settle_pending_measures(self) -> int:
+        """Settle every measure left ``pending`` as ``none``, which nothing will measure now (workbench is off).
+
+        Returns:
+            How many rows were settled.
+        """
+        with self._transaction() as s:
+            settled = cast(
+                "CursorResult[Any]",
+                s.execute(update(Attachment).where(Attachment.measure_state == "pending").values(measure_state="none")),
+            )
+            return settled.rowcount
 
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.

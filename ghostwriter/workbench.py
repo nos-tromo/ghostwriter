@@ -36,8 +36,9 @@ prepared (:meth:`WorkbenchClient.prepare`: its manifest, and its renders made) a
 are viewed one by one (``view(rendition=...)``) or several at once
 (:meth:`WorkbenchClient.fetch_renditions`, from a thread). A clip's transcript and keyframes, which
 Nextext made, stream in as derived files of the clip (:meth:`WorkbenchClient.derived`, workbench 0.9),
-and its manifest then counts frames and says whether it has a transcript. The REST routes run on the
-caller's event loop, each over a fresh client that takes no proxy either.
+and its manifest then counts frames and says whether it has a transcript. A document is measured
+(:meth:`WorkbenchClient.measure`, workbench 0.10, :func:`serves_measure`): its units and the characters a full
+read shows. The REST routes run on the caller's event loop, each over a fresh client that takes no proxy either.
 
 Every request carries the key, the user and the chat as keyed pseudonyms (HMAC-SHA256
 under ``WORKBENCH_API_KEY`` over a label, a NUL byte and the owner or the chat id, as 64
@@ -69,6 +70,7 @@ from loguru import logger
 
 from ghostwriter import __version__
 from ghostwriter.config import Settings
+from ghostwriter.schemas import MeasureUnit
 from ghostwriter.utils.audit_runtime import PURPOSE_HEADER, REQUEST_ID_HEADER
 
 #: The one MCP revision this client speaks.
@@ -101,8 +103,11 @@ MAX_TOOL_IMAGES: Final = 8
 #: A rendition fetched must be smaller than this.
 MAX_RENDITION_BYTES: Final = 768 * 1024
 #: Seconds a prepare is waited for: workbench's 120 s of queue, two job walls of 120 s (an Office file is
-#: converted, then drawn, in one turn) and 30 s.
+#: converted, then drawn, in one turn) and 30 s. A measure waits as long: workbench 0.10's measure gate takes 120 s,
+#: the caller's wall and 30 s, 270 s at its defaults; the wait must stay above that sum if its limits are raised.
 PREPARE_TIMEOUT_S: Final = 390.0
+#: The first workbench that measures a document, as ``(major, minor)``: 0.10.
+MEASURE_WORKBENCH: Final = (0, 10)
 #: Seconds the renditions of one fetch get together.
 RENDITION_TIMEOUT_S: Final = 30.0
 #: A table preview's most columns, rows and characters a cell, as workbench's executor cuts them.
@@ -143,6 +148,15 @@ _KINDS: Final[dict[str, Kind]] = {
     "none": "none",
 }
 _UNITS: Final[dict[str, Unit]] = {"page": "page", "slide": "slide", "frame": "frame"}
+_MEASURE_UNITS: Final[dict[str, MeasureUnit]] = {
+    "page": "page",
+    "slide": "slide",
+    "paragraph": "paragraph",
+    "row": "row",
+    "line": "line",
+}
+# A version workbench names itself as offered: dotted numbers, at least two, of ASCII digits.
+_RELEASE = re.compile(r"([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})*")
 _ACCEPT = "application/json, text/event-stream"
 _USER_LABEL = b"workbench-user/v1"
 _SESSION_LABEL = b"workbench-session/v1"
@@ -385,6 +399,58 @@ class Manifest:
             "duration_s": self.duration_s,
             "transcript": self.transcript,
         }
+
+
+@dataclass(frozen=True)
+class Measure:
+    """How long a document is, as :meth:`WorkbenchClient.measure` reads it (workbench 0.10).
+
+    Attributes:
+        total: How many units it has.
+        unit: What ``total`` counts, in its reader's own unit: ``page``, ``slide``, ``paragraph``, ``row`` or ``line``.
+        chars: The characters a full read shows, counted up to workbench's cap.
+        capped: Whether the count stopped at that cap, so the document is longer still.
+    """
+
+    total: int
+    unit: MeasureUnit
+    chars: int
+    capped: bool
+
+    def as_stored(self) -> dict[str, Any]:
+        """Return what a chat keeps of the measure: its four counts, never a path or a kind.
+
+        Returns:
+            ``total``, ``unit``, ``chars`` and ``capped`` as plain JSON values.
+        """
+        return {"total": self.total, "unit": self.unit, "chars": self.chars, "capped": self.capped}
+
+
+def version_at_least(version: str, floor: tuple[int, int]) -> bool:
+    """Say whether a version workbench names itself is at least ``floor``.
+
+    Args:
+        version: The version, as workbench's discovery carries it.
+        floor: The first ``(major, minor)`` that counts.
+
+    Returns:
+        ``True`` for ``X.Y`` or ``X.Y.Z...`` of ASCII digits with ``(X, Y)`` at ``floor`` or later; ``False`` for an
+        older one, an empty one, and any other text.
+    """
+    found = _RELEASE.fullmatch(version)
+    return found is not None and (int(found[1]), int(found[2])) >= floor
+
+
+def serves_measure(version: str) -> bool:
+    """Say whether a workbench of this version measures a document: 0.10.0 and later.
+
+    Args:
+        version: The version workbench names itself, as its discovery carries it.
+
+    Returns:
+        Whether it is :data:`MEASURE_WORKBENCH` or later (:func:`version_at_least`).
+    """
+    return version_at_least(version, MEASURE_WORKBENCH)
 
 
 @dataclass(frozen=True)
@@ -992,6 +1058,25 @@ def _manifest(answer: object) -> Manifest | None:
     )
 
 
+def _measure_answer(answer: object) -> Measure | None:
+    """Read a measure's answer.
+
+    Args:
+        answer: The JSON document.
+
+    Returns:
+        The measure; ``None`` when it is not an object with a ``unit`` of the five, a count (an int from 0, never a
+        bool) for ``total`` and for ``chars``, and a bool for ``capped``. Its ``path`` and ``kind`` are not read.
+    """
+    if not isinstance(answer, dict):
+        return None
+    unit, capped = answer.get("unit"), answer.get("capped")
+    total, chars = _count(answer.get("total")), _count(answer.get("chars"))
+    if not isinstance(unit, str) or unit not in _MEASURE_UNITS or total is None or chars is None:
+        return None
+    return Measure(total, _MEASURE_UNITS[unit], chars, capped) if isinstance(capped, bool) else None
+
+
 def _view_params(path: str, rendition: int | None, strips: int, strip: int | None) -> dict[str, str | int]:
     """Return the query of a view.
 
@@ -1481,6 +1566,55 @@ class WorkbenchClient:
             len(manifest.renditions),
         )
         return manifest
+
+    async def measure(self, *, call: CallFor, path: str, timeout_s: float = PREPARE_TIMEOUT_S) -> Measure:
+        """Have workbench measure a document of the chat (workbench 0.10): its units and its characters.
+
+        The path goes as the JSON body ``{"path": ...}``, with the headers and the chat of
+        :meth:`prepare`.
+
+        Args:
+            call: The chat.
+            path: The file's path in the chat's folder.
+            timeout_s: The longest wait for each read of the answer; :data:`PREPARE_TIMEOUT_S` unless set.
+
+        Returns:
+            The measure.
+
+        Raises:
+            WorkbenchNotFound: When the chat has no such file; a path outside its folder is not asked for.
+            StorageFull: On workbench's ``507``.
+            WorkbenchUnavailable: On any other failure. Its token is the one a ``422`` names
+                (``unreadable_file``, ``unsupported_format``, ``read_timeout``), ``http:<status>``,
+                ``bad_answer`` for a measure that cannot be read, or ``timeout`` and ``unreachable``.
+        """
+        with _rest_errors("measure"):
+            key = self._required_key()
+            if _inside(chat_folder(key, call.chat_id), path) is None:
+                raise WorkbenchNotFound("not_found")
+            headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
+            async with (
+                self._http(timeout_s) as client,
+                client.stream("POST", "/files/measure", json={"path": path}, headers=headers) as response,
+            ):
+                if response.status_code == 404:
+                    raise WorkbenchNotFound("not_found")
+                if response.status_code == 507:
+                    raise StorageFull
+                if response.status_code == 422:
+                    raise WorkbenchUnavailable(await _refusal_token(response))
+                answer = await _json_answer(response)
+            measure = _measure_answer(answer)
+            if measure is None:
+                raise WorkbenchUnavailable("bad_answer")
+        logger.debug(
+            "workbench measured a file: {} {} units, {} characters, capped {}",
+            measure.total,
+            measure.unit,
+            measure.chars,
+            measure.capped,
+        )
+        return measure
 
     async def derived(self, *, call: CallFor, source: str, role: DerivedRole, chunks: AsyncIterator[bytes]) -> str:
         """Stream one of Nextext's artifacts into workbench, as a derived file of a clip of the chat (workbench 0.9).

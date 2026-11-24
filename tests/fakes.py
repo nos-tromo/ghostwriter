@@ -1,7 +1,7 @@
 """Stand-ins for Ghostwriter's neighbours, built from the shared contract alone.
 
-:class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the
-REST routes ``/files/upload``, ``/files/prepare``, ``/files/derived``, ``/files/view`` and ``/files/chat``.
+:class:`FakeDoor` is workbench as Ghostwriter's key reaches it: ``/mcp`` and the REST routes
+``/files/upload``, ``/files/prepare``, ``/files/measure``, ``/files/derived``, ``/files/view`` and ``/files/chat``.
 :class:`FakeOpenAI` is the router as the OpenAI SDK reaches it, fed by the chunk
 builders :func:`text_chunk`, :func:`reasoning_chunk`, :func:`call_chunk` and
 :func:`usage_chunk`. :class:`FakeWorkbench` and :class:`RecordingAudit` are workbench
@@ -10,6 +10,7 @@ and a turn's audit as the agent loop reaches them. :class:`FakeNextext` is Nexte
 invented.
 """
 
+import asyncio
 import base64
 import dataclasses
 import json
@@ -95,6 +96,7 @@ _ROUTES = frozenset(
         ("POST", "/files/upload"),
         ("DELETE", "/files/upload"),
         ("POST", "/files/prepare"),
+        ("POST", "/files/measure"),
         ("POST", "/files/derived"),
         ("GET", "/files/view"),
         ("DELETE", "/files/chat"),
@@ -382,12 +384,14 @@ class FakeDoor:
     routes by path, from :attr:`answers`: a result or JSON body, an ``httpx.Response``,
     an :class:`RpcError`, an exception to raise, or a callable that takes the chat's
     folder and returns one of those. ``None`` for ``/files/upload``, :data:`TAKE_BACK`, ``/files/prepare``,
-    ``/files/derived`` and ``/files/view`` is the default: an upload is parsed, stored in :attr:`files` and answered
-    with its path, size and :attr:`upload_id`; a take-back deletes a stored file of the chat (404 for none); a
-    prepare answers the file's manifest, a clip's from the derived files posted for it
-    (:func:`stock_manifest`); a derived file is recorded in :attr:`derived` and answered with its id, role and size
-    (404 for a source the chat does not hold, 422 for another role or an empty body); a view serves a stored file
-    of the chat, or with ``rendition`` one of its renders.
+    ``/files/measure``, ``/files/derived`` and ``/files/view`` is the default: an upload is parsed, stored in
+    :attr:`files` and answered with its path, size and :attr:`upload_id`; a take-back deletes a stored file of the
+    chat (404 for none); a prepare answers the file's manifest, a clip's from the derived files posted for it
+    (:func:`stock_manifest`); a measure (workbench 0.10, the path in a JSON body) answers :attr:`measures`' entry for
+    the path, else a stored file of the chat as text in lines, its bytes as its characters (404 for none); a derived
+    file is recorded in :attr:`derived` and answered with its id, role and size (404 for a source the chat does not
+    hold, 422 for another role or an empty body); a view serves a stored file of the chat, or with ``rendition`` one
+    of its renders.
 
     As workbench 0.7's, its ``tools/list`` answer holds ``view_file`` and the image text of
     ``read_document`` only for a request that carries ``X-Accept-Images: 1``; without it, it is
@@ -398,9 +402,12 @@ class FakeDoor:
         requests: Every request, with its body: the JSON-RPC message, the parsed upload, or ``None``.
         answers: The scripted answers, by MCP method or REST path.
         delays: Seconds to wait before answering, by MCP method or REST path.
+        gates: An event to wait for before answering, by MCP method or REST path as :attr:`delays`: a request
+            is recorded at once and answered only once its route's event is set, so a test can hold it open.
         files: The stored files, by path: their bytes and media type.
         derived: The derived files posted, in order: the source's path, the role and the body.
         manifests: The manifest to answer for a path, instead of :func:`stock_manifest`'s.
+        measures: The measure to answer for a path, instead of the stored file's lines and bytes.
         upload_id: The id every upload gets.
         last_call_answer: The last result ``tools/call`` was answered with.
         on_delete: Called when a ``DELETE /files/chat`` the door accepts arrives, before it is answered.
@@ -422,14 +429,17 @@ class FakeDoor:
             "/files/upload": None,
             TAKE_BACK: None,
             "/files/prepare": None,
+            "/files/measure": None,
             "/files/derived": None,
             "/files/view": None,
             "/files/chat": {"deleted": 3},
         }
         self.delays: dict[str, float] = {}
+        self.gates: dict[str, asyncio.Event] = {}
         self.files: dict[str, tuple[bytes, str]] = {}
         self.derived: list[tuple[str, str, bytes]] = []
         self.manifests: dict[str, dict[str, Any]] = {}
+        self.measures: dict[str, dict[str, Any]] = {}
         self.upload_id: str = UPLOAD_ID
         self.last_call_answer: dict[str, Any] | None = None
         self.on_delete: Callable[[], None] | None = None
@@ -458,6 +468,8 @@ class FakeDoor:
             route = TAKE_BACK
         if route in self.delays:
             await anyio.sleep(self.delays[route])
+        if route in self.gates:
+            await self.gates[route].wait()
         if request.headers.get("authorization") != f"Bearer {self.key}":
             return httpx.Response(401, json={"detail": "unauthorized"})
         if (request.method, path) not in _ROUTES:
@@ -491,6 +503,8 @@ class FakeDoor:
             return self._store(request, body, folder)
         if answer is None and path == "/files/prepare":
             return self._prepare(request, folder)
+        if answer is None and path == "/files/measure":
+            return self._measure(request, folder)
         if answer is None and path == "/files/derived":
             return self._derive(request, folder)
         if answer is None and path == "/files/view":
@@ -584,6 +598,34 @@ class FakeDoor:
         """
         manifest = self._manifest_of(request.url.params.get("path", ""), folder)
         return httpx.Response(404, json=NOT_FOUND) if manifest is None else httpx.Response(200, json=manifest)
+
+    def _measure(self, request: httpx.Request, folder: str) -> httpx.Response:
+        """Answer a measure, as workbench 0.10 does: the path is the JSON body's only key.
+
+        Args:
+            request: The measure.
+            folder: The chat's folder.
+
+        Returns:
+            The scripted measure of the path, else a stored file's as text: ``line`` units, its lines and its bytes as
+            its characters, never capped; 404 for a path outside the chat or an unknown one, 422 for another body.
+        """
+        try:
+            body = json.loads(request.content)
+        except ValueError:
+            body = None
+        if not isinstance(body, dict) or set(cast(dict[str, Any], body)) != {"path"}:
+            return httpx.Response(422, json={"detail": [{"loc": ["body"], "msg": "a path only"}]})
+        path = cast(dict[str, Any], body)["path"]
+        if not isinstance(path, str) or not path.startswith(f"{folder}/"):
+            return httpx.Response(404, json=NOT_FOUND)
+        if path in self.measures:
+            return httpx.Response(200, json=self.measures[path])
+        if path not in self.files:
+            return httpx.Response(404, json=NOT_FOUND)
+        data = self.files[path][0]
+        measured = {"path": path, "kind": "text", "unit": "line", "total": len(data.splitlines())}
+        return httpx.Response(200, json={**measured, "chars": len(data), "capped": False})
 
     def _derive(self, request: httpx.Request, folder: str) -> httpx.Response:
         """Take a derived file of a stored file of the chat, as workbench 0.9 does for Ghostwriter.

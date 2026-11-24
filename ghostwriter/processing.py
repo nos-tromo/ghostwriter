@@ -1,8 +1,9 @@
 """The attachment processor: workbench prepares a picture or a PDF before it is ready, an Office file after.
 
 A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and an attachment taken back before it is
-sent cancels its own (:meth:`AttachmentProcessor.cancel`); a cancelled job writes nothing. When either fails after
-the cancel, :meth:`AttachmentProcessor.requeue_chat` prepares the chat's ``processing`` attachments again.
+sent cancels its own (:meth:`AttachmentProcessor.cancel`); a cancelled job writes nothing, a measure in flight
+included. When either fails after the cancel, :meth:`AttachmentProcessor.requeue_chat` prepares the chat's
+``processing`` attachments again, and measures its ``pending`` ones.
 
 An attachment that needs preparing (:func:`~ghostwriter.upload.needs_prepare`, while pictures are
 offered) is stored ``processing`` and handed to :class:`AttachmentProcessor`: asyncio tasks of the one
@@ -26,11 +27,26 @@ answers, and its job (``background``) only adds its facts, its pages or slides, 
 drawn it, which takes far longer than a picture or a PDF. Such a job takes the one :data:`BACKGROUND_SLOTS`
 before one of the :data:`PREPARE_SLOTS`, so Office files never fill both and a picture is not queued behind
 them here. workbench 0.8.1 does the same on its side: it converts in a gate of its own, one file at a time, so a
-picture's prepare is admitted while a deck converts (its ``GHOSTWRITER_WORKBENCH_SLOTS`` at 3 or more, its
-default), and a tool call for the deck's slides waits out the deck's prepare there, up to 120 s. Its manifest is
-kept with :meth:`~ghostwriter.store.ChatStore.keep_manifest`, which changes only a
-``ready`` row without one. A failure is recorded as an ``error`` child as for any document and changes no row:
-the file reads as text, as before. Only a ``processing`` row is requeued, so such a job is not.
+picture's prepare is admitted while a deck converts, and a tool call for the deck's slides waits out the deck's
+prepare there, up to 120 s. From workbench 0.10.0 a measure has a gate of its own too, so Send never waits for an
+Office file or a measure while workbench's ``GHOSTWRITER_WORKBENCH_SLOTS`` is 4 or more, its default; at 3, a
+prepare, a conversion and a measure together take every slot. An Office file's manifest is kept with
+:meth:`~ghostwriter.store.ChatStore.keep_manifest`, which changes only a ``ready`` row without one. A failure is
+recorded as an ``error`` child as for any document and changes no row: the file reads as text, as before. Only a
+``processing`` row is prepared again at start, so such a prepare is not.
+
+A document is measured too, once workbench is 0.10.0 or later (:func:`~ghostwriter.workbench.serves_measure`): its
+units and the characters a full read shows (``POST /files/measure``). It is stored with its measure ``pending`` and
+is ``ready`` as before, a PDF once prepared and any other document at once: Send never waits for the measure. The
+measure is its job's last step, after the prepare and out of its slots, on the one :data:`MEASURE_SLOTS`: documents
+are measured one at a time, and a slow measure holds no picture's or PDF's prepare slot nor an Office file's
+background slot. Its hand-over is ``disclose`` / ``chat.attachment`` (:data:`MEASURE_RECIPIENT`, criteria ``kind``),
+written before the measure is sent; unrecorded, nothing is sent. A busy workbench is asked once more after
+:data:`PREPARE_RETRY_S`. The state is then ``measured``, with the counts
+(:meth:`~ghostwriter.store.ChatStore.settle_measure`, which changes only a ``pending`` row); a failure is recorded
+as an ``error`` child, and the state is ``none``, as it is for an unrecorded hand-over. A ``ready`` row still
+``pending`` at start is measured again, without a prepare (:meth:`AttachmentProcessor.requeue`), its hand-over a
+primary of the system's, ``requeued``. A clip is never measured.
 
 The hand-over is ``disclose`` / ``chat.attachment`` (``workbench:prepare``), the upload's child, written
 before the prepare is sent; unrecorded, nothing is sent and the attachment settles with the token
@@ -77,19 +93,19 @@ A chat's delete cancels its jobs (:meth:`AttachmentProcessor.cancel_chat`), and 
 job runs in its own cancel scope, and a store or audit call in progress finishes on its worker thread
 before the cancel takes effect: a cancelled job settles and records nothing more (but a clip's Nextext delete),
 and none of it writes after :meth:`AttachmentProcessor.aclose` has returned. A delete that fails after its cancel
-keeps the chat, so its ``processing`` attachments are prepared again as at start
-(:meth:`AttachmentProcessor.requeue_chat`); a clip then goes to Nextext again, for a new job. Store and audit calls
-never run on the event loop. Logs carry the attachment's id, its kind, Nextext's job id and a token, never a name or
-a path.
+keeps the chat, so its ``processing`` attachments are prepared again and its ``pending`` measures measured again, as
+at start (:meth:`AttachmentProcessor.requeue_chat`); a clip then goes to Nextext again, for a new job. Store and audit
+calls never run on the event loop. Logs carry the attachment's id, its kind, Nextext's job id and a token, never a
+name or a path.
 """
 
 import asyncio
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping, Sequence
 from contextlib import nullcontext, suppress
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
-from typing import Final, Literal
+from typing import Any, Final, Literal
 
 import anyio
 import anyio.to_thread
@@ -118,6 +134,7 @@ from ghostwriter.workbench import (
     CallFor,
     DerivedRole,
     Manifest,
+    Measure,
     StorageFull,
     UploadTooLarge,
     WorkbenchClient,
@@ -128,14 +145,19 @@ from ghostwriter.workbench import (
 PREPARE_SLOTS: Final = 2
 #: The most Office files prepared in the background at once; each also holds one of :data:`PREPARE_SLOTS`.
 BACKGROUND_SLOTS: Final = 1
+#: The most documents measured at once, on a slot of their own: never one of :data:`PREPARE_SLOTS` or
+#: :data:`BACKGROUND_SLOTS`, which a job leaves before it measures.
+MEASURE_SLOTS: Final = 1
 #: Seconds before a busy workbench is asked once more.
 PREPARE_RETRY_S: Final = 10.0
 #: The longest a status request waits for its attachment's job, in seconds.
 MAX_WAIT_S: Final = 20
 PREPARE_RECIPIENT: Final = "workbench:prepare"
+#: Where a document goes to be measured (workbench 0.10).
+MEASURE_RECIPIENT: Final = "workbench:measure"
 ATTACHMENT: Final = "chat.attachment"
-#: The failure a second prepare may get past: a busy workbench. A prepare that timed out has waited its
-#: whole time already, and Send waits for the picture; it is not asked again.
+#: The failure a second prepare or measure may get past: a busy workbench. A prepare that timed out has waited its
+#: whole time already, and Send waits for the picture; it is not asked again, and neither is a measure.
 RETRIED: Final = frozenset({"http:503"})
 #: The longest wait, in seconds, for each read of the prepare that cuts a picture's strips: its
 #: renditions exist by then, so a workbench that hangs delays ``ready`` by about this, not a full prepare.
@@ -199,6 +221,10 @@ class PrepareJob:
             waits for its transcript, without which the model has nothing to read.
         size: The file's size in bytes, as workbench stored it, for a clip's hand-over to Nextext; ``None`` for a job
             requeued at start, which has not been told it.
+        prepare: Whether workbench prepares the file first: a ``processing`` row, or an Office file's background
+            prepare; not for a document that is only measured.
+        measure: Whether workbench measures the document after that (workbench 0.10), on :data:`MEASURE_SLOTS`; never
+            for a picture or a clip.
     """
 
     attachment_id: str
@@ -209,27 +235,63 @@ class PrepareJob:
     op: Operation | None
     background: bool = False
     size: int | None = None
+    prepare: bool = True
+    measure: bool = False
 
 
 def _requeued(ref: AttachmentRef) -> PrepareJob:
-    """Return the job of an attachment left ``processing``, whose hand-over is the system's.
+    """Return the job of an attachment left ``processing`` or its measure ``pending``; its hand-over is the system's.
 
     Args:
         ref: The attachment.
 
     Returns:
-        Its job, with no request's operation.
+        Its job, with no request's operation: it prepares a ``processing`` row, and measures a ``pending`` one.
     """
-    return PrepareJob(ref.id, ref.chat_id, ref.owner, ref.path, ref.kind, None)
+    return PrepareJob(
+        ref.id,
+        ref.chat_id,
+        ref.owner,
+        ref.path,
+        ref.kind,
+        None,
+        prepare=ref.status == "processing",
+        measure=ref.measure_state == "pending",
+    )
+
+
+def _once(*listed: Sequence[AttachmentRef]) -> list[AttachmentRef]:
+    """Return the attachments of several lists, each one once, in their order.
+
+    Args:
+        listed: The lists, the first one's entry kept for an attachment in more than one.
+
+    Returns:
+        The attachments.
+    """
+    kept: dict[str, AttachmentRef] = {}
+    for refs in listed:
+        for ref in refs:
+            kept.setdefault(ref.id, ref)
+    return list(kept.values())
 
 
 @dataclass(frozen=True)
 class _Running:
-    """A job, the scope that cancels it and its task."""
+    """A job, the scope that cancels it, its task, and the event set once it no longer prepares.
+
+    Attributes:
+        job: The job.
+        scope: The scope that cancels it.
+        task: Its task.
+        prepared: Set once the job has left its prepare (at once for one that only measures), so a status request
+            for a ``processing`` row waits for no measure after it.
+    """
 
     job: PrepareJob
     scope: anyio.CancelScope
     task: asyncio.Task[None]
+    prepared: asyncio.Event
 
 
 @dataclass(frozen=True)
@@ -366,6 +428,7 @@ class AttachmentProcessor:
         self._nextext_timeout_s = nextext_timeout_s
         self._slots = asyncio.Semaphore(PREPARE_SLOTS)
         self._background = asyncio.Semaphore(BACKGROUND_SLOTS)
+        self._measuring = asyncio.Semaphore(MEASURE_SLOTS)
         self._media_slots = asyncio.Semaphore(MEDIA_SLOTS)
         self._reconciled = asyncio.Event()
         self._owned: set[str] = set()
@@ -572,8 +635,11 @@ class AttachmentProcessor:
         if self._closed or self.running(job.attachment_id):
             return
         scope = anyio.CancelScope()
-        task = asyncio.get_running_loop().create_task(self._run(job, scope))
-        self._running[job.attachment_id] = _Running(job, scope, task)
+        prepared = asyncio.Event()
+        if not job.prepare and job.kind != "media":
+            prepared.set()
+        task = asyncio.get_running_loop().create_task(self._run(job, scope, prepared))
+        self._running[job.attachment_id] = _Running(job, scope, task, prepared)
         task.add_done_callback(partial(self._ended, job.attachment_id))
 
     def running(self, attachment_id: str) -> bool:
@@ -589,8 +655,10 @@ class AttachmentProcessor:
         return running is not None and not running.task.done()
 
     async def wait(self, attachment_id: str, timeout_s: float) -> None:
-        """Wait until the attachment's job ends, at most ``timeout_s``.
+        """Wait until the attachment's job has settled what its status request follows, at most ``timeout_s``.
 
+        While the job prepares, that is the prepare: a ``processing`` row is settled then, and a request for it is
+        answered without waiting for the measure after it. After that, it is the job's end, its measure included.
         Without a job the status cannot change, so this sleeps ``timeout_s``: a client that follows it
         asks again no sooner.
 
@@ -602,7 +670,14 @@ class AttachmentProcessor:
         if running is None:
             await asyncio.sleep(timeout_s)
             return
-        await asyncio.wait({running.task}, timeout=timeout_s)
+        if running.prepared.is_set():
+            await asyncio.wait({running.task}, timeout=timeout_s)
+            return
+        prepared = asyncio.get_running_loop().create_task(running.prepared.wait())
+        try:
+            await asyncio.wait({running.task, prepared}, timeout=timeout_s, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            prepared.cancel()
 
     def cancel(self, attachment_id: str) -> bool:
         """Cancel an attachment's job, as its user takes it back. Call it on the event loop's thread only.
@@ -638,21 +713,32 @@ class AttachmentProcessor:
             logger.debug("{} attachment jobs of a deleted chat were cancelled.", cancelled)
         return cancelled
 
+    def _stranded(self) -> list[AttachmentRef]:
+        """Return every attachment a job of this process must take up: ``processing``, or ``ready`` and unmeasured.
+
+        Returns:
+            The rows of :meth:`~ghostwriter.store.ChatStore.processing_attachments` and of
+            :meth:`~ghostwriter.store.ChatStore.pending_measures`, each attachment once.
+        """
+        return _once(self._store.processing_attachments(), self._store.pending_measures())
+
     def requeue(self) -> int:
-        """Prepare again every attachment left ``processing`` by the last process; at start, on the event loop.
+        """Prepare again every attachment left ``processing``, and measure every one left ``pending``; at start.
+
+        On the event loop. A ``processing`` document whose measure is pending is one job, which does both.
 
         Returns:
             How many jobs were started.
         """
-        stranded = self._store.processing_attachments()
+        stranded = self._stranded()
         for ref in stranded:
             self.submit(_requeued(ref))
         if stranded:
-            logger.info("{} attachments left processing are prepared again.", len(stranded))
+            logger.info("{} attachments left processing or unmeasured are taken up again.", len(stranded))
         return len(stranded)
 
     async def requeue_chat(self, chat_id: str) -> int:
-        """Prepare again a chat's ``processing`` attachments, once its delete or a take-back failed after a cancel.
+        """Take up again a chat's ``processing`` and ``pending`` attachments, once its delete or a take-back failed.
 
         The chat's cancelled jobs are awaited first, so no attachment has two jobs; a job of the chat that
         was not cancelled goes on as it is. Each new job is requeued as at start (``op=None``). On the event
@@ -674,7 +760,7 @@ class AttachmentProcessor:
         if self._closed:
             return 0
         try:
-            stranded = await anyio.to_thread.run_sync(self._store.processing_attachments)
+            stranded = await anyio.to_thread.run_sync(self._stranded)
         except Exception as exc:
             logger.warning("A chat's attachments could not be prepared again: {}", type(exc).__name__)
             return 0
@@ -682,7 +768,7 @@ class AttachmentProcessor:
         for ref in started:
             self.submit(_requeued(ref))
         if started:
-            logger.info("{} attachments of a chat whose delete failed are prepared again.", len(started))
+            logger.info("{} attachments of a chat whose delete failed are taken up again.", len(started))
         return len(started)
 
     async def aclose(self) -> None:
@@ -708,34 +794,45 @@ class AttachmentProcessor:
         if running is not None and running.task is task:
             del self._running[attachment_id]
 
-    async def _run(self, job: PrepareJob, scope: anyio.CancelScope) -> None:
+    async def _run(self, job: PrepareJob, scope: anyio.CancelScope, prepared: asyncio.Event) -> None:
         """Run one job in its cancel scope, under a slot; a cancel ends it with nothing more written.
 
         A background job takes the :data:`BACKGROUND_SLOTS` slot first, then one of the :data:`PREPARE_SLOTS`. A
         clip takes one of the :data:`MEDIA_SLOTS` for its round trip at Nextext, then a prepare slot
-        (:meth:`_media`). A cancelled clip still deletes its Nextext job and records that, and nothing more.
+        (:meth:`_media`). A cancelled clip still deletes its Nextext job and records that, and nothing more. A
+        document's measure comes last, once the job has left the prepare's slots (never inside them: an Office file
+        holds the one background slot while it prepares), on one of the :data:`MEASURE_SLOTS` and no other.
 
         A job that fails unexpectedly still settles its attachment as a failure, best effort, so its
-        message is not held back by a row nothing settles any more.
+        message is not held back by a row nothing settles any more, and a measure it had not settled as ``none``.
 
         Args:
             job: The attachment.
             scope: The scope :meth:`cancel_chat` and :meth:`aclose` cancel.
+            prepared: Set once the job has left its prepare.
         """
         with scope:
             try:
                 if job.kind == "media":
                     await self._media(job)
                     return
-                gate = self._background if job.background else nullcontext()
-                async with gate, self._slots:
-                    await self._prepare(job)
+                if job.prepare:
+                    gate = self._background if job.background else nullcontext()
+                    async with gate, self._slots:
+                        await self._prepare(job)
+                prepared.set()
+                if job.measure:
+                    async with self._measuring:
+                        await self._measure(job)
             except Exception as exc:
                 logger.error(
                     "Attachment '{}' ({}) could not be processed: {}", job.attachment_id, job.kind, type(exc).__name__
                 )
                 with suppress(Exception):
                     await self._settle_failed(job, "error")
+                if job.measure:
+                    with suppress(Exception):
+                        await self._settle_measure(job, None, "error")
 
     async def _prepare(self, job: PrepareJob) -> None:
         """Mark the chat's files, record the hand-over, prepare the file and settle the attachment.
@@ -758,6 +855,84 @@ class AttachmentProcessor:
             return
         await self._record_error(job, op, target, _Failure(token, PREPARE_RECIPIENT))
         await self._settle_failed(job, token)
+
+    async def _measure(self, job: PrepareJob) -> None:
+        """Mark the chat's files, record the hand-over, have workbench measure the document and settle its measure.
+
+        Unrecorded, nothing is sent and the measure is ``none``. A failure is recorded as the hand-over's ``error``
+        child, and the measure is ``none``. A cancel (the attachment taken back, its chat deleted) settles nothing.
+
+        Args:
+            job: The document.
+        """
+        try:
+            await anyio.to_thread.run_sync(self._store.mark_files, job.chat_id)
+        except ChatNotFound:
+            logger.debug("Attachment '{}': its chat is gone; nothing is measured.", job.attachment_id)
+            return
+        target = Target(kind="attachment", ids=(job.attachment_id,))
+        op = await self._hand_over(job, target, recipient=MEASURE_RECIPIENT, criteria={"kind": job.kind})
+        if op is None:
+            await self._settle_measure(job, None, "audit")
+            return
+        call = CallFor(job.owner, job.chat_id, forward_headers(op.context))
+        try:
+            measure = await self._ask_measure(call, job.path)
+        except WorkbenchUnavailable as exc:
+            token = exc.token
+        except StorageFull:
+            token = "storage_full"
+        except Exception as exc:
+            logger.warning(
+                "Attachment '{}' ({}): the measure raised {}", job.attachment_id, job.kind, type(exc).__name__
+            )
+            token = "error"
+        else:
+            await self._settle_measure(job, measure.as_stored(), None)
+            return
+        await self._record_error(job, op, target, _Failure(token, MEASURE_RECIPIENT))
+        await self._settle_measure(job, None, token)
+
+    async def _ask_measure(self, call: CallFor, path: str) -> Measure:
+        """Measure the document, once more after :data:`PREPARE_RETRY_S` when workbench was busy.
+
+        Args:
+            call: The chat.
+            path: The file's path in the chat's folder.
+
+        Returns:
+            The measure.
+
+        Raises:
+            WorkbenchUnavailable: As :meth:`~ghostwriter.workbench.WorkbenchClient.measure` raises it.
+            StorageFull: On workbench's ``507``.
+        """
+        try:
+            return await self._workbench.measure(call=call, path=path)
+        except WorkbenchUnavailable as exc:
+            if exc.token not in RETRIED:
+                raise
+            logger.info("workbench measure failed ({}); it is asked once more.", exc.token)
+        await asyncio.sleep(PREPARE_RETRY_S)
+        return await self._workbench.measure(call=call, path=path)
+
+    async def _settle_measure(self, job: PrepareJob, measure: Mapping[str, Any] | None, token: str | None) -> None:
+        """Settle the document's measure: ``measured`` with its counts, or ``none``.
+
+        Args:
+            job: The document.
+            measure: What workbench measured; ``None`` when it could not be measured.
+            token: Why not, for the log.
+        """
+        settled = await anyio.to_thread.run_sync(partial(self._store.settle_measure, job.attachment_id, measure))
+        if not settled:
+            logger.debug(
+                "Attachment '{}' ({}): its measure is not kept, its row gone or settled.", job.attachment_id, job.kind
+            )
+        elif measure is None:
+            logger.info("Attachment '{}' ({}) was not measured: {}", job.attachment_id, job.kind, token)
+        else:
+            logger.debug("Attachment '{}' ({}) is measured.", job.attachment_id, job.kind)
 
     async def _record_error(self, job: PrepareJob, op: Operation, target: Target, failure: _Failure) -> None:
         """Record a hand-over that failed as its ``error`` child, best effort: a failed write is a warning.
@@ -790,12 +965,12 @@ class AttachmentProcessor:
     async def _hand_over(
         self, job: PrepareJob, target: Target, *, recipient: str, criteria: Mapping[str, object]
     ) -> Operation | None:
-        """Record the hand-over of an attachment before it is sent: to workbench's prepare, or a clip's to Nextext.
+        """Record the hand-over of an attachment before it is sent: to workbench's prepare or measure, or to Nextext.
 
         Args:
             job: The attachment.
             target: The attachment, by its id.
-            recipient: Where it goes: :data:`PREPARE_RECIPIENT` or :data:`NEXTEXT_RECIPIENT`.
+            recipient: Where it goes: :data:`PREPARE_RECIPIENT`, :data:`MEASURE_RECIPIENT` or :data:`NEXTEXT_RECIPIENT`.
             criteria: Its parameters; a requeued job's primary adds ``requeued``.
 
         Returns:

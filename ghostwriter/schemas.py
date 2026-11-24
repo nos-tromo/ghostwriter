@@ -15,6 +15,9 @@ AttachmentStatus = Literal["processing", "ready", "failed"]
 NoticeCode = Literal["answer_cut", "document_partial", "document_unread", "images_dropped", "context_trimmed"]
 #: What a document's length is counted in.
 MeasureUnit = Literal["page", "slide", "paragraph", "row", "line"]
+#: Where a document's measure is: ``pending`` while workbench measures it, then ``measured``, or ``none`` when it
+#: could not be measured (also for workbench before 0.10).
+MeasureState = Literal["pending", "measured", "none"]
 
 
 class ChatOut(BaseModel):
@@ -35,6 +38,22 @@ class ChatOut(BaseModel):
     expires_at: datetime | None
 
 
+class LengthOut(BaseModel):
+    """How long a document is, as workbench measured it.
+
+    Attributes:
+        state: ``pending`` while it is measured, ``measured``, or ``none`` when it could not be.
+        total: How many units it has, once measured.
+        unit: What ``total`` counts, once measured.
+        too_long: Whether it is longer than one prompt holds, so it is read only in parts; ``False`` unless measured.
+    """
+
+    state: MeasureState
+    total: int | None
+    unit: MeasureUnit | None
+    too_long: bool
+
+
 class AttachmentOut(BaseModel):
     """A file the user attached.
 
@@ -48,6 +67,8 @@ class AttachmentOut(BaseModel):
         status: ``processing`` while workbench prepares it, then ``ready`` or ``failed``.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.
+        length: A document's measure; ``None`` for one never measured (a picture, a clip, a document stored before
+            measures were), and once its file has expired.
     """
 
     id: str
@@ -59,6 +80,7 @@ class AttachmentOut(BaseModel):
     status: AttachmentStatus
     created_at: datetime
     expired: bool
+    length: LengthOut | None = None
 
 
 class StepOut(BaseModel):

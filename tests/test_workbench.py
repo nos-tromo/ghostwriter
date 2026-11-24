@@ -41,6 +41,7 @@ from ghostwriter.workbench import (
     RENDITION_TIMEOUT_S,
     CallFor,
     Manifest,
+    Measure,
     OutputFile,
     Rendition,
     RenditionRequest,
@@ -55,6 +56,7 @@ from ghostwriter.workbench import (
     WorkbenchNotFound,
     WorkbenchUnavailable,
     chat_folder,
+    serves_measure,
     session_pseudonym,
     user_pseudonym,
 )
@@ -426,6 +428,7 @@ def test_a_call_asks_for_images_only_when_told_to() -> None:
         "delete_chat",
         "delete_upload",
         "prepare",
+        "measure",
         "derived",
         "fetch_renditions",
     ],
@@ -448,6 +451,8 @@ async def test_every_request_carries_the_session_purpose_and_request_id(operatio
             pass
     elif operation == "prepare":
         await client.prepare(call=CALL, path=PDF)
+    elif operation == "measure":
+        await client.measure(call=CALL, path=PDF)
     elif operation == "derived":
         assert (
             await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT)) == DERIVED_ID
@@ -1100,6 +1105,88 @@ async def test_prepare_never_asks_outside_the_chat() -> None:
         with pytest.raises(WorkbenchNotFound):
             await _client(door).prepare(call=CALL, path=path)
     assert door.requests == []
+
+
+NOTES = f"{FOLDER}/tide-notes.txt"
+#: Two lines, 31 characters.
+NOTES_TEXT = b"high tide 06:12\nlow tide 12:30\n"
+#: A measure as workbench 0.10 answers it.
+MEASURED = {"path": NOTES, "kind": "text", "unit": "line", "total": 2, "chars": 31, "capped": False}
+
+
+async def test_measure_asks_for_one_file_of_the_chat() -> None:
+    """POST /files/measure carries the path as its JSON body, and the chat, the purpose and the request id."""
+    door = FakeDoor(server_version="0.10.0")
+    door.files[NOTES] = (NOTES_TEXT, "text/plain")
+    got = await _client(door).measure(call=CALL, path=NOTES)
+    req = door.last("/files/measure")
+    assert (req.method, dict(req.url.params)) == ("POST", {})
+    assert json.loads(req.content) == {"path": NOTES}
+    assert req.headers["content-type"] == "application/json"
+    assert req.headers["accept-encoding"] == "identity"
+    assert req.headers["x-session-id"] == session_pseudonym(KEY, CHAT)
+    assert req.headers["x-user-id"] == user_pseudonym(KEY, "user-a")
+    assert req.headers["x-audit-purpose"] == encode_purpose(None, "ghostwriter chat")
+    assert req.headers["x-request-id"] == "req-0001"
+    assert req.extensions["timeout"]["read"] == PREPARE_TIMEOUT_S == 390.0
+    assert got == Measure(total=2, unit="line", chars=len(NOTES_TEXT), capped=False)
+    assert got.as_stored() == {"total": 2, "unit": "line", "chars": 31, "capped": False}
+
+
+@pytest.mark.parametrize(
+    ("answer", "error", "token"),
+    [
+        (httpx.Response(404, json=NOT_FOUND), WorkbenchNotFound, "not_found"),
+        (httpx.Response(422, json={"detail": "unreadable_file: damaged"}), WorkbenchUnavailable, "unreadable_file"),
+        (httpx.Response(422, json={"detail": "unsupported_format: .xyz"}), WorkbenchUnavailable, "unsupported_format"),
+        (httpx.Response(507, json={"detail": "storage full"}), StorageFull, None),
+        (httpx.Response(503, json={"detail": "busy, retry later"}), WorkbenchUnavailable, "http:503"),
+        ({**MEASURED, "unit": "chapter"}, WorkbenchUnavailable, "bad_answer"),
+        ({**MEASURED, "chars": -1}, WorkbenchUnavailable, "bad_answer"),
+        ({**MEASURED, "capped": "yes"}, WorkbenchUnavailable, "bad_answer"),
+        ({**MEASURED, "total": True}, WorkbenchUnavailable, "bad_answer"),
+        ([MEASURED], WorkbenchUnavailable, "bad_answer"),
+    ],
+    ids=[
+        "not_found",
+        "unreadable",
+        "unsupported",
+        "storage_full",
+        "busy",
+        "unit",
+        "chars",
+        "capped",
+        "total_bool",
+        "not_an_object",
+    ],
+)
+async def test_measure_maps_refusals(answer: object, error: type[Exception], token: str | None) -> None:
+    """As prepare's: 404, a 422's token, 507, http:<status>; an answer the contract does not allow is a bad answer."""
+    door = FakeDoor(server_version="0.10.0")
+    door.files[NOTES] = (NOTES_TEXT, "text/plain")
+    door.answers["/files/measure"] = answer
+    with pytest.raises(error) as raised:
+        await _client(door).measure(call=CALL, path=NOTES)
+    assert type(raised.value) is error
+    assert token is None or getattr(raised.value, "token", None) == token
+
+
+async def test_measure_never_asks_outside_the_chat() -> None:
+    """A path outside the chat's folder is not found, and nothing is sent."""
+    door = FakeDoor(server_version="0.10.0")
+    for path in ("/workspace/other/x.txt", f"{FOLDER}/../x.txt", FOLDER):
+        with pytest.raises(WorkbenchNotFound):
+            await _client(door).measure(call=CALL, path=path)
+    assert door.requests == []
+
+
+@pytest.mark.parametrize(
+    ("version", "served"),
+    [("0.10.0", True), ("0.11", True), ("1.0.2", True), ("0.9.3", False), ("", False), ("dev", False)],
+)
+def test_serves_measure(version: str, served: bool) -> None:
+    """Workbench 0.10 and later measures a document; an older one, no version and any other text do not."""
+    assert serves_measure(version) is served
 
 
 async def test_derived_streams_an_artifact_into_the_clips_folder() -> None:

@@ -40,7 +40,7 @@ from ghostwriter.audit import SYSTEM_ACTOR, RequestContext, forward_headers
 from ghostwriter.config import Settings
 from ghostwriter.utils.audit_runtime import PURPOSE_HEADER, REQUEST_ID_HEADER
 from ghostwriter.vision import system_call
-from ghostwriter.workbench import MAX_ATTACHMENT_BYTES, UploadTooLarge, WorkbenchClient
+from ghostwriter.workbench import MAX_ATTACHMENT_BYTES, UploadTooLarge, WorkbenchClient, version_at_least
 
 #: The name a clip goes under at Nextext, before its suffix.
 MEDIA_NAME: Final = "media"
@@ -88,8 +88,6 @@ _EXT = re.compile(r"\.[a-z0-9]{1,8}")
 _MEDIA_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}/[A-Za-z0-9][A-Za-z0-9!#$&^_.+-]{0,126}")
 # A declared Content-Length: ASCII digits only, so no non-ASCII digit or oversized number reaches int().
 _LENGTH = re.compile(r"[0-9]{1,15}")
-# A version workbench names itself as offered: dotted numbers, at least two, of ASCII digits.
-_RELEASE = re.compile(r"([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})*")
 _STATUSES = frozenset({"queued", "running"} | TERMINAL)
 _FORWARDED = frozenset({PURPOSE_HEADER.lower(), REQUEST_ID_HEADER.lower()})
 _ANSWER_MAX_BYTES = 64 * 1024
@@ -596,11 +594,10 @@ def serves_media(version: str) -> bool:
         version: The version workbench names itself, as its discovery carries it.
 
     Returns:
-        ``True`` for ``X.Y`` or ``X.Y.Z...`` of ASCII digits with ``(X, Y)`` at :data:`MEDIA_WORKBENCH` or
-        later; ``False`` for an older one, an empty one, and any other text.
+        Whether it is :data:`MEDIA_WORKBENCH` or later (:func:`~ghostwriter.workbench.version_at_least`): ``False``
+        for an older one, an empty one, and any text that is not ``X.Y[.Z...]`` of ASCII digits.
     """
-    found = _RELEASE.fullmatch(version)
-    return found is not None and (int(found[1]), int(found[2])) >= MEDIA_WORKBENCH
+    return version_at_least(version, MEDIA_WORKBENCH)
 
 
 class NextextHealth:
