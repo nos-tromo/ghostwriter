@@ -66,13 +66,16 @@ class NoticeEvent:
         """Read a stored notice back.
 
         A name is never read from it, as none is ever stored, and keys this version does not know are left out.
+        A known code whose details are not all this version's (a file id that is not text, a count that is not a
+        whole number of zero or more, a unit not known) keeps what it says without them, as the code alone: the
+        form the sweep leaves once the details' deadline has passed, so no wrong number is ever served.
 
         Args:
             value: The notice, as :meth:`stored` wrote it.
 
         Returns:
-            The notice; ``None`` for a code this version does not know, or a detail of the wrong type: a file id
-            that is not text, a count that is not a whole number of zero or more, or a unit not known.
+            The notice, or the code alone when a detail is malformed; ``None`` for a value that is not a mapping
+            or a code this version does not know.
         """
         if not isinstance(value, Mapping):
             return None
@@ -80,12 +83,12 @@ class NoticeEvent:
         read, total = value.get("read"), value.get("total")
         if not _known_code(code):
             return None
-        if file_id is not None and not isinstance(file_id, str):
-            return None
-        if not all(count is None or _count(count) for count in (read, total)):
-            return None
-        if unit is not None and not _known_unit(unit):
-            return None
+        if (
+            (file_id is not None and not isinstance(file_id, str))
+            or not all(count is None or _count(count) for count in (read, total))
+            or (unit is not None and not _known_unit(unit))
+        ):
+            return cls(code)
         return cls(code, file_id=file_id, read=read, total=total, unit=unit)
 
 

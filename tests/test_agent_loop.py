@@ -980,6 +980,35 @@ def test_a_stopped_round_is_not_cut(loop_env: LoopEnv) -> None:
     assert stopped is not None and stopped.stopped and stopped.finish_reason == "length"
 
 
+def _long_turns(env: LoopEnv, turns: int) -> None:
+    """Store earlier turns of about 3,000 tokens each."""
+    for n in range(turns):
+        env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 1_000, [])
+        env.store.finish_assistant_message(env.store.start_assistant_message(CHAT), "Übersicht " * 300)
+
+
+def test_no_trim_notice_when_the_turns_fit_once_the_pictures_are_dropped(loop_env: LoopEnv) -> None:
+    """A first round trimmed for its picture alone, refused for it, goes again with every turn: no trim is told.
+
+    The trim told is the one of the request the router took, never of one it refused.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=10_000)
+    _long_turns(loop_env, 8)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    assert _questions(loop_env.sent(1)) < 9
+    assert _questions(loop_env.sent(2)) == 9
+
+
+def test_a_chat_still_trimmed_without_its_pictures_is_told_once(loop_env: LoopEnv) -> None:
+    """A first round that leaves turns out without its picture too tells the trim once, as the retry streams."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=10_000)
+    _long_turns(loop_env, 30)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), NoticeEvent("context_trimmed"), TokenEvent("Ohne Bild.")]
+    assert _questions(loop_env.sent(2)) < 31
+
+
 # --- images: attached pictures, tool images, strips, the cap and a refusal -----
 
 

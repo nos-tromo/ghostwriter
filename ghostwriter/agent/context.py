@@ -536,7 +536,7 @@ def fit(
 
     A report, when given, is filled once the replay ends: how many earlier turns there were and how many
     were replayed. It changes nothing of the messages. The loop gives one to the message's first round only,
-    whose trim is the chat's (``context_trimmed``).
+    and its try without images, whose trim is the chat's (``context_trimmed``).
 
     Args:
         system: The system prompt.

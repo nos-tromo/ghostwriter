@@ -1157,32 +1157,30 @@ def test_a_notice_frame_carries_its_details() -> None:
 
 @pytest.mark.parametrize(
     "value",
-    [
-        {},
-        {"code": 7},
-        {"code": "document_partial", "file_id": 7},
-        {"code": "document_partial", "read": "9"},
-        {"code": "document_partial", "read": True},
-        {"code": "document_partial", "total": -1},
-        {"code": "document_partial", "unit": "chapter"},
-        {"code": "document_partial", "unit": ["page"]},
-        ["code", "answer_cut"],
-    ],
-    ids=[
-        "no-code",
-        "code-not-text",
-        "file-id-not-text",
-        "read-not-a-number",
-        "read-a-bool",
-        "total-negative",
-        "unit-not-known",
-        "unit-not-text",
-        "not-a-mapping",
-    ],
+    [{}, {"code": 7}, {"code": "later_code", "file_id": "f" * 32}, ["code", "answer_cut"]],
+    ids=["no-code", "code-not-text", "code-not-known", "not-a-mapping"],
 )
-def test_a_malformed_stored_notice_is_none(value: Any) -> None:
-    """A stored notice that is not one this version wrote reads as none, rather than as a wrong one or a raise."""
+def test_a_stored_notice_without_a_known_code_is_none(value: Any) -> None:
+    """A stored value without a code this version knows reads as no notice at all, rather than raise."""
     assert NoticeEvent.from_stored(value) is None
+
+
+@pytest.mark.parametrize(
+    "details",
+    [
+        {"file_id": 7},
+        {"read": "9"},
+        {"read": True},
+        {"total": -1},
+        {"unit": "chapter"},
+        {"unit": ["page"]},
+    ],
+    ids=["file-id-not-text", "read-not-a-number", "read-a-bool", "total-negative", "unit-not-known", "unit-not-text"],
+)
+def test_a_known_code_with_malformed_details_reads_as_the_code_alone(details: dict[str, Any]) -> None:
+    """A known code keeps what it says, without details that are not this version's: no wrong number is served."""
+    stored = {"code": "document_partial", "file_id": "f" * 32, "read": 9, "total": 500, "unit": "page", **details}
+    assert NoticeEvent.from_stored(stored) == NoticeEvent("document_partial")
 
 
 def test_a_stored_notice_never_reads_a_name_back() -> None:

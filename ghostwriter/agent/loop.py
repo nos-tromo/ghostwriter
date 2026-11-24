@@ -15,11 +15,13 @@ shorter. Without a usage count, only the finish reason tells the cap. A call wor
 busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
 Every call is disclosed before it is sent, and every round recorded after it ends.
 
-The user is told what the answer should say of itself (:class:`~ghostwriter.agent.notices.NoticeEvent`),
+The user is told, as a notice, what limited the answer (:class:`~ghostwriter.agent.notices.NoticeEvent`),
 and the answer's progress keeps each notice told. The message's first round fills a
-:class:`~ghostwriter.agent.context.FitReport`: when it leaves earlier turns out, ``context_trimmed`` is told
-before that round streams, once per message. The last round, one without calls and not stopped, that ends
-at its cap (:func:`_at_cap`, the reasoning cap for a reasoning message) is followed by ``answer_cut``.
+:class:`~ghostwriter.agent.context.FitReport`, filled again when the round goes once more without images:
+when the request the router took left earlier turns out, ``context_trimmed`` is told with that request's
+first event, before any text, once per message; a request the router refused tells nothing. The last round,
+one without calls and not stopped, that ends at its cap (:func:`_at_cap`, the reasoning cap for a reasoning
+message) is followed by ``answer_cut``.
 
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
@@ -822,8 +824,10 @@ class AgentLoop:
     ) -> Generator[TurnEvent, None, tuple[RoundDone | None, list[dict[str, Any]]]]:
         """Fit one round, stream it with its images and record it; a round refused with images goes once more.
 
-        The message's first round is fitted with a :class:`~ghostwriter.agent.context.FitReport`: when it
-        leaves earlier turns out, ``context_trimmed`` is told before it streams. A later round's trim is
+        The message's first round is fitted with a :class:`~ghostwriter.agent.context.FitReport`, and so is
+        its try without images, which fills the report again. ``context_trimmed`` is told with the first
+        event of the try the router took, before any text, when that try's fit left earlier turns out: the
+        trim told is the one of the request sent and taken, never of one refused. A later round's trim is
         not told: the chat was trimmed in the first, and results the model pages past are its own.
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
@@ -846,8 +850,8 @@ class AgentLoop:
             headers: The inference headers.
 
         Yields:
-            TurnEvent: ``context_trimmed`` first, when the first round leaves earlier turns out; the round's
-            text; and ``images_dropped`` when it goes again without images.
+            TurnEvent: ``images_dropped`` when it goes again without images; ``context_trimmed`` before the
+            text of the try the router took, when the first round's fit left earlier turns out; the round's text.
 
         Returns:
             How the round ended, ``None`` when the turn ends with it as it failed; and the tools it offered.
@@ -857,8 +861,6 @@ class AgentLoop:
         if sight.showing:
             self._fetch(turn, sight, fitted)
             _keep_unseen(current, fitted, sight.bank)
-        if report is not None and report.trimmed:
-            yield message.told(NoticeEvent("context_trimmed"))
         while True:
             wire, count = materialise(
                 without_images(fitted) if sight.dropped else fitted, sight.bank, view=sight.showing
@@ -874,6 +876,11 @@ class AgentLoop:
                     cancel=turn.cancel,
                     reasoning=turn.reasoning,
                 ):
+                    if report is not None:
+                        # The router took this attempt: its fit is the one sent, and its trim is told, once.
+                        if report.trimmed:
+                            yield message.told(NoticeEvent("context_trimmed"))
+                        report = None
                     if isinstance(event, TextDelta):
                         if not said and message.shown:
                             message.shown.append("\n\n")
@@ -894,7 +901,7 @@ class AgentLoop:
                     logger.info("Model round {} goes again without its {} images", round_no, count)
                     _drop_images(current, sight)
                     yield message.told(NoticeEvent("images_dropped"))
-                    fitted, tools = request.fitted(current, sight, tooled=tooled)
+                    fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
                     continue
                 if for_length:
                     logger.error(
