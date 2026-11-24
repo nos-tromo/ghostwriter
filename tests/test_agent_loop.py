@@ -8,6 +8,7 @@ import base64
 import dataclasses
 import itertools
 import json
+import logging
 import re
 import threading
 from collections.abc import Callable, Iterator, Sequence
@@ -33,6 +34,8 @@ from ghostwriter.agent.limits import (
     prompt_tokens,
 )
 from ghostwriter.agent.loop import (
+    CONTEXT_ERROR,
+    CONTEXT_REFUSALS,
     AgentLoop,
     ErrorEvent,
     NoticeEvent,
@@ -41,6 +44,7 @@ from ghostwriter.agent.loop import (
     TokenEvent,
     Turn,
     TurnEvent,
+    _refuses_context,
 )
 from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
 from ghostwriter.config import Settings
@@ -954,6 +958,17 @@ def _refused() -> openai.BadRequestError:
     return openai.BadRequestError("image refused", response=httpx2.Response(400, request=request), body=None)
 
 
+def _context_refused(text: str, *, status: int = 400, body: object = None) -> openai.APIStatusError:
+    """Return the router's refusal of a request, with ``text`` as its message, for the status ``status``."""
+    request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
+    response = httpx2.Response(status, request=request)
+    if status == 400:
+        return openai.BadRequestError(text, response=response, body=body)
+    if status == 422:
+        return openai.UnprocessableEntityError(text, response=response, body=body)
+    return openai.APIStatusError(text, response=response, body=body)
+
+
 def _failed_otherwise() -> dict[str, Callable[[], Round]]:
     request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
     return {
@@ -1277,6 +1292,107 @@ def test_a_refusal_without_images_is_not_retried(loop_env: LoopEnv) -> None:
     events = loop_env.run(_refused(), vision=True)
     assert events == [ErrorEvent("model", "The model did not answer.")]
     assert len(loop_env.fake.calls) == 1 and loop_env.audit.log == ["model:1:error"]
+
+
+#: The router's words for a prompt longer than the model's context, as the spec lists them.
+CONTEXT_WORDS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "contextwindowexceeded",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+)
+#: A refusal text no router sends, naming a context for the logs to never hold.
+REFUSAL_TEXT = "synthetic router: maximum context exceeded"
+
+
+def test_the_context_refusals_are_the_spec_s() -> None:
+    """The patterns are the seven the spec names, lower case."""
+    assert CONTEXT_REFUSALS == CONTEXT_WORDS
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        *[
+            pytest.param(_context_refused(f"Synthetic router: {word.title()}, sorry."), True, id=f"message-{word}")
+            for word in CONTEXT_WORDS
+        ],
+        pytest.param(
+            _context_refused(
+                "synthetic router: bad request", body={"error": {"message": "Synthetic: ContextWindowExceeded"}}
+            ),
+            True,
+            id="body",
+        ),
+        pytest.param(_context_refused(REFUSAL_TEXT, status=413), True, id="413"),
+        pytest.param(_context_refused(REFUSAL_TEXT, status=422), False, id="422"),
+        pytest.param(_context_refused("synthetic router: image refused"), False, id="no-pattern"),
+        pytest.param(ValueError(REFUSAL_TEXT), False, id="not-a-status-error"),
+    ],
+)
+def test_refuses_context_reads_the_message_and_the_body(exc: Exception, expected: bool) -> None:
+    """A 400 or 413 whose message or body holds a pattern, in any case, is a refusal for length; nothing else is."""
+    assert _refuses_context(exc) is expected
+
+
+def test_a_context_refusal_without_images_is_the_context_error(
+    loop_env: LoopEnv, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A round refused for its length, with no image to drop, ends the turn with the context error.
+
+    The log says what to look at, and holds neither the router's text nor the question; the round is audited.
+    """
+    events = loop_env.run(_context_refused(REFUSAL_TEXT), content="Summe der Spalte B", vision=True)
+    assert events == [ErrorEvent("context", "This chat is too long for the model.")]
+    assert CONTEXT_ERROR == "This chat is too long for the model."
+    assert len(loop_env.fake.calls) == 1 and loop_env.audit.log == ["model:1:error"] and loop_env.audit.images == [0]
+    errors = [r.getMessage() for r in loguru_caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "GHOSTWRITER_CONTEXT_TOKENS" in errors[0]
+    assert REFUSAL_TEXT not in loguru_caplog.text and "Summe der Spalte B" not in loguru_caplog.text
+
+
+def test_a_context_refusal_with_images_goes_again_without_them(loop_env: LoopEnv) -> None:
+    """A round with a picture refused for its length goes once more without it, after the notice."""
+    events = loop_env.run(_context_refused(REFUSAL_TEXT), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    first, second = loop_env.fake.calls
+    assert "image_url" in json.dumps(first["messages"]) and "image_url" not in json.dumps(second["messages"])
+    assert loop_env.audit.log == ["model:1:error", "model:1:ok"] and loop_env.audit.images == [1, 0]
+
+
+def test_a_second_context_refusal_is_the_context_error(loop_env: LoopEnv) -> None:
+    """The round sent again without images and refused again for its length is the context error."""
+    events = loop_env.run(
+        _context_refused(REFUSAL_TEXT), _context_refused(REFUSAL_TEXT), vision=True, attach=[_photo()]
+    )
+    assert events == [NoticeEvent("images_dropped"), ErrorEvent("context", CONTEXT_ERROR)]
+    assert loop_env.audit.log == ["model:1:error", "model:1:error"] and loop_env.audit.images == [1, 0]
+
+
+def test_a_context_refusal_after_text_is_the_model_error(loop_env: LoopEnv) -> None:
+    """A round that failed once it had said something is the model error, as any failure after text."""
+    events = loop_env.run([text_chunk("Ich sehe"), _context_refused(REFUSAL_TEXT)], vision=True)
+    assert events == [TokenEvent("Ich sehe"), ErrorEvent("model", "The model did not answer.")]
+
+
+@pytest.mark.parametrize(
+    ("attach", "expected"),
+    [
+        pytest.param(
+            [_photo()], [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")], id="with-images-they-are-dropped"
+        ),
+        pytest.param([], [ErrorEvent("model", "The model did not answer.")], id="without-images-the-model-error"),
+    ],
+)
+def test_other_refusals_stay_as_they_were(
+    loop_env: LoopEnv, attach: list[tuple[str, dict[str, Any]]], expected: list[TurnEvent]
+) -> None:
+    """A 400 that is no refusal for length still drops a picture, and without one is still the model error."""
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=attach)
+    assert events == expected
 
 
 @pytest.mark.parametrize("failed", _failed_otherwise().values(), ids=_failed_otherwise().keys())

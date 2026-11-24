@@ -7,7 +7,9 @@ are ``start`` (the stored question's and answer's ids), always first, then ``tok
 ``step``, ``result``, ``notice`` and ``error``, and ``final``, which is always last; a quiet
 stream carries a keep-alive comment every 15 s, which is no frame. ``notice`` names by its
 ``code`` what the user is told while the answer goes on: ``images_dropped``, the model refused
-a round's images and it went again without them. A stop, or
+a round's images and it went again without them. ``error`` names by its ``code`` why the answer
+ended early: ``model``, ``audit``, ``internal``, or ``context``, the router refused a round as longer
+than the model's context, with no image left to drop. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its

@@ -45,8 +45,14 @@ no images asked for, no ``strips``, and a tool's images named as not shown; no n
 wrote before included, sends the model to ``view_file`` any more. Each round is recorded with how many
 images it sent.
 
+A round the router refuses before any text for its length (:func:`_refuses_context`: a status of
+:data:`REFUSED_CONTEXT_STATUSES` and one of :data:`CONTEXT_REFUSALS` in its message or body) goes the same
+way while it carried images. A round without images, or sent again without them and refused again, ends the
+turn with the ``context`` error (:data:`CONTEXT_ERROR`), not the model error, and the log names
+``GHOSTWRITER_CONTEXT_TOKENS``, which may be above the model's context.
+
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
-a label or an image.
+a label, an image or the router's refusal text.
 """
 
 import dataclasses
@@ -131,10 +137,25 @@ from ghostwriter.workbench import (
 CALL_ID: Final = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 #: What the user is told when a model round failed.
 MODEL_ERROR = "The model did not answer."
+#: What the user is told when the router refused a round for its length.
+CONTEXT_ERROR: Final = "This chat is too long for the model."
 #: What the user is told when anything else broke the answer.
 INTERNAL_ERROR = "The answer could not be finished."
 #: The router's statuses for a request it may have refused for its images; such a round is sent once more without.
 REFUSED_IMAGE_STATUSES: Final = frozenset({400, 413, 422})
+#: The router's statuses for a request it refused for its length.
+REFUSED_CONTEXT_STATUSES: Final = frozenset({400, 413})
+#: What the router says of a prompt longer than the model's context, lower case: one of these in a refusal's
+#: message or body makes it a refusal for length.
+CONTEXT_REFUSALS: Final = (
+    "context length",
+    "context window",
+    "maximum context",
+    "contextwindowexceeded",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+)
 
 
 @dataclass(frozen=True)
@@ -211,11 +232,11 @@ class ErrorEvent:
     """Why the answer ended early.
 
     Attributes:
-        code: ``model``, ``audit`` or ``internal``.
+        code: ``model``, ``audit``, ``internal``, or ``context``: the router refused a round for its length.
         message: What the user is told.
     """
 
-    code: Literal["model", "audit", "internal"]
+    code: Literal["model", "audit", "internal", "context"]
     message: str
 
 
@@ -435,6 +456,22 @@ def _refuses_images(exc: Exception) -> bool:
         Whether the router answered with a status of :data:`REFUSED_IMAGE_STATUSES`.
     """
     return isinstance(exc, openai.APIStatusError) and exc.status_code in REFUSED_IMAGE_STATUSES
+
+
+def _refuses_context(exc: Exception) -> bool:
+    """Tell whether a round's failure is the router refusing its prompt as longer than the model's context.
+
+    Args:
+        exc: What the round raised.
+
+    Returns:
+        Whether the router answered with a status of :data:`REFUSED_CONTEXT_STATUSES` and one of
+        :data:`CONTEXT_REFUSALS` is in its message or body, in any case.
+    """
+    if not isinstance(exc, openai.APIStatusError) or exc.status_code not in REFUSED_CONTEXT_STATUSES:
+        return False
+    told = f"{exc.message} {exc.body}".lower()
+    return any(pattern in told for pattern in CONTEXT_REFUSALS)
 
 
 def _unique(call: ToolCall, used: set[str], round_no: int) -> ToolCall:
@@ -750,9 +787,12 @@ class AgentLoop:
 
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
-        with a status of :data:`REFUSED_IMAGE_STATUSES`, of a round that carried images is recorded as a
-        failed round and told with a :class:`NoticeEvent`. The round is then fitted again without sight,
-        as the rest of the turn is, and sent without images; a second failure is the model error.
+        with a status of :data:`REFUSED_IMAGE_STATUSES` (a refusal for length among them,
+        :func:`_refuses_context`), of a round that carried images is recorded as a failed round and told
+        with a :class:`NoticeEvent`. The round is then fitted again without sight, as the rest of the turn
+        is, and sent without images. A failure of a round without images is the ``context`` error when it
+        is a refusal for length, which a second failure of a round sent again is too, and the model error
+        otherwise; a failure after text, or after a stop, is never the ``context`` error.
 
         Args:
             turn: The message.
@@ -805,13 +845,21 @@ class AgentLoop:
                     "Model round {} failed{}: {}", round_no, " after a stop" if stopped else "", type(exc).__name__
                 )
                 audit.model_called(round=round_no, done=None, outcome="error", images=count)
-                if count and not said and not stopped and _refuses_images(exc):
+                for_length = not said and not stopped and _refuses_context(exc)
+                if count and not said and not stopped and (for_length or _refuses_images(exc)):
                     logger.info("Model round {} goes again without its {} images", round_no, count)
                     _drop_images(current, sight)
                     yield NoticeEvent("images_dropped")
                     fitted, tools = request.fitted(current, sight, tooled=tooled)
                     continue
-                if not stopped:
+                if for_length:
+                    logger.error(
+                        "The router refused round {} for its length; GHOSTWRITER_CONTEXT_TOKENS may be above the "
+                        "model's context.",
+                        round_no,
+                    )
+                    yield ErrorEvent("context", CONTEXT_ERROR)
+                elif not stopped:
                     yield ErrorEvent("model", MODEL_ERROR)
                 return None, tools
             if done is None:
