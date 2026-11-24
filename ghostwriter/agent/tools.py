@@ -4,7 +4,9 @@ The model is offered workbench's MCP tools as OpenAI functions. Its arguments ar
 smaller models write them: nothing is no arguments, a JSON string holding an object is decoded
 once, anything else is refused to the model. What it reads back is bounded: a result's text
 (which workbench writes without the table previews) cut to ``TOOL_RESULT_CHARS``, or a small
-JSON object naming why there is none. A result that showed images says how many it returned,
+JSON object naming why there is none. A paged answer, ``read_document``'s, is cut by parts so that
+it stays JSON and keeps ``next_part`` and ``truncated``, with the last part kept cut if need be;
+any other text is cut where it falls. A result that showed images says how many it returned,
 or that they could not be shown; which of them went to the model, the note in each one's place
 says. The texts here are the model-facing protocol.
 
@@ -39,6 +41,8 @@ CUT_ARGUMENTS: Final = (
 BUSY_TOKENS: Final = frozenset({"queue_full", "wait_timeout", "executor_busy"})
 #: What ends a text that was cut.
 CUT_MARK: Final = "…[cut]"
+#: What ends the ``hint`` of a paged answer Ghostwriter cut: how the model reads on.
+CUT_HINT: Final = "Ghostwriter cut this answer to fit; call read_document again with part set to next_part to read on."
 #: The deepest objects and lists may nest in arguments, as docint allows.
 MAX_ARGUMENT_DEPTH: Final = 32
 #: The longest detail a step shows in the trail.
@@ -91,6 +95,104 @@ def cut(text: str, limit: int) -> str:
         The text, or its start and :data:`CUT_MARK`.
     """
     return text if len(text) <= limit else text[: max(0, limit - len(CUT_MARK))] + CUT_MARK
+
+
+def _paged(text: str) -> dict[str, Any] | None:
+    """Read a paged answer: a JSON object whose ``parts`` are objects with a string ``label`` and ``text``.
+
+    Args:
+        text: A result's text.
+
+    Returns:
+        The object, or ``None`` when the text is not JSON, not an object, or its ``parts`` are anything else.
+    """
+    try:
+        body = json.loads(text)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    parts = body.get("parts")
+    if not isinstance(parts, list):
+        return None
+    for part in parts:
+        if not (isinstance(part, dict) and isinstance(part.get("label"), str) and isinstance(part.get("text"), str)):
+            return None
+    return body
+
+
+def _by_parts(body: dict[str, Any], limit: int) -> str | None:
+    """Rebuild a paged answer from the whole parts that fit and one more cut to the room that is left.
+
+    Args:
+        body: The answer, as :func:`_paged` read it.
+        limit: The most characters the rebuilt JSON may have.
+
+    Returns:
+        The JSON, or ``None`` when the fields around the parts leave no room for even the start of one.
+    """
+    parts: list[dict[str, Any]] = body["parts"]
+    hint = body.get("hint")
+    told = f"{hint} {CUT_HINT}" if isinstance(hint, str) and hint else CUT_HINT
+
+    def shaped(kept: list[dict[str, Any]], first_left_out: int) -> str:
+        after = parts[first_left_out]["label"] if first_left_out < len(parts) else body.get("next_part")
+        return compact({**body, "parts": kept, "truncated": True, "next_part": after, "hint": told})
+
+    kept: list[dict[str, Any]] = []
+    for index, part in enumerate(parts):
+        if len(shaped([*kept, part], index + 1)) <= limit:
+            kept.append(part)
+            continue
+        # The most text that fits is searched for, as escaping makes it longer than its characters: by up to six
+        # each, so a step of the size of the excess would overshoot and could lose the whole part.
+        low = len(CUT_MARK) + 1
+        high = limit - len(shaped([*kept, {**part, "text": "", "cut": True}], index + 1))
+        best: str | None = None
+        while low <= high:
+            middle = (low + high) // 2
+            trial = shaped([*kept, {**part, "text": cut(part["text"], middle), "cut": True}], index + 1)
+            if len(trial) <= limit:
+                best, low = trial, middle + 1
+            else:
+                high = middle - 1
+        if best is not None:
+            return best
+        if not kept:
+            return None  # no room for even the start of a part: an answer with no part would only be asked again
+        fitted = shaped(kept, index)
+        return fitted if len(fitted) <= limit else None
+    whole = compact(body)  # every part fits once compacted: nothing was left out
+    return whole if len(whole) <= limit else None
+
+
+def cut_result(text: str, limit: int) -> str:
+    """Cut a tool result to at most ``limit`` characters, keeping a paged answer's paging fields.
+
+    A paged answer, ``read_document``'s, is rebuilt from the whole parts that fit and one more cut to the room that
+    is left, so it stays JSON: ``truncated`` is true, ``next_part`` names the first part left out (workbench's own
+    when the cut falls in its last part), a part cut carries ``cut: true``, and ``hint`` ends with :data:`CUT_HINT`.
+    The ``limit`` counts the JSON as written, escapes included.
+
+    Args:
+        text: The result's text.
+        limit: The most characters it may have.
+
+    Returns:
+        ``text`` when it fits; the paged answer cut by parts; otherwise, and whenever the fields around the parts
+        leave no room or the answer cannot be rebuilt, :func:`cut` of the text. Never raises.
+    """
+    if len(text) <= limit:
+        return text
+    paged = _paged(text)
+    if paged is not None:
+        try:
+            rebuilt = _by_parts(paged, limit)
+        except (ValueError, RecursionError):
+            rebuilt = None
+        if rebuilt is not None:
+            return rebuilt
+    return cut(text, limit)
 
 
 def _without(schema: Mapping[str, Any], hidden: frozenset[str]) -> dict[str, Any]:
@@ -245,13 +347,14 @@ def tool_message(outcome: ToolResult | ToolFailure | Refusal, *, images_seen: bo
         images_seen: Whether a result's images go to the model.
 
     Returns:
-        A result's text, cut to :data:`TOOL_RESULT_CHARS`, and after a newline :data:`SHOWN`, or
+        A result's text, cut to :data:`TOOL_RESULT_CHARS` (a paged answer by its parts, see :func:`cut_result`;
+        anything else where it falls), and after a newline :data:`SHOWN`, or
         :data:`NOT_SHOWN` when not ``images_seen``, if it showed images; otherwise ``{"error", "detail"}``
         as compact JSON: a busy workbench's detail says to try later, a failure's is cut to
         :data:`FAILURE_CHARS`.
     """
     if isinstance(outcome, ToolResult):
-        text = cut(outcome.text, TOOL_RESULT_CHARS)
+        text = cut_result(outcome.text, TOOL_RESULT_CHARS)
         if not outcome.images:
             return text
         return f"{text}\n{(SHOWN if images_seen else NOT_SHOWN).format(n=len(outcome.images))}"

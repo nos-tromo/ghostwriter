@@ -57,7 +57,7 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MESSAGE_WALL_S` | 300 | Seconds a message has for its tools |
 | `TOOL_CUTOFF_S` | 10 | Below this much of the wall, a round gets no tools |
 | `BUSY_RETRY_S` | 2 | Pause before a call workbench answered busy goes once more |
-| `TOOL_RESULT_CHARS` | 12,000 | Characters of a result the model reads |
+| `TOOL_RESULT_CHARS` | 16,384 | Characters of a result the model reads; a `read_document` answer is cut by whole parts, keeping `next_part` |
 | `HISTORY_ARGUMENT_CHARS` / `HISTORY_RESULT_CHARS` | 2,000 / 2,000 | A replayed call's arguments and result |
 | `MAX_RESULTS_PER_MESSAGE` | 20 | Cards a message shows |
 | `INLINE_IMAGE_BYTES` | 10 MiB | The largest image shown inline (png, jpeg, gif, webp) |

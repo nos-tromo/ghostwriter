@@ -408,7 +408,7 @@ def test_the_prompt_and_the_answer_fit_the_context() -> None:
     assert (limits.MAX_TOOL_ROUNDS, limits.MAX_CALLS_PER_ROUND) == (8, 4)
     assert (limits.MESSAGE_WALL_S, limits.TOOL_CUTOFF_S, limits.BUSY_RETRY_S) == (300.0, 10.0, 2.0)
     assert (limits.TOOL_RESULT_CHARS, limits.HISTORY_ARGUMENT_CHARS, limits.HISTORY_RESULT_CHARS) == (
-        12_000,
+        16_384,
         2_000,
         2_000,
     )
