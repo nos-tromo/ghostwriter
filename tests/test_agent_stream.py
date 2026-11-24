@@ -412,6 +412,5 @@ def test_the_prompt_and_the_answer_fit_the_context() -> None:
         2_000,
         2_000,
     )
-    assert limits.MIN_CUT_PART_CHARS == 200
     assert (limits.MAX_RESULTS_PER_MESSAGE, limits.INLINE_IMAGE_BYTES) == (20, 10 * 1024 * 1024)
     assert limits.IMAGE_MIMES == {"image/png", "image/jpeg", "image/gif", "image/webp"}
