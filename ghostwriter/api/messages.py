@@ -17,7 +17,9 @@ with no image left to drop. A stop, or
 the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
-only frame, and when its response ends.
+only frame, and when its response ends. ``final`` names the answer's and the question's ids, the chat, whether the
+answer was ``stopped``, and its ``context_estimate``: the estimated tokens of the next prompt, as stored with the
+answer, or ``null`` for a turn that never began or whose estimate failed.
 
 A turn is recorded as one primary event, written before anything is stored (``collect`` /
 ``chat.message``, or ``modify`` / ``chat.regenerate``), with a child per model round
@@ -50,6 +52,7 @@ from ghostwriter.agent.loop import (
     Turn,
     TurnAudit,
     TurnEvent,
+    TurnOutcome,
 )
 from ghostwriter.agent.notices import NoticeEvent
 from ghostwriter.agent.stream import RoundDone
@@ -279,6 +282,7 @@ class TurnStream:
             "user_message_id": user_message_id,
             "chat": chat.model_dump(mode="json"),
         }
+        self._outcome = TurnOutcome()
         self._lock = threading.Lock()
         self._state: Literal["waiting", "running", "ended"] = "waiting"
 
@@ -310,7 +314,7 @@ class TurnStream:
 
         def stopped() -> None:
             if self._end_waiting():
-                put(sse_frame("final", {**self._final, "stopped": True}))
+                put(sse_frame("final", {**self._final, "stopped": True, "context_estimate": None}))
                 put(None)
 
         self._turns.on_stop(self._turn.chat_id, self._turn.cancel, stopped)
@@ -327,7 +331,7 @@ class TurnStream:
         running: dict[str, StepOut] = {}
         try:
             try:
-                for event in self._agent.run(turn, self._audit):
+                for event in self._agent.run(turn, self._audit, outcome=self._outcome):
                     if isinstance(event, StepEvent):
                         if event.step.status == "running":
                             running[event.step.id] = event.step
@@ -342,7 +346,10 @@ class TurnStream:
                 yield sse_frame("error", {"code": "internal", "message": INTERNAL_ERROR})
             for step in running.values():
                 yield sse_frame("step", step.model_copy(update={"status": "error"}).model_dump(mode="json"))
-            final = sse_frame("final", {**self._final, "stopped": turn.cancel.is_set()})
+            final = sse_frame(
+                "final",
+                {**self._final, "stopped": turn.cancel.is_set(), "context_estimate": self._outcome.context_estimate},
+            )
             self._turns.end(turn.chat_id, turn.cancel)
             yield final
         finally:

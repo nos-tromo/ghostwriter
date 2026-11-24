@@ -59,6 +59,11 @@ way while it carried images. A round without images, or sent again without them 
 turn with the ``context`` error (:data:`CONTEXT_ERROR`), not the model error, and the log names
 ``GHOSTWRITER_CONTEXT_TOKENS``, which may be above the model's context.
 
+When the answer ends, however it ends, the loop estimates the tokens the next message's prompt starts with
+(:func:`~ghostwriter.agent.context.next_prompt_tokens`: the offer's system prompt and tools, and every turn of the
+chat, this one as it will be replayed) and stores it with the answer; the caller's :class:`TurnOutcome` carries it
+too. A turn stopped before it began has none, and nor has an answer whose estimate failed.
+
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
 a label, an image or the router's refusal text.
 """
@@ -76,7 +81,7 @@ from uuid import uuid4
 import openai
 from loguru import logger
 
-from ghostwriter.agent.context import FitReport, PastTurn, fit
+from ghostwriter.agent.context import FitReport, PastTurn, finished_turn, fit, next_prompt_tokens
 from ghostwriter.agent.images import (
     UNSEEN,
     ImageBank,
@@ -241,6 +246,18 @@ class ErrorEvent:
 TurnEvent: TypeAlias = TokenEvent | StepEvent | ResultEvent | NoticeEvent | ErrorEvent
 
 
+@dataclass
+class TurnOutcome:
+    """What a turn leaves for its caller once it has ended, filled by :meth:`AgentLoop.run`.
+
+    Attributes:
+        context_estimate: The estimated tokens of the prompt after this answer, as stored with it; ``None`` when
+            the turn ended before it began or the estimate failed.
+    """
+
+    context_estimate: int | None = None
+
+
 class TurnAudit(Protocol):
     """Where a turn records what it discloses and each model round."""
 
@@ -286,6 +303,9 @@ class _Progress:
         cards: The ids of the files shown as cards.
         withdrawn: Whether the tools were withdrawn for the rest of the message.
         notices: Every notice the user was told, in order.
+        next_prompt: Estimates the tokens of the next message's prompt from the answer's text, as the turn stands
+            when it is called (the offer in force, the turn's messages); set once the turn's messages exist, and
+            ``None`` until then.
     """
 
     started: float
@@ -294,6 +314,7 @@ class _Progress:
     cards: set[str] = field(default_factory=set)
     withdrawn: bool = False
     notices: list[NoticeEvent] = field(default_factory=list)
+    next_prompt: Callable[[str], int] | None = None
 
     def told(self, event: NoticeEvent) -> NoticeEvent:
         """Keep a notice the user is told, for the answer.
@@ -615,14 +636,16 @@ class AgentLoop:
         self._vision = vision
         self._media = media
 
-    def run(self, turn: Turn, audit: TurnAudit) -> Iterator[TurnEvent]:
+    def run(self, turn: Turn, audit: TurnAudit, *, outcome: TurnOutcome | None = None) -> Iterator[TurnEvent]:
         """Answer a message.
 
-        The answer's text and its notices are stored when the run ends, however it ends.
+        The answer's text, its notices and the estimate of the next prompt are stored when the run ends, however
+        it ends.
 
         Args:
             turn: The message.
             audit: Where disclosures and model rounds are recorded.
+            outcome: Filled with the estimate when the run ends; ``None`` keeps it for the store alone.
 
         Yields:
             TurnEvent: Text, steps, cards and notices as they come, each notice also kept in the answer's
@@ -642,20 +665,25 @@ class AgentLoop:
                 logger.error("An answer broke off: {}", type(exc).__name__)
                 yield ErrorEvent("internal", INTERNAL_ERROR)
         finally:
-            self._store_answer(turn, message)
+            estimate = _estimated(message)
+            if outcome is not None:
+                outcome.context_estimate = estimate
+            self._store_answer(turn, message, estimate)
 
-    def _store_answer(self, turn: Turn, message: _Progress) -> None:
-        """Store the answer's text and its notices; a failure is logged, never raised over the turn's own outcome.
+    def _store_answer(self, turn: Turn, message: _Progress, context_estimate: int | None) -> None:
+        """Store the answer's text, its notices and its estimate; a failure is logged, never raised over the turn.
 
         Args:
             turn: The message.
             message: The answer: everything shown, and every notice told, stored without its name.
+            context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
         try:
             self._store.finish_assistant_message(
                 turn.assistant_message_id,
                 "".join(message.shown),
                 notices=[notice.stored() for notice in message.notices],
+                context_estimate=context_estimate,
             )
         except Exception as exc:
             logger.error("An answer could not be stored: {}", type(exc).__name__)
@@ -728,6 +756,15 @@ class AgentLoop:
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
         current: list[dict[str, Any]] = [_asked(question, sight)]
+
+        def next_prompt(text: str) -> int:
+            # As the turn stands when the answer ends: the offer of the last round (the blind one after a refusal),
+            # and the turn's messages as they were left; read then, never now.
+            offer = request.offer(sight)
+            answered = finished_turn(question.text, question.images, current, text)
+            return next_prompt_tokens(offer.system, offer.tools, [*past, answered], images=sight.budget)
+
+        message.next_prompt = next_prompt
         used: set[str] = set()
         round_no = 0
         while not turn.cancel.is_set():
@@ -1103,6 +1140,24 @@ class AgentLoop:
         for card in cards:
             yield ResultEvent(card)
         return outcome
+
+
+def _estimated(message: _Progress) -> int | None:
+    """Estimate the tokens of the next prompt from the answer as it ended.
+
+    Args:
+        message: The answer.
+
+    Returns:
+        The estimate; ``None`` when the turn never began, or when the estimate failed, which is logged by its type.
+    """
+    if message.next_prompt is None:
+        return None
+    try:
+        return message.next_prompt("".join(message.shown))
+    except Exception as exc:
+        logger.warning("The next prompt could not be estimated: {}", type(exc).__name__)
+        return None
 
 
 def _asked(question: UserTurn, sight: _Sight) -> dict[str, Any]:

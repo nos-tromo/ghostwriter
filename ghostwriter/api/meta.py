@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, Request
 from pydantic import BaseModel
 
 from ghostwriter import __version__
+from ghostwriter.agent.limits import prompt_tokens
 from ghostwriter.audit import required_endpoint_actions
 from ghostwriter.config import Settings
 from ghostwriter.identity import Principal, trusted_identity
@@ -67,6 +68,9 @@ class ConfigOut(BaseModel):
         max_recording_bytes: The largest recording.
         chat_retention_days: How long a chat is kept after it starts; ``None`` while retention is off.
         file_retention_days: How long workbench keeps a chat's files.
+        prompt_tokens: The most a round's prompt may hold: the context less the answer and the margin. The SPA
+            divides an answer's ``context_estimate`` by it.
+        reasoning_prompt_tokens: The same for a message with reasoning on, whose answer may be longer.
         version: The running release.
     """
 
@@ -85,6 +89,8 @@ class ConfigOut(BaseModel):
     max_recording_bytes: int
     chat_retention_days: int | None
     file_retention_days: int
+    prompt_tokens: int
+    reasoning_prompt_tokens: int
     version: str
 
 
@@ -127,5 +133,7 @@ def config(request: Request) -> ConfigOut:
         max_recording_bytes=MAX_RECORDING_BYTES,
         chat_retention_days=settings.chat_days,
         file_retention_days=settings.file_days,
+        prompt_tokens=prompt_tokens(settings.context_tokens, reasoning=False),
+        reasoning_prompt_tokens=prompt_tokens(settings.context_tokens, reasoning=True),
         version=__version__,
     )

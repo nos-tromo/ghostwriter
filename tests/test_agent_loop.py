@@ -23,8 +23,8 @@ import openai
 import pytest
 from typing_extensions import override
 
-from ghostwriter.agent.context import estimate_tokens
-from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN
+from ghostwriter.agent.context import estimate_tokens, finished_turn, next_prompt_tokens
+from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN, ImageBudget
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
     MAX_ANSWER_TOKENS,
@@ -44,6 +44,7 @@ from ghostwriter.agent.loop import (
     TokenEvent,
     Turn,
     TurnEvent,
+    TurnOutcome,
     _refuses_context,
 )
 from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
@@ -211,6 +212,7 @@ class LoopEnv:
         vision: bool = False,
         media: NextextHealth | None = None,
         attach: Sequence[tuple[str, dict[str, Any]]] = (),
+        outcome: TurnOutcome | None = None,
     ) -> list[TurnEvent]:
         """Send a message and run its turn to the end.
 
@@ -223,6 +225,7 @@ class LoopEnv:
             media: Nextext's health, as ``app.state.media`` holds it; ``None`` is Nextext off.
             attach: The files the message sends, by name and manifest, each settled ``ready`` first:
                 a manifest of kind ``image`` makes a picture, ``media`` a clip, any other a document.
+            outcome: What the turn fills in when it ends; ``None`` keeps none.
 
         Returns:
             The turn's events.
@@ -267,7 +270,7 @@ class LoopEnv:
             cancel=self.cancel,
             reasoning=reasoning,
         )
-        return list(loop.run(turn, self.audit))
+        return list(loop.run(turn, self.audit, outcome=outcome))
 
     def stored(self) -> str:
         """Return the stored text of the last answer."""
@@ -1007,6 +1010,157 @@ def test_a_chat_still_trimmed_without_its_pictures_is_told_once(loop_env: LoopEn
     events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
     assert events == [NoticeEvent("images_dropped"), NoticeEvent("context_trimmed"), TokenEvent("Ohne Bild.")]
     assert _questions(loop_env.sent(2)) < 31
+
+
+# --- the estimate of the next prompt, left with every answer -----
+
+
+def _estimate_after(env: LoopEnv, *, images: ImageBudget | None = None) -> int:
+    """Return the estimate of the prompt that follows the last answer, from what its last round sent.
+
+    Args:
+        env: The chat the last turn ran in.
+        images: What an image costs when the turn saw, which counts the earlier turns' pictures and reads their lines
+            as a turn that sees does; ``None`` for a turn that did not.
+
+    Returns:
+        The tokens of the last round's system prompt and tools with the chat's turns, the last answer included.
+    """
+    call = env.fake.calls[-1]
+    past, _ = env.store.past_turns(CHAT, before_position=10**6, seen=images is not None)
+    return next_prompt_tokens(call["messages"][0]["content"], call.get("tools", []), past, images=images)
+
+
+def _stored_estimate(env: LoopEnv) -> int | None:
+    return env.store.chat_detail("user-a", CHAT).messages[-1].context_estimate
+
+
+def test_every_answer_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """The stored estimate is what the next prompt starts with: the system prompt, the tools, every turn replayed.
+
+    The answer just finished is among the turns, tool calls and all; the outcome carries the same number.
+    """
+    loop_env.workbench.answers = [RESULT]
+    outcome = TurnOutcome()
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42"), usage_chunk(900, 12, "served-model")], outcome=outcome)
+    assert len(loop_env.fake.calls) == 2 and loop_env.fake.calls[-1]["tools"]
+    stored = _stored_estimate(loop_env)
+    assert stored == _estimate_after(loop_env) and stored is not None and stored > 0
+    assert outcome.context_estimate == stored
+    again = TurnOutcome()
+    loop_env.run([text_chunk("Und noch eine.")], outcome=again)
+    assert again.context_estimate == _stored_estimate(loop_env) == _estimate_after(loop_env)
+    assert again.context_estimate is not None and again.context_estimate > stored
+
+
+def test_an_answer_without_tools_leaves_its_estimate_too(loop_env: LoopEnv) -> None:
+    """With workbench off there is no tool to count; the estimate is the prompt without any."""
+    loop_env.run([text_chunk("Hallo!")], workbench=None)
+    assert "tools" not in loop_env.fake.calls[-1]
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env)
+
+
+def test_a_finished_turn_matches_what_the_loop_stored(loop_env: LoopEnv) -> None:
+    """The turn as the loop holds it, finished, is the turn the store replays: the estimate counts the same."""
+    loop_env.workbench.answers = [RESULT]
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    [stored, *_] = loop_env.store.past_turns(CHAT, before_position=10**6)
+    current = loop_env.sent(2)[1:]
+    assert [m["role"] for m in current] == ["user", "assistant", "tool"]
+    assert stored[-1] == finished_turn("Summe der Spalte B", (), current, "Summe: 42")
+    assert len(stored[-1].rounds) == 1
+
+
+def test_a_picture_is_counted_when_the_turn_saw(loop_env: LoopEnv) -> None:
+    """A turn that saw its picture estimates the next prompt with the picture, at its cost."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.run([text_chunk("Ein Hafen.")], content="Was zeigt das Bild?", vision=True, attach=[_photo()])
+    images = ImageBudget(280, loop_env.settings.max_images)
+    counted = _estimate_after(loop_env, images=images)
+    assert _stored_estimate(loop_env) == counted
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6, seen=True)
+    call = loop_env.fake.calls[-1]
+    assert counted >= next_prompt_tokens(call["messages"][0]["content"], call["tools"], past) + 280
+
+
+def test_after_a_refusal_the_estimate_is_of_the_offer_without_sight(loop_env: LoopEnv) -> None:
+    """A turn whose images were refused goes on as without sight: the next prompt is counted from that offer."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    seeing, blind = loop_env.fake.calls
+    assert "view_file" in _tool_names(seeing) and "view_file" not in _tool_names(blind)
+    images = ImageBudget(280, loop_env.settings.max_images)
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env, images=images)
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6, seen=True)
+    first = next_prompt_tokens(seeing["messages"][0]["content"], seeing["tools"], past, images=images)
+    assert _stored_estimate(loop_env) != first
+
+
+def test_a_stopped_or_failed_answer_still_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """However the turn ends, what it did is in the chat, and so is the estimate of the prompt after it."""
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return usage_chunk(900, 12, "served-model")
+
+    outcome = TurnOutcome()
+    loop_env.run([text_chunk("Ich lese"), stop], outcome=outcome)
+    assert loop_env.stored() == "Ich lese"
+    stopped = _stored_estimate(loop_env)
+    assert stopped == _estimate_after(loop_env) == outcome.context_estimate and stopped is not None
+    loop_env.cancel.clear()
+    failed = TurnOutcome()
+    events = loop_env.run(_router_error(), outcome=failed)
+    assert events == [ErrorEvent("model", "The model did not answer.")]
+    estimate = _stored_estimate(loop_env)
+    assert estimate == _estimate_after(loop_env) == failed.context_estimate
+    assert estimate is not None and stopped is not None and estimate > stopped
+
+
+def test_an_answer_ended_by_a_context_refusal_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """A chat the router found too long still shows how long it is: the estimate is not capped at the budget."""
+    refused = _context_refused("synthetic router: maximum context exceeded")
+    events = loop_env.run(refused)
+    assert [type(e).__name__ for e in events] == ["ErrorEvent"]
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env)
+
+
+def test_a_turn_stopped_before_it_began_has_no_estimate(loop_env: LoopEnv) -> None:
+    """Nothing was asked of the model, no offer was made: there is no estimate to store, and the outcome says so."""
+    loop_env.cancel.set()
+    outcome = TurnOutcome(context_estimate=5)
+    assert loop_env.run([text_chunk("nie")], outcome=outcome) == []
+    assert loop_env.stored() == "" and _stored_estimate(loop_env) is None and outcome.context_estimate is None
+
+
+def test_a_chat_over_the_budget_is_estimated_whole(loop_env: LoopEnv) -> None:
+    """Earlier turns the round left out still count: the estimate is of the whole chat, over the prompt budget."""
+    _long_turns(loop_env, 30)
+    events = loop_env.run([text_chunk("Summe: 42")])
+    assert events == [NoticeEvent("context_trimmed"), TokenEvent("Summe: 42")]
+    estimate = _stored_estimate(loop_env)
+    assert estimate == _estimate_after(loop_env) and estimate is not None
+    assert estimate > PROMPT_TOKENS > estimate_tokens(loop_env.sent(1))
+
+
+def test_an_estimate_that_fails_is_none(
+    loop_env: LoopEnv, monkeypatch: pytest.MonkeyPatch, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed estimate stores none, says so once by its type, and leaves the answer and its events as they are."""
+
+    def broken(*args: object, **kwargs: object) -> int:
+        raise ZeroDivisionError("synthetic: no estimate")
+
+    monkeypatch.setattr("ghostwriter.agent.loop.next_prompt_tokens", broken)
+    outcome = TurnOutcome(context_estimate=7)
+    events = loop_env.run([text_chunk("Summe: 42")], outcome=outcome)
+    assert events == [TokenEvent("Summe: 42")]
+    assert loop_env.stored() == "Summe: 42" and _stored_estimate(loop_env) is None
+    assert outcome.context_estimate is None
+    warnings = [r.getMessage() for r in loguru_caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "ZeroDivisionError" in warnings[0]
+    assert "synthetic" not in loguru_caplog.text
 
 
 # --- images: attached pictures, tool images, strips, the cap and a refusal -----

@@ -23,9 +23,13 @@ from ghostwriter.agent.context import (
     FitReport,
     PastCall,
     PastTurn,
+    _replayed,
+    _Size,
     attachment_facts,
     estimate_tokens,
+    finished_turn,
     fit,
+    next_prompt_tokens,
     user_content,
 )
 from ghostwriter.agent.images import (
@@ -90,6 +94,7 @@ TOOLS = function_tools(
     ]
 )
 SYSTEM = system_prompt(today=date(2026, 11, 16), folder=FOLDER, file_days=7, expired=False)
+SYSTEM_ONLY = [{"role": "system", "content": SYSTEM}]
 EXPIRED = (
     "Some files and tool results of earlier messages in this chat have been deleted, as 7 days had passed. "
     "Say so when the user asks about them, and ask them to attach the file again."
@@ -698,6 +703,45 @@ def test_the_budget_holds_exactly_at_every_size() -> None:
             assert estimate_tokens(more) > budget
 
 
+def test_the_next_prompt_counts_every_turn_and_the_tools() -> None:
+    """The estimate is never capped: 40 big turns come to more than the budget, the tool schemas included.
+
+    It is what ``_Size`` makes of the system message and every turn as it is replayed, plus the tools; and
+    what ``fit`` sends when the budget is no limit.
+    """
+    past = _long_past(40)
+    estimate = next_prompt_tokens(SYSTEM, TOOLS, past)
+    messages = [{"role": "system", "content": SYSTEM}, *(m for turn in past for m in _replayed(turn))]
+    assert estimate > PROMPT_TOKENS
+    assert estimate == _Size(messages).tokens() + estimate_tokens(TOOLS)
+    assert estimate == estimate_tokens(fit(SYSTEM, TOOLS, past, [], budget=10**9)) + estimate_tokens(TOOLS)
+    assert next_prompt_tokens(SYSTEM, [], past) == estimate - estimate_tokens(TOOLS)
+    assert next_prompt_tokens(SYSTEM, TOOLS, []) == estimate_tokens(SYSTEM_ONLY) + estimate_tokens(TOOLS)
+
+
+def test_the_estimate_counts_images_when_the_turn_sees() -> None:
+    """A turn whose question attached a picture counts it, label and cost, when the turn sees; not otherwise."""
+    shot = _photo(1, "harbour-photo.jpg")
+    past = [_past_turn(user="Was zeigt das Bild?", answer="Einen Hafen.")]
+    seen = [PastTurn("Was zeigt das Bild?", (), "Einen Hafen.", False, (shot,))]
+    plain = next_prompt_tokens(SYSTEM, TOOLS, past)
+    assert next_prompt_tokens(SYSTEM, TOOLS, seen) == plain
+    budget = ImageBudget(fixed=280, max_images=8)
+    counted = next_prompt_tokens(SYSTEM, TOOLS, seen, images=budget)
+    assert counted >= plain + 280
+    assert next_prompt_tokens(SYSTEM, TOOLS, past, images=budget) == plain
+    pixels = next_prompt_tokens(SYSTEM, TOOLS, seen, images=ImageBudget(fixed=None, max_images=8))
+    assert pixels > plain and pixels != counted
+
+
+def test_the_estimate_is_not_held_to_the_image_cap() -> None:
+    """Nine pictures over a cap of eight are all counted: the estimate is what could no longer be sent."""
+    shots = tuple(_photo(n, f"harbour-photo-{n}.jpg") for n in range(1, 10))
+    past = [PastTurn("Was zeigen die Bilder?", (), "Häfen.", False, shots)]
+    capped = next_prompt_tokens(SYSTEM, TOOLS, past, images=ImageBudget(fixed=280, max_images=8))
+    assert capped >= next_prompt_tokens(SYSTEM, TOOLS, past) + 9 * 280
+
+
 def test_earlier_tool_results_follow_up_while_not_expired() -> None:
     """A past turn is replayed natively: its question, its calls with their results, cut, then its answer."""
     code = "print('Umsatz')\n" * 400
@@ -789,6 +833,78 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     clock.now = T0 + 7 * DAY
     gone = "Summe der Spalte B\n[Attached: sales.xlsx; expired]"
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(gone, (), "42", True)], True)
+
+
+def test_a_finished_turn_is_what_the_store_replays(store: ChatStore) -> None:
+    """The current turn, as the loop holds it and with its answer, is the earlier turn the store replays next.
+
+    Two rounds: the first with two calls, the second with one; the question names its attachment.
+    """
+    chat = store.create_chat("user-a")
+    attachment = store.add_attachment(
+        chat.id, file_id="1" * 32, path=f"{FOLDER}/sales.xlsx", name="sales.xlsx", size=14, mime=XLSX
+    )
+    asked = store.add_user_message("user-a", chat.id, "Summe der Spalte B", [attachment.id])
+    answer = store.start_assistant_message(chat.id)
+    question = store.user_turn(chat.id, asked.id)
+    calls = [
+        (1, "call_a", "read_document", json.dumps({"path": f"{FOLDER}/sales.xlsx"}), "Monat;Summe"),
+        (1, "call_b", "run_python", json.dumps({"code": "print(42)"}), '{"stdout": "42"}'),
+        (2, "call_c", "read_document", json.dumps({"path": f"{FOLDER}/teil-2.pdf"}), "Seite 2"),
+    ]
+    current: list[dict[str, Any]] = [_user(question.text)]
+    for position, (round_no, call_id, tool, arguments, result) in enumerate(calls):
+        store.add_step(
+            answer,
+            id=str(uuid4()),
+            position=position,
+            round=round_no,
+            call_id=call_id,
+            tool=tool,
+            arguments=arguments,
+            result=result,
+            status="ok",
+        )
+    for round_no in (1, 2):
+        mine = [call for call in calls if call[0] == round_no]
+        current.append(
+            {
+                "role": "assistant",
+                "content": "Ich lese.",
+                "tool_calls": [
+                    {"id": c[1], "type": "function", "function": {"name": c[2], "arguments": c[3]}} for c in mine
+                ],
+            }
+        )
+        current.extend({"role": "tool", "tool_call_id": c[1], "content": c[4]} for c in mine)
+    store.finish_assistant_message(answer, "Summe: 42")
+    [stored, *_] = store.past_turns(chat.id, before_position=10**6)
+    assert stored[-1] == finished_turn(question.text, question.images, current, "Summe: 42")
+    assert [len(calls) for calls in stored[-1].rounds] == [2, 1] and not stored[-1].expired
+
+
+def test_a_finished_turn_without_calls_is_the_question_and_its_answer() -> None:
+    """A turn that called no tool has no rounds; its pictures stay with its question."""
+    shot = _photo(1, "harbour-photo.jpg")
+    assert finished_turn("Hallo", (shot,), [_user("Hallo")], "Guten Tag.") == PastTurn(
+        "Hallo", (), "Guten Tag.", False, (shot,)
+    )
+
+
+def test_a_finished_turn_leaves_out_what_the_store_does_not_replay() -> None:
+    """A tool image's message is never replayed, and a call no tool message answers is not a call of the turn."""
+    current = [
+        _user("Zeig die Seite"),
+        *_viewed("call_0", [PAGE]),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_9", "type": "function", "function": {"name": "view_file", "arguments": "{}"}}],
+        },
+    ]
+    turn = finished_turn("Zeig die Seite", (), current, "Fertig.")
+    assert [[call.call_id for call in calls] for calls in turn.rounds] == [["call_0"]]
+    assert turn.rounds[0][0].result == "0" * 100
 
 
 def test_a_step_reads_back_with_its_detail_until_it_expires(store: ChatStore, clock: Clock) -> None:

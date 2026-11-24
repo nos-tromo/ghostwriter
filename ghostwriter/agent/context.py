@@ -37,6 +37,11 @@ In a round that does not offer ``view_file`` (``view=False``), every note keeps 
 leaves the tool out (:data:`~ghostwriter.agent.images.WITHOUT_VIEW`).
 Without an image budget, the current turn's results are cleared oldest first and then arguments
 cut, as before; an earlier turn is replayed as its text, and the current turn must hold no image ref.
+
+At the end of an answer :func:`next_prompt_tokens` estimates what the next message's prompt starts with: the
+system prompt, the tool schemas and every turn as :func:`fit` would replay it, the answer just finished
+(:func:`finished_turn`) among them. It is sized by the same code and counts what could no longer be sent: no
+budget, no image cap.
 """
 
 import math
@@ -640,3 +645,67 @@ def fit(
     if report is not None:
         report.past_turns, report.replayed_turns = len(past), taken
     return [kept[0], *replayed, *kept[1:]]
+
+
+def next_prompt_tokens(
+    system: str,
+    tools: list[dict[str, Any]],
+    past: Sequence[PastTurn],
+    *,
+    images: ImageBudget | None = None,
+) -> int:
+    """Estimate the tokens the prompt of the next message starts with.
+
+    The system message and every turn as :func:`fit` replays one, sized as :func:`fit` sizes its messages, plus the
+    tool schemas. Nothing is left out for a budget or an image cap: the estimate counts what could no longer be
+    sent, so that a chat past its budget shows as past it.
+
+    Args:
+        system: The system prompt.
+        tools: The tool schemas the next round is offered; none counts none.
+        past: The turns, oldest first, the one just finished the last of them.
+        images: What an image costs when the turn sees, which counts the pictures a question attached; ``None``
+            when it does not, and every turn counts as its text.
+
+    Returns:
+        The estimated tokens.
+    """
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for turn in past:
+        mode: ReplayMode = "images" if images is not None and turn.images else "none"
+        messages.extend(_replayed(turn, mode=mode, images=images))
+    fixed = estimate_tokens(tools) if tools else 0
+    return _Size(messages, images).tokens() + fixed
+
+
+def finished_turn(
+    question: str, images: tuple[AttachedImage, ...], current: Sequence[Mapping[str, Any]], answer: str
+) -> PastTurn:
+    """Return the current turn as the store will replay it once its answer is stored.
+
+    Each round of the turn that called tools is one round of calls, each with the result the model read back; a
+    message that carries a tool's images is no part of it, as no tool image is replayed. A call no tool message
+    answers is left out, as a step is only stored with its result, and so is a round left with no call.
+
+    Args:
+        question: The question as the model reads it: its text and the lines naming its attachments.
+        images: The pictures its question attached that are ready to be seen.
+        current: The turn's messages as the loop holds them: the question, then each round's calls and results.
+        answer: The answer's text, as it is stored.
+
+    Returns:
+        The turn, none of its content expired.
+    """
+    results = {message["tool_call_id"]: message["content"] for message in current if message["role"] == "tool"}
+    rounds: list[tuple[PastCall, ...]] = []
+    for message in current:
+        if message["role"] != "assistant" or not message.get("tool_calls"):
+            continue
+        calls = tuple(
+            PastCall(call["id"], call["function"]["name"], call["function"]["arguments"], results[call["id"]])
+            for call in message["tool_calls"]
+            if call["id"] in results
+        )
+        if calls:
+            rounds.append(calls)
+    return PastTurn(question, tuple(rounds), answer, False, images)

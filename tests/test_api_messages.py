@@ -27,7 +27,7 @@ from sqlalchemy.orm import Session
 from typing_extensions import override
 
 from ghostwriter.agent.limits import TURN_THREADS
-from ghostwriter.agent.loop import AgentLoop, TokenEvent, Turn, TurnAudit, TurnEvent
+from ghostwriter.agent.loop import AgentLoop, TokenEvent, Turn, TurnAudit, TurnEvent, TurnOutcome
 from ghostwriter.agent.notices import NoticeEvent
 from ghostwriter.api.messages import TurnStream, _frame
 from ghostwriter.db import make_engine, utcnow
@@ -257,6 +257,36 @@ def test_a_message_streams_steps_results_tokens_and_a_final_frame(
     assert "tools/call" in door.methods() and not _state(client).turns.running(cid)
 
 
+def test_final_carries_the_estimate(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """The final frame names the estimate of the next prompt: the number the answer was stored with."""
+    cid = _new(client)
+    fake_openai.script = [_read_call(cid), ANSWER]
+    final = _frames(_send(client, cid))[-1].data
+    estimate = final["context_estimate"]
+    assert isinstance(estimate, int) and not isinstance(estimate, bool) and estimate > 0
+    first = _detail(client, cid)["messages"][-1]
+    assert (first["id"], first["context_estimate"]) == (final["message_id"], estimate)
+    fake_openai.script = [ANSWER]
+    later = _frames(_send(client, cid, content="Und noch eine Frage?"))[-1].data
+    assert later["context_estimate"] > estimate
+    assert later["context_estimate"] == _detail(client, cid)["messages"][-1]["context_estimate"]
+    fake_openai.script = [ANSWER]
+    regenerated = _frames(client.post(f"/api/chats/{cid}/regenerate", headers=as_user()))[-1].data
+    assert regenerated["context_estimate"] == _detail(client, cid)["messages"][-1]["context_estimate"]
+    assert regenerated["context_estimate"] == later["context_estimate"]
+
+
+def test_the_final_frame_carries_what_the_loop_estimated() -> None:
+    """The frame holds the turn's own outcome, ``null`` where the turn says none."""
+    for estimate, expected in ((1234, 1234), (None, None)):
+        turns = TurnRegistry()
+        claim = turns.begin("chat-1")
+        assert claim is not None
+        frames = list(_turn_stream(turns, claim, _Agent(TokenEvent("Hallo"), estimate=estimate)).frames())
+        final = json.loads(frames[-1].split("data: ", 1)[1])
+        assert final["context_estimate"] == expected and "context_estimate" in final
+
+
 def test_frames_have_the_documented_fields(client: TestClient, fake_openai: FakeOpenAI) -> None:
     """Each frame carries exactly its documented fields."""
     cid = _new(client)
@@ -268,7 +298,7 @@ def test_frames_have_the_documented_fields(client: TestClient, fake_openai: Fake
     assert set(step) == {"id", "tool", "status", "detail", "arguments", "result", "expired"}
     assert set(result) == {"id", "kind", "file_id", "name", "mime", "size", "preview", "expired"}
     assert error == {"code": "model", "message": "The model did not answer."}
-    assert set(final) == {"message_id", "user_message_id", "chat", "stopped"}
+    assert set(final) == {"message_id", "user_message_id", "chat", "stopped", "context_estimate"}
     assert set(final["chat"]) == {"id", "title", "created_at", "updated_at", "expires_at"}
     fake_openai.script = [ANSWER]
     [token, _] = _frames(_send(client, cid, content="Noch einmal"))
@@ -778,12 +808,15 @@ def test_a_chat_deleted_before_the_claim_takes_no_message(
 class _Agent:
     """The loop as a turn stream drives it: each run is recorded and yields the scripted events."""
 
-    def __init__(self, *scripted: TurnEvent) -> None:
+    def __init__(self, *scripted: TurnEvent, estimate: int | None = None) -> None:
         self.scripted = scripted
+        self.estimate = estimate
         self.ran: list[Turn] = []
 
-    def run(self, turn: Turn, audit: TurnAudit) -> Iterator[TurnEvent]:
+    def run(self, turn: Turn, audit: TurnAudit, *, outcome: TurnOutcome | None = None) -> Iterator[TurnEvent]:
         self.ran.append(turn)
+        if outcome is not None:
+            outcome.context_estimate = self.estimate
         yield from self.scripted
 
 
@@ -985,6 +1018,7 @@ def test_a_stop_ends_a_turn_still_waiting_for_a_thread(client: TestClient, fake_
             frames = list(_read_after_start(r.iter_lines()))
         assert [f.event for f in frames] == ["final"] and frames[0].data["stopped"] is True
         assert frames[0].data["message_id"] == _detail(client, cid)["messages"][-1]["id"]
+        assert frames[0].data["context_estimate"] is None
     finally:
         _give_back(client, limiter, borrowers)
     time.sleep(0.2)
