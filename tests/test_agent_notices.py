@@ -234,6 +234,26 @@ def test_an_attachment_a_tool_used_is_not_unread() -> None:
     assert reading.partial(_files(template, master, photo)) == []
 
 
+def test_a_path_inside_a_tools_text_counts_as_opened() -> None:
+    """A picture written as ``{image: <path>}``, and a master inside a block's JSON, were used: neither is unread.
+
+    The full path is matched, its chat folder included: notes named in a text by their file name alone stay unread.
+    """
+    master = _sent(f"{FOLDER}/harbour-master.pptx", file_id="e5" * 16, total=3, unit="slide")
+    photo = _sent(PHOTO, file_id=PHOTO_ID, kind="image", total=None, unit=None)
+    notes = _sent(NOTES, file_id=NOTES_ID, total=2, unit="line")
+    built = ToolResult(compact({"path": f"{FOLDER}/out/quay-deck.pptx", "hint": None}), ())
+    slides = [
+        {"title": "Pegel", "content": [f"{{image: {PHOTO}}}"]},
+        {"title": "Vorlage", "content": [compact({"image": master.path})], "notes": "aus tide-notes.txt"},
+    ]
+    reading = Reading()
+    reading.call("write_presentation", {"name": "quay-deck", "slides": slides}, built, tool_message(built))
+    assert reading.unread([master, photo, notes], sees=False) == [
+        NoticeEvent("document_unread", file_id=NOTES_ID, name="tide-notes.txt")
+    ]
+
+
 def test_a_failed_call_naming_the_path_leaves_it_unread() -> None:
     """A fill workbench refused, and one the loop never sent, used nothing."""
     template = _sent(f"{FOLDER}/harbour-template.docx", file_id="d4" * 16, total=12, unit="paragraph")

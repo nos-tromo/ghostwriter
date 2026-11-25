@@ -6,14 +6,15 @@ carries every detail set, the name included; what is stored carries no name, whi
 attachment row when the answer is served. A notice holds ids and counts, never content.
 
 The notices about a file come from :class:`Reading`, what one message's calls opened and read. A file is opened by
-any call workbench answered whose arguments name its path, at any depth: read, viewed, a template filled, a master or
-a picture a deck was built with. What a ``read_document`` answer read is the units of its parts, as the model was
-given them, a part cut not counted (:func:`covered` joins them), and a page or slide without text, which was looked
-at; no other tool reads any of a file. ``document_partial`` names an attachment of the chat whose parts
-read cover less than its total: the measure's, or where a part is one unit, the answer's ``total_parts``
-(:data:`TOTAL_PARTS_UNITS`). ``document_unread`` names a ``ready`` attachment of the question, a document or a clip,
-or a picture while the turn does not see, that no call opened. Once a call of :data:`BLIND_TOOLS` ran, which reads
-files without naming what it read, neither is given: a notice never says what is not known to be true.
+any call workbench answered whose arguments name its full path, at any depth, alone or inside a text: read, viewed,
+a template filled, a master or a picture a deck was built with. What a ``read_document`` answer read is the units of
+its parts, as the model was given them, a part cut not counted (:func:`covered` joins them), and a page or slide
+without text, which was looked at; no other tool reads any of a file. ``document_partial`` names an attachment of
+the chat whose parts read cover less than its total: the measure's, or where a part is one unit, the answer's
+``total_parts`` (:data:`TOTAL_PARTS_UNITS`). ``document_unread`` names a ``ready`` attachment of the question, a
+document or a clip, or a picture while the turn does not see, that no call opened. Once a call of
+:data:`BLIND_TOOLS` ran, which reads files without naming what it read, neither is given: a notice never says what
+is not known to be true.
 """
 
 from __future__ import annotations
@@ -240,6 +241,7 @@ class Reading:
         """Start with nothing opened."""
         self._blind = False
         self._opened: set[str] = set()
+        self._said: list[str] = []
         self._read: dict[str, _Read] = {}
 
     def call(
@@ -252,8 +254,9 @@ class Reading:
         """Record one call of the message.
 
         A call of :data:`BLIND_TOOLS` that was sent, answered or not, ends every notice of the message. Any other call
-        workbench answered opens every path its arguments name (:func:`_named`); a ``read_document`` answer also opens
-        its own ``path`` and records what it read, from ``content``'s first line, the JSON the model was given.
+        workbench answered opens every path its arguments name (:func:`_texts`), alone or inside a text, as a picture
+        written ``{image: <path>}`` or a block's JSON is; a ``read_document`` answer also opens its own ``path`` and
+        records what it read, from ``content``'s first line, the JSON the model was given.
 
         Args:
             tool: The tool called.
@@ -266,7 +269,10 @@ class Reading:
             return
         if not isinstance(outcome, ToolResult):
             return
-        self._opened.update(_named(arguments))
+        texts = _texts(arguments)
+        normalised = {posixpath.normpath(text) for text in texts}
+        self._opened.update(normalised)
+        self._said.extend({*texts, *normalised})
         if tool == "read_document":
             self._answer(_path(arguments.get("path") if arguments is not None else None), content)
 
@@ -343,7 +349,7 @@ class Reading:
 
         Returns:
             A notice per ``ready`` document or clip, or picture while the turn does not see, whose path no call
-            workbench answered named; none once a blind tool ran.
+            workbench answered named (:meth:`_used`); none once a blind tool ran.
         """
         if self._blind:
             return []
@@ -352,8 +358,21 @@ class Reading:
             for sent in attached
             if sent.status == "ready"
             and (sent.kind in _UNREAD_KINDS or (sent.kind == "image" and not sees))
-            and posixpath.normpath(sent.path) not in self._opened
+            and not self._used(sent.path)
         ]
+
+    def _used(self, path: str) -> bool:
+        """Tell whether a call workbench answered named a file.
+
+        Args:
+            path: The file's path.
+
+        Returns:
+            Whether its full path, normalised, was opened, or is inside a text an answered call's arguments held, as
+            written or normalised: a match that only ever takes a notice away.
+        """
+        full = posixpath.normpath(path)
+        return full in self._opened or any(full in text for text in self._said)
 
 
 def _path(value: object) -> str | None:
@@ -368,16 +387,16 @@ def _path(value: object) -> str | None:
     return posixpath.normpath(value) if isinstance(value, str) and value else None
 
 
-def _named(arguments: Mapping[str, Any] | None) -> set[str]:
-    """Return every path a call's arguments name.
+def _texts(arguments: Mapping[str, Any] | None) -> list[str]:
+    """Return every text a call's arguments hold, each a path it may name or hold.
 
     Args:
         arguments: The arguments, as the model wrote them; ``None`` for none.
 
     Returns:
-        Each non-empty text among their values, in objects and lists at any depth, normalised (:func:`_path`).
+        Each non-empty text among their values, in objects and lists at any depth, as written.
     """
-    named: set[str] = set()
+    texts: list[str] = []
     values: list[Any] = [arguments] if arguments is not None else []
     while values:
         value = values.pop()
@@ -385,9 +404,9 @@ def _named(arguments: Mapping[str, Any] | None) -> set[str]:
             values.extend(cast(Mapping[str, Any], value).values())
         elif isinstance(value, list):
             values.extend(cast(list[Any], value))
-        elif (path := _path(value)) is not None:
-            named.add(path)
-    return named
+        elif isinstance(value, str) and value:
+            texts.append(value)
+    return texts
 
 
 def _span(value: object) -> tuple[int, int] | None:
