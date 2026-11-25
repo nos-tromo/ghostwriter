@@ -22,7 +22,8 @@ export interface DraftAnswer {
   steps: StepOut[]
   results: ResultOut[]
   error: ErrorFrame['code'] | null
-  /** What the server said about the answer besides its text, each once (a document notice once per file). */
+  /** What the server said about the answer besides its text. A frame's notice is added once (by its code
+   *  and its file); a continue starts with the stored answer's, as they are, which may hold equal ones. */
   notices: NoticeOut[]
   /** The answer's reasoning switch: until its first token, the model is thinking. */
   reasoning: boolean

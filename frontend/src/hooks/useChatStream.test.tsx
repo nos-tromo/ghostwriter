@@ -412,9 +412,11 @@ describe('a notice frame', () => {
     sse.push('token', { text: 'Ohne Bilder' })
     await screen.findByText('Ohne Bilder')
     expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
-    // Live, it is announced politely; it is no error.
+    // Live, it is announced politely; it is no error. A busy ancestor may hold an announcement back
+    // while the answer is written, so the line stands outside the answer's own element.
     expect(screen.getByText(IMAGES_DROPPED)).toHaveAttribute('role', 'status')
-    expect(screen.getByText(IMAGES_DROPPED).closest('[aria-busy="true"]')).not.toBeNull()
+    expect(screen.getByText(IMAGES_DROPPED).closest('[aria-busy="true"]')).toBeNull()
+    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     finish()

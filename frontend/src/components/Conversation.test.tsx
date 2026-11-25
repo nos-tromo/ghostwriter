@@ -186,6 +186,11 @@ function noticeCodes(root: ParentNode = document): string[] {
   return [...root.querySelectorAll<HTMLElement>('[data-notice]')].map((line) => line.dataset.notice ?? '')
 }
 
+/** The warnings React gave about two children with one key, from a spy on `console.error`. */
+function keyWarnings(spy: { mock: { calls: unknown[][] } }): string[] {
+  return spy.mock.calls.map((call) => String(call[0])).filter((text) => text.includes('same key'))
+}
+
 const QUESTION = message({ id: 'q1', role: 'user', content: 'Fasse den Bericht zusammen.' })
 const PARTIAL = { code: 'document_partial' as const, file_id: 'F1', name: 'long-report.pdf', read: 9, total: 500, unit: 'page' as const }
 
@@ -289,6 +294,22 @@ describe('Conversation notices', () => {
     expect(screen.queryByText(/long-report|tide-notes/)).not.toBeInTheDocument()
   })
 
+  it('says each of two notices of one code once their details expired', async () => {
+    // The server serves an expired notice as its code alone, so two files arrive as two equal notices.
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      serveAnswered([{ code: 'document_unread' }, { code: 'document_unread' }, { code: 'document_partial' }, { code: 'document_partial' }])
+      renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+      await screen.findByText('Zusammenfassung')
+      expect(screen.getAllByText('An attachment was not read for this answer.')).toHaveLength(2)
+      expect(screen.getAllByText('A document was read only in part.')).toHaveLength(2)
+      expect(noticeCodes()).toEqual(['document_unread', 'document_unread', 'document_partial', 'document_partial'])
+      expect(keyWarnings(error)).toEqual([])
+    } finally {
+      error.mockRestore()
+    }
+  })
+
   it('ignores a notice of a code it does not know', async () => {
     serveAnswered([{ code: 'something_new' } as unknown as NoticeOut, { code: 'images_dropped' }])
     renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
@@ -371,9 +392,11 @@ describe('Conversation notices', () => {
     expect(draft).toHaveAttribute('aria-busy', 'true')
     expect(screen.getAllByText('Kapitel 1 …')).toHaveLength(1)
     expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
-    expect(within(draft).queryByText('The answer was cut at the length limit.')).not.toBeInTheDocument()
-    // The notices it already had stay, once.
-    expect(within(draft).getAllByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toHaveLength(1)
+    // Only the older answer says it was cut; this one is not, until its round ends so.
+    expect(screen.getAllByText('The answer was cut at the length limit.')).toHaveLength(1)
+    // The notices it already had stay, once, outside the busy element.
+    expect(screen.getAllByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toHaveLength(1)
+    expect(screen.getByText("Of 'long-report.pdf', 9 of 500 pages were read.").closest('[aria-busy="true"]')).toBeNull()
 
     sse.push('start', { message_id: 'a2', user_message_id: null })
     sse.push('token', { text: ' und weiter.' })
@@ -397,6 +420,44 @@ describe('Conversation notices', () => {
     expect(await screen.findByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
   })
 
+  it('carries the expired notices of a cut answer into its continuation', async () => {
+    const sse = sseStream()
+    const error = vi.spyOn(console, 'error').mockImplementation(() => {})
+    try {
+      // Two files unread, their details long gone: two notices that are equal.
+      const CUT = message({
+        id: 'a1',
+        role: 'assistant',
+        content: 'Kapitel 1',
+        notices: [{ code: 'answer_cut' }, { code: 'document_unread' }, { code: 'document_unread' }],
+      })
+      serve({
+        'GET /ghostwriter/api/chats/c1': detail([QUESTION, CUT]),
+        'GET /ghostwriter/api/chats': [CHAT],
+        'POST /ghostwriter/api/chats/c1/messages/a1/continue': () => sse.response(),
+      })
+      renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+      await screen.findByText('Kapitel 1')
+      expect(screen.getAllByText('An attachment was not read for this answer.')).toHaveLength(2)
+      fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+      // The draft has both, as the stored answer had, and no longer says it was cut.
+      await waitFor(() => expect(document.querySelector('[aria-busy="true"]')).not.toBeNull())
+      expect(screen.getAllByText('An attachment was not read for this answer.')).toHaveLength(2)
+      expect(screen.queryByText('The answer was cut at the length limit.')).not.toBeInTheDocument()
+      // A frame names its file, so it is a third notice; sent twice, it is said once.
+      sse.push('notice', { code: 'document_unread', file_id: 'F9', name: 'tide-notes.txt' })
+      sse.push('notice', { code: 'document_unread', file_id: 'F9', name: 'tide-notes.txt' })
+      sse.push('token', { text: ' und 2' })
+      expect(await screen.findByText("'tide-notes.txt' was not read for this answer.")).toBeInTheDocument()
+      expect(screen.getAllByText('An attachment was not read for this answer.')).toHaveLength(2)
+      expect(screen.getAllByText("'tide-notes.txt' was not read for this answer.")).toHaveLength(1)
+      expect(keyWarnings(error)).toEqual([])
+    } finally {
+      error.mockRestore()
+    }
+  })
+
   it('offers Continue again when the continuation was cut too', async () => {
     const sse = sseStream()
     let done = false
@@ -415,6 +476,8 @@ describe('Conversation notices', () => {
     sse.push('notice', { code: 'answer_cut' })
     const live = await screen.findByText('The answer was cut at the length limit.')
     expect(live).toHaveAttribute('role', 'status')
+    expect(live.closest('[aria-busy="true"]')).toBeNull()
+    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull()
     expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
     done = true
     sse.push('final', { message_id: 'a1', user_message_id: null, chat: CHAT, stopped: false, context_estimate: null })

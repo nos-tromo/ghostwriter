@@ -109,17 +109,21 @@ export function MessageView({
   )
 }
 
-/** The answer being written: its steps as they run, its text so far, its cards, its notices as they come. */
+/** The answer being written: its steps as they run, its text so far, its cards; below it, as a sibling,
+ *  its notices as they come. They stand outside the busy element, since assistive technology may hold an
+ *  announcement back while an ancestor is busy. */
 export function DraftView({ chatId, draft, fileDays }: { chatId: string; draft: DraftAnswer; fileDays: number }) {
   return (
-    <div data-role="assistant" aria-busy="true" className="space-y-2">
-      <Trail steps={draft.steps} fileDays={fileDays} live />
-      {draft.text ? <MarkdownProse text={draft.text} /> : !draft.error && <Pending reasoning={draft.reasoning} />}
-      {draft.results.map((result) => (
-        <ResultCard key={result.id} chatId={chatId} result={result} />
-      ))}
+    <>
+      <div data-role="assistant" aria-busy="true" className="space-y-2">
+        <Trail steps={draft.steps} fileDays={fileDays} live />
+        {draft.text ? <MarkdownProse text={draft.text} /> : !draft.error && <Pending reasoning={draft.reasoning} />}
+        {draft.results.map((result) => (
+          <ResultCard key={result.id} chatId={chatId} result={result} />
+        ))}
+      </div>
       <NoticeLines notices={draft.notices} live />
-    </div>
+    </>
   )
 }
 

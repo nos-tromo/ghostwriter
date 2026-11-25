@@ -54,7 +54,8 @@ function lineText(notice: NoticeOut, t: T): string | null {
  * length limit, a document was read in part or not at all, the model took no pictures. Not errors, so
  * the text stays muted and only the icon takes the warning colour.
  *
- * @param notices - The answer's notices, each once; one this app does not know is left out.
+ * @param notices - The answer's notices, in order; one this app does not know is left out. Two may be equal
+ *   (two files unread, their details expired), and each has its line.
  * @param live - Whether the answer is being written: its lines are then announced politely, and a
  *   stored answer's are not.
  * @param onContinue - When given, the `answer_cut` line offers to go on with the answer.
@@ -69,16 +70,18 @@ export function NoticeLines({
   onContinue?: () => void
 }) {
   const t = useT()
-  const lines = notices.flatMap((notice) => {
+  // Keyed by position: once its details expire a notice is its code alone, so two files unread are two
+  // equal notices. The list is only ever appended to while the answer is written, and static after.
+  const lines = notices.flatMap((notice, index) => {
     const text = lineText(notice, t)
-    return text === null ? [] : [{ notice, text }]
+    return text === null ? [] : [{ notice, text, index }]
   })
   if (lines.length === 0) return null
   return (
     <div className="space-y-1">
-      {lines.map(({ notice, text }) => (
+      {lines.map(({ notice, text, index }) => (
         <div
-          key={`${notice.code}:${notice.file_id ?? ''}`}
+          key={`${index}:${notice.code}`}
           data-notice={notice.code}
           className="flex flex-wrap items-center gap-x-2 gap-y-1"
         >
