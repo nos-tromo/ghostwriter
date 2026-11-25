@@ -55,7 +55,7 @@ def test_config_reports_what_the_spa_needs(client: TestClient) -> None:
         "file_retention_days": 7,
         "prompt_tokens": 34_000,
         "reasoning_prompt_tokens": 26_000,
-        "version": "0.6.1",
+        "version": "0.7.0",
     }
 
 
