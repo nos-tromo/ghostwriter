@@ -2273,6 +2273,28 @@ def test_an_answer_that_follows_no_question_is_not_continued(loop_env: LoopEnv) 
     assert loop_env.notices() == [{"code": "answer_cut"}]
 
 
+def test_a_continuation_does_not_say_a_picture_was_not_shown_while_the_model_sees(loop_env: LoopEnv) -> None:
+    """With vision on, the question is replayed as the answer being continued read it: its picture was shown.
+
+    The answer may be cut in the middle of describing the picture, so a prompt that said it was "not shown to the
+    model" would have the model contradict itself. The round itself stays blind: no tool, no image sent again.
+    """
+    loop_env.run(CUT, content="Beschreib das Bild", vision=True, attach=[_photo()])
+    loop_env.go_on(GO_ON, vision=True)
+    went_on = loop_env.fake.calls[-1]
+    told = json.dumps(went_on["messages"], ensure_ascii=False)
+    assert f"image 64{TIMES}48" in told and "not shown to the model" not in told
+    assert "tools" not in went_on and not _image_urls(went_on["messages"])
+
+
+def test_a_continuation_says_a_picture_was_not_shown_while_the_model_does_not_see(loop_env: LoopEnv) -> None:
+    """Without vision the answer never saw the picture, and the continuation's prompt says so, as the answer's did."""
+    loop_env.run(CUT, content="Beschreib das Bild", attach=[_photo()])
+    loop_env.go_on(GO_ON)
+    told = json.dumps(loop_env.fake.calls[-1]["messages"], ensure_ascii=False)
+    assert f"image 64{TIMES}48; not shown to the model" in told
+
+
 def test_a_continuation_estimates_the_next_prompt_as_a_fresh_answer_does(loop_env: LoopEnv) -> None:
     """With vision on, the estimate after a Continue is the one a fresh answer of the same text stores.
 

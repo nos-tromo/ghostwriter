@@ -92,16 +92,74 @@ def test_a_document_read_in_part_says_how_much() -> None:
     ]
 
 
-def test_a_cut_part_does_not_count() -> None:
-    """A part workbench cut, and a part Ghostwriter's cut trimmed (``cut_result``), are not read."""
+def test_a_part_workbench_cut_gives_a_notice_without_numbers() -> None:
+    """A part workbench cut was read in part, by an amount the units do not say: the notice carries no number."""
     reading = Reading()
     _read(reading, _answer(_part(1, 4), _part(5, 9, cut=True)))
-    lone = _answer(_part(10, 14, text="Hochwasser " * 2_000))
+    assert reading.partial(_files(_sent())) == [NoticeEvent("document_partial", FILE, "long-report.pdf")]
+
+
+def test_a_part_ghostwriter_trimmed_gives_a_notice_without_numbers() -> None:
+    """A lone part trimmed to fit the model's window (``cut_result``) was read in part: no "0 of 3000 lines".
+
+    The part's units say lines 1-1200, and the file has 3000; the model was given about a sixth of the part's text.
+    """
+    notes = _sent(NOTES, file_id=NOTES_ID, total=3_000, unit="line")
+    lone = _answer(_part(1, 1_200, text="Hochwasser " * 2_000), path=NOTES, kind="text", total_parts=3_000)
     assert len(lone) > TOOL_RESULT_CHARS and '"cut":true' not in lone
-    _read(reading, lone)
-    assert reading.partial(_files(_sent())) == [
-        NoticeEvent("document_partial", FILE, "long-report.pdf", 4, 500, "page")
+    reading = Reading()
+    _read(reading, lone, NOTES)
+    assert reading.partial(_files(notes)) == [NoticeEvent("document_partial", NOTES_ID, "tide-notes.txt")]
+
+
+def test_a_part_without_units_gives_a_notice_without_numbers() -> None:
+    """A part with ``units: null`` (a run of a table's rows) says nothing of what it covers: no number is given."""
+    reading = Reading()
+    answer = _answer({"label": "table 1", "text": "Gezeitentabelle", "units": None, "cut": False}, total_parts=12)
+    _read(reading, answer)
+    assert reading.partial(_files(_sent(total=12))) == [NoticeEvent("document_partial", FILE, "long-report.pdf")]
+
+
+def test_a_part_without_units_beside_counted_ones_gives_no_numbers() -> None:
+    """One part of the read that cannot be counted takes the numbers from the notice, though the others can."""
+    reading = Reading()
+    _read(reading, _answer(_part(1, 4), {"label": "table 1", "text": "Pegel", "units": None, "cut": False}))
+    assert reading.partial(_files(_sent())) == [NoticeEvent("document_partial", FILE, "long-report.pdf")]
+
+
+def test_a_cut_part_read_again_whole_has_no_notice() -> None:
+    """A part cut, then every unit read again uncut, leaves the file read whole: no notice."""
+    reading = Reading()
+    _read(reading, _answer(_part(1, 9, cut=True)))
+    _read(reading, _answer(_part(1, 4), _part(5, 9)))
+    assert reading.partial(_files(_sent(total=9))) == []
+
+
+def test_a_cut_part_reads_again_in_part_still_gives_no_numbers() -> None:
+    """A part cut, then some of its units read again uncut: still read only in part, still without a number."""
+    reading = Reading()
+    _read(reading, _answer(_part(1, 9, cut=True)))
+    _read(reading, _answer(_part(1, 4)))
+    assert reading.partial(_files(_sent(total=9))) == [NoticeEvent("document_partial", FILE, "long-report.pdf")]
+
+
+def test_only_the_path_with_a_part_cut_loses_its_numbers() -> None:
+    """Of two documents read in one message, the one read cleanly keeps its numbers; the one cut does not."""
+    notes = _sent(NOTES, file_id=NOTES_ID, total=40, unit="line")
+    reading = Reading()
+    _read(reading, _answer(_part(1, 4), _part(5, 9)))
+    _read(reading, _answer(_part(1, 8, cut=True), path=NOTES, kind="text", total_parts=40), NOTES)
+    assert reading.partial(_files(_sent(), notes)) == [
+        NoticeEvent("document_partial", FILE, "long-report.pdf", 9, 500, "page"),
+        NoticeEvent("document_partial", NOTES_ID, "tide-notes.txt"),
     ]
+
+
+def test_a_part_that_does_not_count_gives_no_notice_without_a_length() -> None:
+    """Without a known length, a cut part still gives no notice: the notice's other conditions stand."""
+    reading = Reading()
+    _read(reading, _answer(_part(1, 4, cut=True), kind="xlsx", total_parts=3))
+    assert reading.partial(_files(_sent(total=None, unit=None))) == []
 
 
 def test_pages_without_text_count_as_read() -> None:

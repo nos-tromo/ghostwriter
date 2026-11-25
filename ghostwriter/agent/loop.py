@@ -816,11 +816,12 @@ class AgentLoop:
 
         The answer so far is the base its new text is appended to, and its stored notices, read back
         (:meth:`~ghostwriter.agent.notices.NoticeEvent.from_stored`), are its notices, ``answer_cut`` among them
-        until the round has ended cleanly. The round goes as for a turn that does not see: the blind offer, its
-        turns read without sight. The next prompt is estimated as :meth:`_answer` estimates it, for the next
-        message as it will be offered: with the offer that sees and what images cost while the message's turn
-        would see, the turns read so, the answer as it then reads. A continuation stopped before it began reads
-        nothing.
+        until the round has ended cleanly. The turns are read as the answer being continued read them, with sight
+        while the message's turn would see (a picture's line then does not say it was not shown). The round goes as
+        for a turn that does not see: the blind offer, no tool, no image sent again. The next prompt is estimated
+        as :meth:`_answer` estimates it, for the next message as it will be offered: with the offer that sees and
+        what images cost while the message's turn would see, the answer as it then reads. A continuation stopped
+        before it began reads nothing.
 
         Args:
             turn: The continued turn.
@@ -834,10 +835,10 @@ class AgentLoop:
             return
         settings = self._settings
         seen = self._seen(turn)
-        turns = self._store.answered_turns(turn.chat_id, turn.assistant_message_id)
+        # The turns are read as the answer being continued read them, and as the next message will: a picture's line
+        # says whether the turn sees. Only the round goes blind: it sends no image and offers no tool.
+        turns = self._store.answered_turns(turn.chat_id, turn.assistant_message_id, seen=seen.sees)
         earlier, this = turns[:-1], turns[-1]
-        # The next message reads the turns as a turn that sees, if it would: a picture's line says so.
-        ahead = self._store.answered_turns(turn.chat_id, turn.assistant_message_id, seen=True) if seen.sees else turns
         message.base = this.answer
         stored = self._store.answer_notices(turn.assistant_message_id)
         message.notices = [event for value in stored if (event := NoticeEvent.from_stored(value)) is not None]
@@ -854,7 +855,7 @@ class AgentLoop:
         headers = inference_headers(turn.owner, turn.request_id)
 
         def next_prompt(text: str) -> int:
-            return _estimate(request, upcoming, [*ahead[:-1], dataclasses.replace(ahead[-1], answer=text)])
+            return _estimate(request, upcoming, [*earlier, dataclasses.replace(this, answer=text)])
 
         message.next_prompt = next_prompt
         error: ErrorEvent | None = None

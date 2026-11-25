@@ -11,10 +11,11 @@ a template filled, a master or a picture a deck was built with. What a ``read_do
 its parts, as the model was given them, a part cut not counted (:func:`covered` joins them), and a page or slide
 without text, which was looked at; no other tool reads any of a file. ``document_partial`` names an attachment of
 the chat whose parts read cover less than its total: the measure's, or where a part is one unit, the answer's
-``total_parts`` (:data:`TOTAL_PARTS_UNITS`). ``document_unread`` names a ``ready`` attachment of the question, a
-document or a clip, or a picture while the turn does not see, that no call opened. Once a call of
-:data:`BLIND_TOOLS` ran, which reads files without naming what it read, neither is given: a notice never says what
-is not known to be true.
+``total_parts`` (:data:`TOTAL_PARTS_UNITS`). A part cut, or one whose ``units`` are no span, was read by an amount
+the units do not say: the notice then names the file alone, with no number, never a wrong one. ``document_unread``
+names a ``ready`` attachment of the question, a document or a clip, or a picture while the turn does not see, that no
+call opened. Once a call of :data:`BLIND_TOOLS` ran, which reads files without naming what it read, neither is given:
+a notice never says what is not known to be true.
 """
 
 from __future__ import annotations
@@ -203,11 +204,13 @@ class _Read:
     """What the ``read_document`` answers for one path read.
 
     Attributes:
-        spans: The units of each part given to the model and not cut.
+        spans: The units of each part given to the model that was not cut and whose ``units`` are a span.
         blank: The pages or slides the answers named without text.
         kind: The kind the last answer named.
         total_parts: The ``total_parts`` the last answer named.
         units: Whether any part carried ``units``, as workbench 0.10's do.
+        uncounted: Whether a part given to the model was cut, or carried no span as ``units`` (``null`` or not two
+            whole numbers). What was read of it is then not known to the unit, so no number is told of the file.
     """
 
     spans: list[tuple[int, int]] = field(default_factory=list)
@@ -215,6 +218,7 @@ class _Read:
     kind: str | None = None
     total_parts: int | None = None
     units: bool = False
+    uncounted: bool = False
 
     def length(self, sent: SentFile) -> tuple[int, MeasureUnit] | None:
         """Return how long the file is, and in which unit.
@@ -306,8 +310,10 @@ class Reading:
                 continue
             piece = cast(dict[str, Any], part)
             read.units = read.units or "units" in piece
-            span = _span(piece.get("units"))
-            if span is not None and piece.get("cut") is not True:
+            span, cut = _span(piece.get("units")), piece.get("cut") is True
+            if span is None or cut:
+                read.uncounted = True
+            else:
                 read.spans.append(span)
         blank = answer.get("pages_without_text")
         if isinstance(blank, list):
@@ -322,7 +328,9 @@ class Reading:
         Returns:
             Per path read, in the order first read: a notice when it is an attachment of the chat, an answer for it
             carried ``units``, its length is known (:meth:`_Read.length`) and the units read, a page or slide without
-            text among them and none past the length counted, are fewer. None once a blind tool ran.
+            text among them and none past the length counted, are fewer. The notice says how many of how many, in
+            which unit, unless a part given to the model was cut or had no ``units`` span (:attr:`_Read.uncounted`):
+            then what was read is not known to the unit, and it carries the file alone. None once a blind tool ran.
         """
         if self._blind:
             return []
@@ -336,7 +344,11 @@ class Reading:
             total, unit = length
             spans = [*read.spans, *((n, n) for n in read.blank)] if unit in _PAGED_UNITS else read.spans
             count = covered((first, min(last, total)) for first, last in spans if first <= total)
-            if count < total:
+            if count >= total:
+                continue
+            if read.uncounted:
+                notices.append(NoticeEvent("document_partial", sent.file_id, sent.name))
+            else:
                 notices.append(NoticeEvent("document_partial", sent.file_id, sent.name, count, total, unit))
         return notices
 
