@@ -68,10 +68,17 @@ export const de: Strings = {
   'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
   'composer.transcribing_hint': 'Video und Audio dauern länger, weil sie vor dem Senden transkribiert werden.',
   'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
+  'composer.too_long': 'Nur in Teilen lesbar',
   'composer.images_cap':
     'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',
   'composer.send': 'Senden',
   'composer.stop': 'Stopp',
+
+  // how full the chat's context is: the ring at the composer, and the note above it
+  'context.meter': 'ca. {n} % des Kontexts belegt',
+  'context.nearly_full':
+    'Dieser Chat ist fast so lang, wie das Modell auf einmal lesen kann. Für ein neues Thema beginnen Sie besser einen neuen Chat.',
+  'context.trimmed': 'Ältere Teile dieses Chats werden nicht mehr an das Modell geschickt.',
 
   // a picture at full size
   'lightbox.close': 'Schließen',

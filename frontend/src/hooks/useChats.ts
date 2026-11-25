@@ -61,6 +61,28 @@ export function useCreateChat() {
   return useMutation({ mutationFn: createChat, onSuccess: (chat) => storeChat(qc, chat) })
 }
 
+/**
+ * Starting a chat and opening it: the one place both the chat list's New chat and the composer's note
+ * start one from, so they create and select alike.
+ *
+ * @param onSelect - Called with the new chat's id once it is created.
+ * @returns `start`, which ignores a press while one is being created; whether one is; and why the last one
+ *   failed (null for none).
+ */
+export function useStartChat(onSelect: (id: string | null) => void): {
+  start: () => void
+  pending: boolean
+  error: unknown
+} {
+  const create = useCreateChat()
+  const { mutate, isPending, error } = create
+  const start = () => {
+    if (isPending) return
+    mutate(undefined, { onSuccess: (chat) => onSelect(chat.id) })
+  }
+  return { start, pending: isPending, error }
+}
+
 export function useRenameChat() {
   const qc = useQueryClient()
   return useMutation({

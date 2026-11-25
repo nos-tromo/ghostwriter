@@ -19,9 +19,24 @@ export interface ChatOut {
 export type AttachmentKind = 'document' | 'image' | 'media'
 export type AttachmentStatus = 'processing' | 'ready' | 'failed'
 
+/** What a document is counted in. */
+export type MeasureUnit = 'page' | 'slide' | 'paragraph' | 'row' | 'line'
+
+/** How long a document is, as workbench measured it: `pending` while it is measured, `measured`, or `none`
+ *  when it could not be. `total` and `unit` are null until measured; `too_long` is whether the document is
+ *  longer than one prompt holds, so the model reads it only in parts. */
+export interface AttachmentLength {
+  state: 'pending' | 'measured' | 'none'
+  total: number | null
+  unit: MeasureUnit | null
+  too_long: boolean
+}
+
 /** A file the user attached. `kind` says what it is (a picture is shown, and
  *  seen by a model that can); `status` how far its preparation has come: only
- *  a `ready` file can be sent with a message. */
+ *  a `ready` file can be sent with a message. `length` is a document's measure,
+ *  null for a file never measured (a picture, a clip, a file stored before
+ *  measuring began). */
 export interface AttachmentOut {
   id: string
   file_id: string
@@ -32,6 +47,7 @@ export interface AttachmentOut {
   expired: boolean
   kind: AttachmentKind
   status: AttachmentStatus
+  length: AttachmentLength | null
 }
 
 /** A tool step of an answer; `detail`, `arguments` and `result` are null once expired. */
@@ -114,6 +130,11 @@ export interface AppConfig {
   /** Null while chat retention is off. */
   chat_retention_days: number | null
   file_retention_days: number
+  /** The most tokens one round's prompt may hold, for a message without reasoning: the model's context less
+   *  the answer and a margin. A chat's context estimate is read against it. */
+  prompt_tokens: number
+  /** The same for a message with reasoning on, whose answer may be longer. */
+  reasoning_prompt_tokens: number
   version: string
 }
 
@@ -176,9 +197,6 @@ export interface ErrorFrame {
  *  and answered without them) and `context_trimmed` (earlier turns were left
  *  out of the prompt). A code this app does not know is ignored. */
 export type NoticeCode = 'answer_cut' | 'document_partial' | 'document_unread' | 'images_dropped' | 'context_trimmed'
-
-/** What a document is counted in. */
-export type MeasureUnit = 'page' | 'slide' | 'paragraph' | 'row' | 'line'
 
 /** One notice, as stored with an answer and as its live frame carries it. The
  *  details of a document notice are null once they have expired, and a notice

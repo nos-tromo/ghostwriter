@@ -70,6 +70,7 @@ describe('Conversation', () => {
               expired: false,
               kind: 'document',
               status: 'ready',
+              length: null,
             },
           ],
         }),
@@ -625,6 +626,7 @@ describe('Conversation pictures', () => {
       expired: false,
       kind: 'image',
       status: 'ready',
+      length: null,
       ...fields,
     }
   }

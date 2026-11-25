@@ -65,10 +65,17 @@ export const en = {
   'composer.processing_hint': 'Sending waits until the attached files are ready.',
   'composer.transcribing_hint': 'Video and audio take longer: they are transcribed before they are sent.',
   'composer.unreadable': '{name} could not be read; the model will be told.',
+  'composer.too_long': 'Read only in parts',
   'composer.images_cap':
     'At most {max} images go to the model with one message; the others are only named.',
   'composer.send': 'Send',
   'composer.stop': 'Stop',
+
+  // how full the chat's context is: the ring at the composer, and the note above it
+  'context.meter': 'about {n} % of the context used',
+  'context.nearly_full':
+    'This chat is nearly as long as the model can read at once. For a new topic, start a new chat.',
+  'context.trimmed': 'Earlier parts of this chat are no longer sent to the model.',
 
   // a picture at full size
   'lightbox.close': 'Close',

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createEvent, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PURPOSE_HEADER, PurposeBar, clearAllPurposes, setPurpose } from '@infra/ui'
-import type { AppConfig, AttachmentOut } from '../api/types'
+import type { AppConfig, AttachmentLength, AttachmentOut, MessageOut } from '../api/types'
 import { useConfig } from '../hooks/useConfig'
 import { LanguageContext } from '../i18n/LanguageContext'
 import { ChatPane } from './ChatPane'
@@ -48,6 +48,7 @@ function attachment(id: string, name: string, size = 3): AttachmentOut {
     expired: false,
     kind: 'document',
     status: 'ready',
+    length: null,
   }
 }
 
@@ -71,9 +72,9 @@ const composer = () => textbox().closest('form') as HTMLElement
 const chip = (name: string) => within(composer()).getByText(name).closest('li') as HTMLElement
 
 /** Chat c1 opened, empty unless `routes` says otherwise. */
-function openChat(routes: Record<string, Answer> = {}, config: AppConfig = CONFIG) {
+function openChat(routes: Record<string, Answer> = {}, config: AppConfig = CONFIG, onNewChat: () => void = () => {}) {
   const calls = serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'GET /ghostwriter/api/chats': [CHAT], ...routes })
-  const view = renderWithClient(<ChatPane chatId="c1" config={config} />)
+  const view = renderWithClient(<ChatPane chatId="c1" config={config} onNewChat={onNewChat} />)
   return { calls, ...view }
 }
 
@@ -256,7 +257,7 @@ describe('Composer', () => {
     renderWithClient(
       <>
         <PurposeBar scope="ghostwriter" required />
-        <ChatPane chatId="c1" config={{ ...CONFIG, require_purpose: ['collect'] }} />
+        <ChatPane chatId="c1" config={{ ...CONFIG, require_purpose: ['collect'] }} onNewChat={() => {}} />
       </>,
     )
     await screen.findByText('Ask anything, or attach a document.')
@@ -1010,7 +1011,7 @@ describe('Composer clips', () => {
   /** The composer under a config the page reads itself, as the app does; `config` answers `GET /config`. */
   function Page({ chatId }: { chatId: string }) {
     const { data: config } = useConfig()
-    return config ? <ChatPane chatId={chatId} config={config} /> : null
+    return config ? <ChatPane chatId={chatId} config={config} onNewChat={() => {}} /> : null
   }
 
   it('shows a dropped clip as a video tile while it is transcribed, and sends once it is ready', async () => {
@@ -1241,7 +1242,7 @@ describe('the reasoning switch', () => {
   it('starts off, per chat, and says its state in its name', async () => {
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]), 'GET /ghostwriter/api/chats/c2': detail([]) })
     const user = userEvent.setup()
-    const { rerender } = renderWithClient(<ChatPane key="c1" chatId="c1" config={CONFIG} />)
+    const { rerender } = renderWithClient(<ChatPane key="c1" chatId="c1" config={CONFIG} onNewChat={() => {}} />)
     const off = await screen.findByRole('button', { name: 'Reasoning: Off — faster, plain answer' })
     expect(off).toHaveAttribute('aria-pressed', 'false')
 
@@ -1250,7 +1251,7 @@ describe('the reasoning switch', () => {
     expect(on).toHaveAttribute('aria-pressed', 'true')
 
     // Another chat starts off again.
-    rerender(<ChatPane key="c2" chatId="c2" config={CONFIG} />)
+    rerender(<ChatPane key="c2" chatId="c2" config={CONFIG} onNewChat={() => {}} />)
     expect(await screen.findByRole('button', { name: 'Reasoning: Off — faster, plain answer' })).toHaveAttribute(
       'aria-pressed',
       'false',
@@ -1261,7 +1262,7 @@ describe('the reasoning switch', () => {
     serve({ 'GET /ghostwriter/api/chats/c1': detail([]) })
     renderWithClient(
       <LanguageContext value="de">
-        <ChatPane chatId="c1" config={CONFIG} />
+        <ChatPane chatId="c1" config={CONFIG} onNewChat={() => {}} />
       </LanguageContext>,
     )
     expect(await screen.findByRole('button', { name: 'Reasoning: Aus — schneller, direkte Antwort' })).toBeInTheDocument()
@@ -1479,5 +1480,371 @@ describe('Taking an attachment back', () => {
     store()
     await waitFor(() => expect(callsTo(calls, 'DELETE', FILE)).toHaveLength(1))
     expect(within(composer()).queryByText('sales.xlsx')).not.toBeInTheDocument()
+  })
+})
+
+describe('the context ring and note', () => {
+  const NEARLY = 'This chat is nearly as long as the model can read at once. For a new topic, start a new chat.'
+  const TRIMMED = 'Earlier parts of this chat are no longer sent to the model.'
+  const CHAT_URL = 'GET /ghostwriter/api/chats/c1'
+  const REASONING_OFF = 'Reasoning: Off — faster, plain answer'
+
+  /** The assistant's answer with the estimate it stored, `null` for one without. */
+  const answer = (id: string, estimate: number | null, fields: Partial<MessageOut> = {}): MessageOut =>
+    message({ id, role: 'assistant', content: `Antwort ${id}`, context_estimate: estimate, ...fields })
+  const question = (id: string) => message({ id, role: 'user', content: `Frage ${id}` })
+  const trimmed: MessageOut['notices'] = [{ code: 'context_trimmed' }]
+
+  it('shows no ring in an empty chat, nor after an answer stored without an estimate', async () => {
+    openChat()
+    await screen.findByText('Ask anything, or attach a document.')
+    expect(screen.queryByRole('meter')).not.toBeInTheDocument()
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+  })
+
+  it('shows no ring for a chat written before estimates were kept', async () => {
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', null)]) })
+    await screen.findByText('Antwort a1')
+    expect(screen.queryByRole('meter')).not.toBeInTheDocument()
+  })
+
+  it('shows how full the chat is, by the switch', async () => {
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 20_400)]) })
+    const user = userEvent.setup()
+    const ring = await screen.findByRole('meter', { name: 'about 60 % of the context used' })
+    expect(ring).toHaveAttribute('aria-valuenow', '60')
+    // The reasoning switch has the smaller budget: the same estimate fills more of it.
+    await user.click(screen.getByRole('button', { name: REASONING_OFF }))
+    expect(screen.getByRole('meter', { name: 'about 78 % of the context used' })).toHaveAttribute('aria-valuenow', '78')
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+  })
+
+  it('words the ring in German too', async () => {
+    serve({ [CHAT_URL]: detail([question('q1'), answer('a1', 20_400)]) })
+    renderWithClient(
+      <LanguageContext value="de">
+        <ChatPane chatId="c1" config={CONFIG} onNewChat={() => {}} />
+      </LanguageContext>,
+    )
+    expect(await screen.findByRole('meter', { name: 'ca. 60 % des Kontexts belegt' })).toBeInTheDocument()
+  })
+
+  it('reads the latest answer only', async () => {
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 30_000), question('q2'), answer('a2', 3_400)]) })
+    expect(await screen.findByRole('meter', { name: 'about 10 % of the context used' })).toBeInTheDocument()
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+  })
+
+  it('shows the nearly-full note from 80 % with New chat', async () => {
+    const onNewChat = vi.fn()
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 27_200)]) }, CONFIG, onNewChat)
+    const user = userEvent.setup()
+    const note = await screen.findByText(NEARLY)
+    expect(screen.getByRole('meter', { name: 'about 80 % of the context used' })).toHaveAttribute('data-level', 'warn')
+    expect(screen.queryByText(TRIMMED)).not.toBeInTheDocument()
+    // Not announced: it is read in its place, like the line under an answer that is stored.
+    expect(note.closest('[role="status"], [role="alert"], [aria-live]')).toBeNull()
+    expect(onNewChat).not.toHaveBeenCalled()
+    await user.click(within(composer()).getByRole('button', { name: 'New chat' }))
+    expect(onNewChat).toHaveBeenCalledTimes(1)
+  })
+
+  it('decides the note on the unrounded ratio, as the ring does', async () => {
+    // 27_166 of 34_000 is 0.799: the ring reads 80 and is below the warning level.
+    const { client } = openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 27_166)]) })
+    const ring = await screen.findByRole('meter', { name: 'about 80 % of the context used' })
+    expect(ring).toHaveAttribute('aria-valuenow', '80')
+    expect(ring).toHaveAttribute('data-level', 'normal')
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+
+    act(() => {
+      client.setQueryData(['chat', 'c1'], detail([question('q1'), answer('a1', 27_200)]))
+    })
+    expect(await screen.findByText(NEARLY)).toBeInTheDocument()
+    expect(screen.getByRole('meter')).toHaveAttribute('data-level', 'warn')
+  })
+
+  it('has the note follow the reasoning switch, and stops at a full ring', async () => {
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 22_000)]) })
+    const user = userEvent.setup()
+    await screen.findByRole('meter', { name: 'about 65 % of the context used' })
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: REASONING_OFF }))
+    expect(screen.getByRole('meter', { name: 'about 85 % of the context used' })).toBeInTheDocument()
+    expect(screen.getByText(NEARLY)).toBeInTheDocument()
+  })
+
+  it('caps an estimate over the budget at a full ring', async () => {
+    openChat({ [CHAT_URL]: detail([question('q1'), answer('a1', 40_000)]) })
+    expect(await screen.findByRole('meter', { name: 'about 100 % of the context used' })).toBeInTheDocument()
+    expect(screen.getByText(NEARLY)).toBeInTheDocument()
+  })
+
+  it('shows the trimmed note for the latest answer only', async () => {
+    const { client } = openChat({
+      [CHAT_URL]: detail([question('q1'), answer('a1', 1_000, { notices: trimmed }), question('q2'), answer('a2', 1_000)]),
+    })
+    await screen.findByRole('meter')
+    expect(screen.queryByText(TRIMMED)).not.toBeInTheDocument()
+
+    act(() => {
+      client.setQueryData(
+        ['chat', 'c1'],
+        detail([question('q1'), answer('a1', 1_000), question('q2'), answer('a2', 1_000, { notices: trimmed })]),
+      )
+    })
+    expect(await screen.findByText(TRIMMED)).toBeInTheDocument()
+    expect(screen.queryByText(NEARLY)).not.toBeInTheDocument()
+
+    act(() => {
+      client.setQueryData(['chat', 'c1'], detail([question('q1'), answer('a1', 27_200, { notices: trimmed })]))
+    })
+    expect(await screen.findByText(NEARLY)).toBeInTheDocument()
+    expect(screen.getByText(TRIMMED)).toBeInTheDocument()
+    expect(within(composer()).getAllByRole('button', { name: 'New chat' })).toHaveLength(1)
+  })
+
+  it('shows the trimmed note while the answer is written, and keeps the ring at its last reading', async () => {
+    const sse = sseStream()
+    const { client } = openChat({
+      [CHAT_URL]: detail([question('q1'), answer('a1', 3_400)]),
+      [`POST ${MESSAGES}`]: () => sse.response(),
+    })
+    const user = userEvent.setup()
+    await screen.findByRole('meter', { name: 'about 10 % of the context used' })
+
+    await user.type(textbox(), 'Und Spalte C?{Enter}')
+    await screen.findByRole('button', { name: 'Stop' })
+    expect(screen.queryByText(TRIMMED)).not.toBeInTheDocument()
+    act(() => sse.push('start', { message_id: 'a2', user_message_id: 'q2' }))
+    // A read of the chat meanwhile lists the turn's own rows, whose answer has no estimate yet.
+    act(() => {
+      client.setQueryData(['chat', 'c1'], detail([question('q1'), answer('a1', 3_400), question('q2'), answer('a2', null)]))
+    })
+    act(() => sse.push('notice', { code: 'context_trimmed' }))
+    expect(await screen.findByText(TRIMMED)).toBeInTheDocument()
+    expect(screen.getByRole('meter', { name: 'about 10 % of the context used' })).toBeInTheDocument()
+    act(() => sse.end())
+  })
+})
+
+describe('Composer long documents', () => {
+  const FILE = `${ATTACHMENTS}/a1`
+  const POLL = `${FILE}?wait=20`
+  const TOO_LONG = 'Read only in parts'
+
+  const length = (fields: Partial<AttachmentLength> = {}): AttachmentLength => ({
+    state: 'measured',
+    total: 400,
+    unit: 'page',
+    too_long: false,
+    ...fields,
+  })
+  const PENDING = length({ state: 'pending', total: null, unit: null })
+  const report = (fields: Partial<AttachmentOut> = {}): AttachmentOut => ({
+    ...attachment('a1', 'long-report.pdf', 4096),
+    mime: 'application/pdf',
+    ...fields,
+  })
+
+  it('warns on the tile of a very long document, once it is measured, and sends meanwhile', async () => {
+    let measured!: () => void
+    const held = new Promise<void>((done) => (measured = done))
+    const { calls } = openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(report({ length: PENDING }), 201),
+      [`GET ${POLL}`]: async () => {
+        await held
+        return json(report({ length: length({ too_long: true }) }))
+      },
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    drop(textbox(), [file('long-report.pdf')])
+    await waitFor(() => expect(chip('long-report.pdf')).toHaveAttribute('data-status', 'done'))
+
+    // Ready at once: Send does not wait for the measure, which is followed meanwhile.
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    await waitFor(() => expect(callsTo(calls, 'GET', POLL)).toHaveLength(1))
+    expect(screen.queryByText(TOO_LONG)).not.toBeInTheDocument()
+
+    measured()
+    // The document tile has no button face (nothing opens), so the warning is text in its place.
+    expect(await within(chip('long-report.pdf')).findByText(TOO_LONG)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+  })
+
+  it('says the warning in German too', async () => {
+    serve({
+      'GET /ghostwriter/api/chats/c1': { ...detail([]), pending_attachments: [report({ length: length({ too_long: true }) })] },
+    })
+    renderWithClient(
+      <LanguageContext value="de">
+        <ChatPane chatId="c1" config={CONFIG} onNewChat={() => {}} />
+      </LanguageContext>,
+    )
+    expect(await screen.findByText('Nur in Teilen lesbar')).toBeInTheDocument()
+  })
+
+  it('shows no warning for a document that is not too long, or could not be measured', async () => {
+    serve({
+      'GET /ghostwriter/api/chats/c1': {
+        ...detail([]),
+        pending_attachments: [
+          report({ length: length() }),
+          report({ id: 'a2', name: 'tide-notes.csv', length: length({ state: 'none', total: null, unit: null }) }),
+        ],
+      },
+    })
+    renderWithClient(<ChatPane chatId="c1" config={CONFIG} onNewChat={() => {}} />)
+    await screen.findByText('long-report.pdf')
+    expect(screen.getByText('tide-notes.csv')).toBeInTheDocument()
+    expect(screen.queryByText(TOO_LONG)).not.toBeInTheDocument()
+  })
+
+  it('follows a document the chat lists with its measure pending', async () => {
+    const waiting = { ...detail([]), pending_attachments: [report({ length: PENDING })] }
+    const { calls } = openChat({
+      'GET /ghostwriter/api/chats/c1': waiting,
+      [`GET ${POLL}`]: () => json(report({ length: length({ too_long: true }) })),
+    })
+    expect(await screen.findByText(TOO_LONG)).toBeInTheDocument()
+    expect(callsTo(calls, 'GET', POLL)).toHaveLength(1)
+    expect(callsTo(calls, 'POST', ATTACHMENTS)).toHaveLength(0)
+  })
+
+  it('stops following once a document is measured', async () => {
+    let polls = 0
+    openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(report({ length: PENDING }), 201),
+      [`GET ${POLL}`]: () => {
+        polls += 1
+        return json(report({ length: length({ too_long: true }) }))
+      },
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [file('long-report.pdf')])
+    await waitFor(() => expect(polls).toBe(1))
+    await screen.findByText(TOO_LONG)
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(60_000)
+    })
+    expect(polls).toBe(1)
+  })
+
+  it('asks again no sooner than half a second after a pending answer, and ends with the measure', async () => {
+    let polls = 0
+    openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(report({ length: PENDING }), 201),
+      [`GET ${POLL}`]: () => {
+        polls += 1
+        return json(report({ length: polls < 3 ? PENDING : length({ too_long: true }) }))
+      },
+    })
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [file('long-report.pdf')])
+    await waitFor(() => expect(polls).toBe(1))
+    await act(async () => {
+      vi.advanceTimersByTime(400)
+    })
+    expect(polls).toBe(1)
+    await act(async () => {
+      vi.advanceTimersByTime(200)
+    })
+    await waitFor(() => expect(polls).toBe(2))
+    await act(async () => {
+      vi.advanceTimersByTime(600)
+    })
+    expect(await screen.findByText(TOO_LONG)).toBeInTheDocument()
+    expect(polls).toBe(3)
+  })
+
+  it('does not follow an attachment stored before measuring', async () => {
+    const stored = { ...detail([]), pending_attachments: [report({ length: null })] }
+    const { calls } = openChat({ 'GET /ghostwriter/api/chats/c1': stored })
+    await screen.findByText('long-report.pdf')
+    expect(screen.getByRole('button', { name: 'Send' })).toBeEnabled()
+    expect(screen.queryByText(TOO_LONG)).not.toBeInTheDocument()
+    expect(calls.filter((c) => c.url.includes('?wait='))).toEqual([])
+  })
+
+  it('stops following a document that a message took, once the answer in flight is in', async () => {
+    let first!: () => void
+    const held = new Promise<void>((done) => (first = done))
+    const sse = sseStream()
+    let polls = 0
+    openChat({
+      [`POST ${ATTACHMENTS}`]: () => json(report({ length: PENDING }), 201),
+      [`POST ${MESSAGES}`]: () => sse.response(),
+      [`GET ${POLL}`]: async () => {
+        polls += 1
+        await held
+        return json(report({ length: PENDING }))
+      },
+    })
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [file('long-report.pdf')])
+    await waitFor(() => expect(polls).toBe(1))
+    await user.type(textbox(), 'Fasse zusammen{Enter}')
+    await waitFor(() => expect(within(composer()).queryByText('long-report.pdf')).not.toBeInTheDocument())
+
+    first()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000)
+    })
+    expect(polls).toBe(1)
+    act(() => sse.end())
+  })
+
+  it('follows a document again when the message that took it is refused', async () => {
+    let first!: () => void
+    const held = new Promise<void>((done) => (first = done))
+    let refuse!: () => void
+    const refused = new Promise<void>((done) => (refuse = done))
+    let polls = 0
+    // The chat, read again after the refusal, lists the file as still waiting.
+    let waiting: AttachmentOut[] = []
+    openChat({
+      'GET /ghostwriter/api/chats/c1': () => json({ ...detail([]), pending_attachments: waiting }),
+      [`POST ${ATTACHMENTS}`]: () => {
+        waiting = [report({ length: PENDING })]
+        return json(report({ length: PENDING }), 201)
+      },
+      [`POST ${MESSAGES}`]: async () => {
+        await refused
+        return json({ detail: 'An answer is still being written in this chat.', code: 'busy' }, 409)
+      },
+      [`GET ${POLL}`]: async () => {
+        polls += 1
+        if (polls === 1) await held
+        return json(report({ length: polls < 3 ? PENDING : length({ too_long: true }) }))
+      },
+    })
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    vi.useFakeTimers({ shouldAdvanceTime: true })
+    drop(textbox(), [file('long-report.pdf')])
+    await waitFor(() => expect(polls).toBe(1))
+    await user.type(textbox(), 'Fasse zusammen{Enter}')
+    await waitFor(() => expect(within(composer()).queryByText('long-report.pdf')).not.toBeInTheDocument())
+
+    // The answer to the first request comes while the file is out of the composer: following ends.
+    first()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000)
+    })
+    expect(polls).toBe(1)
+
+    // The message is refused and the file comes back, its measure still pending: it is followed again.
+    refuse()
+    expect(await within(composer()).findByText('long-report.pdf')).toBeInTheDocument()
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000)
+    })
+    expect(await screen.findByText(TOO_LONG)).toBeInTheDocument()
+    expect(polls).toBe(3)
   })
 })

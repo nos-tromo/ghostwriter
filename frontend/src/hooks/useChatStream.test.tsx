@@ -59,6 +59,7 @@ const SALES: AttachmentOut = {
   expired: false,
   kind: 'document',
   status: 'ready',
+  length: null,
 }
 
 /** A stand-in for Task 14's composer: buttons over the conversation's stream. */

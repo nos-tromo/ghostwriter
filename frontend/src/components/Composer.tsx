@@ -5,6 +5,7 @@ import {
   BrainIcon,
   Button,
   ChatComposer,
+  ContextMeter,
   MicButton,
   SendButton,
   StopButton,
@@ -13,10 +14,13 @@ import { transcribe } from '../api/chats'
 import type { AppConfig } from '../api/types'
 import { isAttachable, isClip, isImageName, type Attachments } from '../hooks/useAttachments'
 import type { ChatStream } from '../hooks/useChatStream'
+import { useContextUse } from '../hooks/useContextUse'
 import { useRecorder } from '../hooks/useRecorder'
 import { useT } from '../i18n/LanguageContext'
+import { NEAR_FULL_RATIO, nearlyFull } from '../lib/context'
 import { screenshotName } from '../lib/format'
 import { AttachmentTiles } from './AttachmentTiles'
+import { ContextNote } from './ContextNote'
 import { RequestError } from './RequestError'
 
 /**
@@ -72,6 +76,9 @@ function spliceWords(text: string, start: number, end: number, words: string): {
  *
  * The chat's stream, its attachments and the reasoning switch are the
  * `ChatPane`'s, so the conversation above shows the same answer this sends.
+ *
+ * How full the chat's context is shows as a ring before the switch, read against the budget of the switch as
+ * it is now; from `NEAR_FULL_RATIO`, or once the chat is trimmed, a note above the pill offers a new chat.
  */
 export function Composer({
   chatId,
@@ -80,6 +87,7 @@ export function Composer({
   attachments,
   reasoning,
   onReasoningChange,
+  onNewChat,
 }: {
   chatId: string
   config: AppConfig
@@ -87,8 +95,10 @@ export function Composer({
   attachments: Attachments
   reasoning: boolean
   onReasoningChange: (next: boolean) => void
+  onNewChat: () => void
 }) {
   const t = useT()
+  const { ratio, trimmed } = useContextUse(chatId, stream, config, reasoning)
   const [text, setText] = useState('')
   const textRef = useRef<HTMLTextAreaElement>(null)
   const pickerRef = useRef<HTMLInputElement>(null)
@@ -223,6 +233,7 @@ export function Composer({
             {t(clipProcessing ? 'composer.transcribing_hint' : 'composer.processing_hint')}
           </p>
         )}
+        <ContextNote nearlyFull={nearlyFull(ratio)} trimmed={trimmed} onNewChat={onNewChat} />
         <ChatComposer
           ref={textRef}
           value={text}
@@ -273,6 +284,13 @@ export function Composer({
           }
           end={
             <>
+              {ratio !== null && (
+                <ContextMeter
+                  value={ratio}
+                  label={t('context.meter', { n: Math.round(ratio * 100) })}
+                  warnAt={NEAR_FULL_RATIO}
+                />
+              )}
               <ReasoningToggle reasoning={reasoning} onChange={onReasoningChange} />
               {stream.streaming ? (
                 <StopButton label={t('composer.stop')} onClick={() => void stream.stop()} />
