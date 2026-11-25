@@ -18,6 +18,7 @@ from sqlalchemy import Engine
 
 from ghostwriter.agent.context import (
     CLEARED,
+    LONGER_THAN_A_PROMPT,
     OFFICE_FORMATS,
     UNSEEN_PICTURE,
     FitReport,
@@ -59,7 +60,7 @@ from ghostwriter.agent.limits import (
     TOOL_RESULT_CHARS,
 )
 from ghostwriter.agent.notices import SentFile
-from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION, system_prompt
+from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
     CUT_END_HINT,
     CUT_HINT,
@@ -837,6 +838,46 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(gone, (), "42", True)], True)
 
 
+def test_the_long_line_rides_the_attachment_line(engine: Engine, clock: Clock) -> None:
+    """A document measured longer than one prompt says so on its line, to this turn and to its replay."""
+    store = ChatStore(engine, file_days=7, notice_days=30, prompt_budget=1_000, now=clock)
+    chat = store.create_chat("user-a")
+
+    def attach(name: str, size: int, measure: dict[str, Any] | None) -> str:
+        clock.now += timedelta(seconds=1)
+        file_id = uuid4().hex
+        attachment = store.add_attachment(
+            chat.id,
+            file_id=file_id,
+            path=f"{FOLDER}/{name}",
+            name=name,
+            size=size,
+            mime="text/plain",
+            measure_state="pending",
+        )
+        store.settle_measure(attachment.id, measure)
+        return attachment.id
+
+    long = attach("long-report.txt", 1234, {"total": 40_000, "unit": "line", "chars": 2_000_000, "capped": False})
+    short = attach("tide-notes.txt", 56, {"total": 12, "unit": "line", "chars": 300, "capped": False})
+    unmeasured = attach("quay-ledger.txt", 78, None)
+    first = store.add_user_message("user-a", chat.id, "Fasse zusammen", [long, short, unmeasured])
+    told = f"; {LONGER_THAN_A_PROMPT}"
+    expected = "\n".join(
+        [
+            "Fasse zusammen",
+            f"[Attached: long-report.txt ({FOLDER}/long-report.txt, 1234 bytes{told})]",
+            f"[Attached: tide-notes.txt ({FOLDER}/tide-notes.txt, 56 bytes)]",
+            f"[Attached: quay-ledger.txt ({FOLDER}/quay-ledger.txt, 78 bytes)]",
+        ]
+    )
+    assert store.user_turn(chat.id, first.id).text == expected
+    store.finish_assistant_message(store.start_assistant_message(chat.id), "Zusammenfassung")
+    store.add_user_message("user-a", chat.id, "Und weiter?", [])
+    [turn], _ = store.past_turns(chat.id, before_position=2)
+    assert turn.user == expected
+
+
 def test_the_store_reads_the_chats_files_for_the_notices(store: ChatStore, clock: Clock) -> None:
     """Every attachment of the chat, sent or waiting, by path; its measure's length only while measured and live."""
     chat, other = store.create_chat("user-a"), store.create_chat("user-a")
@@ -977,6 +1018,23 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
     )
 
 
+def test_the_prompt_says_how_to_page_with_tools_only() -> None:
+    """How to read a long document in parts follows the folder sentences, only while tools are offered."""
+    assert PAGING == (
+        "A long document comes in parts: when read_document's answer has next_part, call it again with part set to "
+        "next_part to read on, and say plainly which parts you did not read."
+    )
+    made = "Files and tool results are deleted 7 days after they were made."
+    assert SYSTEM.endswith(f"{made} {PAGING}")
+    day = date(2026, 11, 16)
+    with_sight = system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, vision=True)
+    assert with_sight == f"{SYSTEM} {VISION}" and with_sight.index(PAGING) < with_sight.index(VISION)
+    gone = system_prompt(today=day, folder=FOLDER, file_days=7, expired=True)
+    assert gone == f"{SYSTEM} {EXPIRED}"
+    bare = system_prompt(today=day, folder=None, file_days=7, expired=False)
+    assert PAGING not in bare and "next_part" not in bare
+
+
 def test_the_presentation_sentence_comes_with_the_tool() -> None:
     """The outline-first rule is in the prompt only when write_presentation is offered and tools are.
 
@@ -1114,6 +1172,49 @@ def _clip_manifest(duration_s: float | None, total: int, *, transcript: bool = T
         "duration_s": duration_s,
         "transcript": transcript,
     }
+
+
+@pytest.mark.parametrize(
+    ("manifest", "too_long", "expected"),
+    [
+        (
+            _pdf_manifest(500, []),
+            True,
+            "PDF, 500 pages; longer than one prompt: read it in parts and say which parts you read",
+        ),
+        (
+            _pdf_manifest(500, [3]),
+            True,
+            "PDF, 500 pages; page 3 has no text; longer than one prompt: read it in parts and say which parts you read",
+        ),
+        (None, True, "longer than one prompt: read it in parts and say which parts you read"),
+        ({"kind": "none", "total": 0}, True, "longer than one prompt: read it in parts and say which parts you read"),
+        (_pdf_manifest(500, []), False, "PDF, 500 pages"),
+        (None, False, None),
+    ],
+    ids=["pages", "pages with a blank", "no manifest", "a manifest of kind none", "not too long", "nothing to say"],
+)
+def test_a_long_document_says_to_read_it_in_parts(
+    manifest: dict[str, Any] | None, too_long: bool, expected: str | None
+) -> None:
+    """A document longer than one prompt adds the phrase to its facts, or says it alone; else the line is as before."""
+    assert LONGER_THAN_A_PROMPT == "longer than one prompt: read it in parts and say which parts you read"
+    assert attachment_facts("document", manifest, seen=True, name="long-report.pdf", too_long=too_long) == expected
+
+
+def test_a_picture_and_a_clip_are_never_too_long() -> None:
+    """Only a document is read in parts: ``too_long`` leaves a picture's line and a clip's as they were."""
+    times = "\N{MULTIPLICATION SIGN}"
+    picture = _image_manifest(2048, 1536)
+    assert (
+        attachment_facts("image", picture, seen=True, name="harbour-photo.jpg", too_long=True)
+        == f"image 2048{times}1536"
+    )
+    clip = _clip_manifest(134.2, 8)
+    assert attachment_facts("media", clip, seen=True, name="harbour-tour.mp4", too_long=True) == (
+        "video 02:14, 8 frames; transcript"
+    )
+    assert attachment_facts("media", None, seen=True, name="harbour-tour.mp4", too_long=True) is None
 
 
 def test_the_attachment_line_carries_facts() -> None:

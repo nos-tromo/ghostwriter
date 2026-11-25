@@ -50,7 +50,7 @@ from ghostwriter.agent.loop import (
     TurnOutcome,
     _refuses_context,
 )
-from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, VISION
 from ghostwriter.agent.tools import cut
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
@@ -811,12 +811,14 @@ def test_without_workbench_no_tool_is_offered(loop_env: LoopEnv, workbench: Fake
     assert "tools" not in loop_env.fake.calls[0]
     assert "You have no tools in this chat" in loop_env.sent(1)[0]["content"]
     assert "/workspace/" not in loop_env.sent(1)[0]["content"]
+    assert PAGING not in loop_env.sent(1)[0]["content"]
 
 
 def test_with_workbench_the_prompt_names_the_chats_folder(loop_env: LoopEnv) -> None:
-    """The system prompt names this chat's folder, and discovery asks for this chat."""
+    """The prompt names this chat's folder and how to page a long document; discovery asks for this chat."""
     loop_env.run([text_chunk("Hallo!")])
     assert f"This chat's files are in {FOLDER};" in loop_env.sent(1)[0]["content"]
+    assert PAGING in loop_env.sent(1)[0]["content"]
     assert loop_env.workbench.discoveries == [(CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"}), False)]
 
 

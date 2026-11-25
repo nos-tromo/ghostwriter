@@ -1699,12 +1699,17 @@ class ChatStore:
 
         Returns:
             The text, then each attachment with its path, size and facts
-            (:func:`~ghostwriter.agent.context.attachment_facts`), or as expired or unreadable.
+            (:func:`~ghostwriter.agent.context.attachment_facts`, which says a document measured longer than one prompt
+            is read in parts), or as expired or unreadable.
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
         facts = {
             attachment.id: attachment_facts(
-                attachment.kind, _loaded_manifest(attachment.render), seen=seen, name=attachment.name
+                attachment.kind,
+                _loaded_manifest(attachment.render),
+                seen=seen,
+                name=attachment.name,
+                too_long=self._too_long(attachment),
             )
             for attachment in attachments
         }

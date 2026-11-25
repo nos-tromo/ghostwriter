@@ -43,6 +43,13 @@ DECK_CHECK: Final = (
     "writes the restyled deck as a new file; look at it again, and name the file that is now the deck."
 )
 
+#: How the model reads a document longer than one prompt, given only while tools are offered: ``read_document``
+#: answers with the part asked for and ``next_part`` where it goes on, and what was not read is said plainly.
+PAGING: Final = (
+    "A long document comes in parts: when read_document's answer has next_part, call it again with part set to "
+    "next_part to read on, and say plainly which parts you did not read."
+)
+
 #: What a continuation asks of a provider other than vllm, as a user message after the answer so far: vllm goes on
 #: in that message itself (:data:`~ghostwriter.inference.CONTINUE_BODY`), and no other provider is known to.
 CONTINUE: Final = "Go on exactly where your answer stopped; repeat nothing."
@@ -62,14 +69,15 @@ def system_prompt(
 
     Args:
         today: The date the message is answered on.
-        folder: The chat's folder in workbench; ``None`` when no tool is offered.
+        folder: The chat's folder in workbench; ``None`` when no tool is offered. :data:`PAGING` follows the
+            sentences on the folder, and is given only with one.
         file_days: How long workbench keeps a chat's files.
         expired: Whether files or tool results of earlier messages have expired.
         presentations: Whether workbench offers ``write_presentation``; the outline-first rule is given
             only then, and only when tools are offered.
-        vision: Whether the model sees images and is offered ``view_file``; :data:`VISION` follows the
-            sentences on the chat's folder only then, and only when tools are offered. With ``presentations``
-            too, :data:`DECK_CHECK` follows the outline-first rule.
+        vision: Whether the model sees images and is offered ``view_file``; :data:`VISION` follows :data:`PAGING`
+            only then, and only when tools are offered. With ``presentations`` too, :data:`DECK_CHECK` follows the
+            outline-first rule.
         media: Whether video and audio are offered; :data:`MEDIA` follows :data:`VISION` only then, and only
             with ``vision``, since a clip's frames are looked at with ``view_file``.
 
@@ -90,6 +98,7 @@ def system_prompt(
             "the user below your answer with a download button: name them, and do not repeat their content or write "
             f"links to them. Files and tool results are deleted {file_days} days after they were made."
         )
+        parts.append(PAGING)
         if vision:
             parts.append(VISION)
             if media:
