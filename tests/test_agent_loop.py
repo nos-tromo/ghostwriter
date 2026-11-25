@@ -278,13 +278,20 @@ class LoopEnv:
         )
         return list(loop.run(turn, self.audit, outcome=outcome))
 
-    def go_on(self, *rounds: Round, provider: str = "vllm", outcome: TurnOutcome | None = None) -> list[TurnEvent]:
+    def go_on(
+        self,
+        *rounds: Round,
+        provider: str = "vllm",
+        outcome: TurnOutcome | None = None,
+        vision: bool = False,
+    ) -> list[TurnEvent]:
         """Continue the last answer in place, as the Continue route does, and run its turn to the end.
 
         Args:
             *rounds: The router's rounds, in order; a continuation asks for one.
             provider: The provider behind the router, ``INFERENCE_PROVIDER``.
             outcome: What the turn fills in when it ends; ``None`` keeps none.
+            vision: Whether the model sees images.
 
         Returns:
             The turn's events.
@@ -303,7 +310,33 @@ class LoopEnv:
             cancel=self.cancel,
             continued=True,
         )
-        return list(self._loop(settings, self.workbench).run(turn, self.audit, outcome=outcome))
+        return list(self._loop(settings, self.workbench, vision=vision).run(turn, self.audit, outcome=outcome))
+
+    def again(self, *rounds: Round, vision: bool = False) -> list[TurnEvent]:
+        """Answer the last question again, as the regenerate route does, and run its turn to the end.
+
+        Args:
+            *rounds: The router's rounds, in order.
+            vision: Whether the model sees images.
+
+        Returns:
+            The turn's events.
+        """
+        self.fake.script = list(rounds)
+        question = self.store.question_of(CHAT, self.answer_id)
+        assert question is not None
+        self.store.drop_message(self.answer_id)
+        self.answer_id = self.store.start_assistant_message(CHAT)
+        turn = Turn(
+            chat_id=CHAT,
+            owner="user-a",
+            user_message_id=question,
+            assistant_message_id=self.answer_id,
+            call=CallFor("user-a", CHAT, {"X-Request-ID": "req-0003"}),
+            request_id="req-0003",
+            cancel=self.cancel,
+        )
+        return list(self._loop(self.settings, self.workbench, vision=vision).run(turn, self.audit))
 
     def _loop(
         self,
@@ -2236,3 +2269,26 @@ def test_an_answer_that_follows_no_question_is_not_continued(loop_env: LoopEnv) 
         "Zweite Antwort …",
     ]
     assert loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_continuation_estimates_the_next_prompt_as_a_fresh_answer_does(loop_env: LoopEnv) -> None:
+    """With vision on, the estimate after a Continue is the one a fresh answer of the same text stores.
+
+    It counts what the next message is offered: the system prompt's vision lines, ``view_file`` and the attached
+    picture's tokens. The continuation's own round stays blind and offers no tool.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.run(CUT, content="Beschreib das Bild", vision=True, attach=[_photo()])
+    assert loop_env.notices() == [{"code": "answer_cut"}]
+    loop_env.go_on(GO_ON, vision=True)
+    went_on = loop_env.fake.calls[-1]
+    assert "tools" not in went_on and VISION not in went_on["messages"][0]["content"]
+    assert not _image_urls(went_on["messages"])
+    continued = _stored_estimate(loop_env)
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+    loop_env.again([text_chunk("Kapitel 1 … und weiter."), finish_chunk("stop")], vision=True)
+    fresh = loop_env.fake.calls[-1]
+    assert "view_file" in _tool_names(fresh) and VISION in fresh["messages"][0]["content"]
+    assert _image_urls(fresh["messages"]) == [JPEG_URL]
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+    assert continued is not None and continued == _stored_estimate(loop_env)

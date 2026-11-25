@@ -75,7 +75,9 @@ replays it, the answer so far last (:func:`~ghostwriter.agent.context.continuati
 any other provider is asked to go on after it. The answer's stored notices are kept as they are, and only
 ``answer_cut`` is computed again: it goes once the round ended cleanly below ``MAX_ANSWER_TOKENS``, and otherwise (a
 failed round, a stop, a cut) stays where it was and is told again, before an error. No other notice is told: the
-round adds no turn to trim and calls no tool. A continuation stopped before it began reads and stores nothing.
+round adds no turn to trim and calls no tool. Its estimate of the next prompt is made as an answer's is, for the
+next message as it will be offered (with sight, while a turn would see), though its own round went without. A
+continuation stopped before it began reads and stores nothing.
 
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
 a label, an image or the router's refusal text.
@@ -415,6 +417,24 @@ class _Sight:
 
 
 @dataclass(frozen=True)
+class _Seen:
+    """Whether a message's turn sees, read once as it begins.
+
+    Attributes:
+        model_sees: Whether the model sees (:class:`~ghostwriter.vision.Vision`).
+        full: workbench's listing for a call that takes images, asked only while the model sees; ``None`` otherwise,
+            or when that discovery failed.
+        sees: Whether the turn sees: the model sees, and that listing holds ``view_file``.
+        budget: What an image costs and how many a request carries while the turn sees; ``None`` otherwise.
+    """
+
+    model_sees: bool
+    full: Discovery | None
+    sees: bool
+    budget: ImageBudget | None
+
+
+@dataclass(frozen=True)
 class _Offer:
     """A round's system prompt and the tools it may offer.
 
@@ -747,45 +767,21 @@ class AgentLoop:
         if turn.cancel.is_set():
             return
         settings = self._settings
-        workbench = self._workbench
-        model_sees = self._vision is not None and self._vision.model_sees
-        full = workbench.discover(call=turn.call, images=True) if workbench is not None and model_sees else None
-        sees = full is not None and any(tool.name == VIEW_TOOL for tool in full.tools)
-        question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=sees)
-        past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=sees)
-        today = self._now().date()
-
-        def blind() -> _Offer:
-            # A workbench that failed the discovery for images offers no tool this turn, as any failed one.
-            failed = model_sees and full is None
-            plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
-            return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
-
-        # Clips are offered as NextextHealth.offered says (Nextext healthy, workbench 0.9.0 or later), but from the
-        # discovery this turn already holds: no second listing is read on the turn thread.
-        clips = (
-            sees
-            and full is not None
-            and self._media is not None
-            and self._media.healthy
-            and serves_media(full.server_version)
-        )
-        seeing = (
-            self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
-            if sees
-            else None
+        seen = self._seen(turn)
+        question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=seen.sees)
+        past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=seen.sees)
+        request = self._request(
+            turn,
+            seen,
+            past=past,
+            expired=expired,
+            budget=prompt_tokens(settings.context_tokens, reasoning=turn.reasoning),
         )
         attached = [*question.images, *(image for earlier in past for image in earlier.images)]
         sight = _Sight(
-            sees=sees,
-            budget=ImageBudget(settings.image_tokens, settings.max_images) if sees else None,
+            sees=seen.sees,
+            budget=seen.budget,
             known={image.path: (image.width, image.height) for image in attached},
-        )
-        request = _Request(
-            seeing=seeing,
-            blind=blind,
-            past=past,
-            budget=prompt_tokens(settings.context_tokens, reasoning=turn.reasoning),
         )
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
@@ -794,9 +790,7 @@ class AgentLoop:
         def next_prompt(text: str) -> int:
             # As the turn stands when the answer ends: the offer of the last round (the blind one after a refusal),
             # and the turn's messages as they were left; read then, never now.
-            offer = request.offer(sight)
-            answered = finished_turn(question.text, question.images, current, text)
-            return next_prompt_tokens(offer.system, offer.tools, [*past, answered], images=sight.budget)
+            return _estimate(request, sight, [*past, finished_turn(question.text, question.images, current, text)])
 
         message.next_prompt = next_prompt
         # The rounds' error, if one ended them, is held back: the file notices come first, and the error is last.
@@ -822,9 +816,11 @@ class AgentLoop:
 
         The answer so far is the base its new text is appended to, and its stored notices, read back
         (:meth:`~ghostwriter.agent.notices.NoticeEvent.from_stored`), are its notices, ``answer_cut`` among them
-        until the round has ended cleanly. The offer is the one of a turn that does not see, from workbench's
-        listing for a call without images; the next prompt is estimated with the answer as it then reads. A
-        continuation stopped before it began reads nothing.
+        until the round has ended cleanly. The round goes as for a turn that does not see: the blind offer, its
+        turns read without sight. The next prompt is estimated as :meth:`_answer` estimates it, for the next
+        message as it will be offered: with the offer that sees and what images cost while the message's turn
+        would see, the turns read so, the answer as it then reads. A continuation stopped before it began reads
+        nothing.
 
         Args:
             turn: The continued turn.
@@ -837,27 +833,28 @@ class AgentLoop:
         if turn.cancel.is_set():
             return
         settings = self._settings
-        workbench = self._workbench
+        seen = self._seen(turn)
         turns = self._store.answered_turns(turn.chat_id, turn.assistant_message_id)
         earlier, this = turns[:-1], turns[-1]
+        # The next message reads the turns as a turn that sees, if it would: a picture's line says so.
+        ahead = self._store.answered_turns(turn.chat_id, turn.assistant_message_id, seen=True) if seen.sees else turns
         message.base = this.answer
         stored = self._store.answer_notices(turn.assistant_message_id)
         message.notices = [event for value in stored if (event := NoticeEvent.from_stored(value)) is not None]
-        plain = workbench.discover(call=turn.call, images=False) if workbench is not None else None
-        expired = any(replayed.expired for replayed in turns)
-        offer = self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=self._now().date())
-        sight = _Sight(sees=False, budget=None, known={})
-        request = _Request(
-            seeing=None,
-            blind=lambda: offer,
+        request = self._request(
+            turn,
+            seen,
             past=earlier,
+            expired=any(replayed.expired for replayed in turns),
             budget=prompt_tokens(settings.context_tokens, reasoning=False),
         )
+        sight = _Sight(sees=False, budget=None, known={})
+        upcoming = _Sight(sees=seen.sees, budget=seen.budget, known={})
         current = continuation(this, instruct=settings.inference_provider != "vllm")
         headers = inference_headers(turn.owner, turn.request_id)
 
         def next_prompt(text: str) -> int:
-            return next_prompt_tokens(offer.system, offer.tools, [*earlier, dataclasses.replace(this, answer=text)])
+            return _estimate(request, upcoming, [*ahead[:-1], dataclasses.replace(ahead[-1], answer=text)])
 
         message.next_prompt = next_prompt
         error: ErrorEvent | None = None
@@ -988,6 +985,63 @@ class AgentLoop:
             current.append({"role": "assistant", "content": done.text, "tool_calls": calls})
             current.extend(answers)
             self._tool_images(current, sight, shown)
+
+    def _seen(self, turn: Turn) -> _Seen:
+        """Read whether a message's turn sees, once as it begins.
+
+        Args:
+            turn: The message.
+
+        Returns:
+            Whether the model sees, workbench's listing for a call that takes images (asked only then), whether
+            a turn sees, and what an image costs while it does.
+        """
+        settings = self._settings
+        workbench = self._workbench
+        model_sees = self._vision is not None and self._vision.model_sees
+        full = workbench.discover(call=turn.call, images=True) if workbench is not None and model_sees else None
+        sees = full is not None and any(tool.name == VIEW_TOOL for tool in full.tools)
+        budget = ImageBudget(settings.image_tokens, settings.max_images) if sees else None
+        return _Seen(model_sees=model_sees, full=full, sees=sees, budget=budget)
+
+    def _request(self, turn: Turn, seen: _Seen, *, past: Sequence[PastTurn], expired: bool, budget: int) -> _Request:
+        """Return what a message's rounds are fitted from: its offers, with sight and without, and its earlier turns.
+
+        Args:
+            turn: The message.
+            seen: Whether its turn sees, and the listing for images.
+            past: The earlier turns, oldest first.
+            expired: Whether files or tool results of earlier messages have expired.
+            budget: The tokens a round's prompt may take.
+
+        Returns:
+            The request: the offer that sees while the turn does, and the blind one, made when first needed.
+        """
+        workbench = self._workbench
+        today = self._now().date()
+        full = seen.full
+
+        def blind() -> _Offer:
+            # A workbench that failed the discovery for images offers no tool this turn, as any failed one.
+            failed = seen.model_sees and full is None
+            plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
+            return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
+
+        # Clips are offered as NextextHealth.offered says (Nextext healthy, workbench 0.9.0 or later), but from the
+        # discovery this turn already holds: no second listing is read on the turn thread.
+        clips = (
+            seen.sees
+            and full is not None
+            and self._media is not None
+            and self._media.healthy
+            and serves_media(full.server_version)
+        )
+        seeing = (
+            self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
+            if seen.sees
+            else None
+        )
+        return _Request(seeing=seeing, blind=blind, past=past, budget=budget)
 
     def _offer(
         self,
@@ -1323,6 +1377,22 @@ class AgentLoop:
         for card in cards:
             yield ResultEvent(card)
         return outcome
+
+
+def _estimate(request: _Request, sight: _Sight, turns: Sequence[PastTurn]) -> int:
+    """Estimate the tokens the next message's prompt starts with, for an answer and a continuation alike.
+
+    Args:
+        request: The message's offers.
+        sight: The images of the turn the estimate is made for: its offer in force (the one that sees while images
+            go to the model, else the blind one) and what an image costs while it sees.
+        turns: Every turn of the chat as the next message replays it, the one just answered the last.
+
+    Returns:
+        The estimate (:func:`~ghostwriter.agent.context.next_prompt_tokens`).
+    """
+    offer = request.offer(sight)
+    return next_prompt_tokens(offer.system, offer.tools, turns, images=sight.budget)
 
 
 def _estimated(message: _Progress) -> int | None:

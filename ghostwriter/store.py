@@ -1842,16 +1842,17 @@ class ChatStore:
                 turns.append(PastTurn(question[0], (), "", question[1], question[2]))
             return turns, any(turn.expired for turn in turns)
 
-    def answered_turns(self, chat_id: str, answer_id: str) -> list[PastTurn]:
+    def answered_turns(self, chat_id: str, answer_id: str, *, seen: bool = False) -> list[PastTurn]:
         """Return the turns of a chat through one of its answers, for that answer's continuation.
 
-        Each is read as :meth:`past_turns` reads it, for a turn that does not see. The message just before the
-        answer must be its question: :meth:`past_turns` pairs a question with the first answer after it, so the
-        last turn would otherwise be another answer's.
+        Each is read as :meth:`past_turns` reads it. The message just before the answer must be its question:
+        :meth:`past_turns` pairs a question with the first answer after it, so the last turn would otherwise be
+        another answer's.
 
         Args:
             chat_id: The chat.
             answer_id: The answer.
+            seen: Whether the turn sees images, which a picture's line says; a continuation's own round does not.
 
         Returns:
             The turns, oldest first, the last the answer's own: its question, its live tool contents, its text.
@@ -1877,7 +1878,7 @@ class ChatStore:
             )
         if position is None or before != "user":
             raise LookupError("the chat has no such answer to a question")
-        turns, _ = self.past_turns(chat_id, before_position=position + 1)
+        turns, _ = self.past_turns(chat_id, before_position=position + 1, seen=seen)
         return turns
 
     def answer_notices(self, message_id: str) -> list[dict[str, Any]]:
