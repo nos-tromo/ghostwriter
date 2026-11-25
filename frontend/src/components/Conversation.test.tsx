@@ -244,6 +244,20 @@ describe('Conversation notices', () => {
     expect(screen.getByRole('button', { name: 'Weiter' })).toBeInTheDocument()
   })
 
+  it('puts the German unit in the dative after "von"', async () => {
+    serveAnswered([
+      { ...PARTIAL, file_id: 'F1', name: 'harbour-survey.docx', read: 1, total: 4, unit: 'paragraph' },
+      { ...PARTIAL, file_id: 'F2', name: 'tide-notes.txt', read: 0, total: 1, unit: 'paragraph' },
+    ])
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    expect(await screen.findByText('Von ‚harbour-survey.docx‘ wurden 1 von 4 Absätzen gelesen.')).toBeInTheDocument()
+    expect(screen.getByText('Von ‚tide-notes.txt‘ wurden 0 von 1 Absatz gelesen.')).toBeInTheDocument()
+  })
+
   it('says one page', async () => {
     serveAnswered([{ ...PARTIAL, read: 0, total: 1 }])
     renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)

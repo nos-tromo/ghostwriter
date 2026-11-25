@@ -95,7 +95,7 @@ export const de: Strings = {
   'unit.page_one': 'Seite',
   'unit.slide': 'Folien',
   'unit.slide_one': 'Folie',
-  'unit.paragraph': 'Absätze',
+  'unit.paragraph': 'Absätzen',
   'unit.paragraph_one': 'Absatz',
   'unit.row': 'Zeilen',
   'unit.row_one': 'Zeile',
