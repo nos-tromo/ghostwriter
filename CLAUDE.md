@@ -34,12 +34,26 @@ while it sees (`GHOSTWRITER_VISION`); the bytes live in memory for that one
 message. An attached Word, PowerPoint or OpenDocument text file is prepared too,
 so its pages and slides can be seen (workbench 0.8.1): it is `ready` at once and
 prepared in the background, so Send never waits for it. That holds because
-workbench converts in a gate of its own, with `GHOSTWRITER_WORKBENCH_SLOTS` at 3
-or more (its default). A video or audio clip is taken too, once Nextext is set
-and workbench is 0.9.0 or later: it goes to Nextext for one job, and its
-transcript and frames come back into workbench as derived files of the clip,
-which the model reads with `read_document` and looks at with `view_file`.
-Reference: `docs/`.
+workbench converts in a gate of its own. From workbench 0.10.0 a measure has a
+gate of its own too, so Send never waits for an Office file or a measure while
+workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 4 or more, its default; at 3, a
+prepare, a conversion and a measure together take every slot. A video or audio
+clip is taken too, once Nextext is set and workbench is 0.9.0 or later: it goes
+to Nextext for one job, and its transcript and frames come back into workbench
+as derived files of the clip, which the model reads with `read_document` and
+looks at with `view_file`.
+
+What limits an answer is told to the user, never left to be guessed (design:
+`deploy/docs/superpowers/specs/2026-11-24-ghostwriter-limit-notices-design.md`).
+An answer carries notices, stored with it: `answer_cut` (it ended at its token
+cap, and the latest such answer offers Continue), `document_partial` and
+`document_unread` (a file was read only in part, or an attachment of the
+question not at all), `images_dropped` and `context_trimmed`; an answer the
+router refuses for the model's context ends in the `context` error. A document
+workbench has measured (0.10.0) is known to be longer than one prompt, so its
+tile warns and the model is told to page. The composer shows how full the
+context is, a ring, from the estimate stored with the last answer. Reference:
+`docs/`.
 
 ## Where it fits
 
@@ -76,6 +90,21 @@ Reference: `docs/`.
   restarts or the file is deleted. From 0.8.1 too, an attachment not yet sent is
   taken back with the X on its tile: `DELETE /files/upload` deletes its file and
   renders there, and then its row goes (`api/files.py:remove_attachment`).
+  workbench 0.10.0 measures a document (`POST /files/measure`, body `{path}`;
+  `WorkbenchClient.measure`; the answer holds `unit`, `total`, `chars` and
+  `capped`) on a measure gate of its own, and raises its
+  `GHOSTWRITER_WORKBENCH_SLOTS` to 4. Every `read_document` part from 0.10.0
+  carries `units` (`[first, last]`, 1-based, or `null`) and `cut`. Ghostwriter
+  measures each `document` attachment in the background after its upload, once
+  discovery names 0.10.0 or later (`serves_measure`): on `MEASURE_SLOTS` (1) of
+  its own, never a prepare slot, never `BACKGROUND_SLOTS`, with the wait of a
+  prepare (`PREPARE_TIMEOUT_S`, 390 s, above the 270 s of workbench's measure
+  gate at its defaults). Its state (`attachments.measure_state`: `pending`,
+  `measured`, `none`) never holds Send back. Measured, a document is `too_long`
+  when its count was capped or its `chars` over `CHARS_PER_TOKEN` pass the prompt
+  budget: the tile warns, its attachment line adds `LONGER_THAN_A_PROMPT`, and
+  the system prompt, with tools, adds `PAGING`. What the model read of a file
+  comes from the `units` of the parts it was given, never from a part cut here.
 - **The Nextext seam and clips.** Nextext is reached at `NEXTEXT_API_BASE` on
   `inference-net` with Ghostwriter's own service token (`NEXTEXT_API_KEY`, the
   same value as its entry `ghostwriter=<token>` in Nextext's
@@ -115,37 +144,40 @@ Reference: `docs/`.
 | `ghostwriter/utils/audit_*.py` | vendored from the hub's `configs/audit`; never edited |
 | `ghostwriter/db.py`, `models.py` | SQLite engine and pragmas, schema version, the tables |
 | `ghostwriter/schemas.py` | what the API serves; `expired` is computed at read time |
-| `ghostwriter/store.py` | `ChatStore`: every read and write, by owner; the content deadlines |
+| `ghostwriter/store.py` | `ChatStore`: every read and write, by owner; the content deadlines (an answer's notices and a document's measure too); `too_long` |
 | `ghostwriter/turns.py` | `TurnRegistry`: at most one answer per chat |
 | `ghostwriter/sse.py` | SSE frames; docint's sync-generator bridge |
 | `ghostwriter/body_limit.py` | per-route body caps, as nginx's |
 | `ghostwriter/upload.py` | streaming multipart reader; attachment types, kinds and safe names |
 | `ghostwriter/inference.py` | `ModelClient`: chat rounds and transcriptions through the router |
-| `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, prepare, renditions, `derived` (a clip's artifacts in), chat delete; the pseudonyms |
+| `ghostwriter/workbench.py` | `WorkbenchClient`: MCP tools, upload, view, prepare, `measure` (a document's length, 0.10.0), renditions, `derived` (a clip's artifacts in), chat delete; the pseudonyms |
 | `ghostwriter/vision.py` | `Vision.images_offered` (setting, model, `view_file` listed); the Ollama probe; `system_call` |
 | `ghostwriter/nextext.py` | `NextextClient`: create (a streamed multipart), poll through the list, artifact (streamed, capped), delete, list; `NextextHealth`: the `/ready` probe (`/health` for a Nextext before 1.22) and the offer (`offered`, which also needs workbench 0.9); `JOB_OPTIONS` |
-| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), and an Office file after it is `ready`, in the background, one at a time (`BACKGROUND_SLOTS`); the media step of a clip (to Nextext and back on `MEDIA_SLOTS`, then the prepare), the owned job ids, and `reconcile` (Nextext's jobs no clip owns: at start, after a lost create or a failed delete, in the sweep); the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete or an attachment's take-back |
+| `ghostwriter/processing.py` | `AttachmentProcessor`: prepares a picture or a PDF after its upload (`processing` → `ready` / `failed`), and an Office file after it is `ready`, in the background, one at a time (`BACKGROUND_SLOTS`); the measure step (a document's length, last in its job, one at a time on `MEASURE_SLOTS`, `pending` → `measured` / `none`, recorded as `workbench:measure`); the media step of a clip (to Nextext and back on `MEDIA_SLOTS`, then the prepare), the owned job ids, and `reconcile` (Nextext's jobs no clip owns: at start, after a lost create or a failed delete, in the sweep); the long-poll's `wait`, requeue at start and after a failed delete, cancel on a chat's delete or an attachment's take-back |
 | `ghostwriter/retention_rule.py` | the period rule (docint's, verbatim) and the sweep loop |
 | `ghostwriter/retention.py` | the daily sweep (its first step is the Nextext reconcile, bounded, never stopping the chats) and the dry run |
 | `ghostwriter/log_cfg.py` | the stderr sink; quiet HTTP and SDK loggers |
 | `ghostwriter/agent/limits.py` | the caps per message |
-| `ghostwriter/agent/loop.py` | `AgentLoop`: rounds and tool calls within the caps |
+| `ghostwriter/agent/loop.py` | `AgentLoop`: rounds and tool calls within the caps; the notices it tells, `_refuses_context` (the `context` error), the estimate stored with every answer (`TurnOutcome`), and Continue (`Turn.continued`: one round, no tools, no thinking, appended in place) |
+| `ghostwriter/agent/notices.py` | `NoticeEvent` (the live frame with a file's name, the stored form without it), `Reading` (what a message's calls opened and read: `document_partial`, `document_unread`), `SentFile`, `covered` (the union of the units read) |
 | `ghostwriter/agent/stream.py`, `reasoning.py` | one streamed round; reasoning stripped (docint's) |
-| `ghostwriter/agent/context.py` | the prompt fitted to the budget; follow-ups replayed |
+| `ghostwriter/agent/context.py` | the prompt fitted to the budget; follow-ups replayed; `FitReport` (the earlier turns there were and those replayed, from the first round); `next_prompt_tokens` and `finished_turn` (the estimate of the next prompt, counted as `fit` sizes); `continuation` (a continued turn's messages); `LONGER_THAN_A_PROMPT` in a document's line |
 | `ghostwriter/agent/images.py` | image refs, their token estimate, the notes where one gives way, the `ImageBank` and `materialise` (refs to data URLs, as a round goes out) |
 | `ghostwriter/agent/tools.py` | tools as OpenAI functions; arguments read; what the model reads back |
-| `ghostwriter/agent/prompt.py` | the system prompt |
+| `ghostwriter/agent/prompt.py` | the system prompt; `PAGING` (read a long document in parts, say which); `CONTINUE` (the instruction for a provider that does not go on in the answer's own message) |
 | `ghostwriter/api/chats.py` | list, create, read, rename, delete |
-| `ghostwriter/api/messages.py` | send and regenerate (SSE), stop |
+| `ghostwriter/api/messages.py` | send, regenerate and continue (SSE), stop |
 | `ghostwriter/api/files.py` | attachments and downloads |
 | `ghostwriter/api/speech.py` | `/api/transcribe`, only with speech input on |
-| `ghostwriter/api/meta.py` | `/api/whoami`, `/api/config` |
+| `ghostwriter/api/meta.py` | `/api/whoami`, `/api/config` (with the prompt budgets, plain and reasoning) |
 | `frontend/src/api/` | `apiFetch` (the purpose on every request), routes, SSE reader |
 | `frontend/src/hooks/` | chats, the chat streams (one per chat, held above the open chat), attachments, the recorder, the stray-drop guard |
 | `frontend/src/hooks/usePreview.ts` | a picture's render as an object URL, fetched once with the purpose; says when it is gone |
 | `frontend/src/components/` | chat list, conversation, trail, result cards, composer, retention note |
 | `frontend/src/components/AttachmentTiles.tsx` | the composer's tiles: uploading, processing (a clip: transcribing), ready, failed; preview and lightbox (a clip has neither: its icon only) |
 | `frontend/src/components/AttachmentImage.tsx` | a sent picture in the user's bubble, opening full size in a lightbox |
+| `frontend/src/components/NoticeLines.tsx` | an answer's notices as lines under it, Continue on the latest `answer_cut` |
+| `frontend/src/components/ContextNote.tsx`, `hooks/useContextUse.ts`, `lib/context.ts` | the composer's note (nearly full, trimmed; a New chat button), the ring's ratio from the last answer's estimate, `NEAR_FULL_RATIO` |
 | `frontend/src/i18n/` | en and de with key parity; German uses "Sie" |
 | `frontend/nginx/` | sub-path, the stream, body caps, security headers |
 
@@ -166,8 +198,11 @@ Reference: `docs/`.
 - Nothing is fetched at runtime: no CDN; the highlighting languages are bundled.
 - Audit records references only; an action whose event cannot be written does
   not happen (fail closed).
-- Logs hold ids, counts, statuses and tokens, never content or file names
-  (loguru `{}` placeholders).
+- Logs hold ids, counts, statuses and tokens, never content, file names or a
+  router's refusal text (loguru `{}` placeholders).
+- A notice holds a code, a file's id and counts, never content and never a
+  file's name (the name is read from the attachment row when it is served); a
+  measure sends a path and keeps four counts.
 
 **One process.** The backend runs as `uvicorn --factory ghostwriter.main:create_app`
 with one worker: the process holds the one audit chain, the turn registry and
@@ -204,15 +239,66 @@ the sweep. Never add workers or replicas.
    only `materialise`, just before the model call, swaps each ref for its label
    and a data URL, in a new list. A round the router refuses with images before
    any text goes once more without them, and the turn goes on as without sight.
+   The message's first round fills a `FitReport` (the earlier turns there were
+   and those replayed; filled again for the try without images): a request the
+   router took that left earlier turns out tells `context_trimmed`, once, before
+   any text. A refusal for the model's context (`_refuses_context`: a 400 or 413
+   naming the context) goes the same way once without images, and ends the turn
+   with the `context` error when none were sent or it is refused again; the log
+   then names `GHOSTWRITER_CONTEXT_TOKENS`, which may be above the model's real
+   context. A tool result goes to the model cut at `TOOL_RESULT_CHARS` (16,896:
+   workbench's 16 KB default plus 512 for the fields its size check leaves out,
+   so that a default answer is never cut), and a `read_document` answer is cut
+   by whole parts, keeping `next_part`.
 5. The frames are `start` (always first), then `token`, `step`, `result`,
-   `notice` (what the user is told while the answer goes on: `images_dropped`)
-   and `error`, then `final` (always last), with a keep-alive comment every 15 s.
-   A stop or a disconnect sets the turn's event: the call in flight finishes
-   and is stored, and no further round starts.
+   `notice` and `error`, then `final` (always last), with a keep-alive comment
+   every 15 s. A `notice` is a code with every detail it has, a file's name
+   included (`file_id`, `name`, `read`, `total`, `unit`; stored without the
+   name, which is read from the attachment when the answer is served):
+   `context_trimmed` before any text; `images_dropped` where it happens;
+   `answer_cut` after the text, when the last round, one without calls, ended
+   at its token cap; then, once the rounds have ended (a stop or a model error
+   too), `document_partial` for each attachment of the chat that
+   `read_document` read only in part, and `document_unread` for each
+   attachment of the question no call opened, none of either after a
+   `run_python` or `search_files` call (they read files without naming them);
+   an `error` is last. `final` carries `context_estimate`, the estimated tokens
+   of the next prompt, as stored with the answer (`null` for a turn stopped
+   before it began). A stop or a disconnect sets the turn's event: the call in
+   flight finishes and is stored, and no further round starts.
 6. Every `ChatStore` method is one short transaction that returns schema
    objects. File marks set how long content derived from a file may live
    (`store.py` docstring); the daily sweep (`retention.py`) deletes by the same
-   deadlines.
+   deadlines. The answer is stored with its notices (`messages.notices`; the
+   details of a file's notice, its id and counts, follow the content deadline
+   through `notices_expire_at`, then only the code stays) and the estimate of the
+   next prompt (`messages.context_estimate`): the system prompt, the tool schemas
+   and every turn as `fit` would replay it, this answer among them, counted by
+   the same code and with `CHARS_PER_TOKEN`, so a chat past its budget shows as
+   past it. `/api/config` serves the budgets it is read against, `prompt_tokens`
+   and `reasoning_prompt_tokens` (`limits.prompt_tokens` of
+   `GHOSTWRITER_CONTEXT_TOKENS`); the SPA divides the estimate by the one the
+   reasoning switch selects, for the ring, and decides "nearly full"
+   (`NEAR_FULL_RATIO`, 0.8, a frontend constant) on the same unrounded number.
+
+**Continue.** `POST /api/chats/{id}/messages/{message_id}/continue` goes on with
+the chat's latest answer while it carries `answer_cut`; any other answer, a
+question or an unknown id is 409 `not_continuable`, and a chat with a turn
+running 409 `busy`, both before anything is recorded or stored. It claims the
+chat as a message does and records `modify` / `chat.continue` (target the
+answer, one `chat.answer` child for its one round) before anything is stored.
+`Turn.continued` runs one round with no tools and no thinking, on the budget of
+a round without thinking, over the earlier turns, the turn replayed as history
+and the answer so far as the last assistant message (`context.continuation`).
+On vllm the body is `CONTINUE_BODY` (`continue_final_message: true`,
+`add_generation_prompt: false`, `enable_thinking: false`), so the template goes
+on in that message; any other provider gets the answer so far and then the user
+instruction `CONTINUE`, a less seamless join. The new text is appended to the
+same answer, with the same frames (`start` and `final` name the answer and no
+question); its other notices stay, and `answer_cut` is computed again: gone once
+the round ended cleanly below the cap, told again after a cut, an error or a
+stop. The estimate is made again. Regenerate replaces the whole answer after it,
+as before.
 
 ## Commands
 
@@ -272,6 +358,17 @@ strict; lines are 120 characters.
   `Makefile`, nginx, Vite's `base` and `.env.example` (its tag comments,
   lines under 80 characters).
 - A setting: `load_settings` in `config.py`, `.env.example`, `docs/configuration.md`.
+- The notice codes: `schemas.NoticeCode` (the backend's `notices.NOTICE_CODES`
+  follows it), `NoticeCode` in `frontend/src/api/types.ts`, `NOTICE_CODES` in
+  `frontend/src/hooks/chatStreams.tsx`, and the `notice.*` strings and the lines
+  of `NoticeLines.tsx`; a stored code this version does not know reads as none.
+- The measure units: `schemas.MeasureUnit`, `_MEASURE_UNITS` in `workbench.py`
+  and workbench's own units, `MeasureUnit` in `frontend/src/api/types.ts`,
+  `UNIT_KEYS` in `NoticeLines.tsx` and the `unit.*` strings (many and one).
+- `CHARS_PER_TOKEN` and `limits.prompt_tokens`: they size the prompt budget,
+  the `too_long` of a measured document (`store.py`), the next-prompt estimate
+  and the budgets `/api/config` serves, which the ring and "nearly full" divide
+  by (`NEAR_FULL_RATIO` and `lib/context.ts`).
 - The schema (now version 3: attachments carry `kind`, `status`, `render`,
   `failure`, `measure`, `measure_state`; answers `notices`,
   `context_estimate`, `notices_expire_at`): raise `SCHEMA_VERSION` in `db.py` and add

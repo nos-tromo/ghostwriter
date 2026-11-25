@@ -10,9 +10,9 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 | Table | Columns | Kept |
 |---|---|---|
 | `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
-| `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at | with the chat |
+| `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at; for an answer also notices (a list of codes: `answer_cut`, `document_partial`, `document_unread`, `images_dropped`, `context_trimmed`; the two about a file also its file id and counts: how much was read, of how much, in which unit), context_estimate (the estimated tokens of the next prompt) and notices_expire_at (the deadline of the file details) | with the chat; the file details of a notice until `notices_expire_at`, the content deadline within `WORKBENCH_RETENTION_DAYS` (7), then only the code ([retention.md](retention.md)) |
 | `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 16,896 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
-| `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`, `media`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders; for a clip its frame count, its length and whether it has a transcript), failure (a token), created_at | with the chat, or until its owner takes it back before sending it; `render` until the file period (7 days), then emptied ([retention.md](retention.md)) |
+| `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`, `media`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders; for a clip its frame count, its length and whether it has a transcript), failure (a token), created_at, measure (a document's length: its count, unit, the characters a full read shows and whether the count was capped), measure_state (`pending`, `measured`, `none`; empty for a picture, a clip or a row from before schema 3) | with the chat, or until its owner takes it back before sending it; `render` and `measure` until the file period (7 days), then emptied ([retention.md](retention.md)) |
 | `results` | id, message_id, position, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `file_marks` | chat_id, created_at: when the chat's workbench folder may have got a file (an attachment, a hand-over, a tool call, a step or a result) | with the chat |
 | `retention_periods` | the chat period's state, and the file period the content deadlines were set under | no personal data |
@@ -37,6 +37,11 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
   that always think, or a round cut at `max_tokens` inside a think block, need
   vllm-service's `CHAT_REASONING_PARSER`; otherwise the held reasoning is
   released as text, as in docint.
+- **A file's name in a notice.** A notice about a file holds its workbench id and counts. The name is read
+  from the chat's attachment row when the answer is served, and a live `notice` frame carries it for that
+  stream only.
+- **The router's refusal text.** A round the router refuses for the model's context is told as the `context`
+  error; its text is never kept, logged or recorded.
 - **The purpose.** Only in the audit events and in the headers to workbench and
   to Nextext (every call: create, poll, artifacts, delete), which record it in
   their own audit too. The browser keeps it for the tab's session.
@@ -47,11 +52,13 @@ Logs hold ids, counts, statuses and tokens only.
 
 | To | What | Under |
 |---|---|---|
-| The router, chat (`OPENAI_API_BASE`) | the system prompt (the date and, with tools, the chat's folder and the file period; when workbench offers `write_presentation`, also a fixed rule on presentations; while the model sees, also how to look at files and at the decks it builds; these rules hold no data), the message with its attachments by name, path and size (a clip also by its length, its frame count and whether it has a transcript), the turn's tool calls and results, and earlier turns within the budget; while the model sees, also the attached pictures and the pages or pictures a tool showed, as `image_url` data URLs of workbench's renders (workbench removes their metadata), held for one message, and the earlier turns' pictures while the budget allows | `X-Cache-Scope` (an HMAC of the account under a key that never leaves the process, new at each start), `X-Request-ID` |
+| The router, chat (`OPENAI_API_BASE`) | the system prompt (the date and, with tools, the chat's folder, the file period and a fixed rule on reading a long document in parts (`next_part`); when workbench offers `write_presentation`, also a fixed rule on presentations; while the model sees, also how to look at files and at the decks it builds; these rules hold no data), the message with its attachments by name, path and size (a clip also by its length, its frame count and whether it has a transcript; a document workbench measured as longer than one prompt also says that it is, and to read it in parts), the turn's tool calls and results, and earlier turns within the budget; while the model sees, also the attached pictures and the pages or pictures a tool showed, as `image_url` data URLs of workbench's renders (workbench removes their metadata), held for one message, and the earlier turns' pictures while the budget allows | `X-Cache-Scope` (an HMAC of the account under a key that never leaves the process, new at each start), `X-Request-ID` |
+| The router, a Continue round | the chat as for any round, with no tools and no thinking: the earlier turns within the budget, the turn as an earlier one is replayed (its calls and results cut as a replay cuts them), and the answer so far as the last assistant message; on vllm the body asks the template to go on in that message (`continue_final_message`, `add_generation_prompt` off, `enable_thinking` off); to any other provider the answer is followed by one fixed instruction to go on where it stopped, repeating nothing | the same |
 | The router, speech-to-text | the recording | the same |
 | workbench `/mcp` | tool arguments; results back, with the pages or pictures a tool shows | `X-User-Id` and `X-Session-Id`: HMAC-SHA256 of the account and of the chat id under `WORKBENCH_API_KEY`; the purpose (or `ghostwriter chat`), `X-Request-ID`; `X-Accept-Images: 1` on the discovery of the listing for images, and on a turn's calls only while it sees |
 | workbench `/files/upload`, `/files/view` | an attachment's bytes, a download's bytes | the same |
 | workbench `POST /files/prepare` | the path of a picture, a PDF or an Office file in the chat's folder, and with a fixed image cost `strips=2` for a large picture; the manifest back | the same |
+| workbench `POST /files/measure` | the path of a document in the chat's folder; its length back (its count and unit, the characters of a full read, whether the count was capped), from workbench 0.10.0 only | the same |
 | workbench `GET /files/view?rendition=` | the number of a page or picture; its render back, for a message's model call or for the owner's preview | the same |
 | Ollama `POST /api/show`, on the router's host | the chat model's name only, once at start; only with `INFERENCE_PROVIDER=ollama` and pictures on | the router's key |
 | Nextext `POST /jobs` (`NEXTEXT_API_BASE`) | a video or audio clip, streamed from workbench, under the name `media.<ext>` and never the user's file name, with fixed options (frames at 20 a minute, at most 19; no captions, no summary); only while Nextext is set | `Authorization: Bearer <NEXTEXT_API_KEY>` (the service `ghostwriter`), the purpose (or `ghostwriter chat`), `X-Request-ID` |
@@ -93,7 +100,8 @@ pictures are offered, it is also prepared after that, in the background and one
 at a time; without them it is `ready` and never prepared, as before 0.5.0. Until
 its manifest is kept it reads as text. Then its line names the pages or slides,
 and the model can view them, while the turn sees. The manifest keeps its `unit`
-(`page` or `slide`). workbench 0.8.0 converts the file once and keeps the PDF as
+(`page` or `slide`). A document measured as longer than one prompt adds to its
+line that it is, and to read it in parts ([below](#a-documents-length)). workbench 0.8.0 converts the file once and keeps the PDF as
 its own derived file, deleted with the file.
 
 Four things of workbench 0.8.1 matter here (0.8.0 converts and draws the file,
@@ -102,10 +110,12 @@ but has none of them):
 - **Conversions have a gate of their own.** workbench converts one Office file
   of Ghostwriter's at a time, over all its users, apart from the gate where
   pictures and PDFs are prepared. A picture's or a PDF's prepare is therefore
-  admitted while a deck converts, and Send waits for the picture only. This
-  holds while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its
-  default: a conversion, a picture's prepare and a tool call each take one. With
-  fewer, a prepare or a tool call can queue behind a conversion.
+  admitted while a deck converts, and Send waits for the picture only. From
+  workbench 0.10.0 a measure has a gate of its own too, so Send never waits for
+  an Office file or a measure while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is
+  4 or more, its default; at 3, a prepare, a conversion and a measure together
+  take every slot, and a tool call can queue behind them. With fewer, a prepare
+  or a tool call can queue behind a conversion.
 - **A tool call waits out the prepare.** A call that needs a deck's slides while
   its background prepare runs (`view_file`, or the pictures of `read_document`)
   waits for it in workbench, up to 120 s, and then shows the slides. No second
@@ -131,8 +141,10 @@ file reads as text, as before.
   /api/chats/{id}/attachments/{attachment_id}?wait=` answers when the status
   settles, or after at most 20 s, and keeps nothing. After a `processing`
   answer the SPA asks again no sooner than 500 ms after its request began. A
-  prepare is asked once more after a busy workbench (503), never after one that
-  timed out.
+  `ready` document whose measure is still `pending` is followed the same way,
+  for its length; a `processing` file's wait ends with its prepare, never with
+  the measure after it. A prepare is asked once more after a busy workbench
+  (503), never after one that timed out.
 - **The preview.** `GET …/preview?page=` streams one render from workbench's
   view route, with its hardening headers, for a tile or the lightbox. Nothing is
   kept or cached here, and each call is a `disclose` event.
@@ -146,6 +158,37 @@ file reads as text, as before.
   before 0.7.0 (no `view_file`), the turn has no sight: no picture goes to the
   model, nor a note that `view_file` shows one, and the attachment line says the
   picture is not shown.
+
+## A document's length
+
+From workbench 0.10.0 (`serves_measure`, read from its discovery) every document (not a picture, not a clip) is
+also measured after its upload, for its length. It is stored with its measure `pending` and is `ready` as before:
+Send never waits for the measure. Before 0.10.0, or with workbench off, its state is `none`, and the document reads
+and shows as it did, with no warning.
+
+- **When and where.** The measure is the last step of the file's job, after its prepare for a PDF or an Office
+  file, at once for any other document. Documents are measured one at a time, on a slot of their own
+  (`MEASURE_SLOTS`), never one of the prepare slots or the Office files' background slot, so a slow measure delays
+  no picture's prepare. workbench measures on a gate of its own (0.10.0).
+- **What goes, what comes back.** `POST /files/measure` carries the path in the chat's folder. The answer's count and
+  unit (`page`, `slide`, `paragraph`, `row` or `line`), the characters a full read shows (counted up to workbench's
+  cap) and whether the count was capped are kept as `measure`: four values, never a path or a kind.
+- **Recorded first.** A `disclose` event (`workbench:measure`: its kind) is written before the request; unrecorded,
+  nothing is sent and the state is `none` ([audit.md](audit.md)). A busy workbench (503) is asked once more after
+  10 s. Each read of the answer waits up to `PREPARE_TIMEOUT_S` (390 s), above the 270 s workbench's measure gate
+  takes at its defaults (120 s of queue, the caller's wall, 30 s). A measure that fails is recorded as an `error`
+  child, and the state is `none`.
+- **Too long.** A measured document is `too_long` when its count was capped, or its characters over
+  `CHARS_PER_TOKEN` (3) pass the prompt budget (the context less the answer and the margin: 34,000 tokens at 40k).
+  Then its tile in the composer warns "Read only in parts" („Nur in Teilen lesbar“), its attachment line to the
+  model adds "longer than one prompt: read it in parts and say which parts you read", and the system prompt, while
+  tools are offered, says how: call `read_document` again with `part` set to `next_part`, and say plainly which
+  parts were not read. A document that fits one prompt reads as before.
+- **After the file's period** the measure is emptied with the manifest, and the SPA is served no length
+  ([retention.md](retention.md)). A `ready` document still `pending` at start is measured again, as the system
+  does (`requeued`); with workbench off at start it is settled `none`.
+
+What a message then read of a long document is told under its answer (`document_partial`, [below](#what-the-user-is-told)).
 
 ## A video or audio clip, after its upload
 
@@ -240,8 +283,45 @@ to the model". It says "no speech" whenever the manifest holds no transcript: al
 cap or one workbench could not read, since the manifest keeps workbench's facts, not why Nextext's transcript is
 missing. The model reads the transcript with `read_document` and looks at the frames with `view_file`. workbench
 0.9 leaves a clip out of `run_python` and `search_files` jobs, so these two tools are the only way to it. The
-transcript is text in a tool result, and so goes to the router like any other. workbench's own
-`docs/data-flow.md` (0.9.0) describes the other end of the derived files.
+transcript is text in a tool result, and so goes to the router like any other. A clip is never measured, so its
+line never says it is longer than a prompt; a long transcript is read in parts as any long document is, and
+`document_partial` says so once the parts do not cover it. workbench's own `docs/data-flow.md` (0.9.0) describes
+the other end of the derived files.
+
+## What the user is told
+
+What limited an answer is told under it, stored with it, and the context's fullness at the composer. Each notice
+holds a code and, for a file, its workbench id and counts; the name is read from the attachment row.
+
+| Notice | When | Shown |
+|---|---|---|
+| `answer_cut` | the last round, one without calls, ended at its token cap (`finish_reason` `length`, or output tokens at the cap) | a line under the answer; on the chat's latest answer with Continue |
+| `document_partial` | a `read_document` read a file of the chat only in part: the units of the parts the model was given (a part cut here is not counted) cover less than the measure's total, or, with none, the answer's `total_parts` where a part is one unit (`pdf`, `pptx`, `docx`, `odt`, `text`); a page or slide without text, which was looked at, counts as read | "Of 'name', 3 of 9 pages were read." |
+| `document_unread` | a `ready` document or clip attached to the question, or a picture while the turn does not see, that no call opened | "'name' was not read for this answer." |
+| `images_dropped` | the router refused a round's images, and it went again without them | a line under the answer |
+| `context_trimmed` | the message's first round, the one the router took, left earlier turns out of the prompt | the composer's note for the chat's latest answer only, never under each answer |
+| error `context` | the router refused a round, with no image left to drop, as longer than the model's context | the error line, in place of the model error |
+
+After a `run_python` or `search_files` call neither file notice is given: those tools read files without naming
+what they read, and a notice never says what is not known to be true. A turn with no tools offered still says
+`document_unread`, and it is true.
+
+**The meter.** At the end of every answer, a regenerated or a continued one included, the server estimates the
+tokens the next prompt starts with: the system prompt, the tool schemas and every turn as the replay would send it,
+this answer among them, counted as the budget is, with no image cap and nothing left out, so that a chat past its
+budget shows as past it. It is stored with the answer. The SPA divides it by the budget `GET /api/config` serves
+(`prompt_tokens`, or `reasoning_prompt_tokens` while the composer's reasoning switch is on), up to 100 %, as a ring
+beside the switch. From 80 % (`NEAR_FULL_RATIO`, decided on the unrounded share, so the ring and the note agree) the
+ring takes the warning colour and the composer's note offers a new chat. An empty chat, and an answer stored before
+estimates were kept, show no ring.
+
+**Continue.** On the chat's latest answer cut at its cap, Continue sends one more round to the router, as
+[above](#where-data-goes) (`POST /api/chats/{id}/messages/{message_id}/continue`, recorded as `chat.continue`), and
+appends its text to the same answer. It calls no tool and keeps no file.
+
+**What a notice leaves behind.** A notice's file id and counts are made with the answer, and go at the content
+deadline ([retention.md](retention.md)): after it the answer serves the code, with a line that names neither the
+file nor numbers. A chat written before notices were kept has none and renders as it did.
 
 ## Who can read it
 

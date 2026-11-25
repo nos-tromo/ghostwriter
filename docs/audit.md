@@ -86,6 +86,19 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
   hand-over cannot be written is not sent, without a child. A measure tried again
   after a busy workbench is the same hand-over, recorded once. A chat deleted or
   an attachment taken back meanwhile cancels it: no `error` child follows.
+- A Continue (`POST …/messages/{message_id}/continue`) is recorded as a message is:
+  its primary `modify` / `chat.continue`, naming the answer it goes on with, is written
+  before anything is stored, and its one round is one `ai_call` / `chat.answer` child
+  (`reasoning: false`, `images: 0`; it calls no tool, so no `chat.tool`). A Continue the
+  server refuses (409 `busy`, or `not_continuable` for any answer but the chat's latest
+  one cut at its length limit) records nothing and changes nothing. A record that cannot
+  be written stops it with the `audit` error frame, as for a message.
+- A notice is no event. What an answer tells of itself (`answer_cut`, `document_partial`,
+  `document_unread`, `images_dropped`, `context_trimmed`) is stored with the answer as
+  codes, file ids and counts, never a name or content, and the `chat.answer` criteria
+  are as they were. The sweep records, as `retention.tool_content` with the target
+  `message`, the answers whose notices it strips to their codes
+  ([retention.md](retention.md)).
 - A video or audio clip goes to Nextext after its upload has answered, on its own
   two slots, so its `nextext:transcribe` child follows the upload's events. Its
   `workbench:prepare` child is written only once Nextext's job completed, also
