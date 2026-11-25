@@ -543,8 +543,9 @@ async def _read_after_wait(
     The row is read first, and answered at once unless it is ``processing``, or ``ready`` with its measure
     ``pending``: any other ``ready`` one, an Office file whose background job still runs included, is never waited
     for. A followed row whose job has ended since is read again before the wait, which then lasts its whole time
-    only for a row no job settles. A ``processing`` row's wait ends with its prepare, never with the measure after it
-    (:meth:`~ghostwriter.processing.AttachmentProcessor.wait`).
+    only for a row no job settles. A ``processing`` row's wait ends with its prepare, never with the measure after it,
+    also when the job has left its prepare between the read and the wait
+    (:meth:`~ghostwriter.processing.AttachmentProcessor.wait`'s ``prepare_only``): a send never waits for a measure.
 
     Args:
         store: The chats.
@@ -564,7 +565,7 @@ async def _read_after_wait(
         found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
         if found is None or not _followed(found):
             return found
-    await processor.wait(attachment_id, wait)
+    await processor.wait(attachment_id, wait, prepare_only=found.status == "processing")
     return await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
 
 

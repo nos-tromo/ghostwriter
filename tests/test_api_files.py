@@ -983,7 +983,7 @@ def test_an_office_file_is_not_prepared_with_vision_off(client: TestClient, door
 async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Path) -> None:
     """A ready deck whose background job runs is answered at once, whatever wait was asked, and so is a measured one.
 
-    A processing row waits, and so does a ready one whose measure is pending.
+    A processing row waits for its prepare only, and a ready one whose measure is pending for its job.
     """
     settings = make_settings(tmp_path, vision=True)
     engine = make_engine(settings.db_path)
@@ -1015,10 +1015,10 @@ async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Pat
         processor.wait.assert_not_called()
         found = await _read_after_wait(store, processor, "user-a", cid, scan, wait=20)
         assert found is not None and found.status == "processing"
-        processor.wait.assert_awaited_once_with(scan, 20)
+        processor.wait.assert_awaited_once_with(scan, 20, prepare_only=True)
         found = await _read_after_wait(store, processor, "user-a", cid, notes, wait=20)
         assert found is not None and found.length is not None and found.length.state == "pending"
-        processor.wait.assert_awaited_with(notes, 20)
+        processor.wait.assert_awaited_with(notes, 20, prepare_only=False)
     finally:
         engine.dispose()
 

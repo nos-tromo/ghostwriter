@@ -654,24 +654,28 @@ class AttachmentProcessor:
         running = self._running.get(attachment_id)
         return running is not None and not running.task.done()
 
-    async def wait(self, attachment_id: str, timeout_s: float) -> None:
+    async def wait(self, attachment_id: str, timeout_s: float, *, prepare_only: bool = False) -> None:
         """Wait until the attachment's job has settled what its status request follows, at most ``timeout_s``.
 
         While the job prepares, that is the prepare: a ``processing`` row is settled then, and a request for it is
-        answered without waiting for the measure after it. After that, it is the job's end, its measure included.
-        Without a job the status cannot change, so this sleeps ``timeout_s``: a client that follows it
-        asks again no sooner.
+        answered without waiting for the measure after it. After that, it is the job's end, its measure included;
+        but a request that read the row ``processing`` follows its prepare alone, and returns at once once the job
+        has left it, as the stage may have moved on between its read and its wait. Without a job the status cannot
+        change, so this sleeps ``timeout_s``: a client that follows it asks again no sooner.
 
         Args:
             attachment_id: The attachment.
             timeout_s: The longest wait, in seconds.
+            prepare_only: Whether the request read the row ``processing``: its wait ends with the prepare, never with
+                the measure after it.
         """
         running = self._running.get(attachment_id)
         if running is None:
             await asyncio.sleep(timeout_s)
             return
         if running.prepared.is_set():
-            await asyncio.wait({running.task}, timeout=timeout_s)
+            if not prepare_only:
+                await asyncio.wait({running.task}, timeout=timeout_s)
             return
         prepared = asyncio.get_running_loop().create_task(running.prepared.wait())
         try:

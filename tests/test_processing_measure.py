@@ -6,6 +6,7 @@ an emitter on :class:`~tests.conftest.CapturedAuditStream`. Every name, id and v
 
 import asyncio
 import json
+import threading
 from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -20,6 +21,7 @@ from sqlalchemy import Engine, select
 from sqlalchemy.orm import Session
 
 from ghostwriter import __version__, processing
+from ghostwriter.api.files import _read_after_wait
 from ghostwriter.audit import Operation, RequestContext, open_emitter
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
@@ -32,7 +34,7 @@ from ghostwriter.processing import (
     AttachmentProcessor,
     PrepareJob,
 )
-from ghostwriter.schemas import LengthOut
+from ghostwriter.schemas import AttachmentOut, LengthOut
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import Actor, AuditEmitter, Target
 from ghostwriter.workbench import WorkbenchClient, chat_folder
@@ -294,6 +296,47 @@ async def test_a_wait_on_a_processing_row_ends_with_its_prepare(env: Env) -> Non
     with anyio.fail_after(5):
         await env.processor.wait(job.attachment_id, 30)
     assert _row(env, job)[1] == "measured"
+
+
+async def test_a_poll_that_read_processing_never_waits_for_the_measure(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A status poll that read a PDF ``processing`` answers once it is prepared, though its measure is held.
+
+    The poll's first read is held until the job has left its prepare and sent its measure, so its wait starts with the
+    row ``ready`` and its measure ``pending``: the window between a poll's read and its wait, where the job's stage has
+    moved on. The poll answers the row ready at once; it is not held for the measure, and Send is not held with it.
+    """
+    job = _document(env, "long-report.pdf", b"%PDF-1.7", status="processing")
+    env.door.gates["/files/prepare"] = asyncio.Event()
+    env.door.gates["/files/measure"] = asyncio.Event()
+    read, released = threading.Event(), threading.Event()
+    attachment_out = env.store.attachment_out
+
+    def held(owner: str, chat_id: str, attachment_id: str) -> AttachmentOut | None:
+        found = attachment_out(owner, chat_id, attachment_id)
+        if not read.is_set():
+            read.set()
+            released.wait(5)
+        return found
+
+    monkeypatch.setattr(env.store, "attachment_out", held)
+    env.processor.submit(job)
+    poll = asyncio.create_task(
+        _read_after_wait(env.store, env.processor, "user-a", env.chat_id, job.attachment_id, wait=30)
+    )
+    await _until(read.is_set)
+    assert _row(env, job)[0] == "processing"
+    env.door.gates["/files/prepare"].set()
+    await _until(lambda: bool(_requests(env.door, "/files/measure")))
+    released.set()
+    with anyio.fail_after(5):
+        found = await poll
+    assert found is not None and (found.status, found.length) == (
+        "ready",
+        LengthOut(state="pending", total=None, unit=None, too_long=False),
+    )
+    assert env.processor.running(job.attachment_id)
 
 
 async def test_an_office_file_is_measured_after_its_background_prepare(env: Env) -> None:
