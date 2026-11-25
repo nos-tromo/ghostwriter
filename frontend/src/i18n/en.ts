@@ -35,6 +35,7 @@ export const en = {
   'chat.copy_code': 'Copy code',
   'chat.answer_busy': 'An answer is still being written in this chat.',
   'chat.no_answer': 'There is no answer to regenerate.',
+  'chat.not_continuable': 'Only the latest answer cut at the length limit can be continued.',
   'chat.images_dropped': 'The model did not take the pictures; it answered without them.',
   'chat.attachment_processing': 'Wait until the attached files are ready.',
 
@@ -80,6 +81,24 @@ export const en = {
   'mic.unavailable': 'No microphone could be used.',
   'mic.limit': '{s} s left',
 
+  // what an answer says about itself, under it
+  'notice.answer_cut': 'The answer was cut at the length limit.',
+  'notice.continue': 'Continue',
+  'notice.document_partial': "Of '{name}', {read} of {total} {units} were read.",
+  'notice.document_partial_generic': 'A document was read only in part.',
+  'notice.document_unread': "'{name}' was not read for this answer.",
+  'notice.document_unread_generic': 'An attachment was not read for this answer.',
+  'unit.page': 'pages',
+  'unit.page_one': 'page',
+  'unit.slide': 'slides',
+  'unit.slide_one': 'slide',
+  'unit.paragraph': 'paragraphs',
+  'unit.paragraph_one': 'paragraph',
+  'unit.row': 'rows',
+  'unit.row_one': 'row',
+  'unit.line': 'lines',
+  'unit.line_one': 'line',
+
   // the trail of tool steps
   'trail.steps': '{n} steps',
   'trail.steps_one': '1 step',
@@ -120,6 +139,7 @@ export const en = {
   'error.model': 'The model did not answer. Try again.',
   'error.audit': 'The answer stopped: it could not be recorded.',
   'error.internal': 'Something went wrong.',
+  'error.context': 'This chat is too long for the model. Start a new chat or shorten your message.',
 
   // retention note
   'retention.chats': 'Chats are deleted {days} days after they were started.',

@@ -66,7 +66,10 @@ export interface ResultOut {
   expired: boolean
 }
 
-/** A message with what belongs to it. */
+/** A message with what belongs to it. `notices` is what the answer says about
+ *  itself, stored with it; null for an answer written before notices were kept
+ *  (and for a question). `context_estimate` is the estimated size of the next
+ *  prompt in tokens, null where none was made. */
 export interface MessageOut {
   id: string
   role: Role
@@ -75,6 +78,8 @@ export interface MessageOut {
   attachments: AttachmentOut[]
   steps: StepOut[]
   results: ResultOut[]
+  notices: NoticeOut[] | null
+  context_estimate: number | null
 }
 
 /** A chat as its owner opens it. */
@@ -150,21 +155,41 @@ export interface TokenFrame {
 
 export interface FinalFrame {
   message_id: string
-  /** The message sent, or null for a regenerated answer. */
+  /** The message sent, or null for a regenerated or continued answer. */
   user_message_id: string | null
   chat: ChatOut
   stopped: boolean
+  /** The estimated tokens of the next prompt; null where none was made. */
+  context_estimate: number | null
 }
 
+/** Why the answer ended early; `context` is the router refusing a round as
+ *  longer than the model's context, with no picture left to drop. */
 export interface ErrorFrame {
-  code: 'model' | 'audit' | 'internal'
+  code: 'model' | 'audit' | 'internal' | 'context'
   message: string
 }
 
-/** What the answer should say about itself: `images_dropped`, the model took no
- *  pictures and answered without them. A code this app does not know is ignored. */
-export type NoticeCode = 'images_dropped'
+/** What the answer says about itself: `answer_cut` (it ended at the length
+ *  limit), `document_partial` (a document was read in part), `document_unread`
+ *  (an attachment was not opened), `images_dropped` (the model took no pictures
+ *  and answered without them) and `context_trimmed` (earlier turns were left
+ *  out of the prompt). A code this app does not know is ignored. */
+export type NoticeCode = 'answer_cut' | 'document_partial' | 'document_unread' | 'images_dropped' | 'context_trimmed'
 
-export interface NoticeFrame {
+/** What a document is counted in. */
+export type MeasureUnit = 'page' | 'slide' | 'paragraph' | 'row' | 'line'
+
+/** One notice, as stored with an answer and as its live frame carries it. The
+ *  details of a document notice are null once they have expired, and a notice
+ *  of another kind carries none. */
+export interface NoticeOut {
   code: NoticeCode
+  file_id?: string | null
+  name?: string | null
+  read?: number | null
+  total?: number | null
+  unit?: MeasureUnit | null
 }
+
+export type NoticeFrame = NoticeOut

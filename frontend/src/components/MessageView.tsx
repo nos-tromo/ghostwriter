@@ -5,6 +5,7 @@ import { useLang, useT } from '../i18n/LanguageContext'
 import { formatSize } from '../lib/format'
 import { AttachmentImage } from './AttachmentImage'
 import { MarkdownProse } from './MarkdownProse'
+import { NoticeLines } from './NoticeLines'
 import { ResultCard } from './ResultCard'
 import { Trail } from './Trail'
 
@@ -68,20 +69,23 @@ function Pending({ reasoning }: { reasoning: boolean }) {
 
 /**
  * One message: the user's text with its attachments, or an answer with its
- * trail, its text as Markdown and its result cards. An answer with text can
- * be copied as its Markdown; the last answer offers to be regenerated
- * (`onRegenerate`).
+ * trail, its text as Markdown, its result cards and what it says about itself
+ * (its notices; an answer stored before notices has none). An answer with text
+ * can be copied as its Markdown; the last answer offers to be regenerated
+ * (`onRegenerate`), and, cut at the length limit, to go on (`onContinue`).
  */
 export function MessageView({
   chatId,
   message,
   fileDays,
   onRegenerate,
+  onContinue,
 }: {
   chatId: string
-  message: Pick<MessageOut, 'role' | 'content' | 'attachments' | 'steps' | 'results'>
+  message: Pick<MessageOut, 'role' | 'content' | 'attachments' | 'steps' | 'results' | 'notices'>
   fileDays: number
   onRegenerate?: () => void
+  onContinue?: () => void
 }) {
   const t = useT()
   if (message.role === 'user') return <UserMessage chatId={chatId} message={message} />
@@ -92,6 +96,7 @@ export function MessageView({
       {message.results.map((result) => (
         <ResultCard key={result.id} chatId={chatId} result={result} />
       ))}
+      <NoticeLines notices={message.notices ?? []} live={false} onContinue={onContinue} />
       {(message.content || onRegenerate) && (
         <div className="flex justify-end gap-1">
           {message.content && (
@@ -104,7 +109,7 @@ export function MessageView({
   )
 }
 
-/** The answer being written: its steps as they run, its text so far, its cards. */
+/** The answer being written: its steps as they run, its text so far, its cards, its notices as they come. */
 export function DraftView({ chatId, draft, fileDays }: { chatId: string; draft: DraftAnswer; fileDays: number }) {
   return (
     <div data-role="assistant" aria-busy="true" className="space-y-2">
@@ -113,6 +118,7 @@ export function DraftView({ chatId, draft, fileDays }: { chatId: string; draft: 
       {draft.results.map((result) => (
         <ResultCard key={result.id} chatId={chatId} result={result} />
       ))}
+      <NoticeLines notices={draft.notices} live />
     </div>
   )
 }

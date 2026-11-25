@@ -53,7 +53,16 @@ export const CHAT: ChatOut = {
 }
 
 export function message(fields: Partial<MessageOut> & Pick<MessageOut, 'id' | 'role'>): MessageOut {
-  return { content: '', created_at: '2026-11-02T09:00:00Z', attachments: [], steps: [], results: [], ...fields }
+  return {
+    content: '',
+    created_at: '2026-11-02T09:00:00Z',
+    attachments: [],
+    steps: [],
+    results: [],
+    notices: null,
+    context_estimate: null,
+    ...fields,
+  }
 }
 
 export function step(fields: Partial<StepOut> & Pick<StepOut, 'id' | 'tool'>): StepOut {

@@ -37,6 +37,7 @@ export const de: Strings = {
   'chat.copy_code': 'Code kopieren',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
   'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
+  'chat.not_continuable': 'Nur die letzte Antwort, die an der Längengrenze abgeschnitten wurde, kann fortgesetzt werden.',
   'chat.images_dropped': 'Das Modell hat die Bilder nicht angenommen und ohne sie geantwortet.',
   'chat.attachment_processing': 'Warten Sie, bis die angehängten Dateien bereit sind.',
 
@@ -83,6 +84,24 @@ export const de: Strings = {
   'mic.unavailable': 'Es konnte kein Mikrofon verwendet werden.',
   'mic.limit': 'noch {s} s',
 
+  // what an answer says about itself, under it
+  'notice.answer_cut': 'Die Antwort wurde an der Längengrenze abgeschnitten.',
+  'notice.continue': 'Weiter',
+  'notice.document_partial': 'Von ‚{name}‘ wurden {read} von {total} {units} gelesen.',
+  'notice.document_partial_generic': 'Ein Dokument wurde nur teilweise gelesen.',
+  'notice.document_unread': '‚{name}‘ wurde für diese Antwort nicht gelesen.',
+  'notice.document_unread_generic': 'Ein Anhang wurde für diese Antwort nicht gelesen.',
+  'unit.page': 'Seiten',
+  'unit.page_one': 'Seite',
+  'unit.slide': 'Folien',
+  'unit.slide_one': 'Folie',
+  'unit.paragraph': 'Absätze',
+  'unit.paragraph_one': 'Absatz',
+  'unit.row': 'Zeilen',
+  'unit.row_one': 'Zeile',
+  'unit.line': 'Zeilen',
+  'unit.line_one': 'Zeile',
+
   // the trail of tool steps
   'trail.steps': '{n} Schritte',
   'trail.steps_one': '1 Schritt',
@@ -123,6 +142,7 @@ export const de: Strings = {
   'error.model': 'Das Modell hat nicht geantwortet. Bitte erneut versuchen.',
   'error.audit': 'Die Antwort wurde abgebrochen, weil sie nicht protokolliert werden konnte.',
   'error.internal': 'Etwas ist schiefgelaufen.',
+  'error.context': 'Dieser Chat ist zu lang für das Modell. Beginnen Sie einen neuen Chat oder kürzen Sie Ihre Nachricht.',
 
   // retention note
   'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',

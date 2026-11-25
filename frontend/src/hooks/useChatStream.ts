@@ -1,5 +1,5 @@
 import { useCallback, useSyncExternalStore } from 'react'
-import type { AttachmentOut, MessageIn, RegenerateIn } from '../api/types'
+import type { AttachmentOut, MessageIn, MessageOut, RegenerateIn } from '../api/types'
 import { IDLE, useChatStreams, type PendingMessage, type StreamState } from './chatStreams'
 
 export type { DraftAnswer, PendingMessage, StreamFailure } from './chatStreams'
@@ -11,6 +11,9 @@ export interface ChatStream extends StreamState {
    *  when its answer ended early. */
   send(content: string, attachments: readonly AttachmentOut[], reasoning: boolean): Promise<boolean>
   regenerate(reasoning: boolean): Promise<void>
+  /** Go on with `answer`, the chat's latest, cut at the length limit: its text goes on in the
+   *  same answer. The server refuses another answer, with the code `not_continuable`. */
+  continueAnswer(answer: MessageOut): Promise<void>
   stop(): Promise<void>
 }
 
@@ -36,8 +39,12 @@ export function useChatStream(chatId: string | null): ChatStream {
   const state = useSyncExternalStore(subscribe, () => (chatId === null ? null : streams.get(chatId))) ?? IDLE
 
   const run = useCallback(
-    async (route: 'messages' | 'regenerate', body: MessageIn | RegenerateIn, pendingUser: PendingMessage | null) =>
-      chatId === null ? false : ((await streams.start(chatId, route, body, pendingUser)) ?? false),
+    async (
+      route: 'messages' | 'regenerate' | 'continue',
+      body: MessageIn | RegenerateIn | Record<string, never>,
+      pendingUser: PendingMessage | null,
+      base?: MessageOut,
+    ) => (chatId === null ? false : ((await streams.start(chatId, route, body, pendingUser, base)) ?? false)),
     [streams, chatId],
   )
 
@@ -58,9 +65,16 @@ export function useChatStream(chatId: string | null): ChatStream {
     [run],
   )
 
+  const continueAnswer = useCallback(
+    async (answer: MessageOut) => {
+      await run('continue', {}, null, answer)
+    },
+    [run],
+  )
+
   const stop = useCallback(async () => {
     if (chatId !== null) await streams.stop(chatId)
   }, [streams, chatId])
 
-  return { ...state, send, regenerate, stop }
+  return { ...state, send, regenerate, continueAnswer, stop }
 }

@@ -48,7 +48,7 @@ const TABLE = result({
   preview: { columns: ['Monat', 'Betrag'], rows: [['Jan', '42']], row_count: 1, truncated: false },
 })
 const IMAGES_DROPPED = 'The model did not take the pictures; it answered without them.'
-const FINAL = { message_id: 'm2', user_message_id: 'm1', chat: CHAT, stopped: false }
+const FINAL = { message_id: 'm2', user_message_id: 'm1', chat: CHAT, stopped: false, context_estimate: null }
 const SALES: AttachmentOut = {
   id: 'a1',
   file_id: 'F0',
@@ -395,8 +395,10 @@ function serveTwoChats() {
 }
 
 describe('a notice frame', () => {
-  it('keeps an images_dropped notice with its answer until the next one starts', async () => {
-    const { sse, finish } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
+  it('shows a notice live under the draft, then with the stored answer, and keeps it there', async () => {
+    // The server stores the notice with its answer; a read of the chat brings it back.
+    const NOTICED = { ...ANSWER, notices: [{ code: 'images_dropped' as const }] }
+    const { sse, finish } = serveChat(detail([]), detail([QUESTION, NOTICED]), 'messages')
     renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
     const user = userEvent.setup()
     await screen.findByText('Ask anything, or attach a document.')
@@ -410,18 +412,71 @@ describe('a notice frame', () => {
     sse.push('token', { text: 'Ohne Bilder' })
     await screen.findByText('Ohne Bilder')
     expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
+    // Live, it is announced politely; it is no error.
+    expect(screen.getByText(IMAGES_DROPPED)).toHaveAttribute('role', 'status')
+    expect(screen.getByText(IMAGES_DROPPED).closest('[aria-busy="true"]')).not.toBeNull()
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
 
     finish()
-    // The stored answer replaces the draft; the notice stays with it.
+    // The stored answer replaces the draft and carries its own line: said once, no longer announced.
     expect(await screen.findByText('Summe: 42')).toBeInTheDocument()
     expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
-    expect(screen.getByText(IMAGES_DROPPED)).toHaveAttribute('role', 'status')
+    expect(screen.getByText(IMAGES_DROPPED)).not.toHaveAttribute('role')
+    expect(screen.getByText(IMAGES_DROPPED).closest('[data-role="assistant"]')).not.toHaveAttribute('aria-busy')
 
-    // The next message clears it.
-    serveChat(detail([QUESTION, ANSWER]), detail([QUESTION, ANSWER]), 'messages')
+    // The next message does not clear it: the earlier answer keeps its line.
+    const NEXT = message({ id: 'm4', role: 'assistant', content: 'Wieder 42' })
+    const second = serveChat(
+      detail([QUESTION, NOTICED]),
+      detail([QUESTION, NOTICED, message({ id: 'm3', role: 'user', content: 'Nochmal?' }), NEXT]),
+      'messages',
+    )
     await user.click(screen.getByRole('button', { name: 'Ask' }))
-    await waitFor(() => expect(screen.queryByText(IMAGES_DROPPED)).not.toBeInTheDocument())
+    second.sse.push('token', { text: 'Wieder' })
+    await screen.findByText('Wieder')
+    expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
+    expect(screen.getByText(IMAGES_DROPPED)).not.toHaveAttribute('role')
+    second.finish({ ...FINAL, message_id: 'm4', user_message_id: 'm3' })
+    expect(await screen.findByText('Wieder 42')).toBeInTheDocument()
+    expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
+  })
+
+  it('says a document notice once for a file, and once for each file', async () => {
+    const { sse } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+
+    const unread = (file_id: string, name: string) => ({ code: 'document_unread', file_id, name })
+    sse.push('notice', unread('F1', 'tide-notes.txt'))
+    sse.push('notice', unread('F1', 'tide-notes.txt'))
+    sse.push('notice', unread('F2', 'quay-ledger.xlsx'))
+    sse.push('notice', { code: 'document_partial', file_id: 'F3', name: 'long-report.pdf', read: 9, total: 500, unit: 'page' })
+    sse.push('notice', { code: 'document_partial', file_id: 'F3', name: 'long-report.pdf', read: 9, total: 500, unit: 'page' })
+    sse.push('token', { text: 'Teilweise' })
+    await screen.findByText('Teilweise')
+
+    expect(screen.getAllByText("'tide-notes.txt' was not read for this answer.")).toHaveLength(1)
+    expect(screen.getAllByText("'quay-ledger.xlsx' was not read for this answer.")).toHaveLength(1)
+    expect(screen.getAllByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toHaveLength(1)
+  })
+
+  it('does not say a trimmed context under the answer, live or stored', async () => {
+    const TRIMMED = { ...ANSWER, notices: [{ code: 'context_trimmed' as const }] }
+    const { sse, finish } = serveChat(detail([]), detail([QUESTION, TRIMMED]), 'messages')
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('notice', { code: 'context_trimmed' })
+    sse.push('token', { text: 'Gekürzt' })
+    await screen.findByText('Gekürzt')
+    expect(document.querySelector('[data-notice]')).toBeNull()
+    finish()
+    await screen.findByText('Summe: 42')
+    expect(document.querySelector('[data-notice]')).toBeNull()
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
   })
 
   it('names the notice in the language of the app', async () => {

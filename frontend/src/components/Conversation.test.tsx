@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PURPOSE_HEADER, clearAllPurposes, setPurpose } from '@infra/ui'
-import type { AttachmentOut } from '../api/types'
+import type { AttachmentOut, NoticeOut } from '../api/types'
 import type { ChatStream } from '../hooks/useChatStream'
 import { LanguageContext } from '../i18n/LanguageContext'
 import {
@@ -178,6 +178,334 @@ describe('Conversation', () => {
     fireEvent.click(within(answer).getByRole('button', { name: 'Copy answer' }))
     await waitFor(() => expect(writeText).toHaveBeenCalledWith(markdown))
     expect(await within(answer).findByRole('button', { name: 'Copied' })).toBeInTheDocument()
+  })
+})
+
+/** The codes of the notice lines under an answer, in reading order. */
+function noticeCodes(root: ParentNode = document): string[] {
+  return [...root.querySelectorAll<HTMLElement>('[data-notice]')].map((line) => line.dataset.notice ?? '')
+}
+
+const QUESTION = message({ id: 'q1', role: 'user', content: 'Fasse den Bericht zusammen.' })
+const PARTIAL = { code: 'document_partial' as const, file_id: 'F1', name: 'long-report.pdf', read: 9, total: 500, unit: 'page' as const }
+
+/** A chat of one question and one answer holding `notices`. */
+function serveAnswered(notices: NoticeOut[] | null, content = 'Zusammenfassung') {
+  return serve({
+    'GET /ghostwriter/api/chats/c1': detail([QUESTION, message({ id: 'a1', role: 'assistant', content, notices })]),
+  })
+}
+
+describe('Conversation notices', () => {
+  it("shows a stored answer's notices after a reload", async () => {
+    serveAnswered([
+      { code: 'answer_cut' },
+      PARTIAL,
+      { code: 'document_unread', file_id: 'F2', name: 'quay-ledger.xlsx' },
+      { code: 'images_dropped' },
+      { code: 'context_trimmed' },
+    ])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const answer = (await screen.findByText('Zusammenfassung')).closest('[data-role="assistant"]') as HTMLElement
+
+    expect(within(answer).getByText('The answer was cut at the length limit.')).toBeInTheDocument()
+    expect(within(answer).getByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toBeInTheDocument()
+    expect(within(answer).getByText("'quay-ledger.xlsx' was not read for this answer.")).toBeInTheDocument()
+    expect(within(answer).getByText('The model did not take the pictures; it answered without them.')).toBeInTheDocument()
+    // The trimmed context is not an answer-level line.
+    expect(noticeCodes(answer)).toEqual(['answer_cut', 'document_partial', 'document_unread', 'images_dropped'])
+    // Quiet and stored: muted text, a warning icon, nothing announced.
+    const line = within(answer).getByText("Of 'long-report.pdf', 9 of 500 pages were read.")
+    expect(line).toHaveClass('text-sm', 'text-muted-foreground')
+    expect(line).not.toHaveAttribute('role')
+    expect(line.parentElement?.querySelector('svg')).toHaveClass('text-warning')
+    expect(screen.queryByRole('status')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    // The lines follow the answer's text.
+    expect(screen.getByText('Zusammenfassung').compareDocumentPosition(line)).toBe(Node.DOCUMENT_POSITION_FOLLOWING)
+  })
+
+  it('names the notices in German, with the unit of the document', async () => {
+    serveAnswered([
+      { code: 'answer_cut' },
+      PARTIAL,
+      { code: 'document_partial', file_id: 'F3', name: 'harbour-survey.pptx', read: 1, total: 4, unit: 'slide' },
+      { code: 'document_unread', file_id: 'F2', name: 'quay-ledger.xlsx' },
+    ])
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    expect(await screen.findByText('Die Antwort wurde an der Längengrenze abgeschnitten.')).toBeInTheDocument()
+    expect(screen.getByText('Von ‚long-report.pdf‘ wurden 9 von 500 Seiten gelesen.')).toBeInTheDocument()
+    expect(screen.getByText('Von ‚harbour-survey.pptx‘ wurden 1 von 4 Folien gelesen.')).toBeInTheDocument()
+    expect(screen.getByText('‚quay-ledger.xlsx‘ wurde für diese Antwort nicht gelesen.')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Weiter' })).toBeInTheDocument()
+  })
+
+  it('says one page', async () => {
+    serveAnswered([{ ...PARTIAL, read: 0, total: 1 }])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    expect(await screen.findByText("Of 'long-report.pdf', 0 of 1 page were read.")).toBeInTheDocument()
+  })
+
+  it('counts each unit by its own word', async () => {
+    const units = ['page', 'slide', 'paragraph', 'row', 'line'] as const
+    serveAnswered(units.map((unit) => ({ ...PARTIAL, file_id: `F-${unit}`, name: `${unit}.txt`, read: 2, total: 3, unit })))
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    for (const unit of units) {
+      expect(await screen.findByText(`Of '${unit}.txt', 2 of 3 ${unit}s were read.`)).toBeInTheDocument()
+    }
+  })
+
+  it('falls back to the generic text once the details expired', async () => {
+    serveAnswered([
+      { code: 'document_partial' },
+      // Half of the details is as good as none.
+      { code: 'document_partial', file_id: 'F1', name: 'long-report.pdf', read: null, total: null, unit: null },
+      { code: 'document_partial', file_id: 'F3', name: 'tide-notes.txt', read: 3, total: 9, unit: null },
+      { code: 'document_unread' },
+      { code: 'document_unread', file_id: 'F2', name: null },
+    ])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await screen.findByText('Zusammenfassung')
+    expect(screen.getAllByText('A document was read only in part.')).toHaveLength(3)
+    expect(screen.getAllByText('An attachment was not read for this answer.')).toHaveLength(2)
+    expect(screen.queryByText(/long-report|tide-notes/)).not.toBeInTheDocument()
+  })
+
+  it('ignores a notice of a code it does not know', async () => {
+    serveAnswered([{ code: 'something_new' } as unknown as NoticeOut, { code: 'images_dropped' }])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await screen.findByText('Zusammenfassung')
+    expect(noticeCodes()).toEqual(['images_dropped'])
+  })
+
+  it('renders an answer stored before notices', async () => {
+    serveAnswered(null)
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const answer = (await screen.findByText('Zusammenfassung')).closest('[data-role="assistant"]') as HTMLElement
+    expect(noticeCodes()).toEqual([])
+    expect(within(answer).queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+    // Still copyable and regenerable as before.
+    expect(within(answer).getByRole('button', { name: 'Copy answer' })).toBeInTheDocument()
+    expect(within(answer).getByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
+  })
+
+  it('offers Continue on the latest answer that was cut, and on no other', async () => {
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([
+        QUESTION,
+        message({ id: 'a1', role: 'assistant', content: 'Erster Anlauf', notices: [{ code: 'answer_cut' }] }),
+        message({ id: 'q2', role: 'user', content: 'Und weiter?' }),
+        message({ id: 'a2', role: 'assistant', content: 'Zweiter Anlauf', notices: [{ code: 'answer_cut' }] }),
+      ]),
+    })
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const second = (await screen.findByText('Zweiter Anlauf')).closest('[data-role="assistant"]') as HTMLElement
+    const first = screen.getByText('Erster Anlauf').closest('[data-role="assistant"]') as HTMLElement
+    // Both say they were cut; only the latest can be continued.
+    expect(noticeCodes(first)).toEqual(['answer_cut'])
+    expect(noticeCodes(second)).toEqual(['answer_cut'])
+    expect(screen.getAllByRole('button', { name: 'Continue' })).toHaveLength(1)
+    expect(within(second).getByRole('button', { name: 'Continue' })).toBeInTheDocument()
+  })
+
+  it('offers no Continue on a latest answer that was not cut', async () => {
+    serveAnswered([PARTIAL, { code: 'images_dropped' }])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await screen.findByText('Zusammenfassung')
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+  })
+
+  it('continues a cut answer in place', async () => {
+    const sse = sseStream()
+    let done = false
+    const CUT = message({
+      id: 'a2',
+      role: 'assistant',
+      content: 'Kapitel 1 …',
+      notices: [{ code: 'answer_cut' }, PARTIAL],
+    })
+    const WHOLE = message({
+      id: 'a2',
+      role: 'assistant',
+      content: 'Kapitel 1 … und weiter.',
+      notices: [PARTIAL],
+    })
+    const before = detail([
+      QUESTION,
+      message({ id: 'a1', role: 'assistant', content: 'Erster Anlauf', notices: [{ code: 'answer_cut' }] }),
+      message({ id: 'q2', role: 'user', content: 'Und weiter?' }),
+      CUT,
+    ])
+    const calls = serve({
+      'GET /ghostwriter/api/chats/c1': () => json(done ? detail([...before.messages.slice(0, 3), WHOLE]) : before),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages/a2/continue': () => sse.response(),
+    })
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await screen.findByText('Kapitel 1 …')
+    fireEvent.click(screen.getByRole('button', { name: 'Continue' }))
+
+    // Nothing but the route and an empty body: the answer is named by the path.
+    await waitFor(() => expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages/a2/continue')).toHaveLength(1))
+    expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/messages/a2/continue')[0].body).toEqual({})
+    // At once, one answer holds the text so far: the stored one gives way to the draft, and it is not cut yet.
+    const draft = (await screen.findByText('Kapitel 1 …')).closest('[data-role="assistant"]') as HTMLElement
+    expect(draft).toHaveAttribute('aria-busy', 'true')
+    expect(screen.getAllByText('Kapitel 1 …')).toHaveLength(1)
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+    expect(within(draft).queryByText('The answer was cut at the length limit.')).not.toBeInTheDocument()
+    // The notices it already had stay, once.
+    expect(within(draft).getAllByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toHaveLength(1)
+
+    sse.push('start', { message_id: 'a2', user_message_id: null })
+    sse.push('token', { text: ' und weiter.' })
+    // The text goes on in the same answer, never as a second one.
+    expect(await screen.findByText('Kapitel 1 … und weiter.')).toBeInTheDocument()
+    expect(screen.queryByText('Kapitel 1 …')).not.toBeInTheDocument()
+    expect(screen.getAllByText(/Kapitel 1/)).toHaveLength(1)
+    expect(document.querySelectorAll('[data-role="assistant"]')).toHaveLength(2)
+    expect(screen.getAllByText("Of 'long-report.pdf', 9 of 500 pages were read.")).toHaveLength(1)
+
+    done = true
+    sse.push('final', { message_id: 'a2', user_message_id: null, chat: CHAT, stopped: false, context_estimate: null })
+    sse.end()
+    await waitFor(() => expect(document.querySelector('[aria-busy="true"]')).toBeNull())
+    expect(await screen.findByText('Kapitel 1 … und weiter.')).toBeInTheDocument()
+    expect(document.querySelectorAll('[data-role="assistant"]')).toHaveLength(2)
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+    expect(screen.queryByText('The answer was cut at the length limit.', { selector: 'p' })).toBeInTheDocument() // a1's, the older answer
+    expect(noticeCodes()).toEqual(['answer_cut', 'document_partial'])
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: 'Regenerate' })).toBeInTheDocument()
+  })
+
+  it('offers Continue again when the continuation was cut too', async () => {
+    const sse = sseStream()
+    let done = false
+    const CUT = message({ id: 'a1', role: 'assistant', content: 'Kapitel 1', notices: [{ code: 'answer_cut' }] })
+    const CUT_AGAIN = message({ id: 'a1', role: 'assistant', content: 'Kapitel 1 und 2', notices: [{ code: 'answer_cut' }] })
+    serve({
+      'GET /ghostwriter/api/chats/c1': () => json(detail([QUESTION, done ? CUT_AGAIN : CUT])),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages/a1/continue': () => sse.response(),
+    })
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    sse.push('start', { message_id: 'a1', user_message_id: null })
+    sse.push('token', { text: ' und 2' })
+    // Told again as the round ends: live, it is announced and offers no button.
+    sse.push('notice', { code: 'answer_cut' })
+    const live = await screen.findByText('The answer was cut at the length limit.')
+    expect(live).toHaveAttribute('role', 'status')
+    expect(screen.queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+    done = true
+    sse.push('final', { message_id: 'a1', user_message_id: null, chat: CHAT, stopped: false, context_estimate: null })
+    sse.end()
+    expect(await screen.findByRole('button', { name: 'Continue' })).toBeInTheDocument()
+    expect(screen.getByText('Kapitel 1 und 2')).toBeInTheDocument()
+    expect(screen.getByText('The answer was cut at the length limit.')).not.toHaveAttribute('role')
+  })
+
+  it('names a context refusal', async () => {
+    const sse = sseStream()
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages': () => sse.response(),
+    })
+    const ask = (stream: ChatStream) => (
+      <button type="button" onClick={() => void stream.send('Fasse den Bericht zusammen.', [], false)}>
+        Ask
+      </button>
+    )
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={ask} />)
+    await screen.findByText('Ask anything, or attach a document.')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    sse.push('error', { code: 'context', message: 'synthetic router: maximum context exceeded' })
+    sse.push('final', { message_id: 'a1', user_message_id: 'q1', chat: CHAT, stopped: false, context_estimate: null })
+    sse.end()
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveTextContent('This chat is too long for the model. Start a new chat or shorten your message.')
+    // The router's own words are never shown.
+    expect(alert).not.toHaveTextContent('synthetic router')
+    first.unmount()
+
+    const again = sseStream()
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages': () => again.response(),
+    })
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={ask} />
+      </LanguageContext>,
+    )
+    await screen.findByText('Fragen Sie, was Sie möchten, oder hängen Sie ein Dokument an.')
+    fireEvent.click(screen.getByRole('button', { name: 'Ask' }))
+    again.push('error', { code: 'context', message: 'synthetic router: maximum context exceeded' })
+    again.push('final', { message_id: 'a1', user_message_id: 'q1', chat: CHAT, stopped: false, context_estimate: null })
+    again.end()
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Dieser Chat ist zu lang für das Modell. Beginnen Sie einen neuen Chat oder kürzen Sie Ihre Nachricht.',
+    )
+  })
+
+  it('names a refused continue', async () => {
+    const CUT = message({ id: 'a1', role: 'assistant', content: 'Kapitel 1', notices: [{ code: 'answer_cut' }] })
+    const refused = () =>
+      new Response(
+        JSON.stringify({ detail: 'Only the latest answer cut at the length limit can be continued.', code: 'not_continuable' }),
+        { status: 409 },
+      )
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([QUESTION, CUT]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages/a1/continue': refused,
+    })
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Only the latest answer cut at the length limit can be continued.',
+    )
+    // Nothing was changed: the answer is back in its place, once.
+    expect(await screen.findByText('Kapitel 1')).toBeInTheDocument()
+    expect(screen.getAllByText('Kapitel 1')).toHaveLength(1)
+    first.unmount()
+
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([QUESTION, CUT]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages/a1/continue': refused,
+    })
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    fireEvent.click(await screen.findByRole('button', { name: 'Weiter' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'Nur die letzte Antwort, die an der Längengrenze abgeschnitten wurde, kann fortgesetzt werden.',
+    )
+  })
+
+  it('says a busy chat refused a continue, as it does a regenerate', async () => {
+    const CUT = message({ id: 'a1', role: 'assistant', content: 'Kapitel 1', notices: [{ code: 'answer_cut' }] })
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([QUESTION, CUT]),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/messages/a1/continue': () =>
+        new Response(JSON.stringify({ detail: 'An answer is still being written in this chat.', code: 'busy' }), {
+          status: 409,
+        }),
+    })
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Continue' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('An answer is still being written in this chat.')
   })
 })
 
