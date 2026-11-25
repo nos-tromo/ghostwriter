@@ -4,21 +4,50 @@ A notice is a code (:data:`~ghostwriter.schemas.NoticeCode`) and, for a notice a
 workbench's file id, the file's name, and how much of it was read, of how much, in which unit. The live frame
 carries every detail set, the name included; what is stored carries no name, which is read from the chat's
 attachment row when the answer is served. A notice holds ids and counts, never content.
+
+The notices about a file come from :class:`Reading`, what one message's calls opened and read. A file is opened by
+a ``read_document`` or ``view_file`` call of its path that workbench answered. What a ``read_document`` answer read
+is the units of its parts, as the model was given them, a part cut not counted (:func:`covered` joins them), and a
+page or slide without text, which was looked at. ``document_partial`` names an attachment of the chat whose parts
+read cover less than its total: the measure's, or where a part is one unit, the answer's ``total_parts``
+(:data:`TOTAL_PARTS_UNITS`). ``document_unread`` names a ``ready`` attachment of the question, a document or a clip,
+or a picture while the turn does not see, that no call opened. Once a call of :data:`BLIND_TOOLS` ran, which reads
+files without naming what it read, neither is given: a notice never says what is not known to be true.
 """
 
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
-from dataclasses import dataclass
-from typing import Any, Final, TypeGuard, get_args
+import json
+import posixpath
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
+from typing import Any, Final, TypeGuard, cast, get_args
 
-from ghostwriter.schemas import MeasureUnit, NoticeCode
+from ghostwriter.agent.tools import Refusal
+from ghostwriter.schemas import AttachmentKind, AttachmentStatus, MeasureUnit, NoticeCode
+from ghostwriter.workbench import ToolFailure, ToolResult
 
 #: The codes this version knows; a stored notice with another reads as none.
 NOTICE_CODES: Final[frozenset[str]] = frozenset(get_args(NoticeCode))
 #: The units a length is counted in.
 MEASURE_UNITS: Final[frozenset[str]] = frozenset(get_args(MeasureUnit))
+#: The tools that read the chat's files without naming what they read: once one ran, no file notice is given.
+BLIND_TOOLS: Final = frozenset({"run_python", "search_files"})
+#: The tools that open the file at their ``path``.
+OPENING_TOOLS: Final = frozenset({"read_document", "view_file"})
+#: The kinds of ``read_document``'s answer whose ``total_parts`` counts one unit per part, and that unit.
+TOTAL_PARTS_UNITS: Final[Mapping[str, MeasureUnit]] = {
+    "pdf": "page",
+    "pptx": "slide",
+    "docx": "paragraph",
+    "odt": "paragraph",
+    "text": "line",
+}
+#: The units in which a page or slide without text, looked at, counts as read.
+_PAGED_UNITS: Final[frozenset[str]] = frozenset({"page", "slide"})
+#: The kinds of attachment a question's answer is told it did not read, sight or not; a picture only without sight.
+_UNREAD_KINDS: Final[frozenset[str]] = frozenset({"document", "media"})
 
 
 @dataclass(frozen=True)
@@ -126,3 +155,234 @@ def _count(value: object) -> bool:
         Whether it is a whole number of zero or more, and not a boolean.
     """
     return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+@dataclass(frozen=True)
+class SentFile:
+    """An attachment of the chat, as the notices about it read it.
+
+    Attributes:
+        file_id: workbench's id of the file.
+        path: Its path in the chat's folder.
+        name: The file name.
+        kind: ``document``, ``image`` or ``media``.
+        status: ``processing``, ``ready`` or ``failed``.
+        total: How many units the measure counted, while it is ``measured`` and the file has not expired; else
+            ``None``.
+        unit: What ``total`` counts, on the same terms.
+    """
+
+    file_id: str
+    path: str
+    name: str
+    kind: AttachmentKind
+    status: AttachmentStatus
+    total: int | None
+    unit: MeasureUnit | None
+
+
+def covered(spans: Iterable[tuple[int, int]]) -> int:
+    """Count the units a set of spans covers, each once.
+
+    Args:
+        spans: First and last unit of each span, inclusive, the first not after the last.
+
+    Returns:
+        How many units are in at least one span.
+    """
+    count, end = 0, 0
+    for first, last in sorted(spans):
+        if last > end:
+            count += last - max(first, end + 1) + 1
+            end = last
+    return count
+
+
+@dataclass
+class _Read:
+    """What the ``read_document`` answers for one path read.
+
+    Attributes:
+        spans: The units of each part given to the model and not cut.
+        blank: The pages or slides the answers named without text.
+        kind: The kind the last answer named.
+        total_parts: The ``total_parts`` the last answer named.
+        units: Whether any part carried ``units``, as workbench 0.10's do.
+    """
+
+    spans: list[tuple[int, int]] = field(default_factory=list)
+    blank: set[int] = field(default_factory=set)
+    kind: str | None = None
+    total_parts: int | None = None
+    units: bool = False
+
+    def length(self, sent: SentFile) -> tuple[int, MeasureUnit] | None:
+        """Return how long the file is, and in which unit.
+
+        Args:
+            sent: The attachment read.
+
+        Returns:
+            The measure's total and unit; else the answer's ``total_parts`` where a part is one unit
+            (:data:`TOTAL_PARTS_UNITS`); else ``None``.
+        """
+        if sent.total is not None and sent.unit is not None:
+            return sent.total, sent.unit
+        unit = TOTAL_PARTS_UNITS.get(self.kind) if self.kind is not None else None
+        if unit is not None and self.total_parts is not None:
+            return self.total_parts, unit
+        return None
+
+
+class Reading:
+    """What one message's calls opened, and what of it was read."""
+
+    def __init__(self) -> None:
+        """Start with nothing opened."""
+        self._blind = False
+        self._opened: set[str] = set()
+        self._read: dict[str, _Read] = {}
+
+    def call(
+        self,
+        tool: str,
+        arguments: Mapping[str, Any] | None,
+        outcome: ToolResult | ToolFailure | Refusal,
+        content: str,
+    ) -> None:
+        """Record one call of the message.
+
+        A call of :data:`BLIND_TOOLS` that was sent, answered or not, ends every notice of the message. A call of
+        :data:`OPENING_TOOLS` workbench answered opens the path it names; a ``read_document`` answer also opens its
+        own ``path`` and records what it read, from ``content``'s first line, the JSON the model was given.
+
+        Args:
+            tool: The tool called.
+            arguments: Its arguments, as the model wrote them; ``None`` for arguments that are not an object.
+            outcome: What workbench answered, or why the call was not sent.
+            content: What the model read back, as the loop wrote it (:func:`~ghostwriter.agent.tools.tool_message`).
+        """
+        if tool in BLIND_TOOLS and not isinstance(outcome, Refusal):
+            self._blind = True
+            return
+        if tool not in OPENING_TOOLS or not isinstance(outcome, ToolResult):
+            return
+        path = _path(arguments.get("path") if arguments is not None else None)
+        if path is not None:
+            self._opened.add(path)
+        if tool == "read_document":
+            self._answer(path, content)
+
+    def _answer(self, asked: str | None, content: str) -> None:
+        """Record what a ``read_document`` answer read.
+
+        Args:
+            asked: The path the call named, normalised; ``None`` for none.
+            content: What the model read back.
+        """
+        try:
+            body = json.loads(content.split("\n", 1)[0])
+        except (ValueError, RecursionError):
+            return
+        if not isinstance(body, dict):
+            return
+        answer = cast(dict[str, Any], body)
+        path = _path(answer.get("path")) or asked
+        if path is None:
+            return
+        self._opened.add(path)
+        read = self._read.setdefault(path, _Read())
+        kind, total_parts = answer.get("kind"), answer.get("total_parts")
+        if isinstance(kind, str):
+            read.kind = kind
+        if _count(total_parts):
+            read.total_parts = total_parts
+        parts = answer.get("parts")
+        for part in cast(list[Any], parts) if isinstance(parts, list) else []:
+            if not isinstance(part, dict):
+                continue
+            piece = cast(dict[str, Any], part)
+            read.units = read.units or "units" in piece
+            span = _span(piece.get("units"))
+            if span is not None and piece.get("cut") is not True:
+                read.spans.append(span)
+        blank = answer.get("pages_without_text")
+        if isinstance(blank, list):
+            read.blank.update(n for n in cast(list[Any], blank) if _count(n) and n > 0)
+
+    def partial(self, files: Mapping[str, SentFile]) -> list[NoticeEvent]:
+        """Return a ``document_partial`` for each attachment of the chat read only in part.
+
+        Args:
+            files: Every attachment of the chat, by path.
+
+        Returns:
+            Per path read, in the order first read: a notice when it is an attachment of the chat, an answer for it
+            carried ``units``, its length is known (:meth:`_Read.length`) and the units read, a page or slide without
+            text among them and none past the length counted, are fewer. None once a blind tool ran.
+        """
+        if self._blind:
+            return []
+        by_path = {posixpath.normpath(path): sent for path, sent in files.items()}
+        notices: list[NoticeEvent] = []
+        for path, read in self._read.items():
+            sent = by_path.get(path)
+            length = read.length(sent) if sent is not None and read.units else None
+            if sent is None or length is None:
+                continue
+            total, unit = length
+            spans = [*read.spans, *((n, n) for n in read.blank)] if unit in _PAGED_UNITS else read.spans
+            count = covered((first, min(last, total)) for first, last in spans if first <= total)
+            if count < total:
+                notices.append(NoticeEvent("document_partial", sent.file_id, sent.name, count, total, unit))
+        return notices
+
+    def unread(self, attached: Sequence[SentFile], *, sees: bool) -> list[NoticeEvent]:
+        """Return a ``document_unread`` for each attachment of the question no call opened.
+
+        Args:
+            attached: The question's attachments, in order.
+            sees: Whether the turn saw as it began: then a picture went to the model as an image, and is not counted.
+
+        Returns:
+            A notice per ``ready`` document or clip, or picture while the turn does not see, whose path was not
+            opened; none once a blind tool ran.
+        """
+        if self._blind:
+            return []
+        return [
+            NoticeEvent("document_unread", file_id=sent.file_id, name=sent.name)
+            for sent in attached
+            if sent.status == "ready"
+            and (sent.kind in _UNREAD_KINDS or (sent.kind == "image" and not sees))
+            and posixpath.normpath(sent.path) not in self._opened
+        ]
+
+
+def _path(value: object) -> str | None:
+    """Read a path a call named or an answer gave.
+
+    Args:
+        value: The value.
+
+    Returns:
+        It normalised (:func:`posixpath.normpath`), as workbench reads it; ``None`` for anything but a non-empty text.
+    """
+    return posixpath.normpath(value) if isinstance(value, str) and value else None
+
+
+def _span(value: object) -> tuple[int, int] | None:
+    """Read a part's ``units``.
+
+    Args:
+        value: The value.
+
+    Returns:
+        ``(first, last)`` for two whole numbers from 1, the first not after the last; else ``None``.
+    """
+    if not isinstance(value, list) or len(cast(list[Any], value)) != 2:
+        return None
+    first, last = cast(list[Any], value)
+    if not (_count(first) and _count(last)) or not 1 <= first <= last:
+        return None
+    return first, last

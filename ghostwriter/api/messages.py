@@ -11,10 +11,11 @@ stream carries a keep-alive comment every 15 s, which is no frame. ``notice`` na
 (:meth:`~ghostwriter.agent.notices.NoticeEvent.frame`): ``context_trimmed``, before any text,
 the first round left earlier turns out; ``images_dropped``, the model refused a round's images
 and it went again without them; ``answer_cut``, after the text, the last round ended at its
-token cap. ``error`` names by its ``code`` why the answer ended early: ``model``, ``audit``,
-``internal``, or ``context``, the router refused a round as longer than the model's context,
-with no image left to drop. A stop, or
-the client going away, sets the turn's stop: the call in flight finishes and is stored, no
+token cap; then ``document_partial``, an attachment of the chat was read only in part, and
+``document_unread``, one of the question was not opened, before an ``error``. ``error`` names
+by its ``code`` why the answer ended early: ``model``, ``audit``, ``internal``, or ``context``,
+the router refused a round as longer than the model's context, with no image left to drop. A
+stop, or the client going away, sets the turn's stop: the call in flight finishes and is stored, no
 further round runs, the text so far is stored, and the chat takes a new message as soon as the
 turn has ended. A turn that never got its thread ends at once on a stop, with ``final`` as its
 only frame, and when its response ends. ``final`` names the answer's and the question's ids, the chat, whether the

@@ -21,7 +21,11 @@ and the answer's progress keeps each notice told. The message's first round fill
 when the request the router took left earlier turns out, ``context_trimmed`` is told with that request's
 first event, before any text, once per message; a request the router refused tells nothing. The last round,
 one without calls and not stopped, that ends at its cap (:func:`_at_cap`, the reasoning cap for a reasoning
-message) is followed by ``answer_cut``.
+message) is followed by ``answer_cut``. Each call goes into the answer's :class:`~ghostwriter.agent.notices.Reading`
+with what the model reads back of it; once the rounds have ended, a stop or a model error included, the loop tells
+``document_partial`` for each attachment of the chat a ``read_document`` read only in part, then ``document_unread``
+for each attachment of the question no call opened, none of either after a ``run_python`` or ``search_files``
+call. An error that ended the rounds comes after them, last.
 
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
@@ -73,6 +77,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Final, Literal, Protocol, TypeAlias
@@ -110,7 +115,7 @@ from ghostwriter.agent.limits import (
     TOOL_CUTOFF_S,
     prompt_tokens,
 )
-from ghostwriter.agent.notices import NoticeEvent
+from ghostwriter.agent.notices import NoticeEvent, Reading
 from ghostwriter.agent.prompt import system_prompt
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.agent.tools import (
@@ -306,6 +311,7 @@ class _Progress:
         next_prompt: Estimates the tokens of the next message's prompt from the answer's text, as the turn stands
             when it is called (the offer in force, the turn's messages); set once the turn's messages exist, and
             ``None`` until then.
+        reading: What the message's calls opened and read, which the notices about files are told from.
     """
 
     started: float
@@ -315,6 +321,7 @@ class _Progress:
     withdrawn: bool = False
     notices: list[NoticeEvent] = field(default_factory=list)
     next_prompt: Callable[[str], int] | None = None
+    reading: Reading = field(default_factory=Reading)
 
     def told(self, event: NoticeEvent) -> NoticeEvent:
         """Keep a notice the user is told, for the answer.
@@ -649,8 +656,8 @@ class AgentLoop:
 
         Yields:
             TurnEvent: Text, steps, cards and notices as they come, each notice also kept in the answer's
-            progress; ``answer_cut`` after the last round's text when it ended at its cap; an
-            :class:`ErrorEvent` last when the answer ended early.
+            progress; ``answer_cut`` after the last round's text when it ended at its cap; then
+            ``document_partial`` and ``document_unread``; an :class:`ErrorEvent` last when the answer ended early.
 
         Raises:
             AuditWriteError: When a record could not be written; raised after the answer is stored.
@@ -700,7 +707,11 @@ class AgentLoop:
         return MESSAGE_WALL_S - (self._clock() - message.started)
 
     def _answer(self, turn: Turn, audit: TurnAudit, message: _Progress) -> Iterator[TurnEvent]:
-        """Run the rounds.
+        """Set the turn up, run its rounds, then tell what the message read of the files.
+
+        Once the rounds have ended without raising (also on a stop or a model error), each ``document_partial`` of
+        the chat's attachments, then each ``document_unread`` of the question's, is told; an error that ended the
+        rounds comes after them. A turn stopped before it began tells nothing.
 
         Args:
             turn: The message.
@@ -765,6 +776,55 @@ class AgentLoop:
             return next_prompt_tokens(offer.system, offer.tools, [*past, answered], images=sight.budget)
 
         message.next_prompt = next_prompt
+        # The rounds' error, if one ended them, is held back: the file notices come first, and the error is last.
+        error: ErrorEvent | None = None
+        with closing(self._rounds(turn, audit, message, sight, request, current, cap=cap, headers=headers)) as rounds:
+            for event in rounds:
+                if isinstance(event, ErrorEvent):
+                    error = event
+                else:
+                    yield event
+        reading = message.reading
+        told = [
+            *reading.partial(self._store.chat_files(turn.chat_id)),
+            *reading.unread(question.files, sees=sight.sees),
+        ]
+        for notice in told:
+            yield message.told(notice)
+        if error is not None:
+            yield error
+
+    def _rounds(
+        self,
+        turn: Turn,
+        audit: TurnAudit,
+        message: _Progress,
+        sight: _Sight,
+        request: _Request,
+        current: list[dict[str, Any]],
+        *,
+        cap: int,
+        headers: Mapping[str, str],
+    ) -> Generator[TurnEvent]:
+        """Run the rounds, and the calls between them, until the turn ends.
+
+        Each call is recorded in the answer's reading (:class:`~ghostwriter.agent.notices.Reading`) with what the
+        model reads back of it.
+
+        Args:
+            turn: The message.
+            audit: The turn's audit.
+            message: The answer so far.
+            sight: The turn's images.
+            request: What each round's request is fitted from.
+            current: The current turn's messages, which the rounds extend.
+            cap: The ``max_tokens`` of a round, which tells an answer cut.
+            headers: The inference headers.
+
+        Yields:
+            TurnEvent: As :meth:`run`, the notices about files left out; an :class:`ErrorEvent` ends them.
+        """
+        workbench = self._workbench
         used: set[str] = set()
         round_no = 0
         while not turn.cancel.is_set():
@@ -801,6 +861,7 @@ class AgentLoop:
                     }
                 )
                 content = tool_message(outcome, images_seen=sight.showing)
+                message.reading.call(call.name, parse_arguments(call.arguments), outcome, content)
                 answers.append({"role": "tool", "tool_call_id": call_id, "content": content})
                 if isinstance(outcome, ToolResult) and outcome.images:
                     shown.append((call.name, call_id, outcome.images))

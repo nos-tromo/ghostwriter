@@ -45,7 +45,7 @@ from sqlalchemy.orm import Session
 from ghostwriter.agent.context import PastCall, PastTurn, attachment_facts, user_content
 from ghostwriter.agent.images import AttachedImage, rendition_size
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, PROMPT_TOKENS
-from ghostwriter.agent.notices import MEASURE_UNITS, NoticeEvent
+from ghostwriter.agent.notices import MEASURE_UNITS, NoticeEvent, SentFile
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
@@ -162,11 +162,13 @@ class UserTurn:
             (:func:`~ghostwriter.agent.context.user_content`).
         images: The pictures it attached that are ready to be seen, in their order.
         position: The message's place in the chat.
+        files: Every file it attached, in order, as the notices about them read it.
     """
 
     text: str
     images: tuple[AttachedImage, ...]
     position: int
+    files: tuple[SentFile, ...] = ()
 
 
 def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
@@ -502,6 +504,27 @@ class ChatStore:
             created_at=attachment.created_at,
             expired=expired,
             measure_state=cast(MeasureState | None, attachment.measure_state),
+        )
+
+    def _sent_file(self, attachment: Attachment, now: datetime) -> SentFile:
+        """Read an attachment row for the notices about it.
+
+        Args:
+            attachment: The row.
+            now: The time of the read.
+
+        Returns:
+            The attachment, with its measure's total and unit while it is ``measured`` and the file has not expired.
+        """
+        length = self._length_out(attachment, self._gone(attachment.created_at, now))
+        return SentFile(
+            file_id=attachment.workbench_file_id,
+            path=attachment.path,
+            name=attachment.name,
+            kind=cast(AttachmentKind, attachment.kind),
+            status=cast(AttachmentStatus, attachment.status),
+            total=None if length is None else length.total,
+            unit=None if length is None else length.unit,
         )
 
     def _result_out(self, result: Result, now: datetime) -> ResultOut:
@@ -1715,7 +1738,7 @@ class ChatStore:
         return tuple(images)
 
     def user_turn(self, chat_id: str, message_id: str, *, seen: bool = False) -> UserTurn:
-        """Return a user's message as the model reads it, its pictures, and its place in the chat.
+        """Return a user's message as the model reads it, its pictures, its place in the chat, and its files.
 
         Args:
             chat_id: The chat.
@@ -1724,7 +1747,7 @@ class ChatStore:
 
         Returns:
             The text with its attachments named (:func:`~ghostwriter.agent.context.user_content`),
-            the pictures that are ready to be seen, and the message's position.
+            the pictures that are ready to be seen, the message's position, and every file it attached.
 
         Raises:
             sqlalchemy.exc.NoResultFound: If the chat has no such user's message.
@@ -1743,7 +1766,24 @@ class ChatStore:
                 self._prompt_text(message, attachments, now, seen=seen),
                 self._images(attachments, now),
                 message.position,
+                tuple(self._sent_file(attachment, now) for attachment in attachments),
             )
+
+    def chat_files(self, chat_id: str) -> dict[str, SentFile]:
+        """Return every attachment of a chat, sent or waiting, as the notices about them read it.
+
+        Args:
+            chat_id: The chat.
+
+        Returns:
+            The attachments by path; of two at one path, the later.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            attachments = s.scalars(
+                select(Attachment).where(Attachment.chat_id == chat_id).order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            return {attachment.path: self._sent_file(attachment, now) for attachment in attachments}
 
     def past_turns(self, chat_id: str, *, before_position: int, seen: bool = False) -> tuple[list[PastTurn], bool]:
         """Return the turns before a message, for a follow-up: questions, live tool contents, answers.

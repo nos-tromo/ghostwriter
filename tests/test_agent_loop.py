@@ -11,7 +11,7 @@ import json
 import logging
 import re
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -21,6 +21,8 @@ from uuid import uuid4
 import httpx2
 import openai
 import pytest
+from sqlalchemy import Engine, select
+from sqlalchemy.orm import Session
 from typing_extensions import override
 
 from ghostwriter.agent.context import estimate_tokens, finished_turn, next_prompt_tokens
@@ -51,6 +53,7 @@ from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.inference import ModelClient
+from ghostwriter.models import Message
 from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
@@ -190,6 +193,7 @@ class LoopEnv:
         clock: The monotonic clock.
         cancel: The turn's stop.
         today: The store's time of day.
+        engine: The database, for what the store keeps as it is stored.
         answer_id: The answer the last run wrote.
     """
 
@@ -201,6 +205,7 @@ class LoopEnv:
     clock: HandClock
     cancel: HandStop
     today: StoreClock
+    engine: Engine
     answer_id: str = ""
 
     def run(
@@ -213,6 +218,7 @@ class LoopEnv:
         media: NextextHealth | None = None,
         attach: Sequence[tuple[str, dict[str, Any]]] = (),
         outcome: TurnOutcome | None = None,
+        measures: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> list[TurnEvent]:
         """Send a message and run its turn to the end.
 
@@ -226,6 +232,8 @@ class LoopEnv:
             attach: The files the message sends, by name and manifest, each settled ``ready`` first:
                 a manifest of kind ``image`` makes a picture, ``media`` a clip, any other a document.
             outcome: What the turn fills in when it ends; ``None`` keeps none.
+            measures: workbench's measure of an attached document, by its name: it is ``pending`` when attached,
+                then ``measured``; a document not named here is never measured.
 
         Returns:
             The turn's events.
@@ -244,8 +252,11 @@ class LoopEnv:
                 mime="image/jpeg" if picture else "video/mp4" if clip else "application/pdf",
                 kind="image" if picture else "media" if clip else "document",
                 status="processing",
+                measure_state="pending" if measures and name in measures else None,
             )
             self.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
+            if measures and name in measures:
+                self.store.settle_measure(attachment.id, measures[name])
             ids.append(attachment.id)
         user = self.store.add_user_message("user-a", CHAT, content, ids)
         self.answer_id = self.store.start_assistant_message(CHAT)
@@ -292,7 +303,9 @@ def loop_env(tmp_path: Path) -> Iterator[LoopEnv]:
     store.create_chat("user-a", id=CHAT)
     audit = RecordingAudit()
     clock = HandClock()
-    yield LoopEnv(settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock), today)
+    yield LoopEnv(
+        settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock), today, engine
+    )
     engine.dispose()
 
 
@@ -1863,3 +1876,109 @@ def test_images_past_the_cap_in_one_round_are_returned_and_named_unseen(loop_env
     text = json.dumps(sent)
     assert all(UNSEEN.format(label=f"quay-scan.pdf, page {n}") in text for n in range(1, 9))
     assert "were shown" not in text
+
+
+# --- what the message read: document_partial and document_unread ------------------------------------------------------
+
+REPORT = "long-report.pdf"
+REPORT_PATH = f"{FOLDER}/{REPORT}"
+REPORT_MANIFEST = {**stock_manifest(REPORT_PATH), "total": 500, "pages_without_text": list[int]()}
+REPORT_MEASURE = {"path": REPORT_PATH, "kind": "pdf", "unit": "page", "total": 500, "chars": 1_200_000, "capped": False}
+READ_REPORT = json.dumps({"path": REPORT_PATH})
+NOTES = "tide-notes.txt"
+
+
+def _report_read(*spans: tuple[int, int]) -> ToolResult:
+    """Return workbench 0.10's answer to a read of the report: one part per span, none cut."""
+    parts = [{"label": f"pages {a}-{b}", "text": "Gezeitentabelle", "units": [a, b], "cut": False} for a, b in spans]
+    body = {
+        "path": REPORT_PATH,
+        "kind": "pdf",
+        "parts": parts,
+        "total_parts": 500,
+        "pages_without_text": list[int](),
+        "shown": list[Any](),
+        "truncated": True,
+        "next_part": f"page {spans[-1][1] + 1}",
+        "hint": None,
+    }
+    return ToolResult(json.dumps(body, separators=(",", ":")), ())
+
+
+def _file_id(loop_env: LoopEnv, name: str) -> str:
+    """Return workbench's id of the chat's attachment of that name."""
+    [file_id] = [
+        attachment.file_id
+        for message in loop_env.store.chat_detail("user-a", CHAT).messages
+        for attachment in message.attachments
+        if attachment.name == name
+    ]
+    return file_id
+
+
+def test_the_notices_come_last_and_are_stored(loop_env: LoopEnv) -> None:
+    """A measured report read in part is told after the text; stored, the notice holds its counts and no name."""
+    loop_env.workbench.answers = [_report_read((1, 4), (5, 9))]
+    events = loop_env.run(
+        _calls(READ_REPORT),
+        [text_chunk("Kurz gefasst.")],
+        content="Fass den Bericht zusammen",
+        attach=[(REPORT, REPORT_MANIFEST)],
+        measures={REPORT: REPORT_MEASURE},
+    )
+    file_id = _file_id(loop_env, REPORT)
+    assert [type(e).__name__ for e in events] == ["StepEvent", "StepEvent", "TokenEvent", "NoticeEvent"]
+    assert events[-2:] == [
+        TokenEvent("Kurz gefasst."),
+        NoticeEvent("document_partial", file_id, REPORT, 9, 500, "page"),
+    ]
+    with Session(loop_env.engine) as s:
+        stored = s.scalars(select(Message.notices).where(Message.id == loop_env.answer_id)).one()
+    assert stored is not None and REPORT not in stored
+    assert json.loads(stored) == [
+        {"code": "document_partial", "file_id": file_id, "read": 9, "total": 500, "unit": "page"}
+    ]
+
+
+def test_an_attachment_not_read_without_tools_is_unread(loop_env: LoopEnv) -> None:
+    """With workbench off no tool is offered, so the attached notes were not read, and the user is told so."""
+    events = loop_env.run(
+        [text_chunk("Ohne Werkzeuge.")], workbench=None, attach=[(NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))]
+    )
+    assert events == [
+        TokenEvent("Ohne Werkzeuge."),
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES),
+    ]
+
+
+def test_an_earlier_attachment_read_in_part_is_named(loop_env: LoopEnv) -> None:
+    """A follow-up that reads part of a report an earlier question attached names it; it is not this one's unread."""
+    loop_env.run(
+        [text_chunk("Ein langer Bericht.")], attach=[(REPORT, REPORT_MANIFEST)], measures={REPORT: REPORT_MEASURE}
+    )
+    loop_env.workbench.answers = [_report_read((1, 9))]
+    events = loop_env.run(_calls(READ_REPORT), [text_chunk("Seiten 1 bis 9.")], content="Was steht am Anfang?")
+    assert [e for e in events if isinstance(e, NoticeEvent)] == [
+        NoticeEvent("document_partial", _file_id(loop_env, REPORT), REPORT, 9, 500, "page")
+    ]
+
+
+def test_the_file_notices_follow_answer_cut_and_precede_an_error(loop_env: LoopEnv) -> None:
+    """``answer_cut`` comes first; after a model error, the file notices still come, and the error stays last."""
+    notes = (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+    events = loop_env.run([text_chunk("Kapitel 1 …"), finish_chunk("length")], attach=[notes])
+    unread = NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES)
+    assert events == [TokenEvent("Kapitel 1 …"), NoticeEvent("answer_cut"), unread]
+    other = ("quay-notes.txt", stock_manifest(f"{FOLDER}/quay-notes.txt"))
+    events = loop_env.run(_router_error(), content="Und die?", attach=[other])
+    assert events == [
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, "quay-notes.txt"), name="quay-notes.txt"),
+        ErrorEvent("model", "The model did not answer."),
+    ]
+
+
+def test_a_stopped_turn_still_tells_what_was_not_read(loop_env: LoopEnv) -> None:
+    """A stop during the first call: the call is stored, and the attached notes, never opened, are unread."""
+    loop_env.workbench.answers = [_then(loop_env.cancel.set, RESULT)]
+    events = loop_env.run(_calls(READ_SALES), attach=[(NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))])
+    assert events[-1] == NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES)

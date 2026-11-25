@@ -1189,6 +1189,43 @@ def test_an_answer_from_before_notices_is_served_as_before(client: TestClient, f
     assert answer["content"] and answer["role"] == "assistant"
 
 
+def test_a_regenerated_answer_reports_again(client: TestClient, door: FakeDoor, fake_openai: FakeOpenAI) -> None:
+    """The first answer never opened the notes, and says so; its regenerate read them whole, and says nothing."""
+    cid = _new(client)
+    path = f"{chat_folder(KEY, cid)}/tide-notes.txt"
+    notes = _state(client).store.add_attachment(
+        cid, file_id="4" * 32, path=path, name="tide-notes.txt", size=31, mime="text/plain"
+    )
+    fake_openai.script = [ANSWER]
+    frames = _frames(_send(client, cid, "Was steht in den Notizen?", attachment_ids=[notes.id]))
+    unread = {"code": "document_unread", "file_id": "4" * 32, "name": "tide-notes.txt"}
+    assert [(f.event, f.data) for f in frames[-2:-1]] == [("notice", unread)]
+    assert _detail(client, cid)["messages"][1]["notices"] == [{**unread, "read": None, "total": None, "unit": None}]
+
+    read = {
+        "path": path,
+        "kind": "text",
+        "parts": [{"label": "lines 1-2", "text": "high tide 06:12\nlow tide 12:30", "units": [1, 2], "cut": False}],
+        "total_parts": 2,
+        "pages_without_text": list[int](),
+        "shown": list[Any](),
+        "truncated": False,
+        "next_part": None,
+        "hint": None,
+    }
+    door.answers["tools/call"] = {
+        "resultType": "complete",
+        "isError": False,
+        "content": [{"type": "text", "text": json.dumps(read, separators=(",", ":"))}],
+        "structuredContent": read,
+    }
+    arguments = json.dumps({"path": path})
+    fake_openai.script = [[call_chunk(0, "call_0", "read_document", arguments)], ANSWER]
+    frames = _frames(client.post(f"/api/chats/{cid}/regenerate", headers=as_user()))
+    assert "notice" not in [f.event for f in frames]
+    assert _detail(client, cid)["messages"][1]["notices"] == []
+
+
 def _notice_data(event: NoticeEvent) -> dict[str, Any]:
     """Return the data of a notice's frame."""
     [frame] = _read(iter(_frame(event).split("\n")))

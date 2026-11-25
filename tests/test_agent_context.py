@@ -58,6 +58,7 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
+from ghostwriter.agent.notices import SentFile
 from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION, system_prompt
 from ghostwriter.agent.tools import (
     CUT_END_HINT,
@@ -827,12 +828,45 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     store.finish_assistant_message(store.start_assistant_message(chat.id), "42")
     second = store.add_user_message("user-a", chat.id, "Und Spalte C?", [])
     named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]"
-    assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0)
+    sales = SentFile("1" * 32, f"{FOLDER}/sales.xlsx", "sales.xlsx", "document", "ready", None, None)
+    assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0, (sales,))
     assert store.user_turn(chat.id, second.id) == UserTurn("Und Spalte C?", (), 2)
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(named, (), "42", False)], False)
     clock.now = T0 + 7 * DAY
     gone = "Summe der Spalte B\n[Attached: sales.xlsx; expired]"
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(gone, (), "42", True)], True)
+
+
+def test_the_store_reads_the_chats_files_for_the_notices(store: ChatStore, clock: Clock) -> None:
+    """Every attachment of the chat, sent or waiting, by path; its measure's length only while measured and live."""
+    chat, other = store.create_chat("user-a"), store.create_chat("user-a")
+
+    def attach(chat_id: str, name: str, measure: dict[str, Any] | None = None) -> str:
+        clock.now += timedelta(seconds=1)
+        out = store.add_attachment(
+            chat_id,
+            file_id=name[0] * 32,
+            path=f"{FOLDER}/{name}",
+            name=name,
+            size=64,
+            mime="application/pdf",
+            measure_state="pending",
+        )
+        if measure is not None:
+            store.settle_measure(out.id, measure)
+        return out.id
+
+    measured = {"total": 500, "unit": "page", "chars": 1_200_000, "capped": False}
+    report = attach(chat.id, "long-report.pdf", measured)
+    attach(chat.id, "tide-notes.txt")
+    attach(other.id, "quay-ledger.xlsx", {"total": 40, "unit": "row", "chars": 900, "capped": False})
+    asked = store.add_user_message("user-a", chat.id, "Fass zusammen", [report])
+    pdf = SentFile("l" * 32, f"{FOLDER}/long-report.pdf", "long-report.pdf", "document", "ready", 500, "page")
+    notes = SentFile("t" * 32, f"{FOLDER}/tide-notes.txt", "tide-notes.txt", "document", "ready", None, None)
+    assert store.user_turn(chat.id, asked.id).files == (pdf,)
+    assert store.chat_files(chat.id) == {pdf.path: pdf, notes.path: notes}
+    clock.now += 7 * DAY
+    assert store.chat_files(chat.id)[pdf.path] == dataclasses.replace(pdf, total=None, unit=None)
 
 
 def test_a_finished_turn_is_what_the_store_replays(store: ChatStore) -> None:
@@ -1753,6 +1787,13 @@ def test_the_store_lists_ready_images_of_a_turn(store: ChatStore, clock: Clock) 
         ),
         (photo,),
         0,
+        (
+            SentFile("o" * 32, f"{FOLDER}/old-photo.jpg", "old-photo.jpg", "image", "ready", None, None),
+            SentFile("h" * 32, f"{FOLDER}/harbour-photo.jpg", "harbour-photo.jpg", "image", "ready", None, None),
+            SentFile("q" * 32, f"{FOLDER}/quay-photo.jpg", "quay-photo.jpg", "image", "processing", None, None),
+            SentFile("b" * 32, f"{FOLDER}/blurred-photo.jpg", "blurred-photo.jpg", "image", "failed", None, None),
+            SentFile("s" * 32, f"{FOLDER}/scan.pdf", "scan.pdf", "document", "ready", None, None),
+        ),
     )
     unseen = store.user_turn(chat.id, first.id)
     assert unseen.images == (photo,) and f"image 64{times}48; not shown to the model" in unseen.text
