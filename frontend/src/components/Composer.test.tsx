@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createEvent, fireEvent, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { PURPOSE_HEADER, PurposeBar, clearAllPurposes, setPurpose } from '@infra/ui'
-import type { AppConfig, AttachmentLength, AttachmentOut, MessageOut } from '../api/types'
+import type { QueryClient } from '@tanstack/react-query'
+import type { AppConfig, AttachmentLength, AttachmentOut, ChatDetail, MessageOut } from '../api/types'
 import { useConfig } from '../hooks/useConfig'
 import { LanguageContext } from '../i18n/LanguageContext'
 import { ChatPane } from './ChatPane'
@@ -1494,6 +1495,13 @@ describe('the context ring and note', () => {
     message({ id, role: 'assistant', content: `Antwort ${id}`, context_estimate: estimate, ...fields })
   const question = (id: string) => message({ id, role: 'user', content: `Frage ${id}` })
   const trimmed: MessageOut['notices'] = [{ code: 'context_trimmed' }]
+  /** The chat as a read of it brings it, shown once the query's observers have been told (they are told on
+   *  the next tick, so an assertion straight after would see the chat as it was). */
+  const reread = (client: QueryClient, chat: ChatDetail) =>
+    act(async () => {
+      client.setQueryData(['chat', 'c1'], chat)
+      await new Promise((done) => setTimeout(done, 0))
+    })
 
   it('shows no ring in an empty chat, nor after an answer stored without an estimate', async () => {
     openChat()
@@ -1619,13 +1627,58 @@ describe('the context ring and note', () => {
     expect(screen.queryByText(TRIMMED)).not.toBeInTheDocument()
     act(() => sse.push('start', { message_id: 'a2', user_message_id: 'q2' }))
     // A read of the chat meanwhile lists the turn's own rows, whose answer has no estimate yet.
-    act(() => {
-      client.setQueryData(['chat', 'c1'], detail([question('q1'), answer('a1', 3_400), question('q2'), answer('a2', null)]))
-    })
+    await reread(client, detail([question('q1'), answer('a1', 3_400), question('q2'), answer('a2', null)]))
     act(() => sse.push('notice', { code: 'context_trimmed' }))
     expect(await screen.findByText(TRIMMED)).toBeInTheDocument()
     expect(screen.getByRole('meter', { name: 'about 10 % of the context used' })).toBeInTheDocument()
     act(() => sse.end())
+    // The chat is read again before the stream is let go: the test ends only after that read.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument())
+  })
+
+  it('falls back to the previous answer while a new answer has no estimate yet', async () => {
+    const sse = sseStream()
+    const { client } = openChat({
+      [CHAT_URL]: detail([question('q1'), answer('a1', 17_000)]),
+      [`POST ${MESSAGES}`]: () => sse.response(),
+    })
+    const user = userEvent.setup()
+    await screen.findByRole('meter', { name: 'about 50 % of the context used' })
+
+    await user.type(textbox(), 'Und Spalte C?{Enter}')
+    await screen.findByRole('button', { name: 'Stop' })
+    act(() => sse.push('start', { message_id: 'a2', user_message_id: 'q2' }))
+    // The chat read meanwhile lists the new answer's row, with no estimate: the ring does not go with it.
+    await reread(client, detail([question('q1'), answer('a1', 17_000), question('q2'), answer('a2', null)]))
+    expect(screen.getByRole('meter', { name: 'about 50 % of the context used' })).toBeInTheDocument()
+    act(() => sse.end())
+    // The chat is read again before the stream is let go: the test ends only after that read.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument())
+  })
+
+  it('keeps the ring and the note while a cut answer is continued', async () => {
+    const sse = sseStream()
+    const CONTINUE = `${MESSAGES}/a1/continue`
+    const cut = answer('a1', 27_200, { notices: [{ code: 'answer_cut' }] })
+    const { calls } = openChat({
+      [CHAT_URL]: detail([question('q1'), cut]),
+      [`POST ${CONTINUE}`]: () => sse.response(),
+    })
+    const user = userEvent.setup()
+    await screen.findByText(NEARLY)
+    expect(screen.getByRole('meter', { name: 'about 80 % of the context used' })).toBeInTheDocument()
+
+    await user.click(screen.getByRole('button', { name: 'Continue' }))
+    await waitFor(() => expect(callsTo(calls, 'POST', CONTINUE)).toHaveLength(1))
+    // The row the turn names is the cut answer itself, which already holds its estimate.
+    act(() => sse.push('start', { message_id: 'a1', user_message_id: null }))
+    act(() => sse.push('token', { text: ' weiter' }))
+    expect(await screen.findByText(/weiter/)).toBeInTheDocument()
+    expect(screen.getByRole('meter', { name: 'about 80 % of the context used' })).toBeInTheDocument()
+    expect(screen.getByText(NEARLY)).toBeInTheDocument()
+    act(() => sse.end())
+    // The chat is read again before the stream is let go: the test ends only after that read.
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Stop' })).not.toBeInTheDocument())
   })
 })
 
