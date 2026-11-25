@@ -42,6 +42,9 @@ At the end of an answer :func:`next_prompt_tokens` estimates what the next messa
 system prompt, the tool schemas and every turn as :func:`fit` would replay it, the answer just finished
 (:func:`finished_turn`) among them. It is sized by the same code and counts what could no longer be sent: no
 budget, no image cap.
+
+A continuation (Continue) sends its turn as :func:`continuation` gives it: the turn replayed as an earlier one is,
+the answer so far its last message, and for a provider that does not go on in that message, an instruction after it.
 """
 
 import math
@@ -74,6 +77,7 @@ from ghostwriter.agent.images import (
     told,
 )
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, HISTORY_ARGUMENT_CHARS, HISTORY_RESULT_CHARS, PROMPT_TOKENS
+from ghostwriter.agent.prompt import CONTINUE
 from ghostwriter.agent.tools import CUT_MARK, compact, cut, echoed_arguments, parse_arguments
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.upload import media_kind
@@ -404,6 +408,27 @@ def _replayed(
             for call in calls
         )
     messages.append({"role": "assistant", "content": turn.answer})
+    return messages
+
+
+def continuation(this: PastTurn, *, instruct: bool) -> list[dict[str, Any]]:
+    """Return the current turn of a continuation: the turn so far, its answer the last assistant message.
+
+    The turn is replayed as an earlier one is (:func:`_replayed`), its text alone: its calls' arguments and
+    results in the history form, and no image.
+
+    Args:
+        this: The turn whose answer goes on, as the store replays it.
+        instruct: Whether a user message asks the model to go on (:data:`~ghostwriter.agent.prompt.CONTINUE`),
+            for a provider that does not go on in the last assistant message itself; vllm does.
+
+    Returns:
+        The question, each round's calls and results, then the answer so far; with ``instruct``, the instruction
+        after it.
+    """
+    messages = _replayed(this)
+    if instruct:
+        messages.append({"role": "user", "content": CONTINUE})
     return messages
 
 

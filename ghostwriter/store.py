@@ -1842,6 +1842,69 @@ class ChatStore:
                 turns.append(PastTurn(question[0], (), "", question[1], question[2]))
             return turns, any(turn.expired for turn in turns)
 
+    def answered_turns(self, chat_id: str, answer_id: str) -> list[PastTurn]:
+        """Return the turns of a chat through one of its answers, for that answer's continuation.
+
+        Each is read as :meth:`past_turns` reads it, for a turn that does not see. The message just before the
+        answer must be its question: :meth:`past_turns` pairs a question with the first answer after it, so the
+        last turn would otherwise be another answer's.
+
+        Args:
+            chat_id: The chat.
+            answer_id: The answer.
+
+        Returns:
+            The turns, oldest first, the last the answer's own: its question, its live tool contents, its text.
+
+        Raises:
+            LookupError: If the chat has no such answer, or the message just before it is no question.
+        """
+        with self._transaction() as s:
+            position = s.scalars(
+                select(Message.position).where(
+                    Message.id == answer_id, Message.chat_id == chat_id, Message.role == "assistant"
+                )
+            ).one_or_none()
+            before = (
+                None
+                if position is None
+                else s.scalars(
+                    select(Message.role)
+                    .where(Message.chat_id == chat_id, Message.position < position)
+                    .order_by(Message.position.desc())
+                    .limit(1)
+                ).one_or_none()
+            )
+        if position is None or before != "user":
+            raise LookupError("the chat has no such answer to a question")
+        turns, _ = self.past_turns(chat_id, before_position=position + 1)
+        return turns
+
+    def answer_notices(self, message_id: str) -> list[dict[str, Any]]:
+        """Return an answer's notices as they are stored.
+
+        Args:
+            message_id: The answer.
+
+        Returns:
+            Each stored notice as it was written: its code, and its file's id and counts until the sweep stripped
+            them; none for ``NULL`` (an answer being written, or one stored before schema 3), for a value that is
+            not a JSON list, or for no such answer.
+        """
+        with self._transaction() as s:
+            stored = s.scalars(
+                select(Message.notices).where(Message.id == message_id, Message.role == "assistant")
+            ).one_or_none()
+        if stored is None:
+            return []
+        try:
+            values = json.loads(stored)
+        except ValueError:
+            return []
+        if not isinstance(values, list):
+            return []
+        return [cast(dict[str, Any], value) for value in cast(list[Any], values) if isinstance(value, dict)]
+
     @staticmethod
     def _live_rounds(steps: Sequence[ToolStep], now: datetime) -> tuple[tuple[tuple[PastCall, ...], ...], bool]:
         """Group an answer's steps into rounds, leaving out those whose content has expired.

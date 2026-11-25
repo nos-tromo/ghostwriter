@@ -52,6 +52,7 @@ from tests.fakes import (
     FakeOpenAI,
     Round,
     call_chunk,
+    finish_chunk,
     image_block,
     reasoning_chunk,
     stock_manifest,
@@ -474,6 +475,172 @@ def test_regenerate_needs_an_answer(client: TestClient, audit_stream: CapturedAu
     r = client.post(f"/api/chats/{cid}/regenerate", json={}, headers=as_user())
     assert (r.status_code, r.json()) == (409, {"detail": "There is no answer to regenerate.", "code": "no_answer"})
     assert events(audit_stream)[before:] == [] and not _state(client).turns.running(cid)
+
+
+# --- continue ----------------------------------------------------------------
+
+#: An answer cut at the length limit, mid-sentence.
+CUT: Round = [text_chunk("Kapitel 1 … und"), finish_chunk("length")]
+#: A continuation that ends cleanly, below the cap.
+GO_ON: Round = [text_chunk(" weiter."), finish_chunk("stop"), usage_chunk(950, 3, "served-model")]
+NOT_CONTINUABLE = (
+    409,
+    {"detail": "Only the latest answer cut at the length limit can be continued.", "code": "not_continuable"},
+)
+
+
+def _cut_answer(client: TestClient, fake_openai: FakeOpenAI, cid: str, content: str = "Schreib Kapitel 1") -> str:
+    """Send a message whose answer is cut at the length limit; return the answer's id."""
+    fake_openai.script = [CUT]
+    final = _frames(_send(client, cid, content))[-1].data
+    return str(final["message_id"])
+
+
+def _continue(client: TestClient, cid: str, message_id: str, user: str = "user-a") -> httpx2.Response:
+    return client.post(f"/api/chats/{cid}/messages/{message_id}/continue", headers=as_user(user))
+
+
+def test_continue_streams_into_the_same_answer(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """``start`` names the answer and no question; the tokens follow; the chat keeps one answer, its text appended."""
+    cid = _new(client)
+    answer = _cut_answer(client, fake_openai, cid)
+    fake_openai.script = [GO_ON]
+    frames = _all_frames(_continue(client, cid, answer))
+    assert frames[0] == Frame("start", {"message_id": answer, "user_message_id": None})
+    assert [f.event for f in frames[1:]] == ["token", "final"] and frames[1].data == {"text": " weiter."}
+    final = frames[-1].data
+    assert (final["message_id"], final["user_message_id"], final["stopped"]) == (answer, None, False)
+    question, continued = _detail(client, cid)["messages"]
+    assert (continued["id"], continued["content"], continued["notices"]) == (answer, "Kapitel 1 … und weiter.", [])
+    assert isinstance(final["context_estimate"], int) and final["context_estimate"] == continued["context_estimate"]
+    assert question["role"] == "user" and not _state(client).turns.running(cid)
+    sent = fake_openai.calls[-1]
+    assert sent["messages"][-1] == {"role": "assistant", "content": "Kapitel 1 … und"} and "tools" not in sent
+
+
+@pytest.mark.parametrize("which", ["earlier", "not_cut", "before_notices", "question", "unknown"])
+def test_continue_needs_the_latest_answer_cut(
+    client: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream, which: str
+) -> None:
+    """Only the latest answer, while it carries ``answer_cut``, goes on; anything else is 409, recorded as nothing.
+
+    An answer 0.6 stored has no notices, so it carries no cut. Another owner's chat is not found, and an
+    unauthenticated request is refused.
+    """
+    cid = _new(client)
+    earlier = _cut_answer(client, fake_openai, cid)
+    fake_openai.script = [ANSWER if which == "not_cut" else CUT]
+    latest = _frames(_send(client, cid, "Und Kapitel 2?"))[-1].data
+    if which == "before_notices":
+        engine = make_engine(_state(client).settings.db_path)
+        with Session(engine) as s, s.begin():
+            s.execute(update(Message).where(Message.chat_id == cid).values(notices=None, context_estimate=None))
+        engine.dispose()
+    asked = {
+        "earlier": earlier,
+        "not_cut": latest["message_id"],
+        "before_notices": latest["message_id"],
+        "question": latest["user_message_id"],
+        "unknown": "a0000000-0000-4000-8000-00000000000f",
+    }[which]
+    detail = _detail(client, cid)
+    before = len(events(audit_stream))
+    r = _continue(client, cid, asked)
+    assert (r.status_code, r.json()) == NOT_CONTINUABLE
+    r = _continue(client, cid, latest["message_id"], user="user-b")
+    assert (r.status_code, r.json()) == NOT_FOUND
+    assert client.post(f"/api/chats/{cid}/messages/{asked}/continue").status_code == 401
+    assert events(audit_stream)[before:] == [] and not _state(client).turns.running(cid)
+    assert _detail(client, cid) == detail and len(fake_openai.calls) == 2
+
+
+def test_continue_twice_is_refused(
+    client: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """While a turn holds the chat, Continue is busy; once a clean continuation took the cut away, it is refused.
+
+    Neither refusal records anything or changes the answer.
+    """
+    cid = _new(client)
+    answer = _cut_answer(client, fake_openai, cid)
+    turns = _state(client).turns
+    claim = turns.begin(cid)
+    assert claim is not None
+    before = len(events(audit_stream))
+    r = _continue(client, cid, answer)
+    assert (r.status_code, r.json()) == RUNNING and events(audit_stream)[before:] == []
+    turns.end(cid, claim)
+    fake_openai.script = [GO_ON]
+    assert _frames(_continue(client, cid, answer))[-1].data["stopped"] is False
+    detail = _detail(client, cid)
+    assert detail["messages"][1]["content"] == "Kapitel 1 … und weiter."
+    before = len(events(audit_stream))
+    r = _continue(client, cid, answer)
+    assert (r.status_code, r.json()) == NOT_CONTINUABLE and events(audit_stream)[before:] == []
+    assert _detail(client, cid) == detail and len(fake_openai.calls) == 2 and not turns.running(cid)
+
+
+def test_continue_is_recorded_before_anything_is_stored(
+    client: TestClient, fake_openai: FakeOpenAI, audit_stream: CapturedAuditStream
+) -> None:
+    """``modify`` / ``chat.continue`` names the answer, its one round its child; unwritten, nothing happens."""
+    cid = _new(client)
+    answer = _cut_answer(client, fake_openai, cid)
+    detail = _detail(client, cid)
+    audit_stream.failing = True
+    r = _continue(client, cid, answer)
+    assert (r.status_code, r.json()) == (500, {"detail": "Request failed."})
+    audit_stream.failing = False
+    assert _detail(client, cid) == detail and len(fake_openai.calls) == 1 and not _state(client).turns.running(cid)
+    fake_openai.script = [GO_ON]
+    _frames(_continue(client, cid, answer))
+    [primary] = [e for e in events(audit_stream) if e["operation"] == "chat.continue"]
+    assert (primary["action"], primary["outcome"], primary["target"]) == (
+        "modify",
+        "ok",
+        {"kind": "message", "ids": [answer], "container": cid},
+    )
+    children = [e for e in events(audit_stream) if e.get("parent_event_id") == primary["event_id"]]
+    assert [(e["action"], e["operation"]) for e in children] == [("ai_call", "chat.answer")]
+    assert children[0]["criteria"] == {
+        "round": 1,
+        "tool_calls": 0,
+        "finish_reason": "stop",
+        "stopped": False,
+        "images": 0,
+        "reasoning": False,
+    }
+    assert children[0]["ai"]["output_sha256"] == sha256_text(" weiter.")
+    for content in ("Schreib Kapitel 1", "Kapitel 1 … und", " weiter."):
+        assert content not in audit_stream.getvalue()
+
+
+def test_a_stop_ends_a_continuation(client: TestClient, fake_openai: FakeOpenAI) -> None:
+    """A stop mid-stream ends the continuation as stopped; the text it appended is kept, and the answer stays cut."""
+    cid = _new(client)
+    answer = _cut_answer(client, fake_openai, cid)
+    stopped = threading.Event()
+    fake_openai.script = [
+        [text_chunk(" weiter"), text_chunk(" und"), _gate(stopped, text_chunk(" nie")), text_chunk("!")]
+    ]
+    tokens: list[str] = []
+    with client.stream("POST", f"/api/chats/{cid}/messages/{answer}/continue", headers=as_user()) as response:
+        frames = _read_after_start(response.iter_lines())
+        for frame in frames:
+            assert frame.event == "token"
+            tokens.append(frame.data["text"])
+            if len(tokens) == 2:
+                break
+        assert client.post(f"/api/chats/{cid}/stop", headers=as_user()).status_code == 204
+        stopped.set()
+        rest = list(frames)
+    assert [(f.event, f.data) for f in rest[:-1]] == [("notice", {"code": "answer_cut"})]
+    assert rest[-1].event == "final" and rest[-1].data["stopped"] is True
+    assert tokens == [" weiter", " und"]
+    continued = _detail(client, cid)["messages"][-1]
+    assert continued["content"] == "Kapitel 1 … und weiter und"
+    assert [n["code"] for n in continued["notices"]] == ["answer_cut"]
+    assert not _state(client).turns.running(cid) and fake_openai.streams[-1].closed
 
 
 # --- what a message may say ---------------------------------------------------

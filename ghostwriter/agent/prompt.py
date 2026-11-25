@@ -1,4 +1,7 @@
-"""The system prompt: who answers, in which language, and what the chat's tools and files are."""
+"""The system prompt: who answers, in which language, and what the chat's tools and files are.
+
+And the instruction a continuation sends a provider that does not go on in the answer's own message.
+"""
 
 from datetime import date
 from typing import Final
@@ -39,6 +42,10 @@ DECK_CHECK: Final = (
     "native charts and tables, and set colours, fonts, backgrounds and shapes with python-pptx in run_python, which "
     "writes the restyled deck as a new file; look at it again, and name the file that is now the deck."
 )
+
+#: What a continuation asks of a provider other than vllm, as a user message after the answer so far: vllm goes on
+#: in that message itself (:data:`~ghostwriter.inference.CONTINUE_BODY`), and no other provider is known to.
+CONTINUE: Final = "Go on exactly where your answer stopped; repeat nothing."
 
 
 def system_prompt(

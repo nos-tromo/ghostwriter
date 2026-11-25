@@ -1,4 +1,4 @@
-"""Messages: send one and stream its answer as Server-Sent Events, stop the answer, regenerate the last one.
+"""Messages: send one and stream its answer as Server-Sent Events, stop the answer, regenerate or continue the last one.
 
 A message runs one turn of :class:`~ghostwriter.agent.loop.AgentLoop`, at most one per chat
 (:class:`~ghostwriter.turns.TurnRegistry`), on a thread of the app's turn limiter
@@ -22,8 +22,15 @@ only frame, and when its response ends. ``final`` names the answer's and the que
 answer was ``stopped``, and its ``context_estimate``: the estimated tokens of the next prompt, as stored with the
 answer, or ``null`` for a turn that never began or whose estimate failed.
 
+Continue (``POST /{chat_id}/messages/{message_id}/continue``) goes on with the chat's latest answer while its last
+round ended at the length limit (it carries ``answer_cut``): one round, without tools or thinking, whose text is
+appended to the same answer, with the same frames. ``start`` and ``final`` name that answer and no question
+(``user_message_id`` is ``null``), and the tokens are the appended text only. The answer keeps its other notices;
+``answer_cut`` is told again, after the text, unless the round ended cleanly below the cap. Any other answer, a
+question, or an unknown id is 409 ``not_continuable``.
+
 A turn is recorded as one primary event, written before anything is stored (``collect`` /
-``chat.message``, or ``modify`` / ``chat.regenerate``), with a child per model round
+``chat.message``, ``modify`` / ``chat.regenerate``, or ``modify`` / ``chat.continue``), with a child per model round
 (``ai_call`` / ``chat.answer``, naming how many images it sent; a round sent again without its
 images has two) and one per call sent to workbench (``disclose`` / ``chat.tool``): references
 only. A record that cannot be written stops the answer with the ``audit`` error frame; a step
@@ -81,6 +88,8 @@ PROCESSING: Final = "Wait until the attached files are ready."
 PROCESSING_CODE: Final = "attachment_processing"
 NO_ANSWER: Final = "There is no answer to regenerate."
 NO_ANSWER_CODE: Final = "no_answer"
+NOT_CONTINUABLE: Final = "Only the latest answer cut at the length limit can be continued."
+NOT_CONTINUABLE_CODE: Final = "not_continuable"
 #: What the user is told when a record of the turn could not be written.
 AUDIT_ERROR: Final = "The answer stopped: it could not be recorded."
 STREAM_HEADERS: Final = {"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
@@ -447,6 +456,7 @@ def _answer(
     answer_id: str,
     user_message_id: str | None,
     reasoning: bool,
+    continued: bool = False,
 ) -> TurnResponse:
     """Stream the answer to a question; the turn's claim passes to the stream.
 
@@ -457,9 +467,10 @@ def _answer(
         chat_id: The chat.
         claim: The chat's claim.
         question_id: The user's message answered.
-        answer_id: The answer to write.
+        answer_id: The answer to write, or to go on with.
         user_message_id: The message sent, for the final frame.
         reasoning: The reasoning switch.
+        continued: Whether the turn goes on with the answer in place (Continue).
 
     Returns:
         The stream.
@@ -474,6 +485,7 @@ def _answer(
         request_id=op.context.request_id,
         cancel=claim,
         reasoning=reasoning,
+        continued=continued,
     )
     audit = OperationTurnAudit(
         op, answer_id=answer_id, text_model=settings.text_model, reasoning=reasoning, cancel=claim
@@ -614,6 +626,70 @@ def regenerate(
             answer_id=answer_id,
             user_message_id=None,
             reasoning=body is not None and body.reasoning,
+        )
+    except BaseException:
+        _turns(request).end(chat_id, claim)
+        raise
+
+
+@router.post(
+    "/{chat_id}/messages/{message_id}/continue",
+    response_class=StreamingResponse,
+    response_model=None,
+    summary="Go on with the last answer, cut at the length limit",
+)
+def continue_answer(
+    chat_id: str,
+    message_id: str,
+    request: Request,
+    user: User,
+    op: Annotated[Operation, Depends(audited("modify", "chat.continue", also=("ai_call",)))],
+) -> TurnResponse | JSONResponse:
+    """Append one round to the chat's latest answer, cut at the length limit, streamed as Server-Sent Events.
+
+    Args:
+        chat_id: The chat.
+        message_id: The answer to go on with.
+        request: The request.
+        user: Who asks.
+        op: ``modify`` / ``chat.continue``, recorded with the answer's id before anything is stored; the
+            round is its child.
+
+    Returns:
+        The stream; or 409 ``busy`` while a turn runs in the chat, ``not_continuable`` when the message is not
+        the chat's latest answer, carries no ``answer_cut``, or answers no question, before anything is recorded
+        or stored.
+
+    Raises:
+        HTTPException: 404 for another owner's chat or an unknown one.
+    """
+    store = _store(request)
+    claim = _claim(request, user.name, chat_id)
+    if claim is None:
+        return _conflict(ANSWER_RUNNING, BUSY_CODE)
+    try:
+        owned_chat(store, user.name, chat_id)
+        latest = store.last_answer(user.name, chat_id)
+        question_id = store.question_of(chat_id, message_id) if message_id == latest else None
+        cut = question_id is not None and any(
+            notice.get("code") == "answer_cut" for notice in store.answer_notices(message_id)
+        )
+        if question_id is None or not cut:
+            _turns(request).end(chat_id, claim)
+            return _conflict(NOT_CONTINUABLE, NOT_CONTINUABLE_CODE)
+        op.container = chat_id
+        op.record(target=Target(kind="message", ids=(message_id,)))
+        return _answer(
+            request,
+            op,
+            user.name,
+            chat_id,
+            claim,
+            question_id=question_id,
+            answer_id=message_id,
+            user_message_id=None,
+            reasoning=False,
+            continued=True,
         )
     except BaseException:
         _turns(request).end(chat_id, claim)

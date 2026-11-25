@@ -68,6 +68,15 @@ When the answer ends, however it ends, the loop estimates the tokens the next me
 chat, this one as it will be replayed) and stores it with the answer; the caller's :class:`TurnOutcome` carries it
 too. A turn stopped before it began has none, and nor has an answer whose estimate failed.
 
+A continued turn (:attr:`Turn.continued`, Continue) goes on with an answer cut at its length limit, in place: one
+round, without tools or thinking, with the budget of a round without thinking, whose text is appended to the
+answer so far (:attr:`_Progress.base`). It sends the earlier turns as any round does, then the turn itself as history
+replays it, the answer so far last (:func:`~ghostwriter.agent.context.continuation`): vllm goes on in that message,
+any other provider is asked to go on after it. The answer's stored notices are kept as they are, and only
+``answer_cut`` is computed again: it goes once the round ended cleanly below ``MAX_ANSWER_TOKENS``, and otherwise (a
+failed round, a stop, a cut) stays where it was and is told again, before an error. No other notice is told: the
+round adds no turn to trim and calls no tool. A continuation stopped before it began reads and stores nothing.
+
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
 a label, an image or the router's refusal text.
 """
@@ -86,7 +95,7 @@ from uuid import uuid4
 import openai
 from loguru import logger
 
-from ghostwriter.agent.context import FitReport, PastTurn, finished_turn, fit, next_prompt_tokens
+from ghostwriter.agent.context import FitReport, PastTurn, continuation, finished_turn, fit, next_prompt_tokens
 from ghostwriter.agent.images import (
     UNSEEN,
     ImageBank,
@@ -190,6 +199,8 @@ class Turn:
         request_id: The request's correlation id.
         cancel: Set to stop the answer.
         reasoning: The message's reasoning switch: every round may think first.
+        continued: Whether the turn goes on with the answer, cut at its length limit, in place: one round without
+            tools or thinking, its text appended to the answer's.
     """
 
     chat_id: str
@@ -200,6 +211,7 @@ class Turn:
     request_id: str
     cancel: threading.Event
     reasoning: bool = False
+    continued: bool = False
 
 
 @dataclass(frozen=True)
@@ -303,6 +315,7 @@ class _Progress:
 
     Attributes:
         started: The clock's reading when the answer began.
+        base: The answer's text before this turn, which a continuation appends to; empty for a new answer.
         shown: Every text sent, in order.
         steps: Steps stored so far.
         cards: The ids of the files shown as cards.
@@ -315,6 +328,7 @@ class _Progress:
     """
 
     started: float
+    base: str = ""
     shown: list[str] = field(default_factory=list)
     steps: int = 0
     cards: set[str] = field(default_factory=set)
@@ -322,6 +336,11 @@ class _Progress:
     notices: list[NoticeEvent] = field(default_factory=list)
     next_prompt: Callable[[str], int] | None = None
     reading: Reading = field(default_factory=Reading)
+
+    @property
+    def text(self) -> str:
+        """The answer's text as it is stored: the base, then every text sent."""
+        return self.base + "".join(self.shown)
 
     def told(self, event: NoticeEvent) -> NoticeEvent:
         """Keep a notice the user is told, for the answer.
@@ -644,10 +663,10 @@ class AgentLoop:
         self._media = media
 
     def run(self, turn: Turn, audit: TurnAudit, *, outcome: TurnOutcome | None = None) -> Iterator[TurnEvent]:
-        """Answer a message.
+        """Answer a message, or go on with its answer for a continued turn.
 
         The answer's text, its notices and the estimate of the next prompt are stored when the run ends, however
-        it ends.
+        it ends; a continuation that never began, which read nothing of the answer, stores nothing.
 
         Args:
             turn: The message.
@@ -658,14 +677,16 @@ class AgentLoop:
             TurnEvent: Text, steps, cards and notices as they come, each notice also kept in the answer's
             progress; ``answer_cut`` after the last round's text when it ended at its cap; then
             ``document_partial`` and ``document_unread``; an :class:`ErrorEvent` last when the answer ended early.
+            A continuation yields its text, then ``answer_cut`` unless its round ended cleanly below the cap.
 
         Raises:
             AuditWriteError: When a record could not be written; raised after the answer is stored.
         """
         message = _Progress(started=self._clock())
+        answer = self._continue if turn.continued else self._answer
         try:
             try:
-                yield from self._answer(turn, audit, message)
+                yield from answer(turn, audit, message)
             except AuditWriteError:
                 raise
             except Exception as exc:
@@ -675,20 +696,22 @@ class AgentLoop:
             estimate = _estimated(message)
             if outcome is not None:
                 outcome.context_estimate = estimate
-            self._store_answer(turn, message, estimate)
+            # A continuation's messages exist once it has read the answer; before, storing would empty the answer.
+            if not turn.continued or message.next_prompt is not None:
+                self._store_answer(turn, message, estimate)
 
     def _store_answer(self, turn: Turn, message: _Progress, context_estimate: int | None) -> None:
         """Store the answer's text, its notices and its estimate; a failure is logged, never raised over the turn.
 
         Args:
             turn: The message.
-            message: The answer: everything shown, and every notice told, stored without its name.
+            message: The answer: its base and everything shown, and every notice told, stored without its name.
             context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
         try:
             self._store.finish_assistant_message(
                 turn.assistant_message_id,
-                "".join(message.shown),
+                message.text,
                 notices=[notice.stored() for notice in message.notices],
                 context_estimate=context_estimate,
             )
@@ -793,6 +816,103 @@ class AgentLoop:
             yield message.told(notice)
         if error is not None:
             yield error
+
+    def _continue(self, turn: Turn, audit: TurnAudit, message: _Progress) -> Iterator[TurnEvent]:
+        """Set a continuation up and run its one round; an error that ended it comes last.
+
+        The answer so far is the base its new text is appended to, and its stored notices, read back
+        (:meth:`~ghostwriter.agent.notices.NoticeEvent.from_stored`), are its notices, ``answer_cut`` among them
+        until the round has ended cleanly. The offer is the one of a turn that does not see, from workbench's
+        listing for a call without images; the next prompt is estimated with the answer as it then reads. A
+        continuation stopped before it began reads nothing.
+
+        Args:
+            turn: The continued turn.
+            audit: The turn's audit.
+            message: The answer so far.
+
+        Yields:
+            TurnEvent: As :meth:`run`.
+        """
+        if turn.cancel.is_set():
+            return
+        settings = self._settings
+        workbench = self._workbench
+        turns = self._store.answered_turns(turn.chat_id, turn.assistant_message_id)
+        earlier, this = turns[:-1], turns[-1]
+        message.base = this.answer
+        stored = self._store.answer_notices(turn.assistant_message_id)
+        message.notices = [event for value in stored if (event := NoticeEvent.from_stored(value)) is not None]
+        plain = workbench.discover(call=turn.call, images=False) if workbench is not None else None
+        expired = any(replayed.expired for replayed in turns)
+        offer = self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=self._now().date())
+        sight = _Sight(sees=False, budget=None, known={})
+        request = _Request(
+            seeing=None,
+            blind=lambda: offer,
+            past=earlier,
+            budget=prompt_tokens(settings.context_tokens, reasoning=False),
+        )
+        current = continuation(this, instruct=settings.inference_provider != "vllm")
+        headers = inference_headers(turn.owner, turn.request_id)
+
+        def next_prompt(text: str) -> int:
+            return next_prompt_tokens(offer.system, offer.tools, [*earlier, dataclasses.replace(this, answer=text)])
+
+        message.next_prompt = next_prompt
+        error: ErrorEvent | None = None
+        with closing(self._go_on(turn, audit, message, sight, request, current, headers=headers)) as events:
+            for event in events:
+                if isinstance(event, ErrorEvent):
+                    error = event
+                else:
+                    yield event
+        if error is not None:
+            yield error
+
+    def _go_on(
+        self,
+        turn: Turn,
+        audit: TurnAudit,
+        message: _Progress,
+        sight: _Sight,
+        request: _Request,
+        current: list[dict[str, Any]],
+        *,
+        headers: Mapping[str, str],
+    ) -> Generator[TurnEvent]:
+        """Run a continuation's round, offering no tool, then compute ``answer_cut`` again.
+
+        ``answer_cut`` goes from the answer's notices once the round ended cleanly below ``MAX_ANSWER_TOKENS``. A
+        failed round, a stop (also one before the round, which then does not start) or a round at its cap leaves
+        the answer incomplete: the notice stays where it was, and the user is told it again.
+
+        Args:
+            turn: The continued turn.
+            audit: The turn's audit.
+            message: The answer so far, its stored notices among its notices.
+            sight: The turn's images: none.
+            request: What the round's request is fitted from.
+            current: The continuation's turn (:func:`~ghostwriter.agent.context.continuation`).
+            headers: The inference headers.
+
+        Yields:
+            TurnEvent: The round's text, an :class:`ErrorEvent` if it failed, then ``answer_cut`` unless it ended
+            cleanly.
+        """
+        done: RoundDone | None = None
+        if not turn.cancel.is_set():
+            done, _ = yield from self._round(
+                turn, audit, message, sight, request, current, tooled=False, round_no=1, headers=headers
+            )
+        if done is not None and not done.stopped and not _at_cap(done, MAX_ANSWER_TOKENS):
+            message.notices = [event for event in message.notices if event.code != "answer_cut"]
+            return
+        cut = NoticeEvent("answer_cut")
+        if any(event.code == "answer_cut" for event in message.notices):
+            yield cut
+        else:
+            yield message.told(cut)
 
     def _rounds(
         self,
@@ -930,7 +1050,8 @@ class AgentLoop:
         its try without images, which fills the report again. ``context_trimmed`` is told with the first
         event of the try the router took, before any text, when that try's fit left earlier turns out: the
         trim told is the one of the request sent and taken, never of one refused. A later round's trim is
-        not told: the chat was trimmed in the first, and results the model pages past are its own.
+        not told: the chat was trimmed in the first, and results the model pages past are its own; nor is a
+        continuation's, as Continue keeps the answer's notices and computes only ``answer_cut`` again.
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
         with a status of :data:`REFUSED_IMAGE_STATUSES` (a refusal for length among them,
@@ -958,7 +1079,7 @@ class AgentLoop:
         Returns:
             How the round ended, ``None`` when the turn ends with it as it failed; and the tools it offered.
         """
-        report = FitReport() if round_no == 1 else None
+        report = FitReport() if round_no == 1 and not turn.continued else None
         fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
         if sight.showing:
             self._fetch(turn, sight, fitted)
@@ -977,6 +1098,7 @@ class AgentLoop:
                     headers=headers,
                     cancel=turn.cancel,
                     reasoning=turn.reasoning,
+                    continuation=turn.continued,
                 ):
                     if report is not None:
                         # The router took this attempt: its fit is the one sent, and its trim is told, once.
@@ -1215,7 +1337,7 @@ def _estimated(message: _Progress) -> int | None:
     if message.next_prompt is None:
         return None
     try:
-        return message.next_prompt("".join(message.shown))
+        return message.next_prompt(message.text)
     except Exception as exc:
         logger.warning("The next prompt could not be estimated: {}", type(exc).__name__)
         return None

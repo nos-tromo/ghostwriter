@@ -21,7 +21,7 @@ from uuid import uuid4
 import httpx2
 import openai
 import pytest
-from sqlalchemy import Engine, select
+from sqlalchemy import Engine, select, update
 from sqlalchemy.orm import Session
 from typing_extensions import override
 
@@ -29,6 +29,7 @@ from ghostwriter.agent.context import estimate_tokens, finished_turn, next_promp
 from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN, ImageBudget
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
+    HISTORY_RESULT_CHARS,
     MAX_ANSWER_TOKENS,
     PROMPT_TOKENS,
     REASONING_ANSWER_TOKENS,
@@ -49,10 +50,11 @@ from ghostwriter.agent.loop import (
     TurnOutcome,
     _refuses_context,
 )
-from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PRESENTATIONS, VISION
+from ghostwriter.agent.tools import cut
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
-from ghostwriter.inference import ModelClient
+from ghostwriter.inference import CONTINUE_BODY, ModelClient
 from ghostwriter.models import Message
 from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.store import ChatStore
@@ -260,15 +262,8 @@ class LoopEnv:
             ids.append(attachment.id)
         user = self.store.add_user_message("user-a", CHAT, content, ids)
         self.answer_id = self.store.start_assistant_message(CHAT)
-        loop = AgentLoop(
-            model=ModelClient(self.settings, client=self.fake.as_client()),
-            workbench=chosen.as_client() if isinstance(chosen, FakeWorkbench) else None,
-            store=self.store,
-            settings=self.settings,
-            clock=self.clock,
-            now=lambda: T0,
-            vision=Vision(dataclasses.replace(self.settings, vision=True)) if vision else None,
-            media=media,
+        loop = self._loop(
+            self.settings, chosen if isinstance(chosen, FakeWorkbench) else None, vision=vision, media=media
         )
         headers = {"X-Request-ID": "req-0001"}
         turn = Turn(
@@ -283,9 +278,70 @@ class LoopEnv:
         )
         return list(loop.run(turn, self.audit, outcome=outcome))
 
+    def go_on(self, *rounds: Round, provider: str = "vllm", outcome: TurnOutcome | None = None) -> list[TurnEvent]:
+        """Continue the last answer in place, as the Continue route does, and run its turn to the end.
+
+        Args:
+            *rounds: The router's rounds, in order; a continuation asks for one.
+            provider: The provider behind the router, ``INFERENCE_PROVIDER``.
+            outcome: What the turn fills in when it ends; ``None`` keeps none.
+
+        Returns:
+            The turn's events.
+        """
+        self.fake.script = list(rounds)
+        settings = dataclasses.replace(self.settings, inference_provider=provider)
+        question = self.store.question_of(CHAT, self.answer_id)
+        assert question is not None
+        turn = Turn(
+            chat_id=CHAT,
+            owner="user-a",
+            user_message_id=question,
+            assistant_message_id=self.answer_id,
+            call=CallFor("user-a", CHAT, {"X-Request-ID": "req-0002"}),
+            request_id="req-0002",
+            cancel=self.cancel,
+            continued=True,
+        )
+        return list(self._loop(settings, self.workbench).run(turn, self.audit, outcome=outcome))
+
+    def _loop(
+        self,
+        settings: Settings,
+        workbench: FakeWorkbench | None,
+        *,
+        vision: bool = False,
+        media: NextextHealth | None = None,
+    ) -> AgentLoop:
+        """Return the loop over the env's neighbours.
+
+        Args:
+            settings: The settings.
+            workbench: workbench; ``None`` for none at all.
+            vision: Whether the model sees images.
+            media: Nextext's health; ``None`` is Nextext off.
+
+        Returns:
+            The loop.
+        """
+        return AgentLoop(
+            model=ModelClient(settings, client=self.fake.as_client()),
+            workbench=workbench.as_client() if workbench is not None else None,
+            store=self.store,
+            settings=settings,
+            clock=self.clock,
+            now=lambda: T0,
+            vision=Vision(dataclasses.replace(settings, vision=True)) if vision else None,
+            media=media,
+        )
+
     def stored(self) -> str:
         """Return the stored text of the last answer."""
         return self.store.chat_detail("user-a", CHAT).messages[-1].content
+
+    def notices(self) -> list[dict[str, Any]]:
+        """Return the last answer's notices, as they are stored."""
+        return self.store.answer_notices(self.answer_id)
 
     def sent(self, round: int) -> list[dict[str, Any]]:
         """Return the messages a round sent to the model, 1-based."""
@@ -1996,3 +2052,187 @@ def test_a_template_the_answer_filled_is_not_unread(loop_env: LoopEnv) -> None:
         attach=[(template, stock_manifest(f"{FOLDER}/{template}"))],
     )
     assert [e for e in events if isinstance(e, NoticeEvent)] == []
+
+
+# --- Continue: one round appended to an answer cut at the length limit -----
+
+#: A first answer cut at the length limit, mid-sentence.
+CUT: Round = [text_chunk("Kapitel 1 … und"), finish_chunk("length")]
+#: A continuation that ends cleanly, below the cap.
+GO_ON: Round = [text_chunk(" weiter."), finish_chunk("stop"), usage_chunk(900, 3, "served-model")]
+
+
+def _notes() -> tuple[str, dict[str, Any]]:
+    return (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+
+
+def test_a_continuation_appends_to_the_answer(loop_env: LoopEnv) -> None:
+    """The new text goes on the same answer, its seam as the model wrote it; the cut is gone, the estimate made again.
+
+    The estimate counts the offer's system prompt and tools, and the chat with the answer as it now reads.
+    """
+    loop_env.run(CUT)
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == [{"code": "answer_cut"}]
+    before = _stored_estimate(loop_env)
+    outcome = TurnOutcome()
+    events = loop_env.go_on(GO_ON, outcome=outcome)
+    assert events == [TokenEvent(" weiter.")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter." and loop_env.notices() == []
+    assert [m.role for m in loop_env.store.chat_detail("user-a", CHAT).messages] == ["user", "assistant"]
+    assert loop_env.audit.log[-1] == "model:1:ok" and len(loop_env.fake.calls) == 2
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6)
+    system = loop_env.fake.calls[-1]["messages"][0]["content"]
+    estimate = next_prompt_tokens(system, loop_env.fake.calls[0]["tools"], past)
+    assert _stored_estimate(loop_env) == outcome.context_estimate == estimate
+    assert before is not None and estimate > before
+
+
+def test_on_vllm_the_last_message_is_the_answer_so_far(loop_env: LoopEnv) -> None:
+    """VLLM goes on in the answer's own message, the request's last, with no tool and no thinking.
+
+    A reasoning answer cut at its own cap goes on without thinking, in up to the cap of a round without it.
+    """
+    loop_env.run(
+        [text_chunk("Kapitel 1 … und"), usage_chunk(900, REASONING_ANSWER_TOKENS, "served-model")], reasoning=True
+    )
+    assert loop_env.notices() == [{"code": "answer_cut"}]
+    loop_env.go_on(GO_ON)
+    call = loop_env.fake.calls[-1]
+    assert [m["role"] for m in call["messages"]] == ["system", "user", "assistant"]
+    assert call["messages"][-1] == {"role": "assistant", "content": "Kapitel 1 … und"}
+    assert call["extra_body"] == CONTINUE_BODY and call["max_tokens"] == MAX_ANSWER_TOKENS
+    assert "tools" not in call and "tool_choice" not in call
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+
+
+def test_elsewhere_the_model_is_asked_to_go_on(loop_env: LoopEnv) -> None:
+    """Another provider gets the answer so far, then the instruction to go on, and no body field of its own."""
+    assert CONTINUE == "Go on exactly where your answer stopped; repeat nothing."
+    loop_env.run(CUT)
+    loop_env.go_on(GO_ON, provider="ollama")
+    call = loop_env.fake.calls[-1]
+    assert call["messages"][-2:] == [
+        {"role": "assistant", "content": "Kapitel 1 … und"},
+        {"role": "user", "content": CONTINUE},
+    ]
+    assert "extra_body" not in call and "tools" not in call
+    assert loop_env.stored() == "Kapitel 1 … und weiter." and loop_env.notices() == []
+
+
+def test_a_continuation_replays_its_calls_in_history_form(loop_env: LoopEnv) -> None:
+    """The answer's own calls go as an earlier turn's do: each call, its result cut to HISTORY_RESULT_CHARS."""
+    loop_env.workbench.answers = [ToolResult(json.dumps({"text": "Monat;Summe\n" * 600}), ())]
+    loop_env.run(_calls(READ_SALES), CUT)
+    [step] = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert step.result is not None and len(step.result) > HISTORY_RESULT_CHARS
+    loop_env.go_on(GO_ON)
+    sent = loop_env.sent(3)
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "assistant"]
+    assert sent[2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_0", "type": "function", "function": {"name": "read_document", "arguments": READ_SALES}}
+        ],
+    }
+    assert sent[3] == {"role": "tool", "tool_call_id": "call_0", "content": cut(step.result, HISTORY_RESULT_CHARS)}
+    assert sent[4] == {"role": "assistant", "content": "Kapitel 1 … und"}
+
+
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_continuation_cut_again_keeps_answer_cut(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """A continuation that ends at its cap is cut too: the user is told again, and the answer stays continuable."""
+    loop_env.run(CUT)
+    events = loop_env.go_on([text_chunk(" weiter …"), *ending])
+    assert events == [TokenEvent(" weiter …"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter …" and loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_clean_continuation_keeps_the_other_notices(loop_env: LoopEnv) -> None:
+    """Continue recomputes only ``answer_cut``: the unread notes stay, with their details, and no notice is told."""
+    loop_env.run(CUT, attach=[_notes()])
+    unread = {"code": "document_unread", "file_id": _file_id(loop_env, NOTES)}
+    assert loop_env.notices() == [{"code": "answer_cut"}, unread]
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert loop_env.notices() == [unread]
+
+
+def test_a_continuation_tells_no_trim(loop_env: LoopEnv) -> None:
+    """A continuation of a long chat leaves earlier turns out as any round does, but tells no trim again."""
+    _long_turns(loop_env, 30)
+    loop_env.run(CUT)
+    assert loop_env.notices() == [{"code": "context_trimmed"}, {"code": "answer_cut"}]
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert _questions(loop_env.sent(2)) < 31
+    assert loop_env.notices() == [{"code": "context_trimmed"}]
+
+
+def test_a_stopped_continuation_keeps_what_it_appended(loop_env: LoopEnv) -> None:
+    """A stop after two pieces keeps them on the answer; still incomplete, the answer stays cut, where it was told."""
+    loop_env.run(CUT, attach=[_notes()])
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return text_chunk(" nie")
+
+    events = loop_env.go_on([text_chunk(" wei"), text_chunk("ter"), stop, finish_chunk("stop")])
+    assert events == [TokenEvent(" wei"), TokenEvent("ter"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter"
+    unread = {"code": "document_unread", "file_id": _file_id(loop_env, NOTES)}
+    assert loop_env.notices() == [{"code": "answer_cut"}, unread]
+    assert loop_env.audit.rounds[-1] is not None and loop_env.audit.rounds[-1].stopped
+
+
+def test_a_failed_continuation_changes_nothing_but_the_estimate(loop_env: LoopEnv) -> None:
+    """A model error appends nothing and keeps every notice in its place; only the estimate is made again, the same.
+
+    The answer stays cut, and the user is told so before the error, which comes last.
+    """
+    loop_env.run(CUT, attach=[_notes()])
+    notices, estimate = loop_env.notices(), _stored_estimate(loop_env)
+    with Session(loop_env.engine) as s, s.begin():
+        s.execute(update(Message).where(Message.id == loop_env.answer_id).values(context_estimate=1))
+    outcome = TurnOutcome()
+    events = loop_env.go_on(_router_error(), outcome=outcome)
+    assert events == [NoticeEvent("answer_cut"), ErrorEvent("model", "The model did not answer.")]
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == notices
+    assert _stored_estimate(loop_env) == outcome.context_estimate == estimate
+    assert loop_env.audit.log[-1] == "model:1:error"
+
+
+def test_a_context_refusal_of_a_continuation_is_the_context_error(loop_env: LoopEnv) -> None:
+    """A continuation the router refuses for its length ends with the context error; the answer stays as it was."""
+    loop_env.run(CUT)
+    events = loop_env.go_on(_context_refused("synthetic router: maximum context exceeded"))
+    assert events == [NoticeEvent("answer_cut"), ErrorEvent("context", CONTEXT_ERROR)]
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_continuation_stopped_before_it_began_changes_nothing(loop_env: LoopEnv) -> None:
+    """A stop before the turn reads the answer: no round, and the answer keeps its text, notices and estimate."""
+    loop_env.run(CUT, attach=[_notes()])
+    before = (loop_env.stored(), loop_env.notices(), _stored_estimate(loop_env))
+    loop_env.cancel.set()
+    outcome = TurnOutcome(context_estimate=5)
+    assert loop_env.go_on(GO_ON, outcome=outcome) == []
+    assert (loop_env.stored(), loop_env.notices(), _stored_estimate(loop_env)) == before
+    assert outcome.context_estimate is None and len(loop_env.fake.calls) == 1
+
+
+def test_an_answer_that_follows_no_question_is_not_continued(loop_env: LoopEnv) -> None:
+    """An answer stored after another answer pairs with no question of its own: nothing is sent, nothing changes.
+
+    Read as history, the question before it would be the earlier answer's, and its text would be appended to.
+    """
+    loop_env.run(CUT)
+    first = loop_env.answer_id
+    loop_env.answer_id = loop_env.store.start_assistant_message(CHAT)
+    loop_env.store.finish_assistant_message(loop_env.answer_id, "Zweite Antwort …", notices=[{"code": "answer_cut"}])
+    events = loop_env.go_on(GO_ON)
+    assert events == [ErrorEvent("internal", "The answer could not be finished.")]
+    assert len(loop_env.fake.calls) == 1
+    assert [m.content for m in loop_env.store.chat_detail("user-a", CHAT).messages if m.id != first] == [
+        "Summe der Spalte B",
+        "Zweite Antwort …",
+    ]
+    assert loop_env.notices() == [{"code": "answer_cut"}]
