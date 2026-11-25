@@ -102,9 +102,12 @@ context is, a ring, from the estimate stored with the last answer. Reference:
   gate at its defaults). Its state (`attachments.measure_state`: `pending`,
   `measured`, `none`) never holds Send back. Measured, a document is `too_long`
   when its count was capped or its `chars` over `CHARS_PER_TOKEN` pass the prompt
-  budget: the tile warns, its attachment line adds `LONGER_THAN_A_PROMPT`, and
-  the system prompt, with tools, adds `PAGING`. What the model read of a file
-  comes from the `units` of the parts it was given, never from a part cut here.
+  budget: the tile warns and its attachment line adds `LONGER_THAN_A_PROMPT`.
+  `PAGING` does not depend on it: every system prompt that offers tools holds
+  it, so the model reads on whenever `read_document` answers with `next_part`.
+  What the model read of a file comes from the `units` of the parts it was
+  given, never from a part cut here; a file with a part cut, or one whose
+  `units` are no span, is told read in part without a number, never a wrong one.
 - **The Nextext seam and clips.** Nextext is reached at `NEXTEXT_API_BASE` on
   `inference-net` with Ghostwriter's own service token (`NEXTEXT_API_KEY`, the
   same value as its entry `ghostwriter=<token>` in Nextext's

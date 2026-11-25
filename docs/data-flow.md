@@ -180,10 +180,11 @@ and shows as it did, with no warning.
   child, and the state is `none`.
 - **Too long.** A measured document is `too_long` when its count was capped, or its characters over
   `CHARS_PER_TOKEN` (3) pass the prompt budget (the context less the answer and the margin: 34,000 tokens at 40k).
-  Then its tile in the composer warns "Read only in parts" („Nur in Teilen lesbar“), its attachment line to the
-  model adds "longer than one prompt: read it in parts and say which parts you read", and the system prompt, while
-  tools are offered, says how: call `read_document` again with `part` set to `next_part`, and say plainly which
-  parts were not read. A document that fits one prompt reads as before.
+  Then its tile in the composer warns "Read only in parts" („Nur in Teilen lesbar“), and its attachment line to the
+  model adds "longer than one prompt: read it in parts and say which parts you read". How to read in parts is not
+  part of that: every system prompt that offers tools says it, whatever the attachments are: call `read_document`
+  again with `part` set to `next_part`, and say plainly which parts were not read. A document that fits one prompt
+  reads as before.
 - **After the file's period** the measure is emptied with the manifest, and the SPA is served no length
   ([retention.md](retention.md)). A `ready` document still `pending` at start is measured again, as the system
   does (`requeued`); with workbench off at start it is settled `none`.
@@ -284,8 +285,10 @@ cap or one workbench could not read, since the manifest keeps workbench's facts,
 missing. The model reads the transcript with `read_document` and looks at the frames with `view_file`. workbench
 0.9 leaves a clip out of `run_python` and `search_files` jobs, so these two tools are the only way to it. The
 transcript is text in a tool result, and so goes to the router like any other. A clip is never measured, so its
-line never says it is longer than a prompt; a long transcript is read in parts as any long document is, and
-`document_partial` says so once the parts do not cover it. workbench's own `docs/data-flow.md` (0.9.0) describes
+line never says it is longer than a prompt. A long transcript is read in parts as any long document is, but no
+`document_partial` tells that it was not read whole: workbench answers a clip's read with the kind `transcript`,
+whose parts are not one unit each, so what was read of it is not counted. A clip no call opened is told
+`document_unread`. workbench's own `docs/data-flow.md` (0.9.0) describes
 the other end of the derived files.
 
 ## What the user is told
@@ -296,7 +299,7 @@ holds a code and, for a file, its workbench id and counts; the name is read from
 | Notice | When | Shown |
 |---|---|---|
 | `answer_cut` | the last round, one without calls, ended at its token cap (`finish_reason` `length`, or output tokens at the cap) | a line under the answer; on the chat's latest answer with Continue |
-| `document_partial` | a `read_document` read a file of the chat only in part: the units of the parts the model was given (a part cut here is not counted) cover less than the measure's total, or, with none, the answer's `total_parts` where a part is one unit (`pdf`, `pptx`, `docx`, `odt`, `text`); a page or slide without text, which was looked at, counts as read | "Of 'name', 3 of 9 pages were read." |
+| `document_partial` | a `read_document` read a file of the chat only in part: the units of the parts the model was given (a part cut here is not counted) cover less than the measure's total, or, with none, the answer's `total_parts` where a part is one unit (`pdf`, `pptx`, `docx`, `odt`, `text`); a page or slide without text, which was looked at, counts as read. When a part the model was given was cut, here or by workbench, or had no span as its `units`, what was read of the file is not known to the unit: the notice carries the file alone, with no count | "Of 'name', 3 of 9 pages were read.", or without a count "A document was read only in part." |
 | `document_unread` | a `ready` document or clip attached to the question, or a picture while the turn does not see, that no call opened | "'name' was not read for this answer." |
 | `images_dropped` | the router refused a round's images, and it went again without them | a line under the answer |
 | `context_trimmed` | the message's first round, the one the router took, left earlier turns out of the prompt | the composer's note for the chat's latest answer only, never under each answer |
