@@ -212,6 +212,41 @@ def test_view_file_opens() -> None:
     assert reading.partial(_files(_sent())) == []
 
 
+def test_an_attachment_a_tool_used_is_not_unread() -> None:
+    """A template filled, and a master and a picture a deck was built with, were used: none is unread.
+
+    The picture is named deep in the slides, and written as the model may: the path is normalised. A tool other than
+    ``read_document`` opens a file but reads none of it, so no ``document_partial`` comes of it.
+    """
+    template = _sent(f"{FOLDER}/harbour-template.docx", file_id="d4" * 16, total=12, unit="paragraph")
+    master = _sent(f"{FOLDER}/harbour-master.pptx", file_id="e5" * 16, total=3, unit="slide")
+    photo = _sent(PHOTO, file_id=PHOTO_ID, kind="image", total=None, unit=None)
+    filled = ToolResult(compact({"path": f"{FOLDER}/out/harbour-letter.docx", "hint": None}), ())
+    built = ToolResult(compact({"path": f"{FOLDER}/out/quay-deck.pptx", "hint": None}), ())
+    reading = Reading()
+    reading.call(
+        "fill_template", {"path": template.path, "values": {"Kunde": "Hafenamt"}}, filled, tool_message(filled)
+    )
+    slides = [{"title": "Pegel", "content": [{"image": f"{FOLDER}//harbour-photo.jpg"}]}]
+    deck = {"path": master.path, "name": "quay-deck", "slides": slides}
+    reading.call("write_presentation", deck, built, tool_message(built))
+    assert reading.unread([template, master, photo], sees=False) == []
+    assert reading.partial(_files(template, master, photo)) == []
+
+
+def test_a_failed_call_naming_the_path_leaves_it_unread() -> None:
+    """A fill workbench refused, and one the loop never sent, used nothing."""
+    template = _sent(f"{FOLDER}/harbour-template.docx", file_id="d4" * 16, total=12, unit="paragraph")
+    failed = ToolFailure("unreadable_file", "the template could not be read", True)
+    refused = Refusal("call_limit", REFUSALS["call_limit"])
+    reading = Reading()
+    for outcome in (failed, refused):
+        reading.call("fill_template", {"path": template.path, "values": {}}, outcome, tool_message(outcome))
+    assert reading.unread([template], sees=False) == [
+        NoticeEvent("document_unread", file_id="d4" * 16, name="harbour-template.docx")
+    ]
+
+
 def test_a_picture_counts_only_without_sight() -> None:
     """A picture unopened is unread only in a turn that does not see; one that sees was sent it as an image."""
     photo = _sent(PHOTO, file_id=PHOTO_ID, kind="image", total=None, unit=None)

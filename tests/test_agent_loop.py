@@ -1982,3 +1982,17 @@ def test_a_stopped_turn_still_tells_what_was_not_read(loop_env: LoopEnv) -> None
     loop_env.workbench.answers = [_then(loop_env.cancel.set, RESULT)]
     events = loop_env.run(_calls(READ_SALES), attach=[(NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))])
     assert events[-1] == NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES)
+
+
+def test_a_template_the_answer_filled_is_not_unread(loop_env: LoopEnv) -> None:
+    """A template attached and filled was used, though never read: no ``document_unread`` names it."""
+    template = "harbour-template.docx"
+    loop_env.workbench.answers = [ToolResult(json.dumps({"path": f"{FOLDER}/out/harbour-letter.docx"}), ())]
+    fill = json.dumps({"path": f"{FOLDER}/{template}", "values": {"Kunde": "Hafenamt"}})
+    events = loop_env.run(
+        _calls(fill, name="fill_template"),
+        [text_chunk("Ausgefüllt.")],
+        content="Füll die Vorlage aus",
+        attach=[(template, stock_manifest(f"{FOLDER}/{template}"))],
+    )
+    assert [e for e in events if isinstance(e, NoticeEvent)] == []

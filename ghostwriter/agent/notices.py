@@ -6,9 +6,10 @@ carries every detail set, the name included; what is stored carries no name, whi
 attachment row when the answer is served. A notice holds ids and counts, never content.
 
 The notices about a file come from :class:`Reading`, what one message's calls opened and read. A file is opened by
-a ``read_document`` or ``view_file`` call of its path that workbench answered. What a ``read_document`` answer read
-is the units of its parts, as the model was given them, a part cut not counted (:func:`covered` joins them), and a
-page or slide without text, which was looked at. ``document_partial`` names an attachment of the chat whose parts
+any call workbench answered whose arguments name its path, at any depth: read, viewed, a template filled, a master or
+a picture a deck was built with. What a ``read_document`` answer read is the units of its parts, as the model was
+given them, a part cut not counted (:func:`covered` joins them), and a page or slide without text, which was looked
+at; no other tool reads any of a file. ``document_partial`` names an attachment of the chat whose parts
 read cover less than its total: the measure's, or where a part is one unit, the answer's ``total_parts``
 (:data:`TOTAL_PARTS_UNITS`). ``document_unread`` names a ``ready`` attachment of the question, a document or a clip,
 or a picture while the turn does not see, that no call opened. Once a call of :data:`BLIND_TOOLS` ran, which reads
@@ -34,8 +35,6 @@ NOTICE_CODES: Final[frozenset[str]] = frozenset(get_args(NoticeCode))
 MEASURE_UNITS: Final[frozenset[str]] = frozenset(get_args(MeasureUnit))
 #: The tools that read the chat's files without naming what they read: once one ran, no file notice is given.
 BLIND_TOOLS: Final = frozenset({"run_python", "search_files"})
-#: The tools that open the file at their ``path``.
-OPENING_TOOLS: Final = frozenset({"read_document", "view_file"})
 #: The kinds of ``read_document``'s answer whose ``total_parts`` counts one unit per part, and that unit.
 TOTAL_PARTS_UNITS: Final[Mapping[str, MeasureUnit]] = {
     "pdf": "page",
@@ -252,9 +251,9 @@ class Reading:
     ) -> None:
         """Record one call of the message.
 
-        A call of :data:`BLIND_TOOLS` that was sent, answered or not, ends every notice of the message. A call of
-        :data:`OPENING_TOOLS` workbench answered opens the path it names; a ``read_document`` answer also opens its
-        own ``path`` and records what it read, from ``content``'s first line, the JSON the model was given.
+        A call of :data:`BLIND_TOOLS` that was sent, answered or not, ends every notice of the message. Any other call
+        workbench answered opens every path its arguments name (:func:`_named`); a ``read_document`` answer also opens
+        its own ``path`` and records what it read, from ``content``'s first line, the JSON the model was given.
 
         Args:
             tool: The tool called.
@@ -265,13 +264,11 @@ class Reading:
         if tool in BLIND_TOOLS and not isinstance(outcome, Refusal):
             self._blind = True
             return
-        if tool not in OPENING_TOOLS or not isinstance(outcome, ToolResult):
+        if not isinstance(outcome, ToolResult):
             return
-        path = _path(arguments.get("path") if arguments is not None else None)
-        if path is not None:
-            self._opened.add(path)
+        self._opened.update(_named(arguments))
         if tool == "read_document":
-            self._answer(path, content)
+            self._answer(_path(arguments.get("path") if arguments is not None else None), content)
 
     def _answer(self, asked: str | None, content: str) -> None:
         """Record what a ``read_document`` answer read.
@@ -345,8 +342,8 @@ class Reading:
             sees: Whether the turn saw as it began: then a picture went to the model as an image, and is not counted.
 
         Returns:
-            A notice per ``ready`` document or clip, or picture while the turn does not see, whose path was not
-            opened; none once a blind tool ran.
+            A notice per ``ready`` document or clip, or picture while the turn does not see, whose path no call
+            workbench answered named; none once a blind tool ran.
         """
         if self._blind:
             return []
@@ -369,6 +366,28 @@ def _path(value: object) -> str | None:
         It normalised (:func:`posixpath.normpath`), as workbench reads it; ``None`` for anything but a non-empty text.
     """
     return posixpath.normpath(value) if isinstance(value, str) and value else None
+
+
+def _named(arguments: Mapping[str, Any] | None) -> set[str]:
+    """Return every path a call's arguments name.
+
+    Args:
+        arguments: The arguments, as the model wrote them; ``None`` for none.
+
+    Returns:
+        Each non-empty text among their values, in objects and lists at any depth, normalised (:func:`_path`).
+    """
+    named: set[str] = set()
+    values: list[Any] = [arguments] if arguments is not None else []
+    while values:
+        value = values.pop()
+        if isinstance(value, Mapping):
+            values.extend(cast(Mapping[str, Any], value).values())
+        elif isinstance(value, list):
+            values.extend(cast(list[Any], value))
+        elif (path := _path(value)) is not None:
+            named.add(path)
+    return named
 
 
 def _span(value: object) -> tuple[int, int] | None:
