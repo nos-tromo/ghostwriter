@@ -48,8 +48,11 @@ What limits an answer is told to the user, never left to be guessed (design:
 An answer carries notices, stored with it: `answer_cut` (it ended at its token
 cap, and the latest such answer offers Continue), `document_partial` and
 `document_unread` (a file was read only in part, or an attachment of the
-question not at all), `images_dropped` and `context_trimmed`; an answer the
-router refuses for the model's context ends in the `context` error. A document
+question not at all), `images_dropped`, `context_trimmed` and
+`tools_unavailable` (workbench on, but no tool offered: the prompt asks the
+model to have the message sent again, and the latest such answer offers Try
+again); an answer the router refuses for the model's context ends in the
+`context` error. A document
 workbench has measured (0.10.0) is known to be longer than one prompt, so its
 tile warns and the model is told to page. The composer shows how full the
 context is, a ring, from the estimate stored with the last answer. Reference:
@@ -74,6 +77,9 @@ context is, a ring, from the estimate stored with the last answer. Reference:
   `read_document` in its image words and attaches images only to a call that
   carries `X-Accept-Images: 1` (`workbench.ACCEPT_IMAGES`); without it, it
   answers as 0.6.0 did. Discovery is cached per listing (`discover(images=…)`).
+  A failed one waits `DISCOVERY_RETRY_S` (60 s) only after a timeout or an
+  unusable answer, never after a refused connection, and any answer workbench
+  gives to any request ends the wait of both listings.
   A turn sees when the model sees and the image listing holds `view_file`: it is
   offered that listing, and its calls carry the header. A turn without sight,
   and every round after the router refused a round's images, is offered the
@@ -162,12 +168,12 @@ context is, a ring, from the estimate stored with the last answer. Reference:
 | `ghostwriter/log_cfg.py` | the stderr sink; quiet HTTP and SDK loggers |
 | `ghostwriter/agent/limits.py` | the caps per message |
 | `ghostwriter/agent/loop.py` | `AgentLoop`: rounds and tool calls within the caps; the notices it tells, `_refuses_context` (the `context` error), the estimate stored with every answer (`TurnOutcome`), and Continue (`Turn.continued`: one round, no tools, no thinking, appended in place) |
-| `ghostwriter/agent/notices.py` | `NoticeEvent` (the live frame with a file's name, the stored form without it), `Reading` (what a message's calls opened and read: `document_partial`, `document_unread`), `SentFile`, `covered` (the union of the units read) |
+| `ghostwriter/agent/notices.py` | `NoticeEvent` (the live frame with a file's name, the stored form without it), `Reading` (what a message's calls opened and read: `document_partial`, `document_unread`), `SentFile`, `to_open` (the question's files the model reads only through a tool), `covered` (the union of the units read) |
 | `ghostwriter/agent/stream.py`, `reasoning.py` | one streamed round; reasoning stripped (docint's) |
 | `ghostwriter/agent/context.py` | the prompt fitted to the budget; follow-ups replayed; `FitReport` (the earlier turns there were and those replayed, from the first round); `next_prompt_tokens` and `finished_turn` (the estimate of the next prompt, counted as `fit` sizes); `continuation` (a continued turn's messages); `LONGER_THAN_A_PROMPT` in a document's line |
 | `ghostwriter/agent/images.py` | image refs, their token estimate, the notes where one gives way, the `ImageBank` and `materialise` (refs to data URLs, as a round goes out) |
 | `ghostwriter/agent/tools.py` | tools as OpenAI functions; arguments read; what the model reads back |
-| `ghostwriter/agent/prompt.py` | the system prompt; `PAGING` (read a long document in parts, say which); `CONTINUE` (the instruction for a provider that does not go on in the answer's own message) |
+| `ghostwriter/agent/prompt.py` | the system prompt; `FILES` (work on the attached files with the tools, in this answer); `UNREACHABLE` (workbench on, no tool: ask to send again); `PAGING` (read a long document in parts, say which); `CONTINUE` (the instruction for a provider that does not go on in the answer's own message) |
 | `ghostwriter/api/chats.py` | list, create, read, rename, delete |
 | `ghostwriter/api/messages.py` | send, regenerate and continue (SSE), stop |
 | `ghostwriter/api/files.py` | attachments and downloads |
@@ -227,7 +233,14 @@ the sweep. Never add workers or replicas.
    (`disclose` / `chat.tool`) before it goes to `WorkbenchClient.call_tool`
    over MCP, which never raises. Each round is then recorded (`ai_call` /
    `chat.answer`, with how many images it sent). With workbench off,
-   `app.state.workbench` is `None` and no tool is offered. While the turn sees,
+   `app.state.workbench` is `None` and no tool is offered; with it on and no
+   listing, no tool either, the prompt is `UNREACHABLE` and the notice
+   `tools_unavailable`. Every prompt that offers tools says to work on the
+   attached files with them in this answer (`prompt.FILES`), and a question
+   that attached a file the model reads only through a tool
+   (`notices.to_open`) has its first round ask vllm for `tool_choice`
+   `required`; a router that refuses it before any text is asked once more
+   with `auto`. While the turn sees,
    the question carries its attached pictures and a follow-up those of earlier
    questions that fit, as image parts: refs, never bytes. `fit` counts a ref by
    `estimate_image_tokens` and puts a note in its place where it gives way: the
@@ -258,14 +271,15 @@ the sweep. Never add workers or replicas.
    every 15 s. A `notice` is a code with every detail it has, a file's name
    included (`file_id`, `name`, `read`, `total`, `unit`; stored without the
    name, which is read from the attachment when the answer is served):
-   `context_trimmed` before any text; `images_dropped` where it happens;
+   `tools_unavailable` and `context_trimmed` before any text;
+   `images_dropped` where it happens;
    `answer_cut` after the text, when the last round, one without calls, ended
    at its token cap; then, once the rounds have ended (a stop or a model error
    too), `document_partial` for each attachment of the chat that
    `read_document` read only in part, and `document_unread` for each
    attachment of the question no call opened, none of either after a
-   `run_python` or `search_files` call (they read files without naming them);
-   an `error` is last. `final` carries `context_estimate`, the estimated tokens
+   `run_python` or `search_files` call (they read files without naming them),
+   and none after `tools_unavailable`; an `error` is last. `final` carries `context_estimate`, the estimated tokens
    of the next prompt, as stored with the answer (`null` for a turn stopped
    before it began). A stop or a disconnect sets the turn's event: the call in
    flight finishes and is stored, and no further round starts.
@@ -350,6 +364,8 @@ strict; lines are 120 characters.
   vllm-service's `CHAT_LIMIT_MM_PER_PROMPT` must stay at or above it.
 - An Office suffix: `upload.OFFICE_SUFFIXES`, `agent/images.strips_for_path`,
   `agent/context.attachment_facts` and workbench's `renders.OFFICE_SUFFIXES`.
+- A data or text attachment type in `upload.ATTACHMENT_TYPES`: its format in
+  `agent/context.DATA_FORMATS`, which the attachment line names.
 - The media suffix table, `upload.MEDIA_TYPES` (suffixes and types), and
   workbench's `renders.MEDIA_TYPES`. Which are audio: `upload.AUDIO_SUFFIXES` and
   `AUDIO_EXTENSIONS` in `frontend/src/lib/format.ts`.

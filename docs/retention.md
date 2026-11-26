@@ -64,9 +64,9 @@ answer. A changed file period moves it at the next start, as it moves a step's, 
 Past it the answer is served the bare code, which says "A document was read only in part" or "An attachment was not
 read for this answer", with neither the file's name nor a number, and the sweep strips the stored notice to its code.
 The name is never stored: it is read from the chat's attachment row while the details are served. The answer, the
-codes (`answer_cut`, `images_dropped` and `context_trimmed` hold no file or number, and so no deadline) and the
-estimate of the next prompt, an integer, stay with the chat until its own period ends. A notice is a code, an id
-and counts, never content.
+codes (`answer_cut`, `images_dropped`, `context_trimmed` and `tools_unavailable` hold no file or number, and so no
+deadline) and the estimate of the next prompt, an integer, stay with the chat until its own period ends. A notice is
+a code, an id and counts, never content.
 
 ## The delete order
 

@@ -94,7 +94,7 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
   one cut at its length limit) records nothing and changes nothing. A record that cannot
   be written stops it with the `audit` error frame, as for a message.
 - A notice is no event. What an answer tells of itself (`answer_cut`, `document_partial`,
-  `document_unread`, `images_dropped`, `context_trimmed`) is stored with the answer as
+  `document_unread`, `images_dropped`, `context_trimmed`, `tools_unavailable`) is stored with the answer as
   codes, file ids and counts, never a name or content, and the `chat.answer` criteria
   are as they were. The sweep records, as `retention.tool_content` with the target
   `message`, the answers whose notices it strips to their codes

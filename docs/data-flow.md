@@ -10,7 +10,7 @@ SQLite on the `ghostwriter-data` volume (`ghostwriter/models.py`).
 | Table | Columns | Kept |
 |---|---|---|
 | `chats` | id, owner (the account), title (the first message's first line, or the owner's), created_at, updated_at, expires_at | until `expires_at` (90 days after the start, [retention.md](retention.md)) or the owner's delete |
-| `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at; for an answer also notices (a list of codes: `answer_cut`, `document_partial`, `document_unread`, `images_dropped`, `context_trimmed`; the two about a file also its file id and counts: how much was read, of how much, in which unit), context_estimate (the estimated tokens of the next prompt) and notices_expire_at (the deadline of the file details) | with the chat; the file details of a notice until `notices_expire_at`, the content deadline within `WORKBENCH_RETENTION_DAYS` (7), then only the code ([retention.md](retention.md)) |
+| `messages` | id, chat_id, position, role (`user`, `assistant`), content (the text sent, and the answer shown), created_at; for an answer also notices (a list of codes: `answer_cut`, `document_partial`, `document_unread`, `images_dropped`, `context_trimmed`, `tools_unavailable`; the two about a file also its file id and counts: how much was read, of how much, in which unit), context_estimate (the estimated tokens of the next prompt) and notices_expire_at (the deadline of the file details) | with the chat; the file details of a notice until `notices_expire_at`, the content deadline within `WORKBENCH_RETENTION_DAYS` (7), then only the code ([retention.md](retention.md)) |
 | `tool_steps` | id, message_id, position, round, call_id, tool, arguments (the model's, code included), result (what the model read back, at most 16,896 characters), status, created_at, content_expires_at | `arguments` and `result` until `content_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
 | `attachments` | id, chat_id, message_id, workbench_file_id, path, name, size, mime, kind (`document`, `image`, `media`), status (`processing`, `ready`, `failed`), render (the manifest: the page count, the pages without text and the sizes of the renders; for a clip its frame count, its length and whether it has a transcript), failure (a token), created_at, measure (a document's length: its count, unit, the characters a full read shows and whether the count was capped), measure_state (`pending`, `measured`, `none`; empty for a picture, a clip or a row from before schema 3) | with the chat, or until its owner takes it back before sending it; `render` and `measure` until the file period (7 days), then emptied ([retention.md](retention.md)) |
 | `results` | id, message_id, position, kind (`image`, `table`, `file`), workbench_file_id, path, name, mime, size, preview (a header and at most 5 rows), created_at, preview_expires_at | `preview` until `preview_expires_at`, within `WORKBENCH_RETENTION_DAYS` (7); the rest with the chat |
@@ -81,6 +81,25 @@ then offered that listing, and its calls carry the header. A turn without sight
 is offered the listing without the header, whose `read_document` promises no
 image, and its calls carry none; so does every round after the model refused
 pictures.
+
+A listing whose discovery failed is offered no tool, and is tried again only after
+60 s (`DISCOVERY_RETRY_S`) when the failure took time or workbench answered it: a
+timeout, an unusable answer. A refused connection or a name not found waits for
+nothing, and any answer workbench gives to any request (an upload, a prepare, a
+measure, a call) ends the wait of both listings, so a listing that failed while
+workbench restarted is discovered again by the next turn. A turn with workbench on
+but no tool offered tells `tools_unavailable` before any text, and its prompt asks
+the model to have the message sent again, never to ask for a file's content.
+
+A question that attached a file the model reads only through a tool (a `ready`
+document or clip, or a picture while the turn does not see) makes its first round
+call one: on vllm its `tool_choice` is `required`, every other round's, and every
+round on any other provider, `auto`. A router that refuses `required` (400 or 422)
+before any text is asked once more with `auto`, the refused round recorded as a
+failed `chat.answer`. Every system prompt that offers tools also says to work on
+the attached files with them in the same answer (`FILES`), and the attachment line
+of a data or text file names its format and, once measured, its length:
+`[Attached: name (path, 23049 bytes; CSV table, 91 lines)]`.
 
 ## A picture, a PDF or an Office file, after its upload
 
@@ -303,11 +322,12 @@ holds a code and, for a file, its workbench id and counts; the name is read from
 | `document_unread` | a `ready` document or clip attached to the question, or a picture while the turn does not see, that no call opened | "'name' was not read for this answer." |
 | `images_dropped` | the router refused a round's images, and it went again without them | a line under the answer |
 | `context_trimmed` | the message's first round, the one the router took, left earlier turns out of the prompt | the composer's note for the chat's latest answer only, never under each answer |
+| `tools_unavailable` | workbench is on, but its discovery offered the message's first round no tool; no file notice follows it, as its cause is said | a line under the answer; on the chat's latest answer with Try again (Regenerate) |
 | error `context` | the router refused a round, with no image left to drop, as longer than the model's context | the error line, in place of the model error |
 
 After a `run_python` or `search_files` call neither file notice is given: those tools read files without naming
-what they read, and a notice never says what is not known to be true. A turn with no tools offered still says
-`document_unread`, and it is true.
+what they read, and a notice never says what is not known to be true. A turn with workbench off still says
+`document_unread`, and it is true; one with workbench on but not reachable says `tools_unavailable` instead.
 
 **The meter.** At the end of every answer, a regenerated or a continued one included, the server estimates the
 tokens the next prompt starts with: the system prompt, the tool schemas and every turn as the replay would send it,
