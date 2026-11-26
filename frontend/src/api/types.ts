@@ -194,9 +194,17 @@ export interface ErrorFrame {
 /** What the answer says about itself: `answer_cut` (it ended at the length
  *  limit), `document_partial` (a document was read in part), `document_unread`
  *  (an attachment was not opened), `images_dropped` (the model took no pictures
- *  and answered without them) and `context_trimmed` (earlier turns were left
- *  out of the prompt). A code this app does not know is ignored. */
-export type NoticeCode = 'answer_cut' | 'document_partial' | 'document_unread' | 'images_dropped' | 'context_trimmed'
+ *  and answered without them), `context_trimmed` (earlier turns were left out
+ *  of the prompt) and `tools_unavailable` (workbench could not be reached, so
+ *  the turn ran with no tool; its code alone). A code this app does not know is
+ *  ignored. */
+export type NoticeCode =
+  | 'answer_cut'
+  | 'document_partial'
+  | 'document_unread'
+  | 'images_dropped'
+  | 'context_trimmed'
+  | 'tools_unavailable'
 
 /** One notice, as stored with an answer and as its live frame carries it. The
  *  details of a document notice are null once they have expired, and a notice

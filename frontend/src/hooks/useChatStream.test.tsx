@@ -444,6 +444,33 @@ describe('a notice frame', () => {
     expect(screen.getAllByText(IMAGES_DROPPED)).toHaveLength(1)
   })
 
+  it('keeps a tools_unavailable frame, said once, then with the stored answer', async () => {
+    const TOOLS_UNAVAILABLE = 'The tools could not be reached for this answer, so attached files were not read.'
+    const NOTICED = { ...ANSWER, steps: [], notices: [{ code: 'tools_unavailable' as const }] }
+    const { sse, finish } = serveChat(detail([]), detail([QUESTION, NOTICED]), 'messages')
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)
+    const user = userEvent.setup()
+    await screen.findByText('Ask anything, or attach a document.')
+    await user.click(screen.getByRole('button', { name: 'Ask' }))
+
+    // Its frame carries the code alone; sent twice, it is said once.
+    sse.push('notice', { code: 'tools_unavailable' })
+    sse.push('notice', { code: 'tools_unavailable' })
+    sse.push('token', { text: 'Ohne Werkzeuge' })
+    await screen.findByText('Ohne Werkzeuge')
+    expect(screen.getAllByText(TOOLS_UNAVAILABLE)).toHaveLength(1)
+    expect(screen.getByText(TOOLS_UNAVAILABLE)).toHaveAttribute('role', 'status')
+    expect(document.querySelector('[data-notice="tools_unavailable"]')).not.toBeNull()
+    // Nothing to try again while the answer is written.
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
+
+    finish()
+    expect(await screen.findByText('Summe: 42')).toBeInTheDocument()
+    expect(screen.getAllByText(TOOLS_UNAVAILABLE)).toHaveLength(1)
+    expect(screen.getByText(TOOLS_UNAVAILABLE)).not.toHaveAttribute('role')
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+  })
+
   it('says a document notice once for a file, and once for each file', async () => {
     const { sse } = serveChat(detail([]), detail([QUESTION, ANSWER]), 'messages')
     renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} composer={controls} />)

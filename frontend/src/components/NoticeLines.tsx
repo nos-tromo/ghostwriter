@@ -44,6 +44,8 @@ function lineText(notice: NoticeOut, t: T): string | null {
     }
     case 'images_dropped':
       return t('chat.images_dropped')
+    case 'tools_unavailable':
+      return t('notice.tools_unavailable')
     default:
       return null
   }
@@ -51,23 +53,27 @@ function lineText(notice: NoticeOut, t: T): string | null {
 
 /**
  * What the server said about an answer besides its text, quietly, a line each: it was cut at the
- * length limit, a document was read in part or not at all, the model took no pictures. Not errors, so
- * the text stays muted and only the icon takes the warning colour.
+ * length limit, a document was read in part or not at all, the model took no pictures, the tools could
+ * not be reached. Not errors, so the text stays muted and only the icon takes the warning colour.
  *
  * @param notices - The answer's notices, in order; one this app does not know is left out. Two may be equal
  *   (two files unread, their details expired), and each has its line.
  * @param live - Whether the answer is being written: its lines are then announced politely, and a
  *   stored answer's are not.
  * @param onContinue - When given, the `answer_cut` line offers to go on with the answer.
+ * @param onRetry - When given, the `tools_unavailable` line offers to try the answer again: the
+ *   answer's own regenerate, so it is offered where Regenerate is.
  */
 export function NoticeLines({
   notices,
   live,
   onContinue,
+  onRetry,
 }: {
   notices: readonly NoticeOut[]
   live: boolean
   onContinue?: () => void
+  onRetry?: () => void
 }) {
   const t = useT()
   // Keyed by position: once its details expire a notice is its code alone, so two files unread are two
@@ -92,6 +98,11 @@ export function NoticeLines({
           {notice.code === 'answer_cut' && onContinue && (
             <Button variant="ghost" size="sm" onClick={onContinue}>
               {t('notice.continue')}
+            </Button>
+          )}
+          {notice.code === 'tools_unavailable' && onRetry && (
+            <Button variant="ghost" size="sm" onClick={onRetry}>
+              {t('notice.retry')}
             </Button>
           )}
         </div>

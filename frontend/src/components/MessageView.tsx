@@ -72,7 +72,8 @@ function Pending({ reasoning }: { reasoning: boolean }) {
  * trail, its text as Markdown, its result cards and what it says about itself
  * (its notices; an answer stored before notices has none). An answer with text
  * can be copied as its Markdown; the last answer offers to be regenerated
- * (`onRegenerate`), and, cut at the length limit, to go on (`onContinue`).
+ * (`onRegenerate`; its tools unreachable, its notice line offers the same as
+ * Try again), and, cut at the length limit, to go on (`onContinue`).
  */
 export function MessageView({
   chatId,
@@ -96,7 +97,7 @@ export function MessageView({
       {message.results.map((result) => (
         <ResultCard key={result.id} chatId={chatId} result={result} />
       ))}
-      <NoticeLines notices={message.notices ?? []} live={false} onContinue={onContinue} />
+      <NoticeLines notices={message.notices ?? []} live={false} onContinue={onContinue} onRetry={onRegenerate} />
       {(message.content || onRegenerate) && (
         <div className="flex justify-end gap-1">
           {message.content && (

@@ -571,6 +571,115 @@ describe('Conversation notices', () => {
     )
   })
 
+  it('says the tools could not be reached, quietly, in English and German', async () => {
+    serveAnswered([{ code: 'tools_unavailable' }])
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const answer = (await screen.findByText('Zusammenfassung')).closest('[data-role="assistant"]') as HTMLElement
+    const line = within(answer).getByText('The tools could not be reached for this answer, so attached files were not read.')
+    expect(noticeCodes(answer)).toEqual(['tools_unavailable'])
+    // Stored: muted, a warning icon, nothing announced, no error.
+    expect(line).toHaveClass('text-sm', 'text-muted-foreground')
+    expect(line).not.toHaveAttribute('role')
+    expect(line.parentElement?.querySelector('svg')).toHaveClass('text-warning')
+    expect(within(answer).getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    first.unmount()
+
+    serveAnswered([{ code: 'tools_unavailable' }])
+    renderWithClient(
+      <LanguageContext value="de">
+        <StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />
+      </LanguageContext>,
+    )
+    expect(
+      await screen.findByText('Die Werkzeuge waren für diese Antwort nicht erreichbar; angehängte Dateien wurden nicht gelesen.'),
+    ).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Erneut versuchen' })).toBeInTheDocument()
+  })
+
+  it('offers Try again on the latest answer whose tools could not be reached, and on no other', async () => {
+    serve({
+      'GET /ghostwriter/api/chats/c1': detail([
+        QUESTION,
+        message({ id: 'a1', role: 'assistant', content: 'Erster Anlauf', notices: [{ code: 'tools_unavailable' }] }),
+        message({ id: 'q2', role: 'user', content: 'Und jetzt?' }),
+        message({ id: 'a2', role: 'assistant', content: 'Zweiter Anlauf', notices: [{ code: 'tools_unavailable' }] }),
+      ]),
+    })
+    const first = renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const second = (await screen.findByText('Zweiter Anlauf')).closest('[data-role="assistant"]') as HTMLElement
+    const older = screen.getByText('Erster Anlauf').closest('[data-role="assistant"]') as HTMLElement
+    // Both say it; only the latest can be tried again.
+    expect(noticeCodes(older)).toEqual(['tools_unavailable'])
+    expect(noticeCodes(second)).toEqual(['tools_unavailable'])
+    expect(screen.getAllByRole('button', { name: 'Try again' })).toHaveLength(1)
+    expect(within(second).getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+    first.unmount()
+
+    // A latest answer that reached its tools offers none.
+    serveAnswered([PARTIAL, { code: 'answer_cut' }])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    await screen.findByText('Zusammenfassung')
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
+  })
+
+  it('offers Try again and Continue together on a latest answer that says both', async () => {
+    serveAnswered([{ code: 'tools_unavailable' }, { code: 'answer_cut' }])
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={false} />)
+    const answer = (await screen.findByText('Zusammenfassung')).closest('[data-role="assistant"]') as HTMLElement
+    expect(noticeCodes(answer)).toEqual(['tools_unavailable', 'answer_cut'])
+    const tools = answer.querySelector('[data-notice="tools_unavailable"]') as HTMLElement
+    const cut = answer.querySelector('[data-notice="answer_cut"]') as HTMLElement
+    // Each line carries its own action.
+    expect(within(tools).getByRole('button', { name: 'Try again' })).toBeInTheDocument()
+    expect(within(tools).queryByRole('button', { name: 'Continue' })).not.toBeInTheDocument()
+    expect(within(cut).getByRole('button', { name: 'Continue' })).toBeInTheDocument()
+    expect(within(cut).queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
+  })
+
+  it('tries again by regenerating the answer, and offers it again once the new answer says so too', async () => {
+    const sse = sseStream()
+    let done = false
+    const UNREACHED = message({ id: 'a1', role: 'assistant', content: 'Ohne Werkzeuge', notices: [{ code: 'tools_unavailable' }] })
+    const AGAIN = message({ id: 'a2', role: 'assistant', content: 'Wieder ohne', notices: [{ code: 'tools_unavailable' }] })
+    const calls = serve({
+      'GET /ghostwriter/api/chats/c1': () => json(detail([QUESTION, done ? AGAIN : UNREACHED])),
+      'GET /ghostwriter/api/chats': [CHAT],
+      'POST /ghostwriter/api/chats/c1/regenerate': () => sse.response(),
+    })
+    renderWithClient(<StreamedConversation chatId="c1" config={CONFIG} reasoning={true} />)
+    fireEvent.click(await screen.findByRole('button', { name: 'Try again' }))
+
+    // Exactly the regenerate, with the composer's reasoning switch: no other route.
+    await waitFor(() => expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/regenerate')).toHaveLength(1))
+    expect(callsTo(calls, 'POST', '/ghostwriter/api/chats/c1/regenerate')[0].body).toEqual({ reasoning: true })
+    expect(calls.filter((call) => call.method === 'POST')).toHaveLength(1)
+    // While the new answer is written, the old one is gone and nothing offers to try again.
+    await waitFor(() => expect(screen.queryByText('Ohne Werkzeuge')).not.toBeInTheDocument())
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Regenerate' })).not.toBeInTheDocument()
+
+    // Told live, before any text: announced, outside the busy element, and no button.
+    sse.push('start', { message_id: 'a2', user_message_id: null })
+    sse.push('notice', { code: 'tools_unavailable' })
+    const live = await screen.findByText('The tools could not be reached for this answer, so attached files were not read.')
+    expect(live).toHaveAttribute('role', 'status')
+    expect(live.closest('[aria-busy="true"]')).toBeNull()
+    expect(document.querySelector('[aria-busy="true"]')).not.toBeNull()
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument()
+    sse.push('token', { text: 'Wieder ohne' })
+    await screen.findByText('Wieder ohne')
+
+    done = true
+    sse.push('final', { message_id: 'a2', user_message_id: null, chat: CHAT, stopped: false, context_estimate: null })
+    sse.end()
+    expect(await screen.findByRole('button', { name: 'Try again' })).toBeInTheDocument()
+    expect(screen.getAllByText('The tools could not be reached for this answer, so attached files were not read.')).toHaveLength(1)
+    expect(screen.getByText('The tools could not be reached for this answer, so attached files were not read.')).not.toHaveAttribute(
+      'role',
+    )
+  })
+
   it('says a busy chat refused a continue, as it does a regenerate', async () => {
     const CUT = message({ id: 'a1', role: 'assistant', content: 'Kapitel 1', notices: [{ code: 'answer_cut' }] })
     serve({

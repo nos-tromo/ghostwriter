@@ -98,6 +98,8 @@ export const de: Strings = {
   'notice.document_partial_generic': 'Ein Dokument wurde nur teilweise gelesen.',
   'notice.document_unread': '‚{name}‘ wurde für diese Antwort nicht gelesen.',
   'notice.document_unread_generic': 'Ein Anhang wurde für diese Antwort nicht gelesen.',
+  'notice.tools_unavailable': 'Die Werkzeuge waren für diese Antwort nicht erreichbar; angehängte Dateien wurden nicht gelesen.',
+  'notice.retry': 'Erneut versuchen',
   'unit.page': 'Seiten',
   'unit.page_one': 'Seite',
   'unit.slide': 'Folien',

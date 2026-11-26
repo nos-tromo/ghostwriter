@@ -74,6 +74,7 @@ const NOTICE_CODES: ReadonlySet<string> = new Set<NoticeCode>([
   'document_unread',
   'images_dropped',
   'context_trimmed',
+  'tools_unavailable',
 ])
 
 /** Whether two notices say the same: one code, and for a document notice one file. */

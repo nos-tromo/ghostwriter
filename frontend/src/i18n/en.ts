@@ -95,6 +95,8 @@ export const en = {
   'notice.document_partial_generic': 'A document was read only in part.',
   'notice.document_unread': "'{name}' was not read for this answer.",
   'notice.document_unread_generic': 'An attachment was not read for this answer.',
+  'notice.tools_unavailable': 'The tools could not be reached for this answer, so attached files were not read.',
+  'notice.retry': 'Try again',
   'unit.page': 'pages',
   'unit.page_one': 'page',
   'unit.slide': 'slides',
