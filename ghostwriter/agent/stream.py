@@ -360,6 +360,7 @@ def stream_round(
     cancel: threading.Event,
     reasoning: bool = False,
     continuation: bool = False,
+    require_tool: bool = False,
 ) -> Iterator[TextDelta | RoundDone]:
     """Stream one model round, bounded in tokens, each wait on the router by ``MODEL_TIMEOUT_S``.
 
@@ -374,6 +375,8 @@ def stream_round(
             in up to ``REASONING_ANSWER_TOKENS``, else ``MAX_ANSWER_TOKENS``.
         continuation (bool): Whether the round goes on in the last message, the answer so far: it asks
             for that, and keeps the whitespace its reply opens with.
+        require_tool (bool): Whether the round must call one of ``tools``
+            (:meth:`~ghostwriter.inference.ModelClient.stream` says on which provider that is asked for).
 
     Yields:
         TextDelta | RoundDone: The visible text as it arrives, then exactly one :class:`RoundDone`.
@@ -389,6 +392,7 @@ def stream_round(
         timeout_s=MODEL_TIMEOUT_S,
         reasoning=reasoning,
         continuation=continuation,
+        require_tool=require_tool,
     )
     accumulator = ToolCallAccumulator()
     reader = ReasoningStripper(reasoning_open=reasoning)

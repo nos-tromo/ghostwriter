@@ -80,6 +80,7 @@ def _round(
     tools: list[dict[str, Any]] | None = None,
     reasoning: bool = False,
     continuation: bool = False,
+    require_tool: bool = False,
 ) -> list[TextDelta | RoundDone]:
     rounds = stream_round(
         model,
@@ -89,6 +90,7 @@ def _round(
         cancel=threading.Event(),
         reasoning=reasoning,
         continuation=continuation,
+        require_tool=require_tool,
     )
     return list(rounds)
 
@@ -254,6 +256,21 @@ def test_a_round_with_tools_asks_for_usage_and_bounds_the_answer(settings: Setti
             "extra_body": THINKING_OFF,
         }
     ]
+
+
+@pytest.mark.parametrize(("provider", "choice"), [("vllm", "required"), ("ollama", "auto")])
+def test_a_round_that_must_call_requires_a_call_on_vllm(settings: Settings, provider: str, choice: str) -> None:
+    """A round that must call a tool asks vllm for ``required``; any other provider is asked for ``auto``."""
+    model, fake = _model(dataclasses.replace(settings, inference_provider=provider), [text_chunk("Hallo")])
+    _round(model, tools=TOOLS, require_tool=True)
+    assert fake.calls[0]["tool_choice"] == choice
+
+
+def test_a_round_without_tools_requires_nothing(settings: Settings) -> None:
+    """With no tool offered, a round that must call sends neither key, as any round without tools."""
+    model, fake = _model(settings, [text_chunk("Hallo")])
+    _round(model, tools=[], require_tool=True)
+    assert "tools" not in fake.calls[0] and "tool_choice" not in fake.calls[0]
 
 
 def test_a_stop_closes_the_stream(settings: Settings) -> None:

@@ -159,6 +159,7 @@ class ModelClient:
         timeout_s: float,
         reasoning: bool = False,
         continuation: bool = False,
+        require_tool: bool = False,
     ) -> openai.Stream[Any]:
         """Start one streamed round.
 
@@ -173,6 +174,8 @@ class ModelClient:
                 ``enable_thinking``, elsewhere nothing is sent for it.
             continuation: Whether the round goes on in the last message, an assistant's: on vllm the body is
                 :data:`CONTINUE_BODY`, which thinks in no case; elsewhere nothing is sent for it.
+            require_tool: Whether the round must call a tool: on vllm, with tools offered, ``tool_choice`` is then
+                ``required``; elsewhere ``auto``, as Ollama takes no other.
 
         Returns:
             The stream of chunks; the last one carries the usage.
@@ -183,7 +186,7 @@ class ModelClient:
         options: _Options = {}
         if tools:
             options["tools"] = cast("list[ChatCompletionToolUnionParam]", tools)
-            options["tool_choice"] = "auto"
+            options["tool_choice"] = "required" if require_tool and self.provider == "vllm" else "auto"
         if self.provider == "vllm":
             options["extra_body"] = (
                 copy.deepcopy(dict(CONTINUE_BODY))

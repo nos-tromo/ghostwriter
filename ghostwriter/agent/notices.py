@@ -182,6 +182,23 @@ class SentFile:
     unit: MeasureUnit | None
 
 
+def to_open(attached: Sequence[SentFile], *, sees: bool) -> list[SentFile]:
+    """Return the attachments of a question the model reads only by calling a tool.
+
+    Args:
+        attached: The question's attachments, in order.
+        sees: Whether the turn sees: then a picture is in the question as an image, and needs no call.
+
+    Returns:
+        Each ``ready`` document or clip, and each ``ready`` picture while the turn does not see, in order.
+    """
+    return [
+        sent
+        for sent in attached
+        if sent.status == "ready" and (sent.kind in _UNREAD_KINDS or (sent.kind == "image" and not sees))
+    ]
+
+
 def covered(spans: Iterable[tuple[int, int]]) -> int:
     """Count the units a set of spans covers, each once.
 
@@ -367,10 +384,8 @@ class Reading:
             return []
         return [
             NoticeEvent("document_unread", file_id=sent.file_id, name=sent.name)
-            for sent in attached
-            if sent.status == "ready"
-            and (sent.kind in _UNREAD_KINDS or (sent.kind == "image" and not sees))
-            and not self._used(sent.path)
+            for sent in to_open(attached, sees=sees)
+            if not self._used(sent.path)
         ]
 
     def _used(self, path: str) -> bool:

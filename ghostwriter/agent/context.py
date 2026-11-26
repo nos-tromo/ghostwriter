@@ -97,6 +97,17 @@ OFFICE_FORMATS: Final[Mapping[str, str]] = {
     ".potx": "PowerPoint",
     ".odt": "OpenDocument text",
 }
+#: What an attachment's line calls a data or text file, by the name's suffix: a document with no pages to tell. The
+#: keys are among :data:`~ghostwriter.upload.ATTACHMENT_TYPES`, never a PDF or one of the Office suffixes.
+DATA_FORMATS: Final[Mapping[str, str]] = {
+    ".csv": "CSV table",
+    ".xlsx": "Excel workbook",
+    ".json": "JSON data",
+    ".jsonl": "JSON Lines data",
+    ".ndjson": "JSON Lines data",
+    ".txt": "text",
+    ".md": "Markdown text",
+}
 #: What a document's line says once it is measured longer than one prompt holds.
 LONGER_THAN_A_PROMPT: Final = "longer than one prompt: read it in parts and say which parts you read"
 #: What a picture's line says while the turn does not see, whatever the cause: vision off, a model
@@ -187,7 +198,13 @@ def user_content(
 
 
 def attachment_facts(
-    kind: str, manifest: Mapping[str, Any] | None, *, seen: bool, name: str, too_long: bool = False
+    kind: str,
+    manifest: Mapping[str, Any] | None,
+    *,
+    seen: bool,
+    name: str,
+    too_long: bool = False,
+    length: tuple[int, str] | None = None,
 ) -> str | None:
     """Say what an attachment is, from what workbench reported of it.
 
@@ -195,21 +212,25 @@ def attachment_facts(
         kind: The attachment's kind: ``document``, ``image`` or ``media``.
         manifest: Its manifest as the chat keeps it, or ``None``.
         seen: Whether the turn sees images.
-        name: The attachment's name, whose suffix says an Office file's format and whether a clip is video or
-            audio.
+        name: The attachment's name, whose suffix says an Office file's format, a data or text file's
+            (:data:`DATA_FORMATS`) and whether a clip is video or audio.
         too_long: Whether a document is longer than one prompt holds (measured by the store); a picture or a clip is
             never, and this leaves its line as it was.
+        length: A document's measured length, its count and unit (a :data:`~ghostwriter.schemas.MeasureUnit`), or
+            ``None``; only a data or text file's line tells it, as a PDF and an Office file count their own pages.
 
     Returns:
         For a picture ``image`` and its first rendition's size, followed by :data:`UNSEEN_PICTURE`
         when not ``seen``; for a PDF its pages, for an Office file (``PowerPoint``, ``Word document`` or
         ``OpenDocument text``) its slides or pages as the manifest's ``unit`` says, and for either those
         without text (:func:`_pages_told`), whether ``seen`` or not; for a clip (``media``) its length,
-        frames and transcript (:func:`_clip_told`); else ``None``, which a manifest of kind ``none`` also gives.
-        A ``document`` that is ``too_long`` adds :data:`LONGER_THAN_A_PROMPT` after its facts, or is that phrase
-        alone when it has none.
+        frames and transcript (:func:`_clip_told`); for a data or text file its format and then its ``length``
+        (``CSV table, 91 lines``), whatever its manifest; else ``None``, which a PDF with a manifest of kind
+        ``none`` also gives. A ``document`` that is ``too_long`` adds :data:`LONGER_THAN_A_PROMPT` after its
+        facts, or is that phrase alone when it has none.
     """
-    facts = _facts(kind, manifest, seen=seen, name=name)
+    data = DATA_FORMATS.get(PurePosixPath(name).suffix.lower()) if kind == "document" else None
+    facts = _facts(kind, manifest, seen=seen, name=name) if data is None else _data_told(data, length)
     if too_long and kind == "document":
         return LONGER_THAN_A_PROMPT if facts is None else f"{facts}; {LONGER_THAN_A_PROMPT}"
     return facts
@@ -243,6 +264,22 @@ def _facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: bool, name: s
             return None
         return _pages_told(manifest, office, "slide" if manifest.get("unit") == "slide" else "page")
     return None
+
+
+def _data_told(format_name: str, length: tuple[int, str] | None) -> str:
+    """Say what a data or text file is: its format, then its measured length.
+
+    Args:
+        format_name: What the line calls the format (:data:`DATA_FORMATS`).
+        length: Its count and unit, or ``None``.
+
+    Returns:
+        ``CSV table, 91 lines`` or ``Excel workbook, 1 row``; the format alone without a length.
+    """
+    if length is None:
+        return format_name
+    total, unit = length
+    return f"{format_name}, {total} {unit}" if total == 1 else f"{format_name}, {total} {unit}s"
 
 
 def _is_length(value: object) -> TypeGuard[int | float]:

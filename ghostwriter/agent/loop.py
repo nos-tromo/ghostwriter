@@ -13,10 +13,16 @@ at its cap (its finish reason ``length``, or its output tokens at its ``max_toke
 call, its arguments not an object or empty, is refused as cut, and the model reads to make them
 shorter. Without a usage count, only the finish reason tells the cap. A call workbench answers
 busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
-Every call is disclosed before it is sent, and every round recorded after it ends.
+Every call is disclosed before it is sent, and every round recorded after it ends. A question that attached a
+file the model reads only through a tool (:func:`~ghostwriter.agent.notices.to_open`: a document, a clip, or a
+picture the turn does not see) makes its first round call one: on vllm its ``tool_choice`` is ``required``, and a
+router that refuses that before any text is asked once more with ``auto``.
 
 The user is told, as a notice, what limited the answer (:class:`~ghostwriter.agent.notices.NoticeEvent`),
-and the answer's progress keeps each notice told. The message's first round fills a
+and the answer's progress keeps each notice told. With workbench on but no tool offered to the first round (its
+discovery failed), ``tools_unavailable`` comes first, before any text, and the prompt asks the model to have the
+message sent again (:data:`~ghostwriter.agent.prompt.UNREACHABLE`); no file notice follows it. The message's first
+round fills a
 :class:`~ghostwriter.agent.context.FitReport`, filled again when the round goes once more without images:
 when the request the router took left earlier turns out, ``context_trimmed`` is told with that request's
 first event, before any text, once per message; a request the router refused tells nothing. The last round,
@@ -126,7 +132,7 @@ from ghostwriter.agent.limits import (
     TOOL_CUTOFF_S,
     prompt_tokens,
 )
-from ghostwriter.agent.notices import NoticeEvent, Reading
+from ghostwriter.agent.notices import NoticeEvent, Reading, to_open
 from ghostwriter.agent.prompt import system_prompt
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.agent.tools import (
@@ -173,6 +179,8 @@ CONTEXT_ERROR: Final = "This chat is too long for the model."
 INTERNAL_ERROR = "The answer could not be finished."
 #: The router's statuses for a request it may have refused for its images; such a round is sent once more without.
 REFUSED_IMAGE_STATUSES: Final = frozenset({400, 413, 422})
+#: The router's statuses for a request it may have refused for its ``tool_choice`` ``required``.
+REFUSED_CHOICE_STATUSES: Final = frozenset({400, 422})
 #: The router's statuses for a request it refused for its length.
 REFUSED_CONTEXT_STATUSES: Final = frozenset({400, 413})
 #: What the router says of a prompt longer than the model's context, lower case: one of these in a refusal's
@@ -545,6 +553,18 @@ def _refuses_images(exc: Exception) -> bool:
     return isinstance(exc, openai.APIStatusError) and exc.status_code in REFUSED_IMAGE_STATUSES
 
 
+def _refuses_choice(exc: Exception) -> bool:
+    """Tell whether a round's failure may be the router refusing a required tool call.
+
+    Args:
+        exc: What the round raised.
+
+    Returns:
+        Whether the router answered with a status of :data:`REFUSED_CHOICE_STATUSES`.
+    """
+    return isinstance(exc, openai.APIStatusError) and exc.status_code in REFUSED_CHOICE_STATUSES
+
+
 def _refuses_context(exc: Exception) -> bool:
     """Tell whether a round's failure is the router refusing its prompt as longer than the model's context.
 
@@ -752,9 +772,11 @@ class AgentLoop:
     def _answer(self, turn: Turn, audit: TurnAudit, message: _Progress) -> Iterator[TurnEvent]:
         """Set the turn up, run its rounds, then tell what the message read of the files.
 
-        Once the rounds have ended without raising (also on a stop or a model error), each ``document_partial`` of
-        the chat's attachments, then each ``document_unread`` of the question's, is told; an error that ended the
-        rounds comes after them. A turn stopped before it began tells nothing.
+        With workbench on and no tool offered to the first round, ``tools_unavailable`` is told before the rounds,
+        and no file notice after them. Otherwise, once the rounds have ended without raising (also on a stop or a
+        model error), each ``document_partial`` of the chat's attachments, then each ``document_unread`` of the
+        question's, is told; an error that ended the rounds comes after them. A turn stopped before it began tells
+        nothing.
 
         Args:
             turn: The message.
@@ -793,19 +815,31 @@ class AgentLoop:
             return _estimate(request, sight, [*past, finished_turn(question.text, question.images, current, text)])
 
         message.next_prompt = next_prompt
+        # workbench on, yet the first round offers no tool: the user is told first, and the file notices are not
+        # told, as the cause of every file left unread is.
+        unreachable = self._workbench is not None and not request.offer(sight).tools
+        if unreachable:
+            yield message.told(NoticeEvent("tools_unavailable"))
         # The rounds' error, if one ended them, is held back: the file notices come first, and the error is last.
         error: ErrorEvent | None = None
-        with closing(self._rounds(turn, audit, message, sight, request, current, cap=cap, headers=headers)) as rounds:
+        # A file of the question the model reads only through a tool makes its first round call one (on vllm).
+        opens = bool(to_open(question.files, sees=sight.sees))
+        rounds = self._rounds(turn, audit, message, sight, request, current, cap=cap, headers=headers, opens=opens)
+        with closing(rounds):
             for event in rounds:
                 if isinstance(event, ErrorEvent):
                     error = event
                 else:
                     yield event
         reading = message.reading
-        told = [
-            *reading.partial(self._store.chat_files(turn.chat_id)),
-            *reading.unread(question.files, sees=sight.sees),
-        ]
+        told = (
+            []
+            if unreachable
+            else [
+                *reading.partial(self._store.chat_files(turn.chat_id)),
+                *reading.unread(question.files, sees=sight.sees),
+            ]
+        )
         for notice in told:
             yield message.told(notice)
         if error is not None:
@@ -923,11 +957,12 @@ class AgentLoop:
         *,
         cap: int,
         headers: Mapping[str, str],
+        opens: bool = False,
     ) -> Generator[TurnEvent]:
         """Run the rounds, and the calls between them, until the turn ends.
 
         Each call is recorded in the answer's reading (:class:`~ghostwriter.agent.notices.Reading`) with what the
-        model reads back of it.
+        model reads back of it. With ``opens``, the first round must call a tool (:meth:`_round`).
 
         Args:
             turn: The message.
@@ -938,6 +973,8 @@ class AgentLoop:
             current: The current turn's messages, which the rounds extend.
             cap: The ``max_tokens`` of a round, which tells an answer cut.
             headers: The inference headers.
+            opens: Whether the question attached a file the model reads only through a tool
+                (:func:`~ghostwriter.agent.notices.to_open`).
 
         Yields:
             TurnEvent: As :meth:`run`, the notices about files left out; an :class:`ErrorEvent` ends them.
@@ -949,7 +986,16 @@ class AgentLoop:
             round_no += 1
             tooled = round_no <= MAX_TOOL_ROUNDS and not message.withdrawn and self._left(message) >= TOOL_CUTOFF_S
             done, tools = yield from self._round(
-                turn, audit, message, sight, request, current, tooled=tooled, round_no=round_no, headers=headers
+                turn,
+                audit,
+                message,
+                sight,
+                request,
+                current,
+                tooled=tooled,
+                round_no=round_no,
+                headers=headers,
+                required=opens and round_no == 1,
             )
             # The last round, one without calls, ending at the cap left the answer cut short.
             if done is not None and not done.stopped and not done.calls and _at_cap(done, cap):
@@ -1068,7 +1114,8 @@ class AgentLoop:
                 only while ``seeing`` and ``view_file`` is offered.
 
         Returns:
-            The system prompt, and the tools with their names.
+            The system prompt, and the tools with their names. With workbench on and no ``discovery``, the prompt
+            says the tools are not reachable now (:data:`~ghostwriter.agent.prompt.UNREACHABLE`).
         """
         key = self._settings.workbench_api_key
         folder = chat_folder(key, chat_id) if discovery is not None and key else None
@@ -1083,6 +1130,7 @@ class AgentLoop:
             presentations="write_presentation" in names,
             vision=seeing and VIEW_TOOL in names,
             media=media,
+            unreachable=self._workbench is not None and discovery is None,
         )
         return _Offer(system, function_tools(found), names)
 
@@ -1098,6 +1146,7 @@ class AgentLoop:
         tooled: bool,
         round_no: int,
         headers: Mapping[str, str],
+        required: bool = False,
     ) -> Generator[TurnEvent, None, tuple[RoundDone | None, list[dict[str, Any]]]]:
         """Fit one round, stream it with its images and record it; a round refused with images goes once more.
 
@@ -1126,6 +1175,9 @@ class AgentLoop:
             tooled: Whether the round may offer tools.
             round_no: The round.
             headers: The inference headers.
+            required: Whether the round must call a tool (``tool_choice`` ``required``, asked of vllm only). A
+                refusal of :data:`REFUSED_CHOICE_STATUSES` before any text, after a stop not and never one for
+                length, sends it once more free (``auto``), recorded as a failed round as an image refusal is.
 
         Yields:
             TurnEvent: ``images_dropped`` when it goes again without images; ``context_trimmed`` before the
@@ -1154,6 +1206,7 @@ class AgentLoop:
                     cancel=turn.cancel,
                     reasoning=turn.reasoning,
                     continuation=turn.continued,
+                    require_tool=required,
                 ):
                     if report is not None:
                         # The router took this attempt: its fit is the one sent, and its trim is told, once.
@@ -1181,6 +1234,10 @@ class AgentLoop:
                     _drop_images(current, sight)
                     yield message.told(NoticeEvent("images_dropped"))
                     fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
+                    continue
+                if required and not said and not stopped and not for_length and _refuses_choice(exc):
+                    logger.info("Model round {} goes again without a required call", round_no)
+                    required = False
                     continue
                 if for_length:
                     logger.error(

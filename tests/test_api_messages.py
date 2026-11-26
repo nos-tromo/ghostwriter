@@ -1356,6 +1356,24 @@ def test_an_answer_from_before_notices_is_served_as_before(client: TestClient, f
     assert answer["content"] and answer["role"] == "assistant"
 
 
+def test_an_unreachable_workbench_is_told_and_stored(
+    client: TestClient, door: FakeDoor, fake_openai: FakeOpenAI
+) -> None:
+    """With workbench on but its discovery failing, the answer's first notice says the tools were not reachable."""
+    cid = _new(client)
+    door.answers["server/discover"] = httpx.ConnectError("refused")
+    fake_openai.script = [ANSWER]
+    frames = _frames(_send(client, cid))
+    notices = [f.data for f in frames if f.event == "notice"]
+    assert notices == [{"code": "tools_unavailable"}]
+    assert frames.index(next(f for f in frames if f.event == "notice")) < frames.index(
+        next(f for f in frames if f.event == "token")
+    )
+    assert "tools" not in fake_openai.calls[0]
+    stored = {"code": "tools_unavailable", "file_id": None, "name": None, "read": None, "total": None, "unit": None}
+    assert _detail(client, cid)["messages"][1]["notices"] == [stored]
+
+
 def test_a_regenerated_answer_reports_again(client: TestClient, door: FakeDoor, fake_openai: FakeOpenAI) -> None:
     """The first answer never opened the notes, and says so; its regenerate read them whole, and says nothing."""
     cid = _new(client)

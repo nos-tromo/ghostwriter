@@ -18,6 +18,7 @@ from sqlalchemy import Engine
 
 from ghostwriter.agent.context import (
     CLEARED,
+    DATA_FORMATS,
     LONGER_THAN_A_PROMPT,
     OFFICE_FORMATS,
     UNSEEN_PICTURE,
@@ -60,7 +61,7 @@ from ghostwriter.agent.limits import (
     TOOL_RESULT_CHARS,
 )
 from ghostwriter.agent.notices import SentFile
-from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, VISION, system_prompt
+from ghostwriter.agent.prompt import DECK_CHECK, FILES, MEDIA, PAGING, PRESENTATIONS, UNREACHABLE, VISION, system_prompt
 from ghostwriter.agent.tools import (
     CUT_END_HINT,
     CUT_HINT,
@@ -80,7 +81,7 @@ from ghostwriter.agent.tools import (
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.store import ChatStore, UserTurn
-from ghostwriter.upload import OFFICE_SUFFIXES
+from ghostwriter.upload import ATTACHMENT_TYPES, OFFICE_SUFFIXES
 from ghostwriter.workbench import McpTool, OutputFile, TablePreview, ToolFailure, ToolImage, ToolResult
 from tests.fakes import TINY_JPEG, TINY_PNG, stock_manifest
 
@@ -828,7 +829,7 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     first = store.add_user_message("user-a", chat.id, "Summe der Spalte B", [attachment.id])
     store.finish_assistant_message(store.start_assistant_message(chat.id), "42")
     second = store.add_user_message("user-a", chat.id, "Und Spalte C?", [])
-    named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]"
+    named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes; Excel workbook)]"
     sales = SentFile("1" * 32, f"{FOLDER}/sales.xlsx", "sales.xlsx", "document", "ready", None, None)
     assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0, (sales,))
     assert store.user_turn(chat.id, second.id) == UserTurn("Und Spalte C?", (), 2)
@@ -839,7 +840,7 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
 
 
 def test_the_long_line_rides_the_attachment_line(engine: Engine, clock: Clock) -> None:
-    """A document measured longer than one prompt says so on its line, to this turn and to its replay."""
+    """A document's line says its measured length, and when it is longer than one prompt, to this turn and replay."""
     store = ChatStore(engine, file_days=7, notice_days=30, prompt_budget=1_000, now=clock)
     chat = store.create_chat("user-a")
 
@@ -866,9 +867,9 @@ def test_the_long_line_rides_the_attachment_line(engine: Engine, clock: Clock) -
     expected = "\n".join(
         [
             "Fasse zusammen",
-            f"[Attached: long-report.txt ({FOLDER}/long-report.txt, 1234 bytes{told})]",
-            f"[Attached: tide-notes.txt ({FOLDER}/tide-notes.txt, 56 bytes)]",
-            f"[Attached: quay-ledger.txt ({FOLDER}/quay-ledger.txt, 78 bytes)]",
+            f"[Attached: long-report.txt ({FOLDER}/long-report.txt, 1234 bytes; text, 40000 lines{told})]",
+            f"[Attached: tide-notes.txt ({FOLDER}/tide-notes.txt, 56 bytes; text, 12 lines)]",
+            f"[Attached: quay-ledger.txt ({FOLDER}/quay-ledger.txt, 78 bytes; text)]",
         ]
     )
     assert store.user_turn(chat.id, first.id).text == expected
@@ -1016,6 +1017,34 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
         "user's last message, in Markdown; write tables as Markdown tables. You have no tools in this chat, and "
         "files cannot be read."
     )
+
+
+def test_the_prompt_says_to_work_on_attached_files_with_tools_only() -> None:
+    """With tools the prompt says to work on the attached files in this answer, never to ask for their content."""
+    assert FILES == (
+        "When the user's message names attached files, work on them with the tools in this answer before you reply: "
+        "read_document reads documents, text and tables; run_python computes over a file's data (statistics, totals, "
+        "filters, comparisons, charts), CSV, Excel and JSON with pandas. Compute figures with run_python, never in "
+        "your head. Never ask the user to paste a file's content, and never say you cannot open files."
+    )
+    assert f"never guess its content. {FILES} Python runs in a sandbox" in SYSTEM
+    bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
+    assert FILES not in bare
+
+
+def test_an_unreachable_workbench_has_its_own_sentence() -> None:
+    """Tools that are on but not reachable say so and ask to send again; workbench off keeps its sentence."""
+    assert UNREACHABLE == (
+        "The tools are not reachable right now, so files cannot be read in this answer. If the user asks about a "
+        "file or for work on one, say so in one sentence and ask them to send the message again in a minute; never "
+        "ask them to paste a file's content, and never guess it."
+    )
+    day = date(2026, 11, 16)
+    off = system_prompt(today=day, folder=None, file_days=7, expired=False)
+    down = system_prompt(today=day, folder=None, file_days=7, expired=False, unreachable=True)
+    assert down == off.replace("You have no tools in this chat, and files cannot be read.", UNREACHABLE)
+    assert "You have no tools" not in down and FILES not in down and PAGING not in down
+    assert system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, unreachable=True) == SYSTEM
 
 
 def test_the_prompt_says_how_to_page_with_tools_only() -> None:
@@ -1202,6 +1231,45 @@ def test_a_long_document_says_to_read_it_in_parts(
     assert attachment_facts("document", manifest, seen=True, name="long-report.pdf", too_long=too_long) == expected
 
 
+@pytest.mark.parametrize(
+    ("name", "length", "expected"),
+    [
+        ("tide-table.csv", (91, "line"), "CSV table, 91 lines"),
+        ("tide-table.csv", None, "CSV table"),
+        ("berth-plan.xlsx", (1, "row"), "Excel workbook, 1 row"),
+        ("berth-plan.xlsx", (240, "row"), "Excel workbook, 240 rows"),
+        ("vessels.json", None, "JSON data"),
+        ("vessels.jsonl", (12, "line"), "JSON Lines data, 12 lines"),
+        ("vessels.ndjson", None, "JSON Lines data"),
+        ("quay-notes.txt", (30, "line"), "text, 30 lines"),
+        ("QUAY-NOTES.MD", None, "Markdown text"),
+    ],
+)
+def test_a_data_or_text_file_says_its_format_and_length(
+    name: str, length: tuple[int, str] | None, expected: str
+) -> None:
+    """A document with no pages to tell says its format by its suffix, then its measured length, if any."""
+    for manifest in (None, {"kind": "none", "total": 0}):
+        assert attachment_facts("document", manifest, seen=True, name=name, length=length) == expected
+    long = attachment_facts("document", None, seen=True, name=name, length=length, too_long=True)
+    assert long == f"{expected}; {LONGER_THAN_A_PROMPT}"
+
+
+def test_the_data_formats_are_attachment_types_without_pages() -> None:
+    """Every data format is a type Ghostwriter takes, and none is a PDF or an Office file, which tell their pages."""
+    assert set(DATA_FORMATS) <= set(ATTACHMENT_TYPES)
+    assert not set(DATA_FORMATS) & {".pdf", *OFFICE_SUFFIXES}
+
+
+def test_a_document_with_pages_keeps_its_line_whatever_its_length() -> None:
+    """A PDF or an Office file counts its own pages; its measured length adds nothing, and an unknown suffix none."""
+    assert attachment_facts(
+        "document", _pdf_manifest(12, []), seen=True, name="quay-scan.pdf", length=(12, "page")
+    ) == ("PDF, 12 pages")
+    assert attachment_facts("document", None, seen=True, name="quay-scan.pdf", length=(12, "page")) is None
+    assert attachment_facts("document", None, seen=True, name="harbour.bin", length=(3, "line")) is None
+
+
 def test_a_picture_and_a_clip_are_never_too_long() -> None:
     """Only a document is read in parts: ``too_long`` leaves a picture's line and a clip's as they were."""
     times = "\N{MULTIPLICATION SIGN}"
@@ -1279,7 +1347,7 @@ def test_the_attachment_line_carries_facts() -> None:
         f"[Attached: quay-scan.pdf ({FOLDER}/quay-scan.pdf, 900000 bytes; PDF, 12 pages; pages 3, 7 have no text)]",
         f"[Attached: quay-letter.pdf ({FOLDER}/quay-letter.pdf, 70000 bytes; PDF, 5 pages; page 3 has no text)]",
         f"[Attached: letter.pdf ({FOLDER}/letter.pdf, 2000 bytes; PDF, 1 page)]",
-        f"[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]",
+        f"[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes; Excel workbook)]",
         "[Attached: blurred-photo.jpg; could not be read]",
         "[Attached: old-scan.pdf; expired]",
     ]
@@ -1666,7 +1734,7 @@ def test_an_office_attachment_without_facts_says_nothing() -> None:
     assert attachment_facts("document", none, seen=True, name="quay-report.docx") is None
     assert attachment_facts("document", None, seen=True, name="harbour-deck.pptx") is None
     assert attachment_facts("document", _office_manifest("slide", 0, []), seen=True, name="harbour-deck.pptx") is None
-    assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.xlsx") is None
+    assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.odp") is None
 
 
 def test_a_clips_line_says_what_it_holds() -> None:

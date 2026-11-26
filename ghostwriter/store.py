@@ -436,6 +436,20 @@ class ChatStore:
         chars = _count(measure.get("chars"))
         return measure.get("capped") is True or (chars is not None and chars / CHARS_PER_TOKEN > self._prompt_budget)
 
+    def _length(self, attachment: Attachment) -> tuple[int, str] | None:
+        """Read a measured document's length for its line.
+
+        Args:
+            attachment: The row.
+
+        Returns:
+            Its count and unit once ``measured`` with both readable (:meth:`_length_out`); else ``None``.
+        """
+        served = self._length_out(attachment, expired=False)
+        if served is None or served.total is None or served.unit is None:
+            return None
+        return served.total, served.unit
+
     def _length_out(self, attachment: Attachment, expired: bool) -> LengthOut | None:
         """Serve an attachment's measure.
 
@@ -1706,8 +1720,9 @@ class ChatStore:
 
         Returns:
             The text, then each attachment with its path, size and facts
-            (:func:`~ghostwriter.agent.context.attachment_facts`, which says a document measured longer than one prompt
-            is read in parts), or as expired or unreadable.
+            (:func:`~ghostwriter.agent.context.attachment_facts`, which says a data or text file's format and measured
+            length, and that a document measured longer than one prompt is read in parts), or as expired or
+            unreadable.
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
         facts = {
@@ -1717,6 +1732,7 @@ class ChatStore:
                 seen=seen,
                 name=attachment.name,
                 too_long=self._too_long(attachment),
+                length=self._length(attachment),
             )
             for attachment in attachments
         }

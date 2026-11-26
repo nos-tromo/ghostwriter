@@ -50,7 +50,7 @@ from ghostwriter.agent.loop import (
     TurnOutcome,
     _refuses_context,
 )
-from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, UNREACHABLE, VISION
 from ghostwriter.agent.tools import cut
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
@@ -803,15 +803,36 @@ def test_a_failed_model_record_ends_the_turn_and_keeps_the_text(loop_env: LoopEn
     assert loop_env.workbench.calls == [] and loop_env.stored() == "Ich lese."
 
 
-@pytest.mark.parametrize("workbench", [None, FakeWorkbench(tools=())])
-def test_without_workbench_no_tool_is_offered(loop_env: LoopEnv, workbench: FakeWorkbench | None) -> None:
-    """With no workbench, or none usable, a chat still answers: no tools, and the prompt says so."""
-    events = loop_env.run([text_chunk("Hallo!")], workbench=workbench)
+def test_without_workbench_no_tool_is_offered(loop_env: LoopEnv) -> None:
+    """With workbench off a chat still answers: no tools, the prompt says so, and no notice is told."""
+    events = loop_env.run([text_chunk("Hallo!")], workbench=None)
     assert events == [TokenEvent("Hallo!")]
     assert "tools" not in loop_env.fake.calls[0]
     assert "You have no tools in this chat" in loop_env.sent(1)[0]["content"]
+    assert UNREACHABLE not in loop_env.sent(1)[0]["content"]
     assert "/workspace/" not in loop_env.sent(1)[0]["content"]
     assert PAGING not in loop_env.sent(1)[0]["content"]
+    assert loop_env.notices() == []
+
+
+@pytest.mark.parametrize("vision", [False, True], ids=["blind", "seeing"])
+def test_an_unreachable_workbench_is_told_before_the_text(loop_env: LoopEnv, vision: bool) -> None:
+    """With workbench on but no listing: no tool, the prompt asks to send again, ``tools_unavailable`` comes first."""
+    events = loop_env.run([text_chunk("Bitte später.")], workbench=FakeWorkbench(tools=()), vision=vision)
+    assert events == [NoticeEvent("tools_unavailable"), TokenEvent("Bitte später.")]
+    system = loop_env.sent(1)[0]["content"]
+    assert UNREACHABLE in system and "You have no tools in this chat" not in system
+    assert "/workspace/" not in system and PAGING not in system
+    assert "tools" not in loop_env.fake.calls[0]
+    assert loop_env.notices() == [{"code": "tools_unavailable"}]
+
+
+def test_an_unreachable_workbench_tells_no_attachment_unread(loop_env: LoopEnv) -> None:
+    """The cause is told, so an attachment no call could open is not told unread as well."""
+    notes = (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+    events = loop_env.run([text_chunk("Bitte später.")], workbench=FakeWorkbench(tools=()), attach=[notes])
+    assert events == [NoticeEvent("tools_unavailable"), TokenEvent("Bitte später.")]
+    assert loop_env.notices() == [{"code": "tools_unavailable"}]
 
 
 def test_with_workbench_the_prompt_names_the_chats_folder(loop_env: LoopEnv) -> None:
@@ -2192,6 +2213,14 @@ def test_a_clean_continuation_keeps_the_other_notices(loop_env: LoopEnv) -> None
     assert loop_env.notices() == [unread]
 
 
+def test_a_continuation_tells_no_unreachable_workbench(loop_env: LoopEnv) -> None:
+    """A continuation offers no tool in any case: workbench gone meanwhile tells no ``tools_unavailable``."""
+    loop_env.run(CUT)
+    loop_env.workbench.discovery = None
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert loop_env.notices() == []
+
+
 def test_a_continuation_tells_no_trim(loop_env: LoopEnv) -> None:
     """A continuation of a long chat leaves earlier turns out as any round does, but tells no trim again."""
     _long_turns(loop_env, 30)
@@ -2316,3 +2345,59 @@ def test_a_continuation_estimates_the_next_prompt_as_a_fresh_answer_does(loop_en
     assert _image_urls(fresh["messages"]) == [JPEG_URL]
     assert loop_env.stored() == "Kapitel 1 … und weiter."
     assert continued is not None and continued == _stored_estimate(loop_env)
+
+
+# --- a question with a file to open: vllm's first round must call a tool ----------------------------------------------
+
+
+def _choices(loop_env: LoopEnv) -> list[str | None]:
+    return [call.get("tool_choice") for call in loop_env.fake.calls]
+
+
+def test_a_question_with_a_document_asks_vllm_for_a_call_first(loop_env: LoopEnv) -> None:
+    """An attached document must be opened: vllm's first round requires a call, the next is free again."""
+    loop_env.run(_calls(READ_SALES), [text_chunk("Gelesen.")], attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+
+
+def test_a_picture_the_turn_does_not_see_asks_for_a_call(loop_env: LoopEnv) -> None:
+    """A picture that does not go to the model as an image is opened with a tool, as a document is."""
+    loop_env.run(_calls(READ_SALES), [text_chunk("Gesehen.")], attach=[_photo()])
+    assert _choices(loop_env) == ["required", "auto"]
+
+
+@pytest.mark.parametrize("case", ["no file", "a picture it sees", "ollama", "a follow-up"])
+def test_a_first_round_is_free_without_a_file_to_open(loop_env: LoopEnv, case: str) -> None:
+    """No file of the question to open, a picture already in the message, or a provider other than vllm: ``auto``."""
+    if case == "no file":
+        loop_env.run([text_chunk("Hallo!")])
+    elif case == "a picture it sees":
+        loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    elif case == "ollama":
+        loop_env.settings = dataclasses.replace(loop_env.settings, inference_provider="ollama")
+        loop_env.run([text_chunk("Ohne Pflicht.")], attach=[_notes()])
+    else:
+        loop_env.run(_calls(READ_SALES), [text_chunk("Gelesen.")], attach=[_notes()])
+        loop_env.run([text_chunk("Und weiter.")], content="Was noch?")
+        assert _choices(loop_env)[-1] == "auto"
+        return
+    assert _choices(loop_env) == ["auto"]
+
+
+def test_a_refused_required_round_goes_again_free(loop_env: LoopEnv) -> None:
+    """A router that refuses ``required`` before any text is asked once more with ``auto``; the turn goes on."""
+    events = loop_env.run(_refused(), [text_chunk("Ohne Pflicht.")], attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+    assert events == [
+        TokenEvent("Ohne Pflicht."),
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES),
+    ]
+    assert loop_env.audit.log == ["model:1:error", "model:1:ok"]
+    assert loop_env.stored() == "Ohne Pflicht."
+
+
+def test_a_round_refused_again_without_required_is_the_model_error(loop_env: LoopEnv) -> None:
+    """The free try refused too ends the turn as any refused round does, with the model error."""
+    events = loop_env.run(_refused(), _refused(), attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+    assert events[-1] == ErrorEvent("model", "The model did not answer.")
