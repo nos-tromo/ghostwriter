@@ -392,13 +392,20 @@ class ChatStore:
         self._now = now
 
     @contextmanager
-    def _transaction(self) -> Generator[Session]:
+    def _transaction(self, *, immediate: bool = False) -> Generator[Session]:
         """Open one short transaction.
+
+        Args:
+            immediate: Take SQLite's write lock at the start (``BEGIN IMMEDIATE``), for a transaction that counts
+                before it writes: pysqlite begins a transaction only before its first write, so without it two
+                transactions can count the same rows before either stores.
 
         Yields:
             The session, committed on success and rolled back on an error.
         """
         with Session(self._engine) as s, s.begin():
+            if immediate:
+                s.connection().exec_driver_sql("BEGIN IMMEDIATE")
             yield s
 
     def _gone(self, created_at: datetime, now: datetime) -> bool:
@@ -1282,7 +1289,7 @@ class ChatStore:
             TooManyPending: If the chat already holds ``max_pending`` waiting attachments.
         """
         now = self._now()
-        with self._transaction() as s:
+        with self._transaction(immediate=max_pending is not None) as s:
             if s.get(Chat, chat_id) is None:
                 raise ChatNotFound("chat not found")
             if max_pending is not None and self._pending(s, chat_id, now) >= max_pending:

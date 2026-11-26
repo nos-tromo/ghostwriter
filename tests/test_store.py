@@ -1,7 +1,10 @@
 """The chat store: ownership, the chat period, contents that expire with their files, and deletion."""
 
+import contextlib
 import json
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -419,6 +422,34 @@ def test_the_pending_cap_is_counted_inside_the_write(store: ChatStore) -> None:
     store.add_user_message("user-a", chat.id, "Hallo", [first.id])
     store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
     assert store.pending_count(chat.id) == 2
+
+
+def test_two_parallel_adds_one_below_the_cap_store_one(store: ChatStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second add counts only after the first has stored, under SQLite's write lock: one of the two is refused."""
+    chat = store.create_chat("user-a")
+    _attach(store, chat.id)
+    both_counted = threading.Barrier(2, timeout=0.5)
+    count = ChatStore._pending
+
+    def count_then_meet(self: ChatStore, s: Session, chat_id: str, now: datetime) -> int:
+        pending = count(self, s, chat_id, now)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both_counted.wait()  # without the lock both adds count here before either stores
+        return pending
+
+    monkeypatch.setattr(ChatStore, "_pending", count_then_meet)
+
+    def add(_: int) -> str:
+        path, name = "/workspace/s/sales.xlsx", "sales.xlsx"
+        try:
+            store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
+        except TooManyPending:
+            return "refused"
+        return "stored"
+
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = sorted(pool.map(add, range(2)))
+    assert (outcomes, store.pending_count(chat.id)) == (["refused", "stored"], 2)
 
 
 def test_expired_pending_attachments_do_not_count_against_the_cap(store: ChatStore, clock: Clock) -> None:
