@@ -158,6 +158,59 @@ def _renditions(client: WorkbenchClient, *wanted: RenditionRequest) -> list[tupl
     return client.fetch_renditions(wanted, call=CALL)
 
 
+#: Every request the client makes, by the name :func:`_operate` knows it by.
+OPERATIONS = [
+    "discover",
+    "call_tool",
+    "upload",
+    "view",
+    "delete_chat",
+    "delete_upload",
+    "prepare",
+    "measure",
+    "derived",
+    "fetch_renditions",
+]
+
+
+async def _operate(client: WorkbenchClient, door: FakeDoor, operation: str) -> None:
+    """Make one of :data:`OPERATIONS` against a door that holds a workbook, a PDF and a clip of the chat.
+
+    Args:
+        client: The client.
+        door: Its door; the files are stored first.
+        operation: Which request.
+    """
+    door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
+    door.files[PDF] = (b"%PDF", "application/pdf")
+    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
+    if operation == "discover":
+        client.discover(call=CALL, images=True)
+    elif operation == "call_tool":
+        _call(client)
+    elif operation == "upload":
+        await _upload(client)
+    elif operation == "view":
+        async with client.view(call=CALL, path=f"{FOLDER}/sales.xlsx"):
+            pass
+    elif operation == "prepare":
+        await client.prepare(call=CALL, path=PDF)
+    elif operation == "measure":
+        await client.measure(call=CALL, path=PDF)
+    elif operation == "derived":
+        assert (
+            await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT)) == DERIVED_ID
+        )
+    elif operation == "fetch_renditions":
+        assert (
+            _renditions(client, RenditionRequest(PDF, 1), RenditionRequest(PDF, 2)) == [("image/jpeg", TINY_JPEG)] * 2
+        )
+    elif operation == "delete_upload":
+        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
+    else:
+        await client.delete_chat(call=CALL)
+
+
 @pytest.fixture
 def log_lines() -> Iterator[list[str]]:
     """Capture every loguru line, DEBUG included.
@@ -252,7 +305,7 @@ def test_each_result_is_cached_for_its_ttl() -> None:
 
 
 def test_a_failed_discovery_is_tried_again_at_most_once_a_minute() -> None:
-    """After a failure, turns within the next 60 s get no tool and send nothing."""
+    """After a failure workbench answered, turns within the next 60 s get no tool and send nothing."""
     door = FakeDoor()
     door.answers["server/discover"] = httpx.Response(503, text="unavailable")
     clock = FakeClock()
@@ -265,6 +318,128 @@ def test_a_failed_discovery_is_tried_again_at_most_once_a_minute() -> None:
     door.answers["server/discover"] = FakeDoor().answers["server/discover"]
     assert client.discover(call=CALL, images=True) is not None
     assert door.methods() == ["server/discover", "server/discover", "tools/list"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        httpx.ConnectError("connection refused"),
+        httpx.ConnectError("name or service not known"),
+        httpx.RemoteProtocolError("server disconnected without sending a response"),
+    ],
+    ids=["refused", "no_such_name", "disconnected"],
+)
+def test_an_unreachable_workbench_is_discovered_again_at_once(fault: httpx.TransportError) -> None:
+    """A failure that comes fast sets no delay: the next turn discovers again, and finds workbench once it is back."""
+    door = FakeDoor()
+    door.answers["server/discover"] = fault
+    client = _client(door, FakeClock())
+    assert client.discover(call=CALL, images=True) is None
+    assert client.discover(call=CALL, images=True) is None
+    assert door.methods() == ["server/discover"] * 2
+    door.answers["server/discover"] = discover_result()
+    assert client.discover(call=CALL, images=True) is not None
+    assert door.methods() == ["server/discover"] * 3 + ["tools/list"]
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [httpx.ConnectTimeout("timed out"), httpx.ReadTimeout("timed out"), RuntimeError("door broke")],
+    ids=["connect_timeout", "read_timeout", "error"],
+)
+def test_a_slow_or_broken_discovery_keeps_its_delay(fault: Exception) -> None:
+    """A timeout or an error is tried again only after 60 s, while workbench answers nothing else."""
+    door = FakeDoor()
+    door.answers["server/discover"] = fault
+    clock = FakeClock()
+    client = _client(door, clock)
+    assert client.discover(call=CALL, images=True) is None
+    door.answers["server/discover"] = discover_result()
+    clock.advance(59)
+    assert client.discover(call=CALL, images=True) is None
+    assert door.methods() == ["server/discover"]
+    clock.advance(2)
+    assert client.discover(call=CALL, images=True) is not None
+    assert door.methods() == ["server/discover", "server/discover", "tools/list"]
+
+
+@pytest.mark.parametrize("change", ["no_modern_revision", "no_usable_tool", "rpc_error"])
+def test_an_answered_failure_keeps_its_delay_although_it_was_an_answer(change: str) -> None:
+    """The discovery's own answers end no delay of its own: the next turn, at once, sends nothing."""
+    door = FakeDoor()
+    listed = door.answers["tools/list"]
+    assert isinstance(listed, dict)
+    if change == "no_modern_revision":
+        door.answers["server/discover"] = {"supportedVersions": ["2025-11-25"], "resultType": "complete"}
+    elif change == "no_usable_tool":
+        none: list[dict[str, Any]] = []
+        door.answers["tools/list"] = {**listed, "tools": none}
+    else:
+        door.answers["tools/list"] = RpcError(-32603, "internal error")
+    client = _client(door, FakeClock())
+    assert client.discover(call=CALL, images=True) is None
+    sent = len(door.requests)
+    assert client.discover(call=CALL, images=True) is None
+    assert len(door.requests) == sent
+
+
+@pytest.mark.parametrize("operation", [name for name in OPERATIONS if name != "discover"])
+async def test_any_answer_from_workbench_ends_both_delays(operation: str) -> None:
+    """Both listings timed out and wait out their delay; one answer to any request ends both, and both discover."""
+    door = FakeDoor()
+    door.answers["server/discover"] = httpx.ReadTimeout("timed out")
+    client = _client(door, FakeClock())
+    assert client.discover(call=CALL, images=True) is None
+    assert client.discover(call=CALL, images=False) is None
+    door.answers["server/discover"] = discover_result()
+    assert client.discover(call=CALL, images=True) is None
+    assert door.methods() == ["server/discover"] * 2
+    await _operate(client, door, operation)
+    before = len(door.methods())
+    assert client.discover(call=CALL, images=True) is not None
+    assert client.discover(call=CALL, images=False) is not None
+    assert door.methods()[before:] == ["server/discover", "tools/list"] * 2
+
+
+async def test_a_refusal_is_an_answer_too() -> None:
+    """A refused upload (workbench's 503) shows workbench up all the same: the delay ends."""
+    door = FakeDoor()
+    door.answers["server/discover"] = httpx.ReadTimeout("timed out")
+    client = _client(door, FakeClock())
+    assert client.discover(call=CALL, images=False) is None
+    door.answers["server/discover"] = discover_result()
+    door.answers["/files/upload"] = httpx.Response(503, json={"detail": "busy, retry later"})
+    with pytest.raises(WorkbenchUnavailable):
+        await _upload(client)
+    assert client.discover(call=CALL, images=False) is not None
+
+
+def test_a_failure_is_logged_once_until_a_discovery_succeeds(loguru_caplog: pytest.LogCaptureFixture) -> None:
+    """One warning when a listing goes down, none while it stays down, however it fails; again once it was up."""
+    door = FakeDoor()
+    clock = FakeClock()
+    client = _client(door, clock)
+    door.answers["server/discover"] = httpx.ConnectError("connection refused")
+    assert client.discover(call=CALL, images=True) is None
+    assert client.discover(call=CALL, images=True) is None
+    door.answers["server/discover"] = httpx.ReadTimeout("timed out")
+    assert client.discover(call=CALL, images=True) is None
+    _call(client)
+    door.answers["server/discover"] = httpx.Response(503, text="unavailable")
+    assert client.discover(call=CALL, images=True) is None
+    assert [record.getMessage() for record in loguru_caplog.records] == [
+        "workbench discovery failed: unreachable. No tool is offered; the next turn tries again"
+    ]
+    door.answers["server/discover"] = discover_result()
+    clock.advance(61)
+    assert client.discover(call=CALL, images=True) is not None
+    door.answers["server/discover"] = httpx.Response(503, text="unavailable")
+    clock.advance(3601)
+    assert client.discover(call=CALL, images=True) is None
+    assert [record.getMessage() for record in loguru_caplog.records][1:] == [
+        "workbench discovery failed: http:503. No tool is offered; the next try comes after 60 s,"
+        " or at once when workbench answers a request"
+    ]
 
 
 def _description(found: Any, name: str) -> str:
@@ -290,27 +465,33 @@ def test_each_listing_is_asked_with_its_own_header() -> None:
 
 
 def test_each_listing_is_cached_and_tried_again_on_its_own() -> None:
-    """A listing's cache window and retry delay are its own; a call that drops the discovery drops both."""
+    """A listing's cache window and retry delay are its own; a call that drops the discovery drops both.
+
+    A failure delays its own listing only, and the other's discovery, answered, ends that delay as any answer does.
+    """
     door = FakeDoor()
     clock = FakeClock()
     client = _client(door, clock)
     door.answers["server/discover"] = httpx.Response(503, text="unavailable")
     assert client.discover(call=CALL, images=True) is None
     door.answers["server/discover"] = discover_result()
-    assert client.discover(call=CALL, images=False) is not None
     assert client.discover(call=CALL, images=True) is None
+    assert door.methods() == ["server/discover"]
     assert client.discover(call=CALL, images=False) is not None
-    assert door.methods() == ["server/discover", "server/discover", "tools/list"]
-    clock.advance(61)
+    clock.advance(30)
     assert client.discover(call=CALL, images=True) is not None
+    assert door.methods()[1:] == ["server/discover", "tools/list"] * 2
+    clock.advance(280)
     assert client.discover(call=CALL, images=False) is not None
-    assert door.methods()[3:] == ["server/discover", "tools/list"]
+    assert client.discover(call=CALL, images=True) is not None
+    assert door.methods()[5:] == ["tools/list"]
+    assert door.requests[-1][0].headers.get("x-accept-images") is None
 
     door.answers["tools/call"] = httpx.ConnectError("connection refused")
     _call(client)
     assert client.discover(call=CALL, images=True) is not None
     assert client.discover(call=CALL, images=False) is not None
-    assert door.methods()[6:] == ["server/discover", "tools/list"] * 2
+    assert door.methods()[6:] == ["tools/call"] + ["server/discover", "tools/list"] * 2
 
 
 def test_one_listing_in_progress_does_not_hold_the_other() -> None:
@@ -418,53 +599,11 @@ def test_a_call_asks_for_images_only_when_told_to() -> None:
     assert [request.headers.get("x-accept-images") for request, _ in door.requests] == [None, "1", None, None]
 
 
-@pytest.mark.parametrize(
-    "operation",
-    [
-        "discover",
-        "call_tool",
-        "upload",
-        "view",
-        "delete_chat",
-        "delete_upload",
-        "prepare",
-        "measure",
-        "derived",
-        "fetch_renditions",
-    ],
-)
+@pytest.mark.parametrize("operation", OPERATIONS)
 async def test_every_request_carries_the_session_purpose_and_request_id(operation: str) -> None:
     """Discovery, tools/call and the file routes each carry the chat, the user, the purpose and the request id."""
     door = FakeDoor()
-    door.files[f"{FOLDER}/sales.xlsx"] = (b"PK", XLSX)
-    door.files[PDF] = (b"%PDF", "application/pdf")
-    door.files[CLIP] = (CLIP_BYTES, "video/mp4")
-    client = _client(door)
-    if operation == "discover":
-        client.discover(call=CALL, images=True)
-    elif operation == "call_tool":
-        _call(client)
-    elif operation == "upload":
-        await _upload(client)
-    elif operation == "view":
-        async with client.view(call=CALL, path=f"{FOLDER}/sales.xlsx"):
-            pass
-    elif operation == "prepare":
-        await client.prepare(call=CALL, path=PDF)
-    elif operation == "measure":
-        await client.measure(call=CALL, path=PDF)
-    elif operation == "derived":
-        assert (
-            await client.derived(call=CALL, source=CLIP, role="nextext_jsonl", chunks=_chunks(TRANSCRIPT)) == DERIVED_ID
-        )
-    elif operation == "fetch_renditions":
-        assert (
-            _renditions(client, RenditionRequest(PDF, 1), RenditionRequest(PDF, 2)) == [("image/jpeg", TINY_JPEG)] * 2
-        )
-    elif operation == "delete_upload":
-        await client.delete_upload(call=CALL, path=f"{FOLDER}/sales.xlsx")
-    else:
-        await client.delete_chat(call=CALL)
+    await _operate(_client(door), door, operation)
     assert door.requests
     for request, _ in door.requests:
         assert request.headers["authorization"] == f"Bearer {KEY}"

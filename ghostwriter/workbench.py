@@ -12,9 +12,12 @@ Discovery (``server/discover``, then ``tools/list``, within :data:`DISCOVERY_TIM
 together) is single-flight and cached per result for its ``ttlMs``, for every chat, once
 for each listing: a call that takes images, and one that does not. It succeeds when
 workbench serves this revision and lists at least one tool whose ``inputSchema`` is an
-object; other tools are dropped. A failure offers no tool and is tried again at most once
-per :data:`DISCOVERY_RETRY_S`; each listing keeps its own cache, lock and retry delay. A call
-without an answer, refused arguments, ``-32022`` or ``-32602`` drops both caches. workbench's
+object; other tools are dropped. A failure offers no tool. An ``unreachable`` one (refused,
+no such name), which comes fast, sets no delay: the next turn discovers again. Any other (a
+timeout, an error, an answer of no use) is tried again after :data:`DISCOVERY_RETRY_S`, or
+sooner: an answer workbench gives any request of this client, whatever its status, ends both
+listings' delays. Each listing keeps its own cache, lock and retry delay. A call without an
+answer, refused arguments, ``-32022`` or ``-32602`` drops both caches. workbench's
 discovery reads no principal; it carries the asking turn's headers only because every request does.
 
 The model reads a result's ``content[0].text``, which workbench writes without the table
@@ -84,8 +87,11 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 #: Seconds both discovery requests get together. Never spent from a call's time.
 DISCOVERY_TIMEOUT_S = 5.0
-#: Seconds after a failed discovery before the next try.
+#: Seconds after a failed discovery before the next try, unless it was ``unreachable`` (no delay) or workbench answers
+#: a request meanwhile (the delay ends).
 DISCOVERY_RETRY_S = 60.0
+#: The discovery failure that sets no delay: refused or no such name, which fails fast and is tried again at once.
+_NO_DELAY: Final = "unreachable"
 #: The largest answer read; past it the answer is refused.
 MAX_ANSWER_BYTES = 4 * 1024 * 1024
 #: The largest attachment, as workbench's ``WORKBENCH_UPLOAD_MAX_MB`` counts it.
@@ -1206,12 +1212,36 @@ class WorkbenchClient:
         return httpx.Timeout(t, connect=_CONNECT_S, write=_WRITE_S, pool=_POOL_S)
 
     def _http(self, t: float) -> httpx.AsyncClient:
+        """Return a fresh client for one exchange or one REST request; every request to workbench goes through one.
+
+        Args:
+            t: The deadline, as :meth:`_timeout`.
+
+        Returns:
+            A client that takes no proxy from the environment and ends the discovery delays on every answer.
+        """
         return httpx.AsyncClient(
             base_url=self._settings.workbench_api_base,
             transport=self._transport,
             trust_env=False,
             timeout=self._timeout(t),
+            event_hooks={"response": [self._answered]},
         )
+
+    async def _answered(self, response: httpx.Response) -> None:
+        """End both listings' retry delay: workbench answered a request, whatever its status.
+
+        It runs as the answer's headers arrive, so a discovery's own answer comes before its failure, whose
+        delay then stands. Without the listings' locks: from an exchange's thread or the caller's loop, an
+        answer racing a failure may end the delay just set (one more discovery) or come before it (the delay
+        stands until the next answer); either is benign.
+
+        Args:
+            response: The answer; only its arrival counts.
+        """
+        del response
+        for listing in self._listings.values():
+            listing.retry_at = None
 
     def _headers(self, key: str, call: CallFor) -> dict[str, str]:
         """Return the headers every request carries for a chat.
@@ -1279,7 +1309,9 @@ class WorkbenchClient:
 
         Concurrent callers for one listing wait for its one discovery in progress, never longer than
         its limit plus half a second; a caller that would is offered no tool on this turn. The two
-        listings never wait for each other.
+        listings never wait for each other. After a failure the listing sends nothing while its retry
+        delay holds (:meth:`_discovery_failed`): none after ``unreachable``, else :data:`DISCOVERY_RETRY_S`
+        or until workbench answers any request (:meth:`_answered`).
 
         Args:
             call: The asking turn's chat. Its headers go with the requests, as with every request
@@ -1370,14 +1402,29 @@ class WorkbenchClient:
         return server, tools
 
     def _discovery_failed(self, listing: _Listing, now: float, token: str) -> None:
-        listing.retry_at = now + DISCOVERY_RETRY_S
+        """Set a failed listing's retry delay, and warn once each time it goes down.
+
+        ``unreachable`` sets none, so the next caller discovers again at once; every other token (``timeout``,
+        ``error``, an answer that is no use) delays it :data:`DISCOVERY_RETRY_S`, until workbench answers
+        another request (:meth:`_answered`).
+
+        Args:
+            listing: The listing.
+            now: When its discovery began.
+            token: Why it failed.
+        """
+        listing.retry_at = None if token == _NO_DELAY else now + DISCOVERY_RETRY_S
         if listing.up is not False:
             listing.up = False
-            logger.warning(
-                "workbench discovery failed: {}. No tool is offered; the next try comes after {} s",
-                token,
-                int(DISCOVERY_RETRY_S),
-            )
+            if listing.retry_at is None:
+                logger.warning("workbench discovery failed: {}. No tool is offered; the next turn tries again", token)
+            else:
+                logger.warning(
+                    "workbench discovery failed: {}. No tool is offered; the next try comes after {} s,"
+                    " or at once when workbench answers a request",
+                    token,
+                    int(DISCOVERY_RETRY_S),
+                )
 
     def forget(self) -> None:
         """Drop both listings' cached results, so the next turn discovers again."""
