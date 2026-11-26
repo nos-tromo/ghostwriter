@@ -12,10 +12,14 @@ is stored ``processing`` and its upload answers at once; the attachment processo
 (:func:`~ghostwriter.upload.prepared_later`) is stored ``ready`` and prepared after it, as a background job
 that only adds its facts. While clips are offered (:meth:`~ghostwriter.nextext.NextextHealth.offered`: Nextext
 healthy, workbench 0.9.0 or later), a video or audio clip is stored ``processing`` of the kind ``media``, its job
-carrying its size; without them it is refused 415 as any type not taken. The SPA follows a ``processing`` status
-by long-poll (``GET …/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds; a ``ready``
-one is answered at once), and shows a page or the picture through the preview route, a render streamed from
-workbench's view route with the same hardening.
+carrying its size; without them it is refused 415 as any type not taken. From workbench 0.10.0
+(:func:`~ghostwriter.workbench.serves_measure`) a document is also measured after its upload, in the background: it is
+stored with its measure ``pending`` (``none`` before 0.10) and is ``ready`` as before, and its job measures it last;
+``AttachmentOut.length`` serves the state and, once measured, its units and whether it is ``too_long``. The SPA
+follows a ``processing`` status, and a ``ready`` one whose measure is ``pending``, by long-poll (``GET
+…/attachments/{id}?wait=``, at most :data:`~ghostwriter.processing.MAX_WAIT_S` seconds; any other is answered at once;
+a ``processing`` one is answered once prepared, never after its measure), and shows a page or the picture through the
+preview route, a render streamed from workbench's view route with the same hardening.
 
 The chat is marked as one that used workbench before its file goes out, so its delete asks
 workbench too. Records name a file by its id, never by its name. An attachment is ``collect`` /
@@ -23,7 +27,8 @@ workbench too. Records name a file by its id, never by its name. An attachment i
 ``disclose`` / ``chat.attachment`` (``workbench:upload``) and a second, ``error``, child when the
 hand-over fails; when the chat vanished during the hand-over, the delete of its folder is a
 ``delete`` / ``chat.workbench`` child, recorded before it is sent. The processor adds the prepare's
-hand-over as a further child (``workbench:prepare``). A status read is ``query`` /
+hand-over as a further child (``workbench:prepare``), and a document's measure's (``workbench:measure``). A status
+read is ``query`` /
 ``chat.attachment`` with the status it answers. An attachment its user takes back before sending it is ``delete`` /
 ``chat.attachment``, written first, its job cancelled, with the file's delete in workbench (``DELETE /files/upload``,
 workbench 0.8.1) as its child ``delete`` / ``chat.workbench``; then its row goes. A download is ``disclose`` /
@@ -69,7 +74,7 @@ from ghostwriter.upload import (
     safe_filename,
 )
 from ghostwriter.utils.audit_event import Target
-from ghostwriter.vision import Vision
+from ghostwriter.vision import Vision, system_call
 from ghostwriter.workbench import (
     MAX_ATTACHMENT_BYTES,
     CallFor,
@@ -79,6 +84,7 @@ from ghostwriter.workbench import (
     WorkbenchClient,
     WorkbenchNotFound,
     WorkbenchUnavailable,
+    serves_measure,
 )
 
 router = APIRouter(prefix="/api/chats", tags=["Files"])
@@ -149,6 +155,37 @@ def _media_offered(request: Request) -> bool:
     """
     health: NextextHealth | None = request.app.state.media
     return health is not None and health.offered(request.app.state.workbench)
+
+
+def _measures_offered(request: Request) -> bool:
+    """Say whether a document is measured: workbench's cached discovery names 0.10.0 or later.
+
+    Reads the cached discovery (the listing without images), which may block once per cache window: call it on a
+    pool thread.
+
+    Args:
+        request: The request.
+
+    Returns:
+        Whether workbench :func:`~ghostwriter.workbench.serves_measure`; ``False`` while workbench is off or its
+        discovery fails.
+    """
+    workbench: WorkbenchClient | None = request.app.state.workbench
+    found = None if workbench is None else workbench.discover(call=system_call(), images=False)
+    return found is not None and serves_measure(found.server_version)
+
+
+def _followed(found: AttachmentOut) -> bool:
+    """Say whether a status request waits for an attachment: ``processing``, or ``ready`` with its measure pending.
+
+    Args:
+        found: The attachment as it is now.
+
+    Returns:
+        Whether its job will still change what is served.
+    """
+    pending = found.length is not None and found.length.state == "pending"
+    return found.status == "processing" or (found.status == "ready" and pending)
 
 
 def _checked_name(raw: str, *, images: bool, media: bool) -> tuple[str, str] | JSONResponse:
@@ -256,7 +293,8 @@ async def attach_file(
 
     Returns:
         The pending attachment, ``processing`` while workbench prepares a picture or a PDF, else
-        ``ready``, an Office file too, which is prepared after; or the refusal: 409 ``too_many_pending`` at
+        ``ready``, an Office file too, which is prepared after; a document with its measure ``pending`` from
+        workbench 0.10 (``none`` before); or the refusal: 409 ``too_many_pending`` at
         :data:`~ghostwriter.upload.MAX_PENDING` waiting files not yet expired, also
         when parallel uploads filled the chat meanwhile, counted again as the attachment is stored.
 
@@ -304,6 +342,7 @@ async def attach_file(
     kind = attachment_kind(name)
     prepared = kind == "media" or (offered and needs_prepare(name))
     later = offered and prepared_later(name)
+    measured = kind == "document" and await run_in_threadpool(_measures_offered, request)
     try:
         attachment = await run_in_threadpool(
             store.add_attachment,
@@ -317,14 +356,26 @@ async def attach_file(
             status="processing" if prepared else "ready",
             id=attachment_id,
             max_pending=MAX_PENDING,
+            measure_state="pending" if measured else ("none" if kind == "document" else None),
         )
     except TooManyPending:
         return _refused(status.HTTP_409_CONFLICT, TOO_MANY_PENDING, TOO_MANY_PENDING_CODE)
     except ChatNotFound:
         await _drop_orphan(workbench, op, call)
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=CHAT_NOT_FOUND) from None
-    if prepared or later:
-        job = PrepareJob(attachment_id, chat_id, user.name, stored.path, kind, op, background=later, size=stored.size)
+    if prepared or later or measured:
+        job = PrepareJob(
+            attachment_id,
+            chat_id,
+            user.name,
+            stored.path,
+            kind,
+            op,
+            background=later,
+            size=stored.size,
+            prepare=prepared or later,
+            measure=measured,
+        )
         processor.submit(job)
     return attachment
 
@@ -487,11 +538,14 @@ async def _streamed(
 async def _read_after_wait(
     store: ChatStore, processor: AttachmentProcessor, owner: str, chat_id: str, attachment_id: str, wait: int
 ) -> AttachmentOut | None:
-    """Wait for a ``processing`` attachment's job, at most ``wait`` seconds, and read it again.
+    """Wait for an attachment's job, at most ``wait`` seconds, and read it again.
 
-    The row is read first, and answered at once unless it is ``processing``: a ``ready`` one, an Office
-    file whose background job still runs included, is never waited for. A ``processing`` row whose job has
-    ended since is read again before the wait, which then lasts its whole time only for a row no job settles.
+    The row is read first, and answered at once unless it is ``processing``, or ``ready`` with its measure
+    ``pending``: any other ``ready`` one, an Office file whose background job still runs included, is never waited
+    for. A followed row whose job has ended since is read again before the wait, which then lasts its whole time
+    only for a row no job settles. A ``processing`` row's wait ends with its prepare, never with the measure after it,
+    also when the job has left its prepare between the read and the wait
+    (:meth:`~ghostwriter.processing.AttachmentProcessor.wait`'s ``prepare_only``): a send never waits for a measure.
 
     Args:
         store: The chats.
@@ -505,13 +559,13 @@ async def _read_after_wait(
         The attachment as it is then, or ``None`` once it is gone.
     """
     found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
-    if found is None or found.status != "processing":
+    if found is None or not _followed(found):
         return found
     if not processor.running(attachment_id):
         found = await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
-        if found is None or found.status != "processing":
+        if found is None or not _followed(found):
             return found
-    await processor.wait(attachment_id, wait)
+    await processor.wait(attachment_id, wait, prepare_only=found.status == "processing")
     return await run_in_threadpool(store.attachment_out, owner, chat_id, attachment_id)
 
 
@@ -630,8 +684,8 @@ async def attachment_status(
         request: The request.
         user: Who asks.
         op: ``query`` / ``chat.attachment``, recorded with the status answered.
-        wait: How many seconds to wait while it is ``processing``, at most
-            :data:`~ghostwriter.processing.MAX_WAIT_S`; 0 answers at once.
+        wait: How many seconds to wait while it is ``processing``, or ``ready`` with its measure ``pending``, at
+            most :data:`~ghostwriter.processing.MAX_WAIT_S`; 0 answers at once.
 
     Returns:
         The attachment.
@@ -643,7 +697,7 @@ async def attachment_status(
     store = _store(request)
     found = await run_in_threadpool(store.attachment_out, user.name, chat_id, attachment_id)
     processor = _processor(request)
-    if found is not None and found.status == "processing" and wait and processor is not None:
+    if found is not None and _followed(found) and wait and processor is not None:
         found = await _read_after_wait(store, processor, user.name, chat_id, attachment_id, wait)
     if found is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=ATTACHMENT_NOT_FOUND)

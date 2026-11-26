@@ -13,7 +13,25 @@ at its cap (its finish reason ``length``, or its output tokens at its ``max_toke
 call, its arguments not an object or empty, is refused as cut, and the model reads to make them
 shorter. Without a usage count, only the finish reason tells the cap. A call workbench answers
 busy is sent once more after ``BUSY_RETRY_S``, while its timeout still fits.
-Every call is disclosed before it is sent, and every round recorded after it ends.
+Every call is disclosed before it is sent, and every round recorded after it ends. A question that attached a
+file the model reads only through a tool (:func:`~ghostwriter.agent.notices.to_open`: a document, a clip, or a
+picture the turn does not see) makes its first round call one: on vllm its ``tool_choice`` is ``required``, and a
+router that refuses that before any text is asked once more with ``auto``.
+
+The user is told, as a notice, what limited the answer (:class:`~ghostwriter.agent.notices.NoticeEvent`),
+and the answer's progress keeps each notice told. With workbench on but no tool offered to the first round (its
+discovery failed), ``tools_unavailable`` comes first, before any text, and the prompt asks the model to have the
+message sent again (:data:`~ghostwriter.agent.prompt.UNREACHABLE`); no file notice follows it. The message's first
+round fills a
+:class:`~ghostwriter.agent.context.FitReport`, filled again when the round goes once more without images:
+when the request the router took left earlier turns out, ``context_trimmed`` is told with that request's
+first event, before any text, once per message; a request the router refused tells nothing. The last round,
+one without calls and not stopped, that ends at its cap (:func:`_at_cap`, the reasoning cap for a reasoning
+message) is followed by ``answer_cut``. Each call goes into the answer's :class:`~ghostwriter.agent.notices.Reading`
+with what the model reads back of it; once the rounds have ended, a stop or a model error included, the loop tells
+``document_partial`` for each attachment of the chat a ``read_document`` read only in part, then ``document_unread``
+for each attachment of the question no call opened, none of either after a ``run_python`` or ``search_files``
+call. An error that ended the rounds comes after them, last.
 
 A round goes out without tools past ``MAX_TOOL_ROUNDS``, below ``TOOL_CUTOFF_S`` of the wall,
 or once the tools were withdrawn, and it is the last: the model must answer. The turn also
@@ -45,8 +63,30 @@ no images asked for, no ``strips``, and a tool's images named as not shown; no n
 wrote before included, sends the model to ``view_file`` any more. Each round is recorded with how many
 images it sent.
 
+A round the router refuses before any text for its length (:func:`_refuses_context`: a status of
+:data:`REFUSED_CONTEXT_STATUSES` and one of :data:`CONTEXT_REFUSALS` in its message or body) goes the same
+way while it carried images. A round without images, or sent again without them and refused again, ends the
+turn with the ``context`` error (:data:`CONTEXT_ERROR`), not the model error, and the log names
+``GHOSTWRITER_CONTEXT_TOKENS``, which may be above the model's context.
+
+When the answer ends, however it ends, the loop estimates the tokens the next message's prompt starts with
+(:func:`~ghostwriter.agent.context.next_prompt_tokens`: the offer's system prompt and tools, and every turn of the
+chat, this one as it will be replayed) and stores it with the answer; the caller's :class:`TurnOutcome` carries it
+too. A turn stopped before it began has none, and nor has an answer whose estimate failed.
+
+A continued turn (:attr:`Turn.continued`, Continue) goes on with an answer cut at its length limit, in place: one
+round, without tools or thinking, with the budget of a round without thinking, whose text is appended to the
+answer so far (:attr:`_Progress.base`). It sends the earlier turns as any round does, then the turn itself as history
+replays it, the answer so far last (:func:`~ghostwriter.agent.context.continuation`): vllm goes on in that message,
+any other provider is asked to go on after it. The answer's stored notices are kept as they are, and only
+``answer_cut`` is computed again: it goes once the round ended cleanly below ``MAX_ANSWER_TOKENS``, and otherwise (a
+failed round, a stop, a cut) stays where it was and is told again, before an error. No other notice is told: the
+round adds no turn to trim and calls no tool. Its estimate of the next prompt is made as an answer's is, for the
+next message as it will be offered (with sight, while a turn would see), though its own round went without. A
+continuation stopped before it began reads and stores nothing.
+
 The log holds round numbers, counts and exception types; never a message, an argument, a result,
-a label or an image.
+a label, an image or the router's refusal text.
 """
 
 import dataclasses
@@ -54,6 +94,7 @@ import re
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import closing
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import Any, Final, Literal, Protocol, TypeAlias
@@ -62,7 +103,7 @@ from uuid import uuid4
 import openai
 from loguru import logger
 
-from ghostwriter.agent.context import PastTurn, fit
+from ghostwriter.agent.context import FitReport, PastTurn, continuation, finished_turn, fit, next_prompt_tokens
 from ghostwriter.agent.images import (
     UNSEEN,
     ImageBank,
@@ -91,6 +132,7 @@ from ghostwriter.agent.limits import (
     TOOL_CUTOFF_S,
     prompt_tokens,
 )
+from ghostwriter.agent.notices import NoticeEvent, Reading, to_open
 from ghostwriter.agent.prompt import system_prompt
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.agent.tools import (
@@ -131,10 +173,27 @@ from ghostwriter.workbench import (
 CALL_ID: Final = re.compile(r"[A-Za-z0-9_.:-]{1,64}")
 #: What the user is told when a model round failed.
 MODEL_ERROR = "The model did not answer."
+#: What the user is told when the router refused a round for its length.
+CONTEXT_ERROR: Final = "This chat is too long for the model."
 #: What the user is told when anything else broke the answer.
 INTERNAL_ERROR = "The answer could not be finished."
 #: The router's statuses for a request it may have refused for its images; such a round is sent once more without.
 REFUSED_IMAGE_STATUSES: Final = frozenset({400, 413, 422})
+#: The router's statuses for a request it may have refused for its ``tool_choice`` ``required``.
+REFUSED_CHOICE_STATUSES: Final = frozenset({400, 422})
+#: The router's statuses for a request it refused for its length.
+REFUSED_CONTEXT_STATUSES: Final = frozenset({400, 413})
+#: What the router says of a prompt longer than the model's context, lower case: one of these in a refusal's
+#: message or body makes it a refusal for length.
+CONTEXT_REFUSALS: Final = (
+    "context length",
+    "context window",
+    "maximum context",
+    "contextwindowexceeded",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+)
 
 
 @dataclass(frozen=True)
@@ -150,6 +209,8 @@ class Turn:
         request_id: The request's correlation id.
         cancel: Set to stop the answer.
         reasoning: The message's reasoning switch: every round may think first.
+        continued: Whether the turn goes on with the answer, cut at its length limit, in place: one round without
+            tools or thinking, its text appended to the answer's.
     """
 
     chat_id: str
@@ -160,6 +221,7 @@ class Turn:
     request_id: str
     cancel: threading.Event
     reasoning: bool = False
+    continued: bool = False
 
 
 @dataclass(frozen=True)
@@ -196,30 +258,31 @@ class ResultEvent:
 
 
 @dataclass(frozen=True)
-class NoticeEvent:
-    """Something the user is told while the answer goes on.
-
-    Attributes:
-        code: ``images_dropped``: the model refused the round's images, and the round went again without them.
-    """
-
-    code: Literal["images_dropped"]
-
-
-@dataclass(frozen=True)
 class ErrorEvent:
     """Why the answer ended early.
 
     Attributes:
-        code: ``model``, ``audit`` or ``internal``.
+        code: ``model``, ``audit``, ``internal``, or ``context``: the router refused a round for its length.
         message: What the user is told.
     """
 
-    code: Literal["model", "audit", "internal"]
+    code: Literal["model", "audit", "internal", "context"]
     message: str
 
 
 TurnEvent: TypeAlias = TokenEvent | StepEvent | ResultEvent | NoticeEvent | ErrorEvent
+
+
+@dataclass
+class TurnOutcome:
+    """What a turn leaves for its caller once it has ended, filled by :meth:`AgentLoop.run`.
+
+    Attributes:
+        context_estimate: The estimated tokens of the prompt after this answer, as stored with it; ``None`` when
+            the turn ended before it began or the estimate failed.
+    """
+
+    context_estimate: int | None = None
 
 
 class TurnAudit(Protocol):
@@ -262,17 +325,44 @@ class _Progress:
 
     Attributes:
         started: The clock's reading when the answer began.
+        base: The answer's text before this turn, which a continuation appends to; empty for a new answer.
         shown: Every text sent, in order.
         steps: Steps stored so far.
         cards: The ids of the files shown as cards.
         withdrawn: Whether the tools were withdrawn for the rest of the message.
+        notices: Every notice the user was told, in order.
+        next_prompt: Estimates the tokens of the next message's prompt from the answer's text, as the turn stands
+            when it is called (the offer in force, the turn's messages); set once the turn's messages exist, and
+            ``None`` until then.
+        reading: What the message's calls opened and read, which the notices about files are told from.
     """
 
     started: float
+    base: str = ""
     shown: list[str] = field(default_factory=list)
     steps: int = 0
     cards: set[str] = field(default_factory=set)
     withdrawn: bool = False
+    notices: list[NoticeEvent] = field(default_factory=list)
+    next_prompt: Callable[[str], int] | None = None
+    reading: Reading = field(default_factory=Reading)
+
+    @property
+    def text(self) -> str:
+        """The answer's text as it is stored: the base, then every text sent."""
+        return self.base + "".join(self.shown)
+
+    def told(self, event: NoticeEvent) -> NoticeEvent:
+        """Keep a notice the user is told, for the answer.
+
+        Args:
+            event: The notice.
+
+        Returns:
+            The same notice, to be yielded.
+        """
+        self.notices.append(event)
+        return event
 
 
 @dataclass
@@ -335,6 +425,24 @@ class _Sight:
 
 
 @dataclass(frozen=True)
+class _Seen:
+    """Whether a message's turn sees, read once as it begins.
+
+    Attributes:
+        model_sees: Whether the model sees (:class:`~ghostwriter.vision.Vision`).
+        full: workbench's listing for a call that takes images, asked only while the model sees; ``None`` otherwise,
+            or when that discovery failed.
+        sees: Whether the turn sees: the model sees, and that listing holds ``view_file``.
+        budget: What an image costs and how many a request carries while the turn sees; ``None`` otherwise.
+    """
+
+    model_sees: bool
+    full: Discovery | None
+    sees: bool
+    budget: ImageBudget | None
+
+
+@dataclass(frozen=True)
 class _Offer:
     """A round's system prompt and the tools it may offer.
 
@@ -385,7 +493,7 @@ class _Request:
         return self._blind
 
     def fitted(
-        self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool
+        self, current: list[dict[str, Any]], sight: _Sight, *, tooled: bool, report: FitReport | None = None
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
         """Return a round's messages, fitted to the budget, and the tools it offers.
 
@@ -393,6 +501,7 @@ class _Request:
             current: The current turn's messages.
             sight: The turn's images: the offer, and what an image costs.
             tooled: Whether the round may offer tools.
+            report: Filled with the earlier turns there were and those replayed; ``None`` for none.
 
         Returns:
             The messages (:func:`~ghostwriter.agent.context.fit`), their refs still refs; and the tools.
@@ -400,7 +509,14 @@ class _Request:
         offer = self.offer(sight)
         tools = offer.tools if tooled else []
         fitted = fit(
-            offer.system, tools, self.past, current, budget=self.budget, images=sight.budget, view=sight.showing
+            offer.system,
+            tools,
+            self.past,
+            current,
+            budget=self.budget,
+            images=sight.budget,
+            view=sight.showing,
+            report=report,
         )
         return fitted, tools
 
@@ -435,6 +551,50 @@ def _refuses_images(exc: Exception) -> bool:
         Whether the router answered with a status of :data:`REFUSED_IMAGE_STATUSES`.
     """
     return isinstance(exc, openai.APIStatusError) and exc.status_code in REFUSED_IMAGE_STATUSES
+
+
+def _refuses_choice(exc: Exception) -> bool:
+    """Tell whether a round's failure may be the router refusing a required tool call.
+
+    Args:
+        exc: What the round raised.
+
+    Returns:
+        Whether the router answered with a status of :data:`REFUSED_CHOICE_STATUSES`.
+    """
+    return isinstance(exc, openai.APIStatusError) and exc.status_code in REFUSED_CHOICE_STATUSES
+
+
+def _refuses_context(exc: Exception) -> bool:
+    """Tell whether a round's failure is the router refusing its prompt as longer than the model's context.
+
+    Args:
+        exc: What the round raised.
+
+    Returns:
+        Whether the router answered with a status of :data:`REFUSED_CONTEXT_STATUSES` and one of
+        :data:`CONTEXT_REFUSALS` is in its message or body, in any case.
+    """
+    if not isinstance(exc, openai.APIStatusError) or exc.status_code not in REFUSED_CONTEXT_STATUSES:
+        return False
+    told = f"{exc.message} {exc.body}".lower()
+    return any(pattern in told for pattern in CONTEXT_REFUSALS)
+
+
+def _at_cap(done: RoundDone, cap: int) -> bool:
+    """Tell whether a round ended at its token cap.
+
+    vLLM ends a round in which a call's name streamed with ``tool_calls``, at the cap too: the usage tells.
+    Without a usage count, only the finish reason does.
+
+    Args:
+        done: How the round ended.
+        cap: Its ``max_tokens``.
+
+    Returns:
+        Whether its finish reason is ``length``, or its output tokens reached ``cap``.
+    """
+    return done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
 
 
 def _unique(call: ToolCall, used: set[str], round_no: int) -> ToolCall:
@@ -542,45 +702,61 @@ class AgentLoop:
         self._vision = vision
         self._media = media
 
-    def run(self, turn: Turn, audit: TurnAudit) -> Iterator[TurnEvent]:
-        """Answer a message.
+    def run(self, turn: Turn, audit: TurnAudit, *, outcome: TurnOutcome | None = None) -> Iterator[TurnEvent]:
+        """Answer a message, or go on with its answer for a continued turn.
 
-        The answer's text is stored when the run ends, however it ends.
+        The answer's text, its notices and the estimate of the next prompt are stored when the run ends, however
+        it ends; a continuation that never began, which read nothing of the answer, stores nothing.
 
         Args:
             turn: The message.
             audit: Where disclosures and model rounds are recorded.
+            outcome: Filled with the estimate when the run ends; ``None`` keeps it for the store alone.
 
         Yields:
-            TurnEvent: Text, steps and cards as they come; an :class:`ErrorEvent` last when
-            the answer ended early.
+            TurnEvent: Text, steps, cards and notices as they come, each notice also kept in the answer's
+            progress; ``answer_cut`` after the last round's text when it ended at its cap; then
+            ``document_partial`` and ``document_unread``; an :class:`ErrorEvent` last when the answer ended early.
+            A continuation yields its text, then ``answer_cut`` unless its round ended cleanly below the cap.
 
         Raises:
-            AuditWriteError: When a record could not be written; raised after the text is stored.
+            AuditWriteError: When a record could not be written; raised after the answer is stored.
         """
         message = _Progress(started=self._clock())
+        answer = self._continue if turn.continued else self._answer
         try:
             try:
-                yield from self._answer(turn, audit, message)
+                yield from answer(turn, audit, message)
             except AuditWriteError:
                 raise
             except Exception as exc:
                 logger.error("An answer broke off: {}", type(exc).__name__)
                 yield ErrorEvent("internal", INTERNAL_ERROR)
         finally:
-            self._store_text(turn, "".join(message.shown))
+            estimate = _estimated(message)
+            if outcome is not None:
+                outcome.context_estimate = estimate
+            # A continuation's messages exist once it has read the answer; before, storing would empty the answer.
+            if not turn.continued or message.next_prompt is not None:
+                self._store_answer(turn, message, estimate)
 
-    def _store_text(self, turn: Turn, text: str) -> None:
-        """Store the answer's text; a failure is logged, never raised over the turn's own outcome.
+    def _store_answer(self, turn: Turn, message: _Progress, context_estimate: int | None) -> None:
+        """Store the answer's text, its notices and its estimate; a failure is logged, never raised over the turn.
 
         Args:
             turn: The message.
-            text: Everything shown.
+            message: The answer: its base and everything shown, and every notice told, stored without its name.
+            context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
         try:
-            self._store.finish_assistant_message(turn.assistant_message_id, text)
+            self._store.finish_assistant_message(
+                turn.assistant_message_id,
+                message.text,
+                notices=[notice.stored() for notice in message.notices],
+                context_estimate=context_estimate,
+            )
         except Exception as exc:
-            logger.error("An answer's text could not be stored: {}", type(exc).__name__)
+            logger.error("An answer could not be stored: {}", type(exc).__name__)
 
     def _left(self, message: _Progress) -> float:
         """Return the seconds left of the message's wall.
@@ -594,7 +770,13 @@ class AgentLoop:
         return MESSAGE_WALL_S - (self._clock() - message.started)
 
     def _answer(self, turn: Turn, audit: TurnAudit, message: _Progress) -> Iterator[TurnEvent]:
-        """Run the rounds.
+        """Set the turn up, run its rounds, then tell what the message read of the files.
+
+        With workbench on and no tool offered to the first round, ``tools_unavailable`` is told before the rounds,
+        and no file notice after them. Otherwise, once the rounds have ended without raising (also on a stop or a
+        model error), each ``document_partial`` of the chat's attachments, then each ``document_unread`` of the
+        question's, is told; an error that ended the rounds comes after them. A turn stopped before it began tells
+        nothing.
 
         Args:
             turn: The message.
@@ -607,62 +789,221 @@ class AgentLoop:
         if turn.cancel.is_set():
             return
         settings = self._settings
-        workbench = self._workbench
-        model_sees = self._vision is not None and self._vision.model_sees
-        full = workbench.discover(call=turn.call, images=True) if workbench is not None and model_sees else None
-        sees = full is not None and any(tool.name == VIEW_TOOL for tool in full.tools)
-        question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=sees)
-        past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=sees)
-        today = self._now().date()
-
-        def blind() -> _Offer:
-            # A workbench that failed the discovery for images offers no tool this turn, as any failed one.
-            failed = model_sees and full is None
-            plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
-            return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
-
-        # Clips are offered as NextextHealth.offered says (Nextext healthy, workbench 0.9.0 or later), but from the
-        # discovery this turn already holds: no second listing is read on the turn thread.
-        clips = (
-            sees
-            and full is not None
-            and self._media is not None
-            and self._media.healthy
-            and serves_media(full.server_version)
-        )
-        seeing = (
-            self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
-            if sees
-            else None
+        seen = self._seen(turn)
+        question = self._store.user_turn(turn.chat_id, turn.user_message_id, seen=seen.sees)
+        past, expired = self._store.past_turns(turn.chat_id, before_position=question.position, seen=seen.sees)
+        request = self._request(
+            turn,
+            seen,
+            past=past,
+            expired=expired,
+            budget=prompt_tokens(settings.context_tokens, reasoning=turn.reasoning),
         )
         attached = [*question.images, *(image for earlier in past for image in earlier.images)]
         sight = _Sight(
-            sees=sees,
-            budget=ImageBudget(settings.image_tokens, settings.max_images) if sees else None,
+            sees=seen.sees,
+            budget=seen.budget,
             known={image.path: (image.width, image.height) for image in attached},
-        )
-        request = _Request(
-            seeing=seeing,
-            blind=blind,
-            past=past,
-            budget=prompt_tokens(settings.context_tokens, reasoning=turn.reasoning),
         )
         cap = REASONING_ANSWER_TOKENS if turn.reasoning else MAX_ANSWER_TOKENS
         headers = inference_headers(turn.owner, turn.request_id)
         current: list[dict[str, Any]] = [_asked(question, sight)]
+
+        def next_prompt(text: str) -> int:
+            # As the turn stands when the answer ends: the offer of the last round (the blind one after a refusal),
+            # and the turn's messages as they were left; read then, never now.
+            return _estimate(request, sight, [*past, finished_turn(question.text, question.images, current, text)])
+
+        message.next_prompt = next_prompt
+        # workbench on, yet the first round offers no tool: the user is told first, and the file notices are not
+        # told, as the cause of every file left unread is.
+        unreachable = self._workbench is not None and not request.offer(sight).tools
+        if unreachable:
+            yield message.told(NoticeEvent("tools_unavailable"))
+        # The rounds' error, if one ended them, is held back: the file notices come first, and the error is last.
+        error: ErrorEvent | None = None
+        # A file of the question the model reads only through a tool makes its first round call one (on vllm).
+        opens = bool(to_open(question.files, sees=sight.sees))
+        rounds = self._rounds(turn, audit, message, sight, request, current, cap=cap, headers=headers, opens=opens)
+        with closing(rounds):
+            for event in rounds:
+                if isinstance(event, ErrorEvent):
+                    error = event
+                else:
+                    yield event
+        reading = message.reading
+        told = (
+            []
+            if unreachable
+            else [
+                *reading.partial(self._store.chat_files(turn.chat_id)),
+                *reading.unread(question.files, sees=sight.sees),
+            ]
+        )
+        for notice in told:
+            yield message.told(notice)
+        if error is not None:
+            yield error
+
+    def _continue(self, turn: Turn, audit: TurnAudit, message: _Progress) -> Iterator[TurnEvent]:
+        """Set a continuation up and run its one round; an error that ended it comes last.
+
+        The answer so far is the base its new text is appended to, and its stored notices, read back
+        (:meth:`~ghostwriter.agent.notices.NoticeEvent.from_stored`), are its notices, ``answer_cut`` among them
+        until the round has ended cleanly. The turns are read as the answer being continued read them, with sight
+        while the message's turn would see (a picture's line then does not say it was not shown). The round goes as
+        for a turn that does not see: the blind offer, no tool, no image sent again. The next prompt is estimated
+        as :meth:`_answer` estimates it, for the next message as it will be offered: with the offer that sees and
+        what images cost while the message's turn would see, the answer as it then reads. A continuation stopped
+        before it began reads nothing.
+
+        Args:
+            turn: The continued turn.
+            audit: The turn's audit.
+            message: The answer so far.
+
+        Yields:
+            TurnEvent: As :meth:`run`.
+        """
+        if turn.cancel.is_set():
+            return
+        settings = self._settings
+        seen = self._seen(turn)
+        # The turns are read as the answer being continued read them, and as the next message will: a picture's line
+        # says whether the turn sees. Only the round goes blind: it sends no image and offers no tool.
+        turns = self._store.answered_turns(turn.chat_id, turn.assistant_message_id, seen=seen.sees)
+        earlier, this = turns[:-1], turns[-1]
+        message.base = this.answer
+        stored = self._store.answer_notices(turn.assistant_message_id)
+        message.notices = [event for value in stored if (event := NoticeEvent.from_stored(value)) is not None]
+        request = self._request(
+            turn,
+            seen,
+            past=earlier,
+            expired=any(replayed.expired for replayed in turns),
+            budget=prompt_tokens(settings.context_tokens, reasoning=False),
+        )
+        sight = _Sight(sees=False, budget=None, known={})
+        upcoming = _Sight(sees=seen.sees, budget=seen.budget, known={})
+        current = continuation(this, instruct=settings.inference_provider != "vllm")
+        headers = inference_headers(turn.owner, turn.request_id)
+
+        def next_prompt(text: str) -> int:
+            return _estimate(request, upcoming, [*earlier, dataclasses.replace(this, answer=text)])
+
+        message.next_prompt = next_prompt
+        error: ErrorEvent | None = None
+        with closing(self._go_on(turn, audit, message, sight, request, current, headers=headers)) as events:
+            for event in events:
+                if isinstance(event, ErrorEvent):
+                    error = event
+                else:
+                    yield event
+        if error is not None:
+            yield error
+
+    def _go_on(
+        self,
+        turn: Turn,
+        audit: TurnAudit,
+        message: _Progress,
+        sight: _Sight,
+        request: _Request,
+        current: list[dict[str, Any]],
+        *,
+        headers: Mapping[str, str],
+    ) -> Generator[TurnEvent]:
+        """Run a continuation's round, offering no tool, then compute ``answer_cut`` again.
+
+        ``answer_cut`` goes from the answer's notices once the round ended cleanly below ``MAX_ANSWER_TOKENS``. A
+        failed round, a stop (also one before the round, which then does not start) or a round at its cap leaves
+        the answer incomplete: the notice stays where it was, and the user is told it again.
+
+        Args:
+            turn: The continued turn.
+            audit: The turn's audit.
+            message: The answer so far, its stored notices among its notices.
+            sight: The turn's images: none.
+            request: What the round's request is fitted from.
+            current: The continuation's turn (:func:`~ghostwriter.agent.context.continuation`).
+            headers: The inference headers.
+
+        Yields:
+            TurnEvent: The round's text, an :class:`ErrorEvent` if it failed, then ``answer_cut`` unless it ended
+            cleanly.
+        """
+        done: RoundDone | None = None
+        if not turn.cancel.is_set():
+            done, _ = yield from self._round(
+                turn, audit, message, sight, request, current, tooled=False, round_no=1, headers=headers
+            )
+        if done is not None and not done.stopped and not _at_cap(done, MAX_ANSWER_TOKENS):
+            message.notices = [event for event in message.notices if event.code != "answer_cut"]
+            return
+        cut = NoticeEvent("answer_cut")
+        if any(event.code == "answer_cut" for event in message.notices):
+            yield cut
+        else:
+            yield message.told(cut)
+
+    def _rounds(
+        self,
+        turn: Turn,
+        audit: TurnAudit,
+        message: _Progress,
+        sight: _Sight,
+        request: _Request,
+        current: list[dict[str, Any]],
+        *,
+        cap: int,
+        headers: Mapping[str, str],
+        opens: bool = False,
+    ) -> Generator[TurnEvent]:
+        """Run the rounds, and the calls between them, until the turn ends.
+
+        Each call is recorded in the answer's reading (:class:`~ghostwriter.agent.notices.Reading`) with what the
+        model reads back of it. With ``opens``, the first round must call a tool (:meth:`_round`).
+
+        Args:
+            turn: The message.
+            audit: The turn's audit.
+            message: The answer so far.
+            sight: The turn's images.
+            request: What each round's request is fitted from.
+            current: The current turn's messages, which the rounds extend.
+            cap: The ``max_tokens`` of a round, which tells an answer cut.
+            headers: The inference headers.
+            opens: Whether the question attached a file the model reads only through a tool
+                (:func:`~ghostwriter.agent.notices.to_open`).
+
+        Yields:
+            TurnEvent: As :meth:`run`, the notices about files left out; an :class:`ErrorEvent` ends them.
+        """
+        workbench = self._workbench
         used: set[str] = set()
         round_no = 0
         while not turn.cancel.is_set():
             round_no += 1
             tooled = round_no <= MAX_TOOL_ROUNDS and not message.withdrawn and self._left(message) >= TOOL_CUTOFF_S
             done, tools = yield from self._round(
-                turn, audit, message, sight, request, current, tooled=tooled, round_no=round_no, headers=headers
+                turn,
+                audit,
+                message,
+                sight,
+                request,
+                current,
+                tooled=tooled,
+                round_no=round_no,
+                headers=headers,
+                required=opens and round_no == 1,
             )
+            # The last round, one without calls, ending at the cap left the answer cut short.
+            if done is not None and not done.stopped and not done.calls and _at_cap(done, cap):
+                yield message.told(NoticeEvent("answer_cut"))
             if done is None or done.stopped or not done.calls or not tools or workbench is None:
                 return
             names = request.offer(sight).names
-            # vLLM ends a round in which a call's name streamed with "tool_calls", at the cap too: the usage tells.
-            at_cap = done.finish_reason == "length" or (done.output_tokens is not None and done.output_tokens >= cap)
+            at_cap = _at_cap(done, cap)
             calls: list[dict[str, Any]] = []
             answers: list[dict[str, Any]] = []
             shown: list[tuple[str, str, tuple[ToolImage, ...]]] = []
@@ -684,12 +1025,70 @@ class AgentLoop:
                     }
                 )
                 content = tool_message(outcome, images_seen=sight.showing)
+                message.reading.call(call.name, parse_arguments(call.arguments), outcome, content)
                 answers.append({"role": "tool", "tool_call_id": call_id, "content": content})
                 if isinstance(outcome, ToolResult) and outcome.images:
                     shown.append((call.name, call_id, outcome.images))
             current.append({"role": "assistant", "content": done.text, "tool_calls": calls})
             current.extend(answers)
             self._tool_images(current, sight, shown)
+
+    def _seen(self, turn: Turn) -> _Seen:
+        """Read whether a message's turn sees, once as it begins.
+
+        Args:
+            turn: The message.
+
+        Returns:
+            Whether the model sees, workbench's listing for a call that takes images (asked only then), whether
+            a turn sees, and what an image costs while it does.
+        """
+        settings = self._settings
+        workbench = self._workbench
+        model_sees = self._vision is not None and self._vision.model_sees
+        full = workbench.discover(call=turn.call, images=True) if workbench is not None and model_sees else None
+        sees = full is not None and any(tool.name == VIEW_TOOL for tool in full.tools)
+        budget = ImageBudget(settings.image_tokens, settings.max_images) if sees else None
+        return _Seen(model_sees=model_sees, full=full, sees=sees, budget=budget)
+
+    def _request(self, turn: Turn, seen: _Seen, *, past: Sequence[PastTurn], expired: bool, budget: int) -> _Request:
+        """Return what a message's rounds are fitted from: its offers, with sight and without, and its earlier turns.
+
+        Args:
+            turn: The message.
+            seen: Whether its turn sees, and the listing for images.
+            past: The earlier turns, oldest first.
+            expired: Whether files or tool results of earlier messages have expired.
+            budget: The tokens a round's prompt may take.
+
+        Returns:
+            The request: the offer that sees while the turn does, and the blind one, made when first needed.
+        """
+        workbench = self._workbench
+        today = self._now().date()
+        full = seen.full
+
+        def blind() -> _Offer:
+            # A workbench that failed the discovery for images offers no tool this turn, as any failed one.
+            failed = seen.model_sees and full is None
+            plain = workbench.discover(call=turn.call, images=False) if workbench is not None and not failed else None
+            return self._offer(plain, seeing=False, chat_id=turn.chat_id, expired=expired, today=today)
+
+        # Clips are offered as NextextHealth.offered says (Nextext healthy, workbench 0.9.0 or later), but from the
+        # discovery this turn already holds: no second listing is read on the turn thread.
+        clips = (
+            seen.sees
+            and full is not None
+            and self._media is not None
+            and self._media.healthy
+            and serves_media(full.server_version)
+        )
+        seeing = (
+            self._offer(full, seeing=True, chat_id=turn.chat_id, expired=expired, today=today, media=clips)
+            if seen.sees
+            else None
+        )
+        return _Request(seeing=seeing, blind=blind, past=past, budget=budget)
 
     def _offer(
         self,
@@ -715,7 +1114,8 @@ class AgentLoop:
                 only while ``seeing`` and ``view_file`` is offered.
 
         Returns:
-            The system prompt, and the tools with their names.
+            The system prompt, and the tools with their names. With workbench on and no ``discovery``, the prompt
+            says the tools are not reachable now (:data:`~ghostwriter.agent.prompt.UNREACHABLE`).
         """
         key = self._settings.workbench_api_key
         folder = chat_folder(key, chat_id) if discovery is not None and key else None
@@ -730,6 +1130,7 @@ class AgentLoop:
             presentations="write_presentation" in names,
             vision=seeing and VIEW_TOOL in names,
             media=media,
+            unreachable=self._workbench is not None and discovery is None,
         )
         return _Offer(system, function_tools(found), names)
 
@@ -745,14 +1146,24 @@ class AgentLoop:
         tooled: bool,
         round_no: int,
         headers: Mapping[str, str],
+        required: bool = False,
     ) -> Generator[TurnEvent, None, tuple[RoundDone | None, list[dict[str, Any]]]]:
         """Fit one round, stream it with its images and record it; a round refused with images goes once more.
 
+        The message's first round is fitted with a :class:`~ghostwriter.agent.context.FitReport`, and so is
+        its try without images, which fills the report again. ``context_trimmed`` is told with the first
+        event of the try the router took, before any text, when that try's fit left earlier turns out: the
+        trim told is the one of the request sent and taken, never of one refused. A later round's trim is
+        not told: the chat was trimmed in the first, and results the model pages past are its own; nor is a
+        continuation's, as Continue keeps the answer's notices and computes only ``answer_cut`` again.
         The renditions of the attached pictures the round is the first to send are fetched first, and
         the newest tool images it has no room for are kept as never shown. A failure before any text,
-        with a status of :data:`REFUSED_IMAGE_STATUSES`, of a round that carried images is recorded as a
-        failed round and told with a :class:`NoticeEvent`. The round is then fitted again without sight,
-        as the rest of the turn is, and sent without images; a second failure is the model error.
+        with a status of :data:`REFUSED_IMAGE_STATUSES` (a refusal for length among them,
+        :func:`_refuses_context`), of a round that carried images is recorded as a failed round and told
+        with a :class:`NoticeEvent`. The round is then fitted again without sight, as the rest of the turn
+        is, and sent without images. A failure of a round without images is the ``context`` error when it
+        is a refusal for length, which a second failure of a round sent again is too, and the model error
+        otherwise; a failure after text, or after a stop, is never the ``context`` error.
 
         Args:
             turn: The message.
@@ -764,14 +1175,19 @@ class AgentLoop:
             tooled: Whether the round may offer tools.
             round_no: The round.
             headers: The inference headers.
+            required: Whether the round must call a tool (``tool_choice`` ``required``, asked of vllm only). A
+                refusal of :data:`REFUSED_CHOICE_STATUSES` before any text, after a stop not and never one for
+                length, sends it once more free (``auto``), recorded as a failed round as an image refusal is.
 
         Yields:
-            TurnEvent: The round's text, and a notice when it goes again without images.
+            TurnEvent: ``images_dropped`` when it goes again without images; ``context_trimmed`` before the
+            text of the try the router took, when the first round's fit left earlier turns out; the round's text.
 
         Returns:
             How the round ended, ``None`` when the turn ends with it as it failed; and the tools it offered.
         """
-        fitted, tools = request.fitted(current, sight, tooled=tooled)
+        report = FitReport() if round_no == 1 and not turn.continued else None
+        fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
         if sight.showing:
             self._fetch(turn, sight, fitted)
             _keep_unseen(current, fitted, sight.bank)
@@ -789,7 +1205,14 @@ class AgentLoop:
                     headers=headers,
                     cancel=turn.cancel,
                     reasoning=turn.reasoning,
+                    continuation=turn.continued,
+                    require_tool=required,
                 ):
+                    if report is not None:
+                        # The router took this attempt: its fit is the one sent, and its trim is told, once.
+                        if report.trimmed:
+                            yield message.told(NoticeEvent("context_trimmed"))
+                        report = None
                     if isinstance(event, TextDelta):
                         if not said and message.shown:
                             message.shown.append("\n\n")
@@ -805,13 +1228,25 @@ class AgentLoop:
                     "Model round {} failed{}: {}", round_no, " after a stop" if stopped else "", type(exc).__name__
                 )
                 audit.model_called(round=round_no, done=None, outcome="error", images=count)
-                if count and not said and not stopped and _refuses_images(exc):
+                for_length = not said and not stopped and _refuses_context(exc)
+                if count and not said and not stopped and (for_length or _refuses_images(exc)):
                     logger.info("Model round {} goes again without its {} images", round_no, count)
                     _drop_images(current, sight)
-                    yield NoticeEvent("images_dropped")
-                    fitted, tools = request.fitted(current, sight, tooled=tooled)
+                    yield message.told(NoticeEvent("images_dropped"))
+                    fitted, tools = request.fitted(current, sight, tooled=tooled, report=report)
                     continue
-                if not stopped:
+                if required and not said and not stopped and not for_length and _refuses_choice(exc):
+                    logger.info("Model round {} goes again without a required call", round_no)
+                    required = False
+                    continue
+                if for_length:
+                    logger.error(
+                        "The router refused round {} for its length; GHOSTWRITER_CONTEXT_TOKENS may be above the "
+                        "model's context.",
+                        round_no,
+                    )
+                    yield ErrorEvent("context", CONTEXT_ERROR)
+                elif not stopped:
                     yield ErrorEvent("model", MODEL_ERROR)
                 return None, tools
             if done is None:
@@ -1000,6 +1435,40 @@ class AgentLoop:
         for card in cards:
             yield ResultEvent(card)
         return outcome
+
+
+def _estimate(request: _Request, sight: _Sight, turns: Sequence[PastTurn]) -> int:
+    """Estimate the tokens the next message's prompt starts with, for an answer and a continuation alike.
+
+    Args:
+        request: The message's offers.
+        sight: The images of the turn the estimate is made for: its offer in force (the one that sees while images
+            go to the model, else the blind one) and what an image costs while it sees.
+        turns: Every turn of the chat as the next message replays it, the one just answered the last.
+
+    Returns:
+        The estimate (:func:`~ghostwriter.agent.context.next_prompt_tokens`).
+    """
+    offer = request.offer(sight)
+    return next_prompt_tokens(offer.system, offer.tools, turns, images=sight.budget)
+
+
+def _estimated(message: _Progress) -> int | None:
+    """Estimate the tokens of the next prompt from the answer as it ended.
+
+    Args:
+        message: The answer.
+
+    Returns:
+        The estimate; ``None`` when the turn never began, or when the estimate failed, which is logged by its type.
+    """
+    if message.next_prompt is None:
+        return None
+    try:
+        return message.next_prompt(message.text)
+    except Exception as exc:
+        logger.warning("The next prompt could not be estimated: {}", type(exc).__name__)
+        return None
 
 
 def _asked(question: UserTurn, sight: _Sight) -> dict[str, Any]:

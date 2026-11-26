@@ -15,7 +15,7 @@ cannot work stops startup and names the variable, never its value
 | `INFERENCE_PROVIDER` | `vllm` | Must match the endpoint. On `vllm` every round sends `enable_thinking` with the composer's reasoning switch; other providers get no such field. |
 | `OPENAI_API_BASE` | `http://vllm-router:4000/v1` | The OpenAI-compatible endpoint, with `/v1`. |
 | `TEXT_MODEL` | `Qwen/Qwen3.8-27B-FP8` | The chat model. |
-| `GHOSTWRITER_CONTEXT_TOKENS` | `40000` | The chat model's context: vllm-service's `CHAT_MAX_MODEL_LEN`. Each round's prompt budget follows from it (Caps per message); under 22,000 stops startup. Larger than the model's context, a long chat's round is refused by the router. |
+| `GHOSTWRITER_CONTEXT_TOKENS` | `40000` | The chat model's context: vllm-service's `CHAT_MAX_MODEL_LEN`. Each round's prompt budget follows from it (Caps per message); under 22,000 stops startup. `GET /api/config` serves the budgets that follow from it, `prompt_tokens` (the context less the plain answer and the margin) and `reasoning_prompt_tokens` (less the reasoning answer), which the SPA's context ring divides the last answer's estimate by, so the ring moves with this value. Larger than the model's context, the budgets are too large, and a round the router refuses as longer than the model's context ends in the `context` error ("This chat is too long for the model"); the log then names this variable, never the router's refusal text. |
 | `GHOSTWRITER_VISION` | `on` | On, users can attach images, which go to the chat model with their message, and the model is shown the pages that have no text. `off`, or a workbench off or before 0.7.0 (no `view_file`), behaves as before: no picture, nor a note of one, goes to the model. Only an Ollama model is checked: on `INFERENCE_PROVIDER=ollama`, Ghostwriter reads the chat model's capabilities once at start (`POST /api/show` on the router's host) and turns images off when `vision` is missing; it can only turn them off, and an answer it cannot read changes nothing. On vLLM nothing is checked: set `off` for a text-only model, or every round that carries pictures is refused by the router and goes again without them, telling the user `images_dropped`. |
 | `GHOSTWRITER_MAX_IMAGES` | `8` | The most images one request carries (1–32). Must not exceed vllm-service's `CHAT_LIMIT_MM_PER_PROMPT`. |
 | `GHOSTWRITER_IMAGE_CONTEXT_TOKENS` | unset | Tokens one image costs the model (1–10,000). Unset: one per 32x32 pixels (Qwen). A number: a fixed cost per image (280 for gemma); pages then go as two strips. |
@@ -47,17 +47,17 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | Cap | Value | Meaning |
 |---|---|---|
 | `CONTEXT_TOKENS` | 40,000 | The model's context while `GHOSTWRITER_CONTEXT_TOKENS` is unset |
-| `MAX_ANSWER_TOKENS` / `REASONING_ANSWER_TOKENS` | 4,000 / 12,000 | A round's `max_tokens`, plain and reasoning; the thinking counts against the answer |
+| `MAX_ANSWER_TOKENS` / `REASONING_ANSWER_TOKENS` | 4,000 / 12,000 | A round's `max_tokens`, plain and reasoning; the thinking counts against the answer. A last round without calls that ends at its cap tells `answer_cut`; Continue's one round has the plain cap |
 | `CONTEXT_MARGIN_TOKENS` | 2,000 | Kept free of prompt and answer: the estimate's error, the chat template |
-| `PROMPT_TOKENS` / `REASONING_PROMPT_TOKENS` | 34,000 / 26,000 at 40k | A round's prompt, tool schemas included: the context less the answer and the margin (`prompt_tokens`) |
+| `PROMPT_TOKENS` / `REASONING_PROMPT_TOKENS` | 34,000 / 26,000 at 40k | A round's prompt, tool schemas included: the context less the answer and the margin (`prompt_tokens`); `/api/config` serves the two budgets of the configured context, and a document is `too_long` against the first |
 | `MIN_PROMPT_TOKENS` / `MIN_CONTEXT_TOKENS` | 8,000 / 22,000 | The least a reasoning prompt may hold, and so the smallest context the backend starts with |
-| `CHARS_PER_TOKEN` | 3 | The estimate the budget is counted by |
+| `CHARS_PER_TOKEN` | 3 | The estimate the budget is counted by: a round's prompt, the next-prompt estimate behind the context ring, and whether a measured document is `too_long` (its characters over this pass the prompt budget) |
 | `MODEL_TIMEOUT_S` | 120 | Seconds each wait on the router may take, not the whole round |
 | `MAX_TOOL_ROUNDS` / `MAX_CALLS_PER_ROUND` | 8 / 4 | Rounds offered tools; calls a round may run |
 | `MESSAGE_WALL_S` | 300 | Seconds a message has for its tools |
 | `TOOL_CUTOFF_S` | 10 | Below this much of the wall, a round gets no tools |
 | `BUSY_RETRY_S` | 2 | Pause before a call workbench answered busy goes once more |
-| `TOOL_RESULT_CHARS` | 12,000 | Characters of a result the model reads |
+| `TOOL_RESULT_CHARS` | 16,896 | Characters of a result the model reads: workbench's 16 KB default plus 512 for the null fields its size check leaves out, so a default answer is never cut; a `read_document` answer is cut by whole parts (one is trimmed only when it is the only one that fits), keeping `next_part`, and its `hint` is made to agree with it |
 | `HISTORY_ARGUMENT_CHARS` / `HISTORY_RESULT_CHARS` | 2,000 / 2,000 | A replayed call's arguments and result |
 | `MAX_RESULTS_PER_MESSAGE` | 20 | Cards a message shows |
 | `INLINE_IMAGE_BYTES` | 10 MiB | The largest image shown inline (png, jpeg, gif, webp) |
@@ -65,13 +65,14 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_ATTACHMENT_BYTES` | 50 MiB | An attachment, a video or audio clip included (`workbench.py`) |
 | `MAX_RENDITION_BYTES` | 768 KiB | A render of a page or picture fetched must be smaller (`workbench.py`) |
 | `MAX_IMAGE_BYTES` / `MAX_IMAGES_BYTES` / `MAX_TOOL_IMAGES` | 1 MiB / 3 MiB / 8 | The pictures kept from one tool answer: each, all together, and how many (`workbench.py`) |
-| `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`). A prepare whose file another call is still making waits for that call first, up to 120 s more, and then usually finds the manifest made; the rare one that waits it out and then converts the file itself can pass 390 s and is cut, and the file reads as text |
+| `PREPARE_TIMEOUT_S` | 390 | Seconds each read of a prepare's answer may wait: workbench's 120 s of queue, two job walls of 120 s (an Office file is converted, then drawn) and 30 s (`workbench.py`). A prepare whose file another call is still making waits for that call first, up to 120 s more, and then usually finds the manifest made; the rare one that waits it out and then converts the file itself can pass 390 s and is cut, and the file reads as text. A document's measure waits as long, for each read: workbench 0.10.0's measure gate waits 120 s, plus the caller's wall, plus 30 s, 270 s at its defaults, and 390 s stays above that sum; it must stay above it if workbench's limits are raised |
 | `PREPARE_RETRY_S` | 10 | Pause before a prepare workbench answered busy (503) goes once more; one that timed out is not tried again (`processing.py`) |
 | `STRIPS_TIMEOUT_S` | 60 | The same for the second prepare that cuts a large picture's strips; it is not tried again (`processing.py`) |
 | `STRIP_LONG_SIDE` / `TOKEN_SIDE` | 1,024 px / 32 px | At a fixed image cost, a page or picture whose long side is over the first goes as two strips; with none set, an image costs a token per started square of the second (`agent/images.py`) |
 | `RENDITION_TIMEOUT_S` | 30 | Seconds the renders of one fetch get together (`workbench.py`) |
 | `PREPARE_SLOTS` | 2 | Attachments prepared at once, in the one process (`processing.py`) |
-| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). From workbench 0.8.1 a conversion has a gate of its own too, so Send never waits for an Office file while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 3 or more, its default |
+| `BACKGROUND_SLOTS` | 1 | Office files prepared at once in the background, within `PREPARE_SLOTS`, so a picture's prepare always has a slot here (`processing.py`). From workbench 0.8.1 a conversion has a gate of its own; from workbench 0.10.0 a measure has a gate of its own too, so Send never waits for an Office file or a measure while workbench's `GHOSTWRITER_WORKBENCH_SLOTS` is 4 or more, its default; at 3, a prepare, a conversion and a measure together take every slot |
+| `MEASURE_SLOTS` | 1 | Documents measured at once, on a slot of their own, never one of `PREPARE_SLOTS` or `BACKGROUND_SLOTS`, so a slow measure delays no picture's or PDF's prepare; workbench measures on a gate of its own too (`processing.py`) |
 | `MEDIA_SLOTS` | 2 | Clips at Nextext at once, in the one process; a clip there holds none of the `PREPARE_SLOTS`, so a picture is ready as fast as without clips (`processing.py`) |
 | `POLL_S` / `POLL_SLOW_S` / `POLL_SLOW_AFTER_S` | 2 s / 5 s / 60 s | Between two polls of a clip's job at Nextext, and the age of the job from which the longer wait holds (`processing.py`) |
 | `POLL_TOLERATED` | 3 | Failed polls in a row a clip rides out within its budget; a fourth in a row fails it `nextext_unavailable`. A job that is gone fails it at once (`processing.py`) |
@@ -85,3 +86,4 @@ They live in `ghostwriter/agent/limits.py`; the last rows name their own module.
 | `MAX_WAIT_S` | 20 | The longest `?wait=` of an attachment's status long poll (`processing.py`) |
 | `MAX_PENDING` | 10 | Unexpired attachments waiting in a chat (`upload.py`); 10 per message too (`api/messages.py`) |
 | `MAX_MESSAGE_CHARS` | 20,000 | Characters of a message, after stripping (`api/messages.py`) |
+| `NEAR_FULL_RATIO` | 0.8 | The share of the prompt budget from which the context ring takes the warning colour and the composer's note says the chat is nearly full, with a New chat button. The SPA's own constant (`frontend/src/lib/context.ts`), not a setting: the share is the last answer's `context_estimate` over `prompt_tokens` (`reasoning_prompt_tokens` while the reasoning switch is on) of `GET /api/config`, decided on the unrounded number |

@@ -13,9 +13,18 @@ import { Conversation } from './Conversation'
  * included, carries over: a chat opens with reasoning off. Its answer lives
  * in the app's registry, so leaving the chat keeps it being written. Files
  * dropped on the conversation go to the same attachments as the paperclip's,
- * while attachments are on.
+ * while attachments are on. `onNewChat` is the composer's offer of a fresh chat once
+ * this one is nearly full.
  */
-export function ChatPane({ chatId, config }: { chatId: string; config: AppConfig }) {
+export function ChatPane({
+  chatId,
+  config,
+  onNewChat,
+}: {
+  chatId: string
+  config: AppConfig
+  onNewChat: () => void
+}) {
   const stream = useChatStream(chatId)
   const attachments = useAttachments(chatId, config)
   const [reasoning, setReasoning] = useState(false)
@@ -34,6 +43,7 @@ export function ChatPane({ chatId, config }: { chatId: string; config: AppConfig
           attachments={attachments}
           reasoning={reasoning}
           onReasoningChange={setReasoning}
+          onNewChat={onNewChat}
         />
       }
     />

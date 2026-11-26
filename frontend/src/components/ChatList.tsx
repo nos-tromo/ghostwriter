@@ -17,7 +17,7 @@ import {
 import { ApiError } from '../api/client'
 import { describeError } from '../api/errorMessage'
 import type { ChatOut } from '../api/types'
-import { useChats, useCreateChat, useDeleteChat, useRenameChat } from '../hooks/useChats'
+import { useChats, useDeleteChat, useRenameChat, useStartChat } from '../hooks/useChats'
 import { useT } from '../i18n/LanguageContext'
 
 /** The longest title the backend takes (`MAX_TITLE_CHARS`). */
@@ -51,7 +51,7 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
   const t = useT()
   const headingId = useId()
   const chats = useChats()
-  const create = useCreateChat()
+  const { start, pending: starting, error: startError } = useStartChat(onSelect)
   // The open chat as it is now, for a delete that settles after the user moved on.
   const selectedRef = useRef(selected)
   useEffect(() => {
@@ -65,7 +65,6 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
     else rowsRef.current.delete(id)
   }
 
-  const start = () => create.mutate(undefined, { onSuccess: (chat) => onSelect(chat.id) })
   // The deleted row takes its menu with it, so focus moves to the row that
   // followed it, or to the new-chat button after the last one, never to <body>.
   const onDeleted = (id: string, nextId: string | null) => {
@@ -80,9 +79,9 @@ export function ChatList({ selected, onSelect }: { selected: string | null; onSe
         <h2 id={headingId} className="px-3 text-xs font-medium uppercase tracking-wider text-muted-foreground">
           {t('chat.list')}
         </h2>
-        <NewButton ref={newRef} label={t('chat.new')} busy={create.isPending} onClick={start} className="h-7" />
+        <NewButton ref={newRef} label={t('chat.new')} busy={starting} onClick={start} className="h-7" />
       </div>
-      {create.isError && <ErrorLine error={create.error} />}
+      {startError !== null && <ErrorLine error={startError} />}
       {chats.isPending ? (
         <Spinner className="mx-3" label={t('chat.loading')} />
       ) : chats.isError ? (

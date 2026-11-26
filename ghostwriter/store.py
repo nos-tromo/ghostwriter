@@ -10,10 +10,23 @@ result's preview) expires with the earliest file that can still exist then, the
 earliest mark after ``t`` minus the file period, or a file period after ``t``:
 nothing derived from a file outlives it (spec §5.6). An attachment or a result
 itself lives as long as its own file, and so does its manifest (the counts and
-sizes workbench reported of it, kept in ``render``): derived from the file, it is
-not served, and is emptied, once the file's period has passed. A chat without
-marks never used workbench. The retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
-deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`).
+sizes workbench reported of it, kept in ``render``) and its measure (its length,
+kept in ``measure``): derived from the file, they are not served, and are emptied,
+once the file's period has passed. The measure's state is a column of its own
+(``measure_state``): ``pending`` until workbench has measured the document, then
+``measured`` or ``none``; ``NULL`` for a picture, a clip, or a row from before
+measures. A measured document is ``too_long`` when its count was capped or its
+characters, over ``CHARS_PER_TOKEN``, pass the prompt budget. An answer stores its notices
+(:class:`~ghostwriter.agent.notices.NoticeEvent`) when it is written. The details
+of a notice about a file (:data:`PARAM_CODES`: the file's id and how much of it
+was read) are content made with the answer: the first write that holds one sets
+``notices_expire_at``, the content deadline from the answer's start, and a later
+write of the same answer keeps it. Until then they are served, with the file's
+name read from its attachment, never stored; after it only the codes are, and
+the sweep strips the rest. A chat without marks never used workbench. The
+retention sweep (:mod:`ghostwriter.retention`) reads what is due by the same
+deadlines (:meth:`ChatStore.due_chats`, :meth:`ChatStore.due_contents`,
+:meth:`ChatStore.due_notices`).
 """
 
 import json
@@ -31,6 +44,8 @@ from sqlalchemy.orm import Session
 
 from ghostwriter.agent.context import PastCall, PastTurn, attachment_facts, user_content
 from ghostwriter.agent.images import AttachedImage, rendition_size
+from ghostwriter.agent.limits import CHARS_PER_TOKEN, PROMPT_TOKENS
+from ghostwriter.agent.notices import MEASURE_UNITS, NoticeEvent, SentFile
 from ghostwriter.agent.tools import parse_arguments, step_detail
 from ghostwriter.db import utcnow
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, RetentionPeriod, ToolStep
@@ -41,7 +56,11 @@ from ghostwriter.schemas import (
     AttachmentStatus,
     ChatDetail,
     ChatOut,
+    LengthOut,
+    MeasureState,
+    MeasureUnit,
     MessageOut,
+    NoticeOut,
     ResultKind,
     ResultOut,
     Role,
@@ -69,6 +88,10 @@ STORED_MANIFEST_KEYS: Final = (
 )
 #: What a stored rendition keeps: its place, its size and its type.
 _RENDITION_KEYS: Final = ("n", "width", "height", "mime")
+#: What a measure keeps of what workbench reports: its units, what they are, its characters and whether it was capped.
+MEASURE_KEYS: Final = ("total", "unit", "chars", "capped")
+#: The notices about a file, whose details (its id and counts) follow the content deadline.
+PARAM_CODES: Final = frozenset({"document_partial", "document_unread"})
 
 
 class ChatNotFound(LookupError):
@@ -113,6 +136,7 @@ class AttachmentRef:
             without one, and once the file's period has passed.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.
+        measure_state: Where its measure is (``pending``, ``measured`` or ``none``); ``None`` for one never measured.
     """
 
     id: str
@@ -126,6 +150,7 @@ class AttachmentRef:
     manifest: Mapping[str, Any] | None
     created_at: datetime
     expired: bool
+    measure_state: MeasureState | None
 
 
 @dataclass(frozen=True)
@@ -137,11 +162,13 @@ class UserTurn:
             (:func:`~ghostwriter.agent.context.user_content`).
         images: The pictures it attached that are ready to be seen, in their order.
         position: The message's place in the chat.
+        files: Every file it attached, in order, as the notices about them read it.
     """
 
     text: str
     images: tuple[AttachedImage, ...]
     position: int
+    files: tuple[SentFile, ...] = ()
 
 
 def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
@@ -162,6 +189,43 @@ def _loaded_manifest(render: str | None) -> Mapping[str, Any] | None:
     return cast(Mapping[str, Any], manifest) if isinstance(manifest, dict) else None
 
 
+def _count(value: object) -> int | None:
+    """Read a stored count.
+
+    Args:
+        value: The value.
+
+    Returns:
+        It, when it is an int from 0 and no bool; else ``None``.
+    """
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+
+def _loaded_measure(stored: str | None) -> Mapping[str, Any] | None:
+    """Read a stored measure.
+
+    Args:
+        stored: The row's ``measure``.
+
+    Returns:
+        The measure (``total``, ``unit``, ``chars``, ``capped``), or ``None`` without one or for one that is not a
+        JSON object.
+    """
+    return _loaded_manifest(stored)
+
+
+def _dumped(value: object) -> str:
+    """Write a stored value as compact JSON.
+
+    Args:
+        value: The value.
+
+    Returns:
+        Its JSON, non-ASCII kept as it is.
+    """
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
 def _stored_manifest(manifest: Mapping[str, Any]) -> str:
     """Reduce what workbench reported of a file to what the chat keeps, as JSON.
 
@@ -179,7 +243,68 @@ def _stored_manifest(manifest: Mapping[str, Any]) -> str:
             {key: rendition[key] for key in _RENDITION_KEYS if key in rendition}
             for rendition in cast(list[Mapping[str, Any]], renditions)
         ]
-    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"))
+    return _dumped(kept)
+
+
+def _loaded_notices(stored: str) -> list[NoticeEvent]:
+    """Read an answer's stored notices.
+
+    Args:
+        stored: The row's ``notices``.
+
+    Returns:
+        Each notice with a code this version knows, in order; none for a value that is not a JSON list.
+    """
+    try:
+        values = json.loads(stored)
+    except ValueError:
+        return []
+    if not isinstance(values, list):
+        return []
+    return [event for value in cast(list[Any], values) if (event := NoticeEvent.from_stored(value)) is not None]
+
+
+def _codes_only(stored: str | None) -> str | None:
+    """Strip stored notices to their codes, as the sweep leaves them past their deadline.
+
+    Args:
+        stored: The row's ``notices``.
+
+    Returns:
+        A JSON list of ``{"code"}`` items, a code this version does not know left out; ``None`` for ``None``.
+    """
+    return None if stored is None else _dumped([{"code": event.code} for event in _loaded_notices(stored)])
+
+
+def _notices_out(message: Message, names: Mapping[str, str], now: datetime) -> list[NoticeOut] | None:
+    """Serve an answer's notices, their details only until their deadline.
+
+    Args:
+        message: The row.
+        names: The chat's attachments' names, by workbench's file id.
+        now: The time of the read.
+
+    Returns:
+        The notices in order: with their details and their file's name while ``notices_expire_at`` is ahead, the
+        codes alone after it or without one; ``None`` while none are stored (a question, an answer being written,
+        one stored before schema 3).
+    """
+    if message.notices is None:
+        return None
+    detailed = message.notices_expire_at is not None and message.notices_expire_at > now
+    return [
+        NoticeOut(
+            code=event.code,
+            file_id=event.file_id,
+            name=None if event.file_id is None else names.get(event.file_id),
+            read=event.read,
+            total=event.total,
+            unit=event.unit,
+        )
+        if detailed
+        else NoticeOut(code=event.code)
+        for event in _loaded_notices(message.notices)
+    ]
 
 
 def _title(content: str) -> str | None:
@@ -246,26 +371,41 @@ class ChatStore:
         engine: The database, with its schema (:func:`ghostwriter.db.init_db`).
         file_days: How long workbench keeps a chat's files; tool contents and previews follow it.
         notice_days: How long a new or shorter chat period waits before it deletes.
+        prompt_budget: The most a round's prompt holds, in tokens; a document measured longer is ``too_long``.
         now: The clock.
     """
 
     def __init__(
-        self, engine: Engine, *, file_days: int, notice_days: int, now: Callable[[], datetime] = utcnow
+        self,
+        engine: Engine,
+        *,
+        file_days: int,
+        notice_days: int,
+        prompt_budget: int = PROMPT_TOKENS,
+        now: Callable[[], datetime] = utcnow,
     ) -> None:
-        """Keep the engine, the periods and the clock."""
+        """Keep the engine, the periods, the prompt budget and the clock."""
         self._engine = engine
         self._file_period = timedelta(days=file_days)
         self._notice_days = notice_days
+        self._prompt_budget = prompt_budget
         self._now = now
 
     @contextmanager
-    def _transaction(self) -> Generator[Session]:
+    def _transaction(self, *, immediate: bool = False) -> Generator[Session]:
         """Open one short transaction.
+
+        Args:
+            immediate: Take SQLite's write lock at the start (``BEGIN IMMEDIATE``), for a transaction that counts
+                before it writes: pysqlite begins a transaction only before its first write, so without it two
+                transactions can count the same rows before either stores.
 
         Yields:
             The session, committed on success and rolled back on an error.
         """
         with Session(self._engine) as s, s.begin():
+            if immediate:
+                s.connection().exec_driver_sql("BEGIN IMMEDIATE")
             yield s
 
     def _gone(self, created_at: datetime, now: datetime) -> bool:
@@ -280,6 +420,61 @@ class ChatStore:
         """
         return created_at + self._file_period <= now
 
+    def _too_long(self, attachment: Attachment) -> bool:
+        """Tell whether a measured document is longer than one prompt holds, so it is read only in parts.
+
+        Args:
+            attachment: The row.
+
+        Returns:
+            Whether it is ``measured`` and its count was capped, or its characters over ``CHARS_PER_TOKEN`` are more
+            than the prompt budget; ``False`` for any other row, and for a measure that does not read.
+        """
+        measure = _loaded_measure(attachment.measure) if attachment.measure_state == "measured" else None
+        if measure is None:
+            return False
+        chars = _count(measure.get("chars"))
+        return measure.get("capped") is True or (chars is not None and chars / CHARS_PER_TOKEN > self._prompt_budget)
+
+    def _length(self, attachment: Attachment) -> tuple[int, str] | None:
+        """Read a measured document's length for its line.
+
+        Args:
+            attachment: The row.
+
+        Returns:
+            Its count and unit once ``measured`` with both readable (:meth:`_length_out`); else ``None``.
+        """
+        served = self._length_out(attachment, expired=False)
+        if served is None or served.total is None or served.unit is None:
+            return None
+        return served.total, served.unit
+
+    def _length_out(self, attachment: Attachment, expired: bool) -> LengthOut | None:
+        """Serve an attachment's measure.
+
+        Args:
+            attachment: The row.
+            expired: Whether its file's period has passed.
+
+        Returns:
+            ``None`` once the file has expired or for one never measured (``NULL``); else its state, with its total,
+            unit and ``too_long`` once ``measured`` (``None``, ``None`` and ``False`` while ``pending`` or ``none``).
+        """
+        state = cast(MeasureState | None, attachment.measure_state)
+        if expired or state is None:
+            return None
+        if state != "measured":
+            return LengthOut(state=state, total=None, unit=None, too_long=False)
+        measure = _loaded_measure(attachment.measure) or {}
+        unit = measure.get("unit")
+        return LengthOut(
+            state=state,
+            total=_count(measure.get("total")),
+            unit=cast(MeasureUnit, unit) if isinstance(unit, str) and unit in MEASURE_UNITS else None,
+            too_long=self._too_long(attachment),
+        )
+
     def _attachment_out(self, attachment: Attachment, now: datetime) -> AttachmentOut:
         """Serve an attachment row.
 
@@ -288,8 +483,9 @@ class ChatStore:
             now: The time of the read.
 
         Returns:
-            The attachment, expired once workbench's period for it has passed.
+            The attachment, expired once workbench's period for it has passed, with its length while it is not.
         """
+        expired = self._gone(attachment.created_at, now)
         return AttachmentOut(
             id=attachment.id,
             file_id=attachment.workbench_file_id,
@@ -299,7 +495,8 @@ class ChatStore:
             kind=cast(AttachmentKind, attachment.kind),
             status=cast(AttachmentStatus, attachment.status),
             created_at=attachment.created_at,
-            expired=self._gone(attachment.created_at, now),
+            expired=expired,
+            length=self._length_out(attachment, expired),
         )
 
     def _attachment_ref(self, attachment: Attachment, owner: str, now: datetime) -> AttachmentRef:
@@ -327,6 +524,28 @@ class ChatStore:
             manifest=None if expired else _loaded_manifest(attachment.render),
             created_at=attachment.created_at,
             expired=expired,
+            measure_state=cast(MeasureState | None, attachment.measure_state),
+        )
+
+    def _sent_file(self, attachment: Attachment, now: datetime) -> SentFile:
+        """Read an attachment row for the notices about it.
+
+        Args:
+            attachment: The row.
+            now: The time of the read.
+
+        Returns:
+            The attachment, with its measure's total and unit while it is ``measured`` and the file has not expired.
+        """
+        length = self._length_out(attachment, self._gone(attachment.created_at, now))
+        return SentFile(
+            file_id=attachment.workbench_file_id,
+            path=attachment.path,
+            name=attachment.name,
+            kind=cast(AttachmentKind, attachment.kind),
+            status=cast(AttachmentStatus, attachment.status),
+            total=None if length is None else length.total,
+            unit=None if length is None else length.unit,
         )
 
     def _result_out(self, result: Result, now: datetime) -> ResultOut:
@@ -453,8 +672,9 @@ class ChatStore:
         """Put the configured periods in force, at startup.
 
         Records the chat period's next state and gives every chat its
-        deadline under it. Tool contents and previews whose deadline has not
-        passed get theirs again under the current file period: capped by the
+        deadline under it. Tool contents, previews and notices' details whose
+        deadline has not passed get theirs again under the current file period
+        (a notice's made at its answer's start): capped by the
         files that could still exist when they were made, under the period
         then in force (recorded here too), so a shorter period never moves a
         deadline later. One already passed keeps it, so a longer period
@@ -522,6 +742,17 @@ class ChatStore:
                         for result_id, made, chat_id in results
                     ],
                 )
+            notices = s.execute(
+                select(Message.id, Message.created_at, Message.chat_id).where(Message.notices_expire_at > now)
+            ).all()
+            if notices:
+                s.execute(
+                    update(Message),
+                    [
+                        {"id": message_id, "notices_expire_at": deadline(chat_id, made)}
+                        for message_id, made, chat_id in notices
+                    ],
+                )
         return state
 
     def create_chat(self, owner: str, *, id: str | None = None) -> ChatOut:
@@ -580,14 +811,15 @@ class ChatStore:
             return _chat_out(self._owned(s, owner, chat_id))
 
     def chat_detail(self, owner: str, chat_id: str) -> ChatDetail:
-        """Return an owner's chat with its messages, steps, results and attachments.
+        """Return an owner's chat with its messages, steps, results, attachments and notices.
 
         Args:
             owner: Who asks.
             chat_id: The chat.
 
         Returns:
-            The chat, its messages in order and its pending attachments.
+            The chat, its messages in order and its pending attachments; an answer's notices name their file
+            by its attachment in this chat.
 
         Raises:
             ChatNotFound: If the owner has no chat with that id.
@@ -611,6 +843,7 @@ class ChatStore:
                 .where(Message.chat_id == chat_id)
                 .order_by(Result.message_id, Result.position)
             ).all()
+            names = {a.workbench_file_id: a.name for a in attachments}
             return ChatDetail(
                 chat=_chat_out(chat),
                 messages=[
@@ -622,6 +855,8 @@ class ChatStore:
                         attachments=[self._attachment_out(a, now) for a in attachments if a.message_id == message.id],
                         steps=[_step_out(step, now) for step in steps if step.message_id == message.id],
                         results=[self._result_out(r, now) for r in results if r.message_id == message.id],
+                        notices=_notices_out(message, names, now),
+                        context_estimate=message.context_estimate,
                     )
                     for message in messages
                 ],
@@ -701,7 +936,7 @@ class ChatStore:
     def due_contents(self, now: datetime, limit: int) -> tuple[list[str], list[str], list[str]]:
         """Return the tool steps, results and attachments whose content has expired and is not yet emptied.
 
-        An attachment's content is its manifest, derived from its file: it is due once the
+        An attachment's content is its manifest and its measure, derived from its file: they are due once the
         file's period has passed.
 
         Args:
@@ -709,7 +944,7 @@ class ChatStore:
             limit: The most steps, the most results and the most attachments returned.
 
         Returns:
-            The steps' ids, the results' ids and the ids of the attachments whose manifest is
+            The steps' ids, the results' ids and the ids of the attachments whose manifest or measure is
             due, the earliest deadline first.
         """
         with self._transaction() as s:
@@ -730,7 +965,10 @@ class ChatStore:
             ).all()
             attachments = s.scalars(
                 select(Attachment.id)
-                .where(Attachment.created_at <= now - self._file_period, Attachment.render.is_not(None))
+                .where(
+                    Attachment.created_at <= now - self._file_period,
+                    or_(Attachment.render.is_not(None), Attachment.measure.is_not(None)),
+                )
                 .order_by(Attachment.created_at, Attachment.id)
                 .limit(limit)
             ).all()
@@ -739,9 +977,9 @@ class ChatStore:
     def empty_contents(
         self, step_ids: Sequence[str], result_ids: Sequence[str], attachment_ids: Sequence[str] = ()
     ) -> None:
-        """Empty steps' arguments and results, results' previews and attachments' manifests.
+        """Empty steps' arguments and results, results' previews and attachments' manifests and measures.
 
-        The tool, status, name, size and type stay; so does the attachment itself.
+        The tool, status, name, size and type stay; so does the attachment itself, and its measure's state.
 
         Args:
             step_ids: The steps.
@@ -754,7 +992,44 @@ class ChatStore:
             if result_ids:
                 s.execute(update(Result).where(Result.id.in_(result_ids)).values(preview=None))
             if attachment_ids:
-                s.execute(update(Attachment).where(Attachment.id.in_(attachment_ids)).values(render=None))
+                s.execute(update(Attachment).where(Attachment.id.in_(attachment_ids)).values(render=None, measure=None))
+
+    def due_notices(self, now: datetime, limit: int) -> list[str]:
+        """Return the answers whose notices' details have expired and are not yet stripped.
+
+        Args:
+            now: The time of the sweep.
+            limit: The most answers returned.
+
+        Returns:
+            The answers' ids, the earliest deadline first.
+        """
+        with self._transaction() as s:
+            return list(
+                s.scalars(
+                    select(Message.id)
+                    .where(Message.notices_expire_at.is_not(None), Message.notices_expire_at <= now)
+                    .order_by(Message.notices_expire_at, Message.id)
+                    .limit(limit)
+                ).all()
+            )
+
+    def strip_notices(self, message_ids: Sequence[str]) -> None:
+        """Strip answers' notices to their codes and clear their deadline; the answers and their order stay.
+
+        Args:
+            message_ids: The answers.
+        """
+        with self._transaction() as s:
+            rows = s.execute(select(Message.id, Message.notices).where(Message.id.in_(message_ids))).all()
+            if rows:
+                s.execute(
+                    update(Message),
+                    [
+                        {"id": message_id, "notices": _codes_only(stored), "notices_expire_at": None}
+                        for message_id, stored in rows
+                    ],
+                )
 
     def checkpoint(self) -> None:
         """Copy the write-ahead log into the database file and empty it, outside any transaction.
@@ -849,17 +1124,39 @@ class ChatStore:
             s.add(message)
             return message.id
 
-    def finish_assistant_message(self, message_id: str, content: str) -> None:
-        """Store an answer's text.
+    def finish_assistant_message(
+        self,
+        message_id: str,
+        content: str,
+        *,
+        notices: Sequence[Mapping[str, Any]] = (),
+        context_estimate: int | None = None,
+    ) -> None:
+        """Store an answer's text, its notices and the estimate of the next prompt.
+
+        A notice about a file (:data:`PARAM_CODES`) sets the content deadline of the notices' details, from the
+        answer's start, when none is set yet; a later write of the same answer (a Continue) keeps it.
 
         Args:
             message_id: The answer.
             content: Its text.
+            notices: Its notices, each as :meth:`~ghostwriter.agent.notices.NoticeEvent.stored` gives it: codes, ids
+                and counts. A ``name`` is dropped from each, whoever the caller is: a file's name is read from its
+                attachment row when the answer is served. None is stored as an empty list.
+            context_estimate: The estimated tokens of the next prompt, or ``None``.
         """
+        stored = [{key: value for key, value in notice.items() if key != "name"} for notice in notices]
         with self._transaction() as s:
-            s.execute(
-                update(Message).where(Message.id == message_id, Message.role == "assistant").values(content=content)
-            )
+            message = s.scalars(
+                select(Message).where(Message.id == message_id, Message.role == "assistant")
+            ).one_or_none()
+            if message is None:
+                return
+            message.content = content
+            message.notices = _dumped(stored)
+            message.context_estimate = context_estimate
+            if message.notices_expire_at is None and any(notice.get("code") in PARAM_CODES for notice in stored):
+                message.notices_expire_at = self._content_deadline(s, message.chat_id, message.created_at)
 
     def add_step(
         self,
@@ -957,7 +1254,7 @@ class ChatStore:
                 name=name,
                 mime=mime,
                 size=size,
-                preview=None if preview is None else json.dumps(preview, ensure_ascii=False, separators=(",", ":")),
+                preview=None if preview is None else _dumped(preview),
                 created_at=now,
                 preview_expires_at=self._content_deadline(s, chat_id, now),
             )
@@ -978,6 +1275,7 @@ class ChatStore:
         status: str = "ready",
         id: str | None = None,
         max_pending: int | None = None,
+        measure_state: MeasureState | None = None,
     ) -> AttachmentOut:
         """Store a file handed to workbench, by reference, pending until a message sends it; it leaves a file mark.
 
@@ -994,6 +1292,8 @@ class ChatStore:
             max_pending: The most attachments the chat may hold waiting, counted under the write
                 lock, so parallel uploads cannot pass it, and expired ones not counted; ``None``
                 counts nothing.
+            measure_state: ``pending`` for a document workbench measures, ``none`` for one it does not (before
+                0.10); ``None`` for a picture or a clip, which are never measured.
 
         Returns:
             The attachment.
@@ -1003,7 +1303,7 @@ class ChatStore:
             TooManyPending: If the chat already holds ``max_pending`` waiting attachments.
         """
         now = self._now()
-        with self._transaction() as s:
+        with self._transaction(immediate=max_pending is not None) as s:
             if s.get(Chat, chat_id) is None:
                 raise ChatNotFound("chat not found")
             if max_pending is not None and self._pending(s, chat_id, now) >= max_pending:
@@ -1020,6 +1320,7 @@ class ChatStore:
                 kind=kind,
                 status=status,
                 created_at=now,
+                measure_state=measure_state,
             )
             s.add(attachment)
             self._mark(s, chat_id, now)
@@ -1325,6 +1626,62 @@ class ChatStore:
             )
             return kept.rowcount == 1
 
+    def settle_measure(self, attachment_id: str, measure: Mapping[str, Any] | None) -> bool:
+        """Settle a document's measure, once.
+
+        Only a ``pending`` row changes, so a second settle and a settle of a row deleted meanwhile change nothing.
+
+        Args:
+            attachment_id: The attachment.
+            measure: What workbench measured, stored ``measured`` as its four counts (``total``, ``unit``,
+                ``chars``, ``capped``); ``None`` stores ``none``: it could not be measured.
+
+        Returns:
+            Whether the row changed: ``False`` when it is gone, never measured or settled already.
+        """
+        kept = None if measure is None else _dumped({key: measure[key] for key in MEASURE_KEYS if key in measure})
+        with self._transaction() as s:
+            settled = cast(
+                "CursorResult[Any]",
+                s.execute(
+                    update(Attachment)
+                    .where(Attachment.id == attachment_id, Attachment.measure_state == "pending")
+                    .values(measure_state="none" if kept is None else "measured", measure=kept)
+                ),
+            )
+            return settled.rowcount == 1
+
+    def pending_measures(self) -> list[AttachmentRef]:
+        """Return every ``ready`` attachment whose measure is still ``pending``, across chats.
+
+        A ``processing`` one is :meth:`processing_attachments`', whose job measures it after its prepare.
+
+        Returns:
+            The attachments, each with the owner of its chat, the oldest first.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            rows = s.execute(
+                select(Attachment, Chat.owner)
+                .join(Chat, Attachment.chat_id == Chat.id)
+                .where(Attachment.status == "ready", Attachment.measure_state == "pending")
+                .order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            return [self._attachment_ref(attachment, owner, now) for attachment, owner in rows]
+
+    def settle_pending_measures(self) -> int:
+        """Settle every measure left ``pending`` as ``none``, which nothing will measure now (workbench is off).
+
+        Returns:
+            How many rows were settled.
+        """
+        with self._transaction() as s:
+            settled = cast(
+                "CursorResult[Any]",
+                s.execute(update(Attachment).where(Attachment.measure_state == "pending").values(measure_state="none")),
+            )
+            return settled.rowcount
+
     def settle_processing(self, failure: str) -> int:
         """Settle every attachment left ``processing``, which nothing will settle now.
 
@@ -1363,12 +1720,19 @@ class ChatStore:
 
         Returns:
             The text, then each attachment with its path, size and facts
-            (:func:`~ghostwriter.agent.context.attachment_facts`), or as expired or unreadable.
+            (:func:`~ghostwriter.agent.context.attachment_facts`, which says a data or text file's format and measured
+            length, and that a document measured longer than one prompt is read in parts), or as expired or
+            unreadable.
         """
         paths = {attachment.id: attachment.path for attachment in attachments}
         facts = {
             attachment.id: attachment_facts(
-                attachment.kind, _loaded_manifest(attachment.render), seen=seen, name=attachment.name
+                attachment.kind,
+                _loaded_manifest(attachment.render),
+                seen=seen,
+                name=attachment.name,
+                too_long=self._too_long(attachment),
+                length=self._length(attachment),
             )
             for attachment in attachments
         }
@@ -1402,7 +1766,7 @@ class ChatStore:
         return tuple(images)
 
     def user_turn(self, chat_id: str, message_id: str, *, seen: bool = False) -> UserTurn:
-        """Return a user's message as the model reads it, its pictures, and its place in the chat.
+        """Return a user's message as the model reads it, its pictures, its place in the chat, and its files.
 
         Args:
             chat_id: The chat.
@@ -1411,7 +1775,7 @@ class ChatStore:
 
         Returns:
             The text with its attachments named (:func:`~ghostwriter.agent.context.user_content`),
-            the pictures that are ready to be seen, and the message's position.
+            the pictures that are ready to be seen, the message's position, and every file it attached.
 
         Raises:
             sqlalchemy.exc.NoResultFound: If the chat has no such user's message.
@@ -1430,7 +1794,24 @@ class ChatStore:
                 self._prompt_text(message, attachments, now, seen=seen),
                 self._images(attachments, now),
                 message.position,
+                tuple(self._sent_file(attachment, now) for attachment in attachments),
             )
+
+    def chat_files(self, chat_id: str) -> dict[str, SentFile]:
+        """Return every attachment of a chat, sent or waiting, as the notices about them read it.
+
+        Args:
+            chat_id: The chat.
+
+        Returns:
+            The attachments by path; of two at one path, the later.
+        """
+        now = self._now()
+        with self._transaction() as s:
+            attachments = s.scalars(
+                select(Attachment).where(Attachment.chat_id == chat_id).order_by(Attachment.created_at, Attachment.id)
+            ).all()
+            return {attachment.path: self._sent_file(attachment, now) for attachment in attachments}
 
     def past_turns(self, chat_id: str, *, before_position: int, seen: bool = False) -> tuple[list[PastTurn], bool]:
         """Return the turns before a message, for a follow-up: questions, live tool contents, answers.
@@ -1488,6 +1869,70 @@ class ChatStore:
             if question is not None:
                 turns.append(PastTurn(question[0], (), "", question[1], question[2]))
             return turns, any(turn.expired for turn in turns)
+
+    def answered_turns(self, chat_id: str, answer_id: str, *, seen: bool = False) -> list[PastTurn]:
+        """Return the turns of a chat through one of its answers, for that answer's continuation.
+
+        Each is read as :meth:`past_turns` reads it. The message just before the answer must be its question:
+        :meth:`past_turns` pairs a question with the first answer after it, so the last turn would otherwise be
+        another answer's.
+
+        Args:
+            chat_id: The chat.
+            answer_id: The answer.
+            seen: Whether the turn sees images, which a picture's line says; a continuation's own round does not.
+
+        Returns:
+            The turns, oldest first, the last the answer's own: its question, its live tool contents, its text.
+
+        Raises:
+            LookupError: If the chat has no such answer, or the message just before it is no question.
+        """
+        with self._transaction() as s:
+            position = s.scalars(
+                select(Message.position).where(
+                    Message.id == answer_id, Message.chat_id == chat_id, Message.role == "assistant"
+                )
+            ).one_or_none()
+            before = (
+                None
+                if position is None
+                else s.scalars(
+                    select(Message.role)
+                    .where(Message.chat_id == chat_id, Message.position < position)
+                    .order_by(Message.position.desc())
+                    .limit(1)
+                ).one_or_none()
+            )
+        if position is None or before != "user":
+            raise LookupError("the chat has no such answer to a question")
+        turns, _ = self.past_turns(chat_id, before_position=position + 1, seen=seen)
+        return turns
+
+    def answer_notices(self, message_id: str) -> list[dict[str, Any]]:
+        """Return an answer's notices as they are stored.
+
+        Args:
+            message_id: The answer.
+
+        Returns:
+            Each stored notice as it was written: its code, and its file's id and counts until the sweep stripped
+            them; none for ``NULL`` (an answer being written, or one stored before schema 3), for a value that is
+            not a JSON list, or for no such answer.
+        """
+        with self._transaction() as s:
+            stored = s.scalars(
+                select(Message.notices).where(Message.id == message_id, Message.role == "assistant")
+            ).one_or_none()
+        if stored is None:
+            return []
+        try:
+            values = json.loads(stored)
+        except ValueError:
+            return []
+        if not isinstance(values, list):
+            return []
+        return [cast(dict[str, Any], value) for value in cast(list[Any], values) if isinstance(value, dict)]
 
     @staticmethod
     def _live_rounds(steps: Sequence[ToolStep], now: datetime) -> tuple[tuple[tuple[PastCall, ...], ...], bool]:

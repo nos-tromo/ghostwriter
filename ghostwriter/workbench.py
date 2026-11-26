@@ -12,9 +12,12 @@ Discovery (``server/discover``, then ``tools/list``, within :data:`DISCOVERY_TIM
 together) is single-flight and cached per result for its ``ttlMs``, for every chat, once
 for each listing: a call that takes images, and one that does not. It succeeds when
 workbench serves this revision and lists at least one tool whose ``inputSchema`` is an
-object; other tools are dropped. A failure offers no tool and is tried again at most once
-per :data:`DISCOVERY_RETRY_S`; each listing keeps its own cache, lock and retry delay. A call
-without an answer, refused arguments, ``-32022`` or ``-32602`` drops both caches. workbench's
+object; other tools are dropped. A failure offers no tool. An ``unreachable`` one (refused,
+no such name), which comes fast, sets no delay: the next turn discovers again. Any other (a
+timeout, an error, an answer of no use) is tried again after :data:`DISCOVERY_RETRY_S`, or
+sooner: an answer workbench gives any request of this client, whatever its status, ends both
+listings' delays. Each listing keeps its own cache, lock and retry delay. A call without an
+answer, refused arguments, ``-32022`` or ``-32602`` drops both caches. workbench's
 discovery reads no principal; it carries the asking turn's headers only because every request does.
 
 The model reads a result's ``content[0].text``, which workbench writes without the table
@@ -36,8 +39,9 @@ prepared (:meth:`WorkbenchClient.prepare`: its manifest, and its renders made) a
 are viewed one by one (``view(rendition=...)``) or several at once
 (:meth:`WorkbenchClient.fetch_renditions`, from a thread). A clip's transcript and keyframes, which
 Nextext made, stream in as derived files of the clip (:meth:`WorkbenchClient.derived`, workbench 0.9),
-and its manifest then counts frames and says whether it has a transcript. The REST routes run on the
-caller's event loop, each over a fresh client that takes no proxy either.
+and its manifest then counts frames and says whether it has a transcript. A document is measured
+(:meth:`WorkbenchClient.measure`, workbench 0.10, :func:`serves_measure`): its units and the characters a full
+read shows. The REST routes run on the caller's event loop, each over a fresh client that takes no proxy either.
 
 Every request carries the key, the user and the chat as keyed pseudonyms (HMAC-SHA256
 under ``WORKBENCH_API_KEY`` over a label, a NUL byte and the owner or the chat id, as 64
@@ -69,6 +73,7 @@ from loguru import logger
 
 from ghostwriter import __version__
 from ghostwriter.config import Settings
+from ghostwriter.schemas import MeasureUnit
 from ghostwriter.utils.audit_runtime import PURPOSE_HEADER, REQUEST_ID_HEADER
 
 #: The one MCP revision this client speaks.
@@ -82,8 +87,11 @@ META_SERVER_INFO = "io.modelcontextprotocol/serverInfo"
 
 #: Seconds both discovery requests get together. Never spent from a call's time.
 DISCOVERY_TIMEOUT_S = 5.0
-#: Seconds after a failed discovery before the next try.
+#: Seconds after a failed discovery before the next try, unless it was ``unreachable`` (no delay) or workbench answers
+#: a request meanwhile (the delay ends).
 DISCOVERY_RETRY_S = 60.0
+#: The discovery failure that sets no delay: refused or no such name, which fails fast and is tried again at once.
+_NO_DELAY: Final = "unreachable"
 #: The largest answer read; past it the answer is refused.
 MAX_ANSWER_BYTES = 4 * 1024 * 1024
 #: The largest attachment, as workbench's ``WORKBENCH_UPLOAD_MAX_MB`` counts it.
@@ -101,8 +109,11 @@ MAX_TOOL_IMAGES: Final = 8
 #: A rendition fetched must be smaller than this.
 MAX_RENDITION_BYTES: Final = 768 * 1024
 #: Seconds a prepare is waited for: workbench's 120 s of queue, two job walls of 120 s (an Office file is
-#: converted, then drawn, in one turn) and 30 s.
+#: converted, then drawn, in one turn) and 30 s. A measure waits as long: workbench 0.10's measure gate takes 120 s,
+#: the caller's wall and 30 s, 270 s at its defaults; the wait must stay above that sum if its limits are raised.
 PREPARE_TIMEOUT_S: Final = 390.0
+#: The first workbench that measures a document, as ``(major, minor)``: 0.10.
+MEASURE_WORKBENCH: Final = (0, 10)
 #: Seconds the renditions of one fetch get together.
 RENDITION_TIMEOUT_S: Final = 30.0
 #: A table preview's most columns, rows and characters a cell, as workbench's executor cuts them.
@@ -143,6 +154,15 @@ _KINDS: Final[dict[str, Kind]] = {
     "none": "none",
 }
 _UNITS: Final[dict[str, Unit]] = {"page": "page", "slide": "slide", "frame": "frame"}
+_MEASURE_UNITS: Final[dict[str, MeasureUnit]] = {
+    "page": "page",
+    "slide": "slide",
+    "paragraph": "paragraph",
+    "row": "row",
+    "line": "line",
+}
+# A version workbench names itself as offered: dotted numbers, at least two, of ASCII digits.
+_RELEASE = re.compile(r"([0-9]{1,6})\.([0-9]{1,6})(?:\.[0-9]{1,6})*")
 _ACCEPT = "application/json, text/event-stream"
 _USER_LABEL = b"workbench-user/v1"
 _SESSION_LABEL = b"workbench-session/v1"
@@ -385,6 +405,58 @@ class Manifest:
             "duration_s": self.duration_s,
             "transcript": self.transcript,
         }
+
+
+@dataclass(frozen=True)
+class Measure:
+    """How long a document is, as :meth:`WorkbenchClient.measure` reads it (workbench 0.10).
+
+    Attributes:
+        total: How many units it has.
+        unit: What ``total`` counts, in its reader's own unit: ``page``, ``slide``, ``paragraph``, ``row`` or ``line``.
+        chars: The characters a full read shows, counted up to workbench's cap.
+        capped: Whether the count stopped at that cap, so the document is longer still.
+    """
+
+    total: int
+    unit: MeasureUnit
+    chars: int
+    capped: bool
+
+    def as_stored(self) -> dict[str, Any]:
+        """Return what a chat keeps of the measure: its four counts, never a path or a kind.
+
+        Returns:
+            ``total``, ``unit``, ``chars`` and ``capped`` as plain JSON values.
+        """
+        return {"total": self.total, "unit": self.unit, "chars": self.chars, "capped": self.capped}
+
+
+def version_at_least(version: str, floor: tuple[int, int]) -> bool:
+    """Say whether a version workbench names itself is at least ``floor``.
+
+    Args:
+        version: The version, as workbench's discovery carries it.
+        floor: The first ``(major, minor)`` that counts.
+
+    Returns:
+        ``True`` for ``X.Y`` or ``X.Y.Z...`` of ASCII digits with ``(X, Y)`` at ``floor`` or later; ``False`` for an
+        older one, an empty one, and any other text.
+    """
+    found = _RELEASE.fullmatch(version)
+    return found is not None and (int(found[1]), int(found[2])) >= floor
+
+
+def serves_measure(version: str) -> bool:
+    """Say whether a workbench of this version measures a document: 0.10.0 and later.
+
+    Args:
+        version: The version workbench names itself, as its discovery carries it.
+
+    Returns:
+        Whether it is :data:`MEASURE_WORKBENCH` or later (:func:`version_at_least`).
+    """
+    return version_at_least(version, MEASURE_WORKBENCH)
 
 
 @dataclass(frozen=True)
@@ -992,6 +1064,25 @@ def _manifest(answer: object) -> Manifest | None:
     )
 
 
+def _measure_answer(answer: object) -> Measure | None:
+    """Read a measure's answer.
+
+    Args:
+        answer: The JSON document.
+
+    Returns:
+        The measure; ``None`` when it is not an object with a ``unit`` of the five, a count (an int from 0, never a
+        bool) for ``total`` and for ``chars``, and a bool for ``capped``. Its ``path`` and ``kind`` are not read.
+    """
+    if not isinstance(answer, dict):
+        return None
+    unit, capped = answer.get("unit"), answer.get("capped")
+    total, chars = _count(answer.get("total")), _count(answer.get("chars"))
+    if not isinstance(unit, str) or unit not in _MEASURE_UNITS or total is None or chars is None:
+        return None
+    return Measure(total, _MEASURE_UNITS[unit], chars, capped) if isinstance(capped, bool) else None
+
+
 def _view_params(path: str, rendition: int | None, strips: int, strip: int | None) -> dict[str, str | int]:
     """Return the query of a view.
 
@@ -1121,12 +1212,36 @@ class WorkbenchClient:
         return httpx.Timeout(t, connect=_CONNECT_S, write=_WRITE_S, pool=_POOL_S)
 
     def _http(self, t: float) -> httpx.AsyncClient:
+        """Return a fresh client for one exchange or one REST request; every request to workbench goes through one.
+
+        Args:
+            t: The deadline, as :meth:`_timeout`.
+
+        Returns:
+            A client that takes no proxy from the environment and ends the discovery delays on every answer.
+        """
         return httpx.AsyncClient(
             base_url=self._settings.workbench_api_base,
             transport=self._transport,
             trust_env=False,
             timeout=self._timeout(t),
+            event_hooks={"response": [self._answered]},
         )
+
+    async def _answered(self, response: httpx.Response) -> None:
+        """End both listings' retry delay: workbench answered a request, whatever its status.
+
+        It runs as the answer's headers arrive, so a discovery's own answer comes before its failure, whose
+        delay then stands. Without the listings' locks: from an exchange's thread or the caller's loop, an
+        answer racing a failure may end the delay just set (one more discovery) or come before it (the delay
+        stands until the next answer); either is benign.
+
+        Args:
+            response: The answer; only its arrival counts.
+        """
+        del response
+        for listing in self._listings.values():
+            listing.retry_at = None
 
     def _headers(self, key: str, call: CallFor) -> dict[str, str]:
         """Return the headers every request carries for a chat.
@@ -1194,7 +1309,9 @@ class WorkbenchClient:
 
         Concurrent callers for one listing wait for its one discovery in progress, never longer than
         its limit plus half a second; a caller that would is offered no tool on this turn. The two
-        listings never wait for each other.
+        listings never wait for each other. After a failure the listing sends nothing while its retry
+        delay holds (:meth:`_discovery_failed`): none after ``unreachable``, else :data:`DISCOVERY_RETRY_S`
+        or until workbench answers any request (:meth:`_answered`).
 
         Args:
             call: The asking turn's chat. Its headers go with the requests, as with every request
@@ -1285,14 +1402,29 @@ class WorkbenchClient:
         return server, tools
 
     def _discovery_failed(self, listing: _Listing, now: float, token: str) -> None:
-        listing.retry_at = now + DISCOVERY_RETRY_S
+        """Set a failed listing's retry delay, and warn once each time it goes down.
+
+        ``unreachable`` sets none, so the next caller discovers again at once; every other token (``timeout``,
+        ``error``, an answer that is no use) delays it :data:`DISCOVERY_RETRY_S`, until workbench answers
+        another request (:meth:`_answered`).
+
+        Args:
+            listing: The listing.
+            now: When its discovery began.
+            token: Why it failed.
+        """
+        listing.retry_at = None if token == _NO_DELAY else now + DISCOVERY_RETRY_S
         if listing.up is not False:
             listing.up = False
-            logger.warning(
-                "workbench discovery failed: {}. No tool is offered; the next try comes after {} s",
-                token,
-                int(DISCOVERY_RETRY_S),
-            )
+            if listing.retry_at is None:
+                logger.warning("workbench discovery failed: {}. No tool is offered; the next turn tries again", token)
+            else:
+                logger.warning(
+                    "workbench discovery failed: {}. No tool is offered; the next try comes after {} s,"
+                    " or at once when workbench answers a request",
+                    token,
+                    int(DISCOVERY_RETRY_S),
+                )
 
     def forget(self) -> None:
         """Drop both listings' cached results, so the next turn discovers again."""
@@ -1481,6 +1613,55 @@ class WorkbenchClient:
             len(manifest.renditions),
         )
         return manifest
+
+    async def measure(self, *, call: CallFor, path: str, timeout_s: float = PREPARE_TIMEOUT_S) -> Measure:
+        """Have workbench measure a document of the chat (workbench 0.10): its units and its characters.
+
+        The path goes as the JSON body ``{"path": ...}``, with the headers and the chat of
+        :meth:`prepare`.
+
+        Args:
+            call: The chat.
+            path: The file's path in the chat's folder.
+            timeout_s: The longest wait for each read of the answer; :data:`PREPARE_TIMEOUT_S` unless set.
+
+        Returns:
+            The measure.
+
+        Raises:
+            WorkbenchNotFound: When the chat has no such file; a path outside its folder is not asked for.
+            StorageFull: On workbench's ``507``.
+            WorkbenchUnavailable: On any other failure. Its token is the one a ``422`` names
+                (``unreadable_file``, ``unsupported_format``, ``read_timeout``), ``http:<status>``,
+                ``bad_answer`` for a measure that cannot be read, or ``timeout`` and ``unreachable``.
+        """
+        with _rest_errors("measure"):
+            key = self._required_key()
+            if _inside(chat_folder(key, call.chat_id), path) is None:
+                raise WorkbenchNotFound("not_found")
+            headers = {**self._headers(key, call), "Accept-Encoding": "identity"}
+            async with (
+                self._http(timeout_s) as client,
+                client.stream("POST", "/files/measure", json={"path": path}, headers=headers) as response,
+            ):
+                if response.status_code == 404:
+                    raise WorkbenchNotFound("not_found")
+                if response.status_code == 507:
+                    raise StorageFull
+                if response.status_code == 422:
+                    raise WorkbenchUnavailable(await _refusal_token(response))
+                answer = await _json_answer(response)
+            measure = _measure_answer(answer)
+            if measure is None:
+                raise WorkbenchUnavailable("bad_answer")
+        logger.debug(
+            "workbench measured a file: {} {} units, {} characters, capped {}",
+            measure.total,
+            measure.unit,
+            measure.chars,
+            measure.capped,
+        )
+        return measure
 
     async def derived(self, *, call: CallFor, source: str, role: DerivedRole, chunks: AsyncIterator[bytes]) -> str:
         """Stream one of Nextext's artifacts into workbench, as a derived file of a clip of the chat (workbench 0.9).

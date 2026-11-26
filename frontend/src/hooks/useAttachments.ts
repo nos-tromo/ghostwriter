@@ -63,8 +63,8 @@ const POLL_WAIT_S = 20
 /** How long to wait before asking again after a request that did not get through. */
 const RETRY_MS = 2_000
 
-/** The least time from one request to the next after a `processing` answer, should one come early
- *  (a proxy that drops `?wait`): the long poll never turns into a loop. */
+/** The least time from one request to the next after a `processing` or a `pending` answer, should one come
+ *  early (a proxy that drops `?wait`): the long poll never turns into a loop. */
 const PROCESSING_FLOOR_MS = 500
 
 /** Whether a file of this name is a picture, by the deployment's picture types, in any case. */
@@ -112,6 +112,16 @@ function refusalOf(error: unknown, name: string, config: AppConfig): PendingErro
 function kindOfAttachment(attachment: AttachmentOut): PendingFile['kind'] {
   if (attachment.kind === 'media') return clipKind(attachment.name)
   return attachment.kind === 'image' ? 'image' : 'document'
+}
+
+/** Whether a document's measure is still being taken: its status request waits on it as on a preparation. */
+function measuring(attachment: AttachmentOut | undefined): boolean {
+  return attachment?.length?.state === 'pending'
+}
+
+/** Whether a file is followed: still being prepared, or ready with its measure pending. */
+function isFollowed(file: PendingFile): boolean {
+  return file.status === 'processing' || (file.status === 'done' && measuring(file.attachment))
 }
 
 /** A file attached earlier, still waiting in the chat for a message. */
@@ -180,6 +190,13 @@ function pause(ms: number, signal: AbortSignal): Promise<void> {
  * file as an error, and the chat's list never brings it back as one still
  * being prepared. Leaving the chat stops it.
  *
+ * A document is ready as soon as it is stored, and is sent so: Send never waits for its measure
+ * (`attachment.length.state`, `pending`). The measure is followed too, by the same requests, for as long as
+ * the file is in the composer, until it is `measured` (the tile warns of a very long one) or `none`. A message
+ * that takes the file ends it, and a refused one that gives the file back starts it again. A refusal of the
+ * request leaves the file ready, only without its measure. A file stored before measuring began (`length`
+ * null) is not followed.
+ *
  * Any file can be taken back before a message sends it. One the server holds
  * is deleted there first (it is `removing` meanwhile, and nothing is sent); it
  * leaves the view only once that succeeded, or the server holds it no more (a
@@ -208,6 +225,9 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
   const urlsRef = useRef<Map<string, string>>(new Map())
   // The attachments followed so far, by id: each is followed once.
   const followedRef = useRef<Set<string>>(new Set())
+  // The attachments in the composer as it was last drawn, by id: once a message takes a ready file, its
+  // measure is no longer followed here.
+  const inComposerRef = useRef<ReadonlySet<string>>(new Set())
   // A followed attachment of the chat's own list, as it is now, by id.
   const [prepared, setPrepared] = useState<ReadonlyMap<string, AttachmentOut>>(() => new Map())
   // Attachments being or having been taken back, by id: their following and their upload end quietly.
@@ -342,8 +362,10 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
     const earlier = (chat?.pending_attachments ?? []).filter(
       (a) => !a.expired && !known.has(a.id) && !taken.has(a.id),
     )
-    // A listed attachment still preparing is as the follow found it, once it has.
-    const found = earlier.map((a) => waiting(a.status === 'processing' ? (prepared.get(a.id) ?? a) : a))
+    // A listed attachment still preparing or measured is as the follow found it, once it has.
+    const found = earlier.map((a) =>
+      waiting(a.status === 'processing' || measuring(a) ? (prepared.get(a.id) ?? a) : a),
+    )
     const marked = (f: PendingFile): PendingFile =>
       removing.has(f.key) || removeFailed.has(f.key)
         ? { ...f, ...(removing.has(f.key) && { removing: true }), ...(removeFailed.has(f.key) && { removeFailed: true }) }
@@ -377,13 +399,19 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
     if (id !== undefined) setTaken((ids) => new Set(ids).add(id))
   }, [])
 
-  // One follower's requests, until the attachment's preparation ends, the server refuses it, or `gone` holds.
+  // One follower's requests, until the attachment's preparation and its measure end, the server refuses it,
+  // or `gone` holds. A ready file is taken as such at once (Send does not wait for its measure), and its
+  // measure is followed on, for as long as the file is in the composer. Resolves true when it ended there,
+  // with the measure still pending: a file the composer gets back is followed again.
   const followed = useCallback(
-    async (file: PendingFile, gone: () => boolean) => {
+    async (file: PendingFile, gone: () => boolean): Promise<boolean> => {
       const signal = controllerRef.current?.signal
-      if (chatId === null || file.attachment === undefined || signal === undefined) return
+      if (chatId === null || file.attachment === undefined || signal === undefined) return false
       const id = file.attachment.id
+      // Whether the file has been taken as ready: from then on what is followed is only its measure.
+      let ready = false
       while (!gone()) {
+        if (ready && !inComposerRef.current.has(id)) return true
         const asked = Date.now()
         try {
           const latest = await getAttachment(chatId, id, POLL_WAIT_S, signal)
@@ -391,18 +419,23 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
             await pause(Math.max(0, PROCESSING_FLOOR_MS - (Date.now() - asked)), signal)
             continue
           }
-          if (!gone()) ended(file, latest)
-          return
+          const stillMeasuring = measuring(latest)
+          if (!gone() && (!ready || !stillMeasuring)) ended(file, latest)
+          if (!stillMeasuring) return false
+          ready = true
+          await pause(Math.max(0, PROCESSING_FLOOR_MS - (Date.now() - asked)), signal)
         } catch (error) {
-          if (gone()) return
-          // A refusal is no network trouble: asking again would only be refused again.
+          if (gone()) return false
+          // A refusal is no network trouble: asking again would only be refused again. A file already
+          // taken as ready stays so, with its measure unknown.
           if (error instanceof ApiError && error.status < 500) {
-            lost(file)
-            return
+            if (!ready) lost(file)
+            return false
           }
           await pause(RETRY_MS, signal)
         }
       }
+      return false
     },
     [chatId, ended, lost],
   )
@@ -415,19 +448,21 @@ export function useAttachments(chatId: string | null, config: AppConfig): Attach
       // Taken back: its answer, a 404 above all, is no news of the file. Its entry is let go, so a taking back
       // that fails has it followed again, by one follower.
       const gone = () => signal.aborted || removedRef.current.has(id)
+      let left = false
       try {
-        await followed(file, gone)
+        left = await followed(file, gone)
       } finally {
-        if (removedRef.current.has(id)) followedRef.current.delete(id)
+        if (left || removedRef.current.has(id)) followedRef.current.delete(id)
       }
     },
     [chatId, followed],
   )
 
   useEffect(() => {
+    inComposerRef.current = new Set(pending.flatMap((f) => (f.attachment ? [f.attachment.id] : [])))
     for (const file of pending) {
       const id = file.attachment?.id
-      if (file.status !== 'processing' || id === undefined || followedRef.current.has(id)) continue
+      if (!isFollowed(file) || id === undefined || followedRef.current.has(id)) continue
       followedRef.current.add(id)
       void follow(file)
     }

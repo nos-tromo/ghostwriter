@@ -19,9 +19,24 @@ export interface ChatOut {
 export type AttachmentKind = 'document' | 'image' | 'media'
 export type AttachmentStatus = 'processing' | 'ready' | 'failed'
 
+/** What a document is counted in. */
+export type MeasureUnit = 'page' | 'slide' | 'paragraph' | 'row' | 'line'
+
+/** How long a document is, as workbench measured it: `pending` while it is measured, `measured`, or `none`
+ *  when it could not be. `total` and `unit` are null until measured; `too_long` is whether the document is
+ *  longer than one prompt holds, so the model reads it only in parts. */
+export interface AttachmentLength {
+  state: 'pending' | 'measured' | 'none'
+  total: number | null
+  unit: MeasureUnit | null
+  too_long: boolean
+}
+
 /** A file the user attached. `kind` says what it is (a picture is shown, and
  *  seen by a model that can); `status` how far its preparation has come: only
- *  a `ready` file can be sent with a message. */
+ *  a `ready` file can be sent with a message. `length` is a document's measure,
+ *  null for a file never measured (a picture, a clip, a file stored before
+ *  measuring began). */
 export interface AttachmentOut {
   id: string
   file_id: string
@@ -32,6 +47,7 @@ export interface AttachmentOut {
   expired: boolean
   kind: AttachmentKind
   status: AttachmentStatus
+  length: AttachmentLength | null
 }
 
 /** A tool step of an answer; `detail`, `arguments` and `result` are null once expired. */
@@ -66,7 +82,10 @@ export interface ResultOut {
   expired: boolean
 }
 
-/** A message with what belongs to it. */
+/** A message with what belongs to it. `notices` is what the answer says about
+ *  itself, stored with it; null for an answer written before notices were kept
+ *  (and for a question). `context_estimate` is the estimated size of the next
+ *  prompt in tokens, null where none was made. */
 export interface MessageOut {
   id: string
   role: Role
@@ -75,6 +94,8 @@ export interface MessageOut {
   attachments: AttachmentOut[]
   steps: StepOut[]
   results: ResultOut[]
+  notices: NoticeOut[] | null
+  context_estimate: number | null
 }
 
 /** A chat as its owner opens it. */
@@ -109,6 +130,11 @@ export interface AppConfig {
   /** Null while chat retention is off. */
   chat_retention_days: number | null
   file_retention_days: number
+  /** The most tokens one round's prompt may hold, for a message without reasoning: the model's context less
+   *  the answer and a margin. A chat's context estimate is read against it. */
+  prompt_tokens: number
+  /** The same for a message with reasoning on, whose answer may be longer. */
+  reasoning_prompt_tokens: number
   version: string
 }
 
@@ -150,21 +176,46 @@ export interface TokenFrame {
 
 export interface FinalFrame {
   message_id: string
-  /** The message sent, or null for a regenerated answer. */
+  /** The message sent, or null for a regenerated or continued answer. */
   user_message_id: string | null
   chat: ChatOut
   stopped: boolean
+  /** The estimated tokens of the next prompt; null where none was made. */
+  context_estimate: number | null
 }
 
+/** Why the answer ended early; `context` is the router refusing a round as
+ *  longer than the model's context, with no picture left to drop. */
 export interface ErrorFrame {
-  code: 'model' | 'audit' | 'internal'
+  code: 'model' | 'audit' | 'internal' | 'context'
   message: string
 }
 
-/** What the answer should say about itself: `images_dropped`, the model took no
- *  pictures and answered without them. A code this app does not know is ignored. */
-export type NoticeCode = 'images_dropped'
+/** What the answer says about itself: `answer_cut` (it ended at the length
+ *  limit), `document_partial` (a document was read in part), `document_unread`
+ *  (an attachment was not opened), `images_dropped` (the model took no pictures
+ *  and answered without them), `context_trimmed` (earlier turns were left out
+ *  of the prompt) and `tools_unavailable` (workbench could not be reached, so
+ *  the turn ran with no tool; its code alone). A code this app does not know is
+ *  ignored. */
+export type NoticeCode =
+  | 'answer_cut'
+  | 'document_partial'
+  | 'document_unread'
+  | 'images_dropped'
+  | 'context_trimmed'
+  | 'tools_unavailable'
 
-export interface NoticeFrame {
+/** One notice, as stored with an answer and as its live frame carries it. The
+ *  details of a document notice are null once they have expired, and a notice
+ *  of another kind carries none. */
+export interface NoticeOut {
   code: NoticeCode
+  file_id?: string | null
+  name?: string | null
+  read?: number | null
+  total?: number | null
+  unit?: MeasureUnit | null
 }
+
+export type NoticeFrame = NoticeOut

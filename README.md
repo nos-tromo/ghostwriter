@@ -15,6 +15,11 @@ workbench 0.9: they are transcribed, and a video's frames can be seen.
 A reasoning switch in the composer lets the model think before it answers; it
 is off by default, and the thinking is never shown or stored.
 
+Ghostwriter says what limited an answer: under it, when the answer was cut at its length
+limit (with a Continue button), a document was read only in part or an attachment
+was not read; on a tile, that a document is longer than one prompt (with workbench
+0.10); and a ring at the composer, for how full the chat's context is.
+
 ```bash
 cp .env.example .env    # then set OPENAI_API_KEY
 make network            # once per host: inference-net, edge-net, workbench-net

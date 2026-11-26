@@ -16,12 +16,13 @@ runs on ``app.state.speech_threads``, a limiter of ``SPEECH_THREADS`` threads of
 its own. ``app.state.sweeper`` is the retention sweep (:mod:`ghostwriter.retention`),
 which the lifespan runs a minute after start and then daily, and cancels at
 shutdown. ``app.state.processor`` is the attachment processor (:mod:`ghostwriter.processing`), ``None``
-while workbench is off: at start it prepares again what the last process left ``processing``, or, without
-workbench, settles it; at shutdown its jobs are cancelled and awaited before the database goes. It takes a
-video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it. Right after the requeue the
-lifespan starts its start reconcile (:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which
-start-up never waits for: once Nextext's probe passes, it deletes every job Nextext lists for Ghostwriter, then opens
-the gate every clip, a requeued one too, waits for before it makes its job.
+while workbench is off: at start it prepares again what the last process left ``processing`` and measures what it
+left ``pending``, or, without workbench, settles both; at shutdown its jobs are cancelled and awaited before the
+database goes. It takes a video or audio clip to Nextext (``app.state.nextext``) and back before it prepares it.
+Right after the requeue the lifespan starts its start reconcile
+(:meth:`~ghostwriter.processing.AttachmentProcessor.start_media`), which start-up never waits for: once Nextext's
+probe passes, it deletes every job Nextext lists for Ghostwriter, then opens the gate every clip, a requeued one too,
+waits for before it makes its job.
 ``app.state.vision`` decides whether pictures are offered (:mod:`ghostwriter.vision`); on
 Ollama, with pictures on, the lifespan also starts its one probe of the chat model, which start-up never
 waits for, and cancels it at shutdown. ``app.state.nextext`` is the Nextext client and ``app.state.media`` the
@@ -49,7 +50,7 @@ from sqlalchemy import Engine
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from ghostwriter import __version__
-from ghostwriter.agent.limits import TURN_THREADS
+from ghostwriter.agent.limits import TURN_THREADS, prompt_tokens
 from ghostwriter.agent.loop import AgentLoop
 from ghostwriter.api import chats, files, messages, meta, speech
 from ghostwriter.audit import open_emitter, settle_failed_operations, start_chain
@@ -115,7 +116,8 @@ def create_app(
 
         The store's schema is brought to this release's version and the
         configured periods are put in force before the first request; attachments
-        left ``processing`` are prepared again, or settled without workbench; then
+        left ``processing`` are prepared again and measures left ``pending`` taken up
+        again, or both settled without workbench; then
         the retention sweep starts, the Ollama probe where it applies and Nextext's health probe while Nextext is
         on (start-up waits for neither); all are cancelled first at shutdown, then the
         attachment jobs, before the database goes.
@@ -136,7 +138,13 @@ def create_app(
             start_chain(app, emitter)
             engine = make_engine(settings.db_path)
             init_db(engine)
-            store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days, now=now)
+            store = ChatStore(
+                engine,
+                file_days=settings.file_days,
+                notice_days=settings.notice_days,
+                prompt_budget=prompt_tokens(settings.context_tokens, reasoning=False),
+                now=now,
+            )
             app.state.store = store
             store.apply_periods(settings.chat_days)
             workbench: WorkbenchClient | None = app.state.workbench
@@ -152,8 +160,11 @@ def create_app(
                 )
                 processor.requeue()
                 processor.start_media()
-            elif settled := store.settle_processing("unavailable"):
-                logger.info("{} attachments left processing were settled without workbench.", settled)
+            else:
+                if settled := store.settle_processing("unavailable"):
+                    logger.info("{} attachments left processing were settled without workbench.", settled)
+                if unmeasured := store.settle_pending_measures():
+                    logger.info("{} measures left pending were settled without workbench.", unmeasured)
             app.state.processor = processor
             app.state.agent = AgentLoop(
                 model=chat_model,

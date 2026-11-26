@@ -8,9 +8,10 @@ import base64
 import dataclasses
 import itertools
 import json
+import logging
 import re
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -20,12 +21,15 @@ from uuid import uuid4
 import httpx2
 import openai
 import pytest
+from sqlalchemy import Engine, select, update
+from sqlalchemy.orm import Session
 from typing_extensions import override
 
-from ghostwriter.agent.context import estimate_tokens
-from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN
+from ghostwriter.agent.context import estimate_tokens, finished_turn, next_prompt_tokens
+from ghostwriter.agent.images import LEFT_OUT, LEGEND, NO_ROOM, NOT_LOADED, NOT_RESENT, RETIRED, UNSEEN, ImageBudget
 from ghostwriter.agent.limits import (
     BUSY_RETRY_S,
+    HISTORY_RESULT_CHARS,
     MAX_ANSWER_TOKENS,
     PROMPT_TOKENS,
     REASONING_ANSWER_TOKENS,
@@ -33,6 +37,8 @@ from ghostwriter.agent.limits import (
     prompt_tokens,
 )
 from ghostwriter.agent.loop import (
+    CONTEXT_ERROR,
+    CONTEXT_REFUSALS,
     AgentLoop,
     ErrorEvent,
     NoticeEvent,
@@ -41,11 +47,15 @@ from ghostwriter.agent.loop import (
     TokenEvent,
     Turn,
     TurnEvent,
+    TurnOutcome,
+    _refuses_context,
 )
-from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION
+from ghostwriter.agent.prompt import CONTINUE, DECK_CHECK, MEDIA, PAGING, PRESENTATIONS, UNREACHABLE, VISION
+from ghostwriter.agent.tools import cut
 from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine
-from ghostwriter.inference import ModelClient
+from ghostwriter.inference import CONTINUE_BODY, ModelClient
+from ghostwriter.models import Message
 from ghostwriter.nextext import NextextClient, NextextHealth
 from ghostwriter.store import ChatStore
 from ghostwriter.utils.audit_event import AuditWriteError
@@ -185,6 +195,7 @@ class LoopEnv:
         clock: The monotonic clock.
         cancel: The turn's stop.
         today: The store's time of day.
+        engine: The database, for what the store keeps as it is stored.
         answer_id: The answer the last run wrote.
     """
 
@@ -196,6 +207,7 @@ class LoopEnv:
     clock: HandClock
     cancel: HandStop
     today: StoreClock
+    engine: Engine
     answer_id: str = ""
 
     def run(
@@ -207,6 +219,8 @@ class LoopEnv:
         vision: bool = False,
         media: NextextHealth | None = None,
         attach: Sequence[tuple[str, dict[str, Any]]] = (),
+        outcome: TurnOutcome | None = None,
+        measures: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> list[TurnEvent]:
         """Send a message and run its turn to the end.
 
@@ -219,6 +233,9 @@ class LoopEnv:
             media: Nextext's health, as ``app.state.media`` holds it; ``None`` is Nextext off.
             attach: The files the message sends, by name and manifest, each settled ``ready`` first:
                 a manifest of kind ``image`` makes a picture, ``media`` a clip, any other a document.
+            outcome: What the turn fills in when it ends; ``None`` keeps none.
+            measures: workbench's measure of an attached document, by its name: it is ``pending`` when attached,
+                then ``measured``; a document not named here is never measured.
 
         Returns:
             The turn's events.
@@ -237,20 +254,16 @@ class LoopEnv:
                 mime="image/jpeg" if picture else "video/mp4" if clip else "application/pdf",
                 kind="image" if picture else "media" if clip else "document",
                 status="processing",
+                measure_state="pending" if measures and name in measures else None,
             )
             self.store.settle_attachment(attachment.id, status="ready", manifest=manifest, failure=None)
+            if measures and name in measures:
+                self.store.settle_measure(attachment.id, measures[name])
             ids.append(attachment.id)
         user = self.store.add_user_message("user-a", CHAT, content, ids)
         self.answer_id = self.store.start_assistant_message(CHAT)
-        loop = AgentLoop(
-            model=ModelClient(self.settings, client=self.fake.as_client()),
-            workbench=chosen.as_client() if isinstance(chosen, FakeWorkbench) else None,
-            store=self.store,
-            settings=self.settings,
-            clock=self.clock,
-            now=lambda: T0,
-            vision=Vision(dataclasses.replace(self.settings, vision=True)) if vision else None,
-            media=media,
+        loop = self._loop(
+            self.settings, chosen if isinstance(chosen, FakeWorkbench) else None, vision=vision, media=media
         )
         headers = {"X-Request-ID": "req-0001"}
         turn = Turn(
@@ -263,11 +276,105 @@ class LoopEnv:
             cancel=self.cancel,
             reasoning=reasoning,
         )
-        return list(loop.run(turn, self.audit))
+        return list(loop.run(turn, self.audit, outcome=outcome))
+
+    def go_on(
+        self,
+        *rounds: Round,
+        provider: str = "vllm",
+        outcome: TurnOutcome | None = None,
+        vision: bool = False,
+    ) -> list[TurnEvent]:
+        """Continue the last answer in place, as the Continue route does, and run its turn to the end.
+
+        Args:
+            *rounds: The router's rounds, in order; a continuation asks for one.
+            provider: The provider behind the router, ``INFERENCE_PROVIDER``.
+            outcome: What the turn fills in when it ends; ``None`` keeps none.
+            vision: Whether the model sees images.
+
+        Returns:
+            The turn's events.
+        """
+        self.fake.script = list(rounds)
+        settings = dataclasses.replace(self.settings, inference_provider=provider)
+        question = self.store.question_of(CHAT, self.answer_id)
+        assert question is not None
+        turn = Turn(
+            chat_id=CHAT,
+            owner="user-a",
+            user_message_id=question,
+            assistant_message_id=self.answer_id,
+            call=CallFor("user-a", CHAT, {"X-Request-ID": "req-0002"}),
+            request_id="req-0002",
+            cancel=self.cancel,
+            continued=True,
+        )
+        return list(self._loop(settings, self.workbench, vision=vision).run(turn, self.audit, outcome=outcome))
+
+    def again(self, *rounds: Round, vision: bool = False) -> list[TurnEvent]:
+        """Answer the last question again, as the regenerate route does, and run its turn to the end.
+
+        Args:
+            *rounds: The router's rounds, in order.
+            vision: Whether the model sees images.
+
+        Returns:
+            The turn's events.
+        """
+        self.fake.script = list(rounds)
+        question = self.store.question_of(CHAT, self.answer_id)
+        assert question is not None
+        self.store.drop_message(self.answer_id)
+        self.answer_id = self.store.start_assistant_message(CHAT)
+        turn = Turn(
+            chat_id=CHAT,
+            owner="user-a",
+            user_message_id=question,
+            assistant_message_id=self.answer_id,
+            call=CallFor("user-a", CHAT, {"X-Request-ID": "req-0003"}),
+            request_id="req-0003",
+            cancel=self.cancel,
+        )
+        return list(self._loop(self.settings, self.workbench, vision=vision).run(turn, self.audit))
+
+    def _loop(
+        self,
+        settings: Settings,
+        workbench: FakeWorkbench | None,
+        *,
+        vision: bool = False,
+        media: NextextHealth | None = None,
+    ) -> AgentLoop:
+        """Return the loop over the env's neighbours.
+
+        Args:
+            settings: The settings.
+            workbench: workbench; ``None`` for none at all.
+            vision: Whether the model sees images.
+            media: Nextext's health; ``None`` is Nextext off.
+
+        Returns:
+            The loop.
+        """
+        return AgentLoop(
+            model=ModelClient(settings, client=self.fake.as_client()),
+            workbench=workbench.as_client() if workbench is not None else None,
+            store=self.store,
+            settings=settings,
+            clock=self.clock,
+            now=lambda: T0,
+            vision=Vision(dataclasses.replace(settings, vision=True)) if vision else None,
+            media=media,
+        )
 
     def stored(self) -> str:
         """Return the stored text of the last answer."""
         return self.store.chat_detail("user-a", CHAT).messages[-1].content
+
+    def notices(self) -> list[dict[str, Any]]:
+        """Return the last answer's notices, as they are stored."""
+        return self.store.answer_notices(self.answer_id)
 
     def sent(self, round: int) -> list[dict[str, Any]]:
         """Return the messages a round sent to the model, 1-based."""
@@ -285,7 +392,9 @@ def loop_env(tmp_path: Path) -> Iterator[LoopEnv]:
     store.create_chat("user-a", id=CHAT)
     audit = RecordingAudit()
     clock = HandClock()
-    yield LoopEnv(settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock), today)
+    yield LoopEnv(
+        settings, store, FakeOpenAI(), FakeWorkbench(audit=audit), audit, clock, HandStop(clock), today, engine
+    )
     engine.dispose()
 
 
@@ -694,20 +803,43 @@ def test_a_failed_model_record_ends_the_turn_and_keeps_the_text(loop_env: LoopEn
     assert loop_env.workbench.calls == [] and loop_env.stored() == "Ich lese."
 
 
-@pytest.mark.parametrize("workbench", [None, FakeWorkbench(tools=())])
-def test_without_workbench_no_tool_is_offered(loop_env: LoopEnv, workbench: FakeWorkbench | None) -> None:
-    """With no workbench, or none usable, a chat still answers: no tools, and the prompt says so."""
-    events = loop_env.run([text_chunk("Hallo!")], workbench=workbench)
+def test_without_workbench_no_tool_is_offered(loop_env: LoopEnv) -> None:
+    """With workbench off a chat still answers: no tools, the prompt says so, and no notice is told."""
+    events = loop_env.run([text_chunk("Hallo!")], workbench=None)
     assert events == [TokenEvent("Hallo!")]
     assert "tools" not in loop_env.fake.calls[0]
     assert "You have no tools in this chat" in loop_env.sent(1)[0]["content"]
+    assert UNREACHABLE not in loop_env.sent(1)[0]["content"]
     assert "/workspace/" not in loop_env.sent(1)[0]["content"]
+    assert PAGING not in loop_env.sent(1)[0]["content"]
+    assert loop_env.notices() == []
+
+
+@pytest.mark.parametrize("vision", [False, True], ids=["blind", "seeing"])
+def test_an_unreachable_workbench_is_told_before_the_text(loop_env: LoopEnv, vision: bool) -> None:
+    """With workbench on but no listing: no tool, the prompt asks to send again, ``tools_unavailable`` comes first."""
+    events = loop_env.run([text_chunk("Bitte später.")], workbench=FakeWorkbench(tools=()), vision=vision)
+    assert events == [NoticeEvent("tools_unavailable"), TokenEvent("Bitte später.")]
+    system = loop_env.sent(1)[0]["content"]
+    assert UNREACHABLE in system and "You have no tools in this chat" not in system
+    assert "/workspace/" not in system and PAGING not in system
+    assert "tools" not in loop_env.fake.calls[0]
+    assert loop_env.notices() == [{"code": "tools_unavailable"}]
+
+
+def test_an_unreachable_workbench_tells_no_attachment_unread(loop_env: LoopEnv) -> None:
+    """The cause is told, so an attachment no call could open is not told unread as well."""
+    notes = (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+    events = loop_env.run([text_chunk("Bitte später.")], workbench=FakeWorkbench(tools=()), attach=[notes])
+    assert events == [NoticeEvent("tools_unavailable"), TokenEvent("Bitte später.")]
+    assert loop_env.notices() == [{"code": "tools_unavailable"}]
 
 
 def test_with_workbench_the_prompt_names_the_chats_folder(loop_env: LoopEnv) -> None:
-    """The system prompt names this chat's folder, and discovery asks for this chat."""
+    """The prompt names this chat's folder and how to page a long document; discovery asks for this chat."""
     loop_env.run([text_chunk("Hallo!")])
     assert f"This chat's files are in {FOLDER};" in loop_env.sent(1)[0]["content"]
+    assert PAGING in loop_env.sent(1)[0]["content"]
     assert loop_env.workbench.discoveries == [(CallFor("user-a", CHAT, {"X-Request-ID": "req-0001"}), False)]
 
 
@@ -895,6 +1027,267 @@ def test_a_smaller_context_fits_every_round_to_what_it_leaves(loop_env: LoopEnv,
     assert len(loop_env.sent(1)) > 3
 
 
+# --- notices: a chat trimmed in the first round, an answer cut at its cap -----
+
+
+def _questions(messages: list[dict[str, Any]]) -> int:
+    """Return how many user messages a round sent, the current question included."""
+    return sum(message["role"] == "user" for message in messages)
+
+
+def test_a_trimmed_chat_is_told_once_in_the_first_round(loop_env: LoopEnv) -> None:
+    """Earlier turns the first round leaves out are told before any text; a later round's trim is not told again."""
+    for n in range(30):
+        loop_env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 700, [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), "Übersicht " * 400)
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    assert [e for e in events if isinstance(e, NoticeEvent)] == [NoticeEvent("context_trimmed")]
+    first_token = next(i for i, e in enumerate(events) if isinstance(e, TokenEvent))
+    assert events.index(NoticeEvent("context_trimmed")) < first_token
+    assert events[0] == NoticeEvent("context_trimmed")
+    assert len(loop_env.fake.calls) == 2
+    assert all(_questions(loop_env.sent(n)) < 31 for n in (1, 2))
+
+
+def test_no_trim_notice_when_every_turn_fits(loop_env: LoopEnv) -> None:
+    """A chat whose earlier turns all fit is told nothing."""
+    for n in range(3):
+        loop_env.store.add_user_message("user-a", CHAT, f"Frage {n}", [])
+        loop_env.store.finish_assistant_message(loop_env.store.start_assistant_message(CHAT), f"Antwort {n}")
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    assert not any(isinstance(e, NoticeEvent) for e in events)
+    assert _questions(loop_env.sent(1)) == 4
+
+
+@pytest.mark.parametrize(
+    "ending",
+    [[finish_chunk("length")], [usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")]],
+    ids=["length", "usage"],
+)
+def test_an_answer_cut_at_the_cap_says_so(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """The last round, one without calls, ending at the cap is an answer cut: the user is told after its text."""
+    events = loop_env.run([text_chunk("Kapitel 1 …"), *ending])
+    assert events == [TokenEvent("Kapitel 1 …"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 …"
+
+
+@pytest.mark.parametrize(
+    ("completion", "told"),
+    [(4_000, []), (12_000, [NoticeEvent("answer_cut")])],
+    ids=["at-the-plain-cap", "at-its-own-cap"],
+)
+def test_a_reasoning_answer_is_cut_at_its_own_cap(loop_env: LoopEnv, completion: int, told: list[NoticeEvent]) -> None:
+    """A reasoning answer has the larger cap, its thinking included: 4,000 tokens out is no cut there."""
+    events = loop_env.run([text_chunk("Kapitel 1 …"), usage_chunk(900, completion, "served-model")], reasoning=True)
+    assert [e for e in events if isinstance(e, NoticeEvent)] == told
+
+
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_tool_round_at_the_cap_is_no_answer_cut(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """A round with calls at the cap goes on to the next round; only the last round's cap is the answer's."""
+    loop_env.workbench.answers = [RESULT]
+    events = loop_env.run(
+        [call_chunk(0, "call_0", "read_document", READ_SALES), *ending],
+        [text_chunk("Summe: 42"), usage_chunk(900, 12, "served-model")],
+    )
+    assert not any(isinstance(e, NoticeEvent) for e in events) and len(loop_env.fake.calls) == 2
+
+
+def test_a_stopped_round_is_not_cut(loop_env: LoopEnv) -> None:
+    """A round the stop ended says nothing of the cap, though its finish reason came in before the stop."""
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return usage_chunk(900, MAX_ANSWER_TOKENS, "served-model")
+
+    events = loop_env.run([text_chunk("Kapitel 1 …"), finish_chunk("length"), stop])
+    assert events == [TokenEvent("Kapitel 1 …")]
+    stopped = loop_env.audit.rounds[0]
+    assert stopped is not None and stopped.stopped and stopped.finish_reason == "length"
+
+
+def _long_turns(env: LoopEnv, turns: int) -> None:
+    """Store earlier turns of about 3,000 tokens each."""
+    for n in range(turns):
+        env.store.add_user_message("user-a", CHAT, f"{n}: " + "Größe " * 1_000, [])
+        env.store.finish_assistant_message(env.store.start_assistant_message(CHAT), "Übersicht " * 300)
+
+
+def test_no_trim_notice_when_the_turns_fit_once_the_pictures_are_dropped(loop_env: LoopEnv) -> None:
+    """A first round trimmed for its picture alone, refused for it, goes again with every turn: no trim is told.
+
+    The trim told is the one of the request the router took, never of one it refused.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=10_000)
+    _long_turns(loop_env, 8)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    assert _questions(loop_env.sent(1)) < 9
+    assert _questions(loop_env.sent(2)) == 9
+
+
+def test_a_chat_still_trimmed_without_its_pictures_is_told_once(loop_env: LoopEnv) -> None:
+    """A first round that leaves turns out without its picture too tells the trim once, as the retry streams."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=10_000)
+    _long_turns(loop_env, 30)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), NoticeEvent("context_trimmed"), TokenEvent("Ohne Bild.")]
+    assert _questions(loop_env.sent(2)) < 31
+
+
+# --- the estimate of the next prompt, left with every answer -----
+
+
+def _estimate_after(env: LoopEnv, *, images: ImageBudget | None = None) -> int:
+    """Return the estimate of the prompt that follows the last answer, from what its last round sent.
+
+    Args:
+        env: The chat the last turn ran in.
+        images: What an image costs when the turn saw, which counts the earlier turns' pictures and reads their lines
+            as a turn that sees does; ``None`` for a turn that did not.
+
+    Returns:
+        The tokens of the last round's system prompt and tools with the chat's turns, the last answer included.
+    """
+    call = env.fake.calls[-1]
+    past, _ = env.store.past_turns(CHAT, before_position=10**6, seen=images is not None)
+    return next_prompt_tokens(call["messages"][0]["content"], call.get("tools", []), past, images=images)
+
+
+def _stored_estimate(env: LoopEnv) -> int | None:
+    return env.store.chat_detail("user-a", CHAT).messages[-1].context_estimate
+
+
+def test_every_answer_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """The stored estimate is what the next prompt starts with: the system prompt, the tools, every turn replayed.
+
+    The answer just finished is among the turns, tool calls and all; the outcome carries the same number.
+    """
+    loop_env.workbench.answers = [RESULT]
+    outcome = TurnOutcome()
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42"), usage_chunk(900, 12, "served-model")], outcome=outcome)
+    assert len(loop_env.fake.calls) == 2 and loop_env.fake.calls[-1]["tools"]
+    stored = _stored_estimate(loop_env)
+    assert stored == _estimate_after(loop_env) and stored is not None and stored > 0
+    assert outcome.context_estimate == stored
+    again = TurnOutcome()
+    loop_env.run([text_chunk("Und noch eine.")], outcome=again)
+    assert again.context_estimate == _stored_estimate(loop_env) == _estimate_after(loop_env)
+    assert again.context_estimate is not None and again.context_estimate > stored
+
+
+def test_an_answer_without_tools_leaves_its_estimate_too(loop_env: LoopEnv) -> None:
+    """With workbench off there is no tool to count; the estimate is the prompt without any."""
+    loop_env.run([text_chunk("Hallo!")], workbench=None)
+    assert "tools" not in loop_env.fake.calls[-1]
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env)
+
+
+def test_a_finished_turn_matches_what_the_loop_stored(loop_env: LoopEnv) -> None:
+    """The turn as the loop holds it, finished, is the turn the store replays: the estimate counts the same."""
+    loop_env.workbench.answers = [RESULT]
+    loop_env.run(_calls(READ_SALES), [text_chunk("Summe: 42")])
+    [stored, *_] = loop_env.store.past_turns(CHAT, before_position=10**6)
+    current = loop_env.sent(2)[1:]
+    assert [m["role"] for m in current] == ["user", "assistant", "tool"]
+    assert stored[-1] == finished_turn("Summe der Spalte B", (), current, "Summe: 42")
+    assert len(stored[-1].rounds) == 1
+
+
+def test_a_picture_is_counted_when_the_turn_saw(loop_env: LoopEnv) -> None:
+    """A turn that saw its picture estimates the next prompt with the picture, at its cost."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.run([text_chunk("Ein Hafen.")], content="Was zeigt das Bild?", vision=True, attach=[_photo()])
+    images = ImageBudget(280, loop_env.settings.max_images)
+    counted = _estimate_after(loop_env, images=images)
+    assert _stored_estimate(loop_env) == counted
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6, seen=True)
+    call = loop_env.fake.calls[-1]
+    assert counted >= next_prompt_tokens(call["messages"][0]["content"], call["tools"], past) + 280
+
+
+def test_after_a_refusal_the_estimate_is_of_the_offer_without_sight(loop_env: LoopEnv) -> None:
+    """A turn whose images were refused goes on as without sight: the next prompt is counted from that offer."""
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    seeing, blind = loop_env.fake.calls
+    assert "view_file" in _tool_names(seeing) and "view_file" not in _tool_names(blind)
+    images = ImageBudget(280, loop_env.settings.max_images)
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env, images=images)
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6, seen=True)
+    first = next_prompt_tokens(seeing["messages"][0]["content"], seeing["tools"], past, images=images)
+    assert _stored_estimate(loop_env) != first
+
+
+def test_a_stopped_or_failed_answer_still_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """However the turn ends, what it did is in the chat, and so is the estimate of the prompt after it."""
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return usage_chunk(900, 12, "served-model")
+
+    outcome = TurnOutcome()
+    loop_env.run([text_chunk("Ich lese"), stop], outcome=outcome)
+    assert loop_env.stored() == "Ich lese"
+    stopped = _stored_estimate(loop_env)
+    assert stopped == _estimate_after(loop_env) == outcome.context_estimate and stopped is not None
+    loop_env.cancel.clear()
+    failed = TurnOutcome()
+    events = loop_env.run(_router_error(), outcome=failed)
+    assert events == [ErrorEvent("model", "The model did not answer.")]
+    estimate = _stored_estimate(loop_env)
+    assert estimate == _estimate_after(loop_env) == failed.context_estimate
+    assert estimate is not None and stopped is not None and estimate > stopped
+
+
+def test_an_answer_ended_by_a_context_refusal_leaves_its_estimate(loop_env: LoopEnv) -> None:
+    """A chat the router found too long still shows how long it is: the estimate is not capped at the budget."""
+    refused = _context_refused("synthetic router: maximum context exceeded")
+    events = loop_env.run(refused)
+    assert [type(e).__name__ for e in events] == ["ErrorEvent"]
+    assert _stored_estimate(loop_env) == _estimate_after(loop_env)
+
+
+def test_a_turn_stopped_before_it_began_has_no_estimate(loop_env: LoopEnv) -> None:
+    """Nothing was asked of the model, no offer was made: there is no estimate to store, and the outcome says so."""
+    loop_env.cancel.set()
+    outcome = TurnOutcome(context_estimate=5)
+    assert loop_env.run([text_chunk("nie")], outcome=outcome) == []
+    assert loop_env.stored() == "" and _stored_estimate(loop_env) is None and outcome.context_estimate is None
+
+
+def test_a_chat_over_the_budget_is_estimated_whole(loop_env: LoopEnv) -> None:
+    """Earlier turns the round left out still count: the estimate is of the whole chat, over the prompt budget."""
+    _long_turns(loop_env, 30)
+    events = loop_env.run([text_chunk("Summe: 42")])
+    assert events == [NoticeEvent("context_trimmed"), TokenEvent("Summe: 42")]
+    estimate = _stored_estimate(loop_env)
+    assert estimate == _estimate_after(loop_env) and estimate is not None
+    assert estimate > PROMPT_TOKENS > estimate_tokens(loop_env.sent(1))
+
+
+def test_an_estimate_that_fails_is_none(
+    loop_env: LoopEnv, monkeypatch: pytest.MonkeyPatch, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A failed estimate stores none, says so once by its type, and leaves the answer and its events as they are."""
+
+    def broken(*args: object, **kwargs: object) -> int:
+        raise ZeroDivisionError("synthetic: no estimate")
+
+    monkeypatch.setattr("ghostwriter.agent.loop.next_prompt_tokens", broken)
+    outcome = TurnOutcome(context_estimate=7)
+    events = loop_env.run([text_chunk("Summe: 42")], outcome=outcome)
+    assert events == [TokenEvent("Summe: 42")]
+    assert loop_env.stored() == "Summe: 42" and _stored_estimate(loop_env) is None
+    assert outcome.context_estimate is None
+    warnings = [r.getMessage() for r in loguru_caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "ZeroDivisionError" in warnings[0]
+    assert "synthetic" not in loguru_caplog.text
+
+
 # --- images: attached pictures, tool images, strips, the cap and a refusal -----
 
 
@@ -952,6 +1345,17 @@ def _refused() -> openai.BadRequestError:
     """Return the router's refusal of a request with images."""
     request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
     return openai.BadRequestError("image refused", response=httpx2.Response(400, request=request), body=None)
+
+
+def _context_refused(text: str, *, status: int = 400, body: object = None) -> openai.APIStatusError:
+    """Return the router's refusal of a request, with ``text`` as its message, for the status ``status``."""
+    request = httpx2.Request("POST", "http://router.test/v1/chat/completions")
+    response = httpx2.Response(status, request=request)
+    if status == 400:
+        return openai.BadRequestError(text, response=response, body=body)
+    if status == 422:
+        return openai.UnprocessableEntityError(text, response=response, body=body)
+    return openai.APIStatusError(text, response=response, body=body)
 
 
 def _failed_otherwise() -> dict[str, Callable[[], Round]]:
@@ -1279,6 +1683,107 @@ def test_a_refusal_without_images_is_not_retried(loop_env: LoopEnv) -> None:
     assert len(loop_env.fake.calls) == 1 and loop_env.audit.log == ["model:1:error"]
 
 
+#: The router's words for a prompt longer than the model's context, as the spec lists them.
+CONTEXT_WORDS = (
+    "context length",
+    "context window",
+    "maximum context",
+    "contextwindowexceeded",
+    "too many tokens",
+    "prompt is too long",
+    "input is too long",
+)
+#: A refusal text no router sends, naming a context for the logs to never hold.
+REFUSAL_TEXT = "synthetic router: maximum context exceeded"
+
+
+def test_the_context_refusals_are_the_spec_s() -> None:
+    """The patterns are the seven the spec names, lower case."""
+    assert CONTEXT_REFUSALS == CONTEXT_WORDS
+
+
+@pytest.mark.parametrize(
+    ("exc", "expected"),
+    [
+        *[
+            pytest.param(_context_refused(f"Synthetic router: {word.title()}, sorry."), True, id=f"message-{word}")
+            for word in CONTEXT_WORDS
+        ],
+        pytest.param(
+            _context_refused(
+                "synthetic router: bad request", body={"error": {"message": "Synthetic: ContextWindowExceeded"}}
+            ),
+            True,
+            id="body",
+        ),
+        pytest.param(_context_refused(REFUSAL_TEXT, status=413), True, id="413"),
+        pytest.param(_context_refused(REFUSAL_TEXT, status=422), False, id="422"),
+        pytest.param(_context_refused("synthetic router: image refused"), False, id="no-pattern"),
+        pytest.param(ValueError(REFUSAL_TEXT), False, id="not-a-status-error"),
+    ],
+)
+def test_refuses_context_reads_the_message_and_the_body(exc: Exception, expected: bool) -> None:
+    """A 400 or 413 whose message or body holds a pattern, in any case, is a refusal for length; nothing else is."""
+    assert _refuses_context(exc) is expected
+
+
+def test_a_context_refusal_without_images_is_the_context_error(
+    loop_env: LoopEnv, loguru_caplog: pytest.LogCaptureFixture
+) -> None:
+    """A round refused for its length, with no image to drop, ends the turn with the context error.
+
+    The log says what to look at, and holds neither the router's text nor the question; the round is audited.
+    """
+    events = loop_env.run(_context_refused(REFUSAL_TEXT), content="Summe der Spalte B", vision=True)
+    assert events == [ErrorEvent("context", "This chat is too long for the model.")]
+    assert CONTEXT_ERROR == "This chat is too long for the model."
+    assert len(loop_env.fake.calls) == 1 and loop_env.audit.log == ["model:1:error"] and loop_env.audit.images == [0]
+    errors = [r.getMessage() for r in loguru_caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 1 and "GHOSTWRITER_CONTEXT_TOKENS" in errors[0]
+    assert REFUSAL_TEXT not in loguru_caplog.text and "Summe der Spalte B" not in loguru_caplog.text
+
+
+def test_a_context_refusal_with_images_goes_again_without_them(loop_env: LoopEnv) -> None:
+    """A round with a picture refused for its length goes once more without it, after the notice."""
+    events = loop_env.run(_context_refused(REFUSAL_TEXT), [text_chunk("Ohne Bild.")], vision=True, attach=[_photo()])
+    assert events == [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")]
+    first, second = loop_env.fake.calls
+    assert "image_url" in json.dumps(first["messages"]) and "image_url" not in json.dumps(second["messages"])
+    assert loop_env.audit.log == ["model:1:error", "model:1:ok"] and loop_env.audit.images == [1, 0]
+
+
+def test_a_second_context_refusal_is_the_context_error(loop_env: LoopEnv) -> None:
+    """The round sent again without images and refused again for its length is the context error."""
+    events = loop_env.run(
+        _context_refused(REFUSAL_TEXT), _context_refused(REFUSAL_TEXT), vision=True, attach=[_photo()]
+    )
+    assert events == [NoticeEvent("images_dropped"), ErrorEvent("context", CONTEXT_ERROR)]
+    assert loop_env.audit.log == ["model:1:error", "model:1:error"] and loop_env.audit.images == [1, 0]
+
+
+def test_a_context_refusal_after_text_is_the_model_error(loop_env: LoopEnv) -> None:
+    """A round that failed once it had said something is the model error, as any failure after text."""
+    events = loop_env.run([text_chunk("Ich sehe"), _context_refused(REFUSAL_TEXT)], vision=True)
+    assert events == [TokenEvent("Ich sehe"), ErrorEvent("model", "The model did not answer.")]
+
+
+@pytest.mark.parametrize(
+    ("attach", "expected"),
+    [
+        pytest.param(
+            [_photo()], [NoticeEvent("images_dropped"), TokenEvent("Ohne Bild.")], id="with-images-they-are-dropped"
+        ),
+        pytest.param([], [ErrorEvent("model", "The model did not answer.")], id="without-images-the-model-error"),
+    ],
+)
+def test_other_refusals_stay_as_they_were(
+    loop_env: LoopEnv, attach: list[tuple[str, dict[str, Any]]], expected: list[TurnEvent]
+) -> None:
+    """A 400 that is no refusal for length still drops a picture, and without one is still the model error."""
+    events = loop_env.run(_refused(), [text_chunk("Ohne Bild.")], vision=True, attach=attach)
+    assert events == expected
+
+
 @pytest.mark.parametrize("failed", _failed_otherwise().values(), ids=_failed_otherwise().keys())
 def test_a_round_with_images_that_failed_otherwise_is_not_retried(
     loop_env: LoopEnv, failed: Callable[[], Round]
@@ -1483,3 +1988,416 @@ def test_images_past_the_cap_in_one_round_are_returned_and_named_unseen(loop_env
     text = json.dumps(sent)
     assert all(UNSEEN.format(label=f"quay-scan.pdf, page {n}") in text for n in range(1, 9))
     assert "were shown" not in text
+
+
+# --- what the message read: document_partial and document_unread ------------------------------------------------------
+
+REPORT = "long-report.pdf"
+REPORT_PATH = f"{FOLDER}/{REPORT}"
+REPORT_MANIFEST = {**stock_manifest(REPORT_PATH), "total": 500, "pages_without_text": list[int]()}
+REPORT_MEASURE = {"path": REPORT_PATH, "kind": "pdf", "unit": "page", "total": 500, "chars": 1_200_000, "capped": False}
+READ_REPORT = json.dumps({"path": REPORT_PATH})
+NOTES = "tide-notes.txt"
+
+
+def _report_read(*spans: tuple[int, int]) -> ToolResult:
+    """Return workbench 0.10's answer to a read of the report: one part per span, none cut."""
+    parts = [{"label": f"pages {a}-{b}", "text": "Gezeitentabelle", "units": [a, b], "cut": False} for a, b in spans]
+    body = {
+        "path": REPORT_PATH,
+        "kind": "pdf",
+        "parts": parts,
+        "total_parts": 500,
+        "pages_without_text": list[int](),
+        "shown": list[Any](),
+        "truncated": True,
+        "next_part": f"page {spans[-1][1] + 1}",
+        "hint": None,
+    }
+    return ToolResult(json.dumps(body, separators=(",", ":")), ())
+
+
+def _file_id(loop_env: LoopEnv, name: str) -> str:
+    """Return workbench's id of the chat's attachment of that name."""
+    [file_id] = [
+        attachment.file_id
+        for message in loop_env.store.chat_detail("user-a", CHAT).messages
+        for attachment in message.attachments
+        if attachment.name == name
+    ]
+    return file_id
+
+
+def test_the_notices_come_last_and_are_stored(loop_env: LoopEnv) -> None:
+    """A measured report read in part is told after the text; stored, the notice holds its counts and no name."""
+    loop_env.workbench.answers = [_report_read((1, 4), (5, 9))]
+    events = loop_env.run(
+        _calls(READ_REPORT),
+        [text_chunk("Kurz gefasst.")],
+        content="Fass den Bericht zusammen",
+        attach=[(REPORT, REPORT_MANIFEST)],
+        measures={REPORT: REPORT_MEASURE},
+    )
+    file_id = _file_id(loop_env, REPORT)
+    assert [type(e).__name__ for e in events] == ["StepEvent", "StepEvent", "TokenEvent", "NoticeEvent"]
+    assert events[-2:] == [
+        TokenEvent("Kurz gefasst."),
+        NoticeEvent("document_partial", file_id, REPORT, 9, 500, "page"),
+    ]
+    with Session(loop_env.engine) as s:
+        stored = s.scalars(select(Message.notices).where(Message.id == loop_env.answer_id)).one()
+    assert stored is not None and REPORT not in stored
+    assert json.loads(stored) == [
+        {"code": "document_partial", "file_id": file_id, "read": 9, "total": 500, "unit": "page"}
+    ]
+
+
+def test_an_attachment_not_read_without_tools_is_unread(loop_env: LoopEnv) -> None:
+    """With workbench off no tool is offered, so the attached notes were not read, and the user is told so."""
+    events = loop_env.run(
+        [text_chunk("Ohne Werkzeuge.")], workbench=None, attach=[(NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))]
+    )
+    assert events == [
+        TokenEvent("Ohne Werkzeuge."),
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES),
+    ]
+
+
+def test_an_earlier_attachment_read_in_part_is_named(loop_env: LoopEnv) -> None:
+    """A follow-up that reads part of a report an earlier question attached names it; it is not this one's unread."""
+    loop_env.run(
+        [text_chunk("Ein langer Bericht.")], attach=[(REPORT, REPORT_MANIFEST)], measures={REPORT: REPORT_MEASURE}
+    )
+    loop_env.workbench.answers = [_report_read((1, 9))]
+    events = loop_env.run(_calls(READ_REPORT), [text_chunk("Seiten 1 bis 9.")], content="Was steht am Anfang?")
+    assert [e for e in events if isinstance(e, NoticeEvent)] == [
+        NoticeEvent("document_partial", _file_id(loop_env, REPORT), REPORT, 9, 500, "page")
+    ]
+
+
+def test_the_file_notices_follow_answer_cut_and_precede_an_error(loop_env: LoopEnv) -> None:
+    """``answer_cut`` comes first; after a model error, the file notices still come, and the error stays last."""
+    notes = (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+    events = loop_env.run([text_chunk("Kapitel 1 …"), finish_chunk("length")], attach=[notes])
+    unread = NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES)
+    assert events == [TokenEvent("Kapitel 1 …"), NoticeEvent("answer_cut"), unread]
+    other = ("quay-notes.txt", stock_manifest(f"{FOLDER}/quay-notes.txt"))
+    events = loop_env.run(_router_error(), content="Und die?", attach=[other])
+    assert events == [
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, "quay-notes.txt"), name="quay-notes.txt"),
+        ErrorEvent("model", "The model did not answer."),
+    ]
+
+
+def test_a_stopped_turn_still_tells_what_was_not_read(loop_env: LoopEnv) -> None:
+    """A stop during the first call: the call is stored, and the attached notes, never opened, are unread."""
+    loop_env.workbench.answers = [_then(loop_env.cancel.set, RESULT)]
+    events = loop_env.run(_calls(READ_SALES), attach=[(NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))])
+    assert events[-1] == NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES)
+
+
+def test_a_template_the_answer_filled_is_not_unread(loop_env: LoopEnv) -> None:
+    """A template attached and filled was used, though never read: no ``document_unread`` names it."""
+    template = "harbour-template.docx"
+    loop_env.workbench.answers = [ToolResult(json.dumps({"path": f"{FOLDER}/out/harbour-letter.docx"}), ())]
+    fill = json.dumps({"path": f"{FOLDER}/{template}", "values": {"Kunde": "Hafenamt"}})
+    events = loop_env.run(
+        _calls(fill, name="fill_template"),
+        [text_chunk("Ausgefüllt.")],
+        content="Füll die Vorlage aus",
+        attach=[(template, stock_manifest(f"{FOLDER}/{template}"))],
+    )
+    assert [e for e in events if isinstance(e, NoticeEvent)] == []
+
+
+# --- Continue: one round appended to an answer cut at the length limit -----
+
+#: A first answer cut at the length limit, mid-sentence.
+CUT: Round = [text_chunk("Kapitel 1 … und"), finish_chunk("length")]
+#: A continuation that ends cleanly, below the cap.
+GO_ON: Round = [text_chunk(" weiter."), finish_chunk("stop"), usage_chunk(900, 3, "served-model")]
+
+
+def _notes() -> tuple[str, dict[str, Any]]:
+    return (NOTES, stock_manifest(f"{FOLDER}/{NOTES}"))
+
+
+def test_a_continuation_appends_to_the_answer(loop_env: LoopEnv) -> None:
+    """The new text goes on the same answer, its seam as the model wrote it; the cut is gone, the estimate made again.
+
+    The estimate counts the offer's system prompt and tools, and the chat with the answer as it now reads.
+    """
+    loop_env.run(CUT)
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == [{"code": "answer_cut"}]
+    before = _stored_estimate(loop_env)
+    outcome = TurnOutcome()
+    events = loop_env.go_on(GO_ON, outcome=outcome)
+    assert events == [TokenEvent(" weiter.")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter." and loop_env.notices() == []
+    assert [m.role for m in loop_env.store.chat_detail("user-a", CHAT).messages] == ["user", "assistant"]
+    assert loop_env.audit.log[-1] == "model:1:ok" and len(loop_env.fake.calls) == 2
+    past, _ = loop_env.store.past_turns(CHAT, before_position=10**6)
+    system = loop_env.fake.calls[-1]["messages"][0]["content"]
+    estimate = next_prompt_tokens(system, loop_env.fake.calls[0]["tools"], past)
+    assert _stored_estimate(loop_env) == outcome.context_estimate == estimate
+    assert before is not None and estimate > before
+
+
+def test_on_vllm_the_last_message_is_the_answer_so_far(loop_env: LoopEnv) -> None:
+    """VLLM goes on in the answer's own message, the request's last, with no tool and no thinking.
+
+    A reasoning answer cut at its own cap goes on without thinking, in up to the cap of a round without it.
+    """
+    loop_env.run(
+        [text_chunk("Kapitel 1 … und"), usage_chunk(900, REASONING_ANSWER_TOKENS, "served-model")], reasoning=True
+    )
+    assert loop_env.notices() == [{"code": "answer_cut"}]
+    loop_env.go_on(GO_ON)
+    call = loop_env.fake.calls[-1]
+    assert [m["role"] for m in call["messages"]] == ["system", "user", "assistant"]
+    assert call["messages"][-1] == {"role": "assistant", "content": "Kapitel 1 … und"}
+    assert call["extra_body"] == CONTINUE_BODY and call["max_tokens"] == MAX_ANSWER_TOKENS
+    assert "tools" not in call and "tool_choice" not in call
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+
+
+def test_elsewhere_the_model_is_asked_to_go_on(loop_env: LoopEnv) -> None:
+    """Another provider gets the answer so far, then the instruction to go on, and no body field of its own."""
+    assert CONTINUE == "Go on exactly where your answer stopped; repeat nothing."
+    loop_env.run(CUT)
+    loop_env.go_on(GO_ON, provider="ollama")
+    call = loop_env.fake.calls[-1]
+    assert call["messages"][-2:] == [
+        {"role": "assistant", "content": "Kapitel 1 … und"},
+        {"role": "user", "content": CONTINUE},
+    ]
+    assert "extra_body" not in call and "tools" not in call
+    assert loop_env.stored() == "Kapitel 1 … und weiter." and loop_env.notices() == []
+
+
+def test_a_continuation_replays_its_calls_in_history_form(loop_env: LoopEnv) -> None:
+    """The answer's own calls go as an earlier turn's do: each call, its result cut to HISTORY_RESULT_CHARS."""
+    loop_env.workbench.answers = [ToolResult(json.dumps({"text": "Monat;Summe\n" * 600}), ())]
+    loop_env.run(_calls(READ_SALES), CUT)
+    [step] = loop_env.store.chat_detail("user-a", CHAT).messages[-1].steps
+    assert step.result is not None and len(step.result) > HISTORY_RESULT_CHARS
+    loop_env.go_on(GO_ON)
+    sent = loop_env.sent(3)
+    assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "assistant"]
+    assert sent[2] == {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "call_0", "type": "function", "function": {"name": "read_document", "arguments": READ_SALES}}
+        ],
+    }
+    assert sent[3] == {"role": "tool", "tool_call_id": "call_0", "content": cut(step.result, HISTORY_RESULT_CHARS)}
+    assert sent[4] == {"role": "assistant", "content": "Kapitel 1 … und"}
+
+
+@pytest.mark.parametrize("ending", AT_THE_CAP.values(), ids=AT_THE_CAP.keys())
+def test_a_continuation_cut_again_keeps_answer_cut(loop_env: LoopEnv, ending: list[Chunk]) -> None:
+    """A continuation that ends at its cap is cut too: the user is told again, and the answer stays continuable."""
+    loop_env.run(CUT)
+    events = loop_env.go_on([text_chunk(" weiter …"), *ending])
+    assert events == [TokenEvent(" weiter …"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter …" and loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_clean_continuation_keeps_the_other_notices(loop_env: LoopEnv) -> None:
+    """Continue recomputes only ``answer_cut``: the unread notes stay, with their details, and no notice is told."""
+    loop_env.run(CUT, attach=[_notes()])
+    unread = {"code": "document_unread", "file_id": _file_id(loop_env, NOTES)}
+    assert loop_env.notices() == [{"code": "answer_cut"}, unread]
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert loop_env.notices() == [unread]
+
+
+def test_a_continuation_tells_no_unreachable_workbench(loop_env: LoopEnv) -> None:
+    """A continuation offers no tool in any case: workbench gone meanwhile tells no ``tools_unavailable``."""
+    loop_env.run(CUT)
+    loop_env.workbench.discovery = None
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert loop_env.notices() == []
+
+
+def test_a_continuation_tells_no_trim(loop_env: LoopEnv) -> None:
+    """A continuation of a long chat leaves earlier turns out as any round does, but tells no trim again."""
+    _long_turns(loop_env, 30)
+    loop_env.run(CUT)
+    assert loop_env.notices() == [{"code": "context_trimmed"}, {"code": "answer_cut"}]
+    assert loop_env.go_on(GO_ON) == [TokenEvent(" weiter.")]
+    assert _questions(loop_env.sent(2)) < 31
+    assert loop_env.notices() == [{"code": "context_trimmed"}]
+
+
+def test_a_stopped_continuation_keeps_what_it_appended(loop_env: LoopEnv) -> None:
+    """A stop after two pieces keeps them on the answer; still incomplete, the answer stays cut, where it was told."""
+    loop_env.run(CUT, attach=[_notes()])
+
+    def stop() -> Chunk:
+        loop_env.cancel.set()
+        return text_chunk(" nie")
+
+    events = loop_env.go_on([text_chunk(" wei"), text_chunk("ter"), stop, finish_chunk("stop")])
+    assert events == [TokenEvent(" wei"), TokenEvent("ter"), NoticeEvent("answer_cut")]
+    assert loop_env.stored() == "Kapitel 1 … und weiter"
+    unread = {"code": "document_unread", "file_id": _file_id(loop_env, NOTES)}
+    assert loop_env.notices() == [{"code": "answer_cut"}, unread]
+    assert loop_env.audit.rounds[-1] is not None and loop_env.audit.rounds[-1].stopped
+
+
+def test_a_failed_continuation_changes_nothing_but_the_estimate(loop_env: LoopEnv) -> None:
+    """A model error appends nothing and keeps every notice in its place; only the estimate is made again, the same.
+
+    The answer stays cut, and the user is told so before the error, which comes last.
+    """
+    loop_env.run(CUT, attach=[_notes()])
+    notices, estimate = loop_env.notices(), _stored_estimate(loop_env)
+    with Session(loop_env.engine) as s, s.begin():
+        s.execute(update(Message).where(Message.id == loop_env.answer_id).values(context_estimate=1))
+    outcome = TurnOutcome()
+    events = loop_env.go_on(_router_error(), outcome=outcome)
+    assert events == [NoticeEvent("answer_cut"), ErrorEvent("model", "The model did not answer.")]
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == notices
+    assert _stored_estimate(loop_env) == outcome.context_estimate == estimate
+    assert loop_env.audit.log[-1] == "model:1:error"
+
+
+def test_a_context_refusal_of_a_continuation_is_the_context_error(loop_env: LoopEnv) -> None:
+    """A continuation the router refuses for its length ends with the context error; the answer stays as it was."""
+    loop_env.run(CUT)
+    events = loop_env.go_on(_context_refused("synthetic router: maximum context exceeded"))
+    assert events == [NoticeEvent("answer_cut"), ErrorEvent("context", CONTEXT_ERROR)]
+    assert loop_env.stored() == "Kapitel 1 … und" and loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_continuation_stopped_before_it_began_changes_nothing(loop_env: LoopEnv) -> None:
+    """A stop before the turn reads the answer: no round, and the answer keeps its text, notices and estimate."""
+    loop_env.run(CUT, attach=[_notes()])
+    before = (loop_env.stored(), loop_env.notices(), _stored_estimate(loop_env))
+    loop_env.cancel.set()
+    outcome = TurnOutcome(context_estimate=5)
+    assert loop_env.go_on(GO_ON, outcome=outcome) == []
+    assert (loop_env.stored(), loop_env.notices(), _stored_estimate(loop_env)) == before
+    assert outcome.context_estimate is None and len(loop_env.fake.calls) == 1
+
+
+def test_an_answer_that_follows_no_question_is_not_continued(loop_env: LoopEnv) -> None:
+    """An answer stored after another answer pairs with no question of its own: nothing is sent, nothing changes.
+
+    Read as history, the question before it would be the earlier answer's, and its text would be appended to.
+    """
+    loop_env.run(CUT)
+    first = loop_env.answer_id
+    loop_env.answer_id = loop_env.store.start_assistant_message(CHAT)
+    loop_env.store.finish_assistant_message(loop_env.answer_id, "Zweite Antwort …", notices=[{"code": "answer_cut"}])
+    events = loop_env.go_on(GO_ON)
+    assert events == [ErrorEvent("internal", "The answer could not be finished.")]
+    assert len(loop_env.fake.calls) == 1
+    assert [m.content for m in loop_env.store.chat_detail("user-a", CHAT).messages if m.id != first] == [
+        "Summe der Spalte B",
+        "Zweite Antwort …",
+    ]
+    assert loop_env.notices() == [{"code": "answer_cut"}]
+
+
+def test_a_continuation_does_not_say_a_picture_was_not_shown_while_the_model_sees(loop_env: LoopEnv) -> None:
+    """With vision on, the question is replayed as the answer being continued read it: its picture was shown.
+
+    The answer may be cut in the middle of describing the picture, so a prompt that said it was "not shown to the
+    model" would have the model contradict itself. The round itself stays blind: no tool, no image sent again.
+    """
+    loop_env.run(CUT, content="Beschreib das Bild", vision=True, attach=[_photo()])
+    loop_env.go_on(GO_ON, vision=True)
+    went_on = loop_env.fake.calls[-1]
+    told = json.dumps(went_on["messages"], ensure_ascii=False)
+    assert f"image 64{TIMES}48" in told and "not shown to the model" not in told
+    assert "tools" not in went_on and not _image_urls(went_on["messages"])
+
+
+def test_a_continuation_says_a_picture_was_not_shown_while_the_model_does_not_see(loop_env: LoopEnv) -> None:
+    """Without vision the answer never saw the picture, and the continuation's prompt says so, as the answer's did."""
+    loop_env.run(CUT, content="Beschreib das Bild", attach=[_photo()])
+    loop_env.go_on(GO_ON)
+    told = json.dumps(loop_env.fake.calls[-1]["messages"], ensure_ascii=False)
+    assert f"image 64{TIMES}48; not shown to the model" in told
+
+
+def test_a_continuation_estimates_the_next_prompt_as_a_fresh_answer_does(loop_env: LoopEnv) -> None:
+    """With vision on, the estimate after a Continue is the one a fresh answer of the same text stores.
+
+    It counts what the next message is offered: the system prompt's vision lines, ``view_file`` and the attached
+    picture's tokens. The continuation's own round stays blind and offers no tool.
+    """
+    loop_env.settings = dataclasses.replace(loop_env.settings, image_tokens=280)
+    loop_env.run(CUT, content="Beschreib das Bild", vision=True, attach=[_photo()])
+    assert loop_env.notices() == [{"code": "answer_cut"}]
+    loop_env.go_on(GO_ON, vision=True)
+    went_on = loop_env.fake.calls[-1]
+    assert "tools" not in went_on and VISION not in went_on["messages"][0]["content"]
+    assert not _image_urls(went_on["messages"])
+    continued = _stored_estimate(loop_env)
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+    loop_env.again([text_chunk("Kapitel 1 … und weiter."), finish_chunk("stop")], vision=True)
+    fresh = loop_env.fake.calls[-1]
+    assert "view_file" in _tool_names(fresh) and VISION in fresh["messages"][0]["content"]
+    assert _image_urls(fresh["messages"]) == [JPEG_URL]
+    assert loop_env.stored() == "Kapitel 1 … und weiter."
+    assert continued is not None and continued == _stored_estimate(loop_env)
+
+
+# --- a question with a file to open: vllm's first round must call a tool ----------------------------------------------
+
+
+def _choices(loop_env: LoopEnv) -> list[str | None]:
+    return [call.get("tool_choice") for call in loop_env.fake.calls]
+
+
+def test_a_question_with_a_document_asks_vllm_for_a_call_first(loop_env: LoopEnv) -> None:
+    """An attached document must be opened: vllm's first round requires a call, the next is free again."""
+    loop_env.run(_calls(READ_SALES), [text_chunk("Gelesen.")], attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+
+
+def test_a_picture_the_turn_does_not_see_asks_for_a_call(loop_env: LoopEnv) -> None:
+    """A picture that does not go to the model as an image is opened with a tool, as a document is."""
+    loop_env.run(_calls(READ_SALES), [text_chunk("Gesehen.")], attach=[_photo()])
+    assert _choices(loop_env) == ["required", "auto"]
+
+
+@pytest.mark.parametrize("case", ["no file", "a picture it sees", "ollama", "a follow-up"])
+def test_a_first_round_is_free_without_a_file_to_open(loop_env: LoopEnv, case: str) -> None:
+    """No file of the question to open, a picture already in the message, or a provider other than vllm: ``auto``."""
+    if case == "no file":
+        loop_env.run([text_chunk("Hallo!")])
+    elif case == "a picture it sees":
+        loop_env.run([text_chunk("Ein Hafen.")], vision=True, attach=[_photo()])
+    elif case == "ollama":
+        loop_env.settings = dataclasses.replace(loop_env.settings, inference_provider="ollama")
+        loop_env.run([text_chunk("Ohne Pflicht.")], attach=[_notes()])
+    else:
+        loop_env.run(_calls(READ_SALES), [text_chunk("Gelesen.")], attach=[_notes()])
+        loop_env.run([text_chunk("Und weiter.")], content="Was noch?")
+        assert _choices(loop_env)[-1] == "auto"
+        return
+    assert _choices(loop_env) == ["auto"]
+
+
+def test_a_refused_required_round_goes_again_free(loop_env: LoopEnv) -> None:
+    """A router that refuses ``required`` before any text is asked once more with ``auto``; the turn goes on."""
+    events = loop_env.run(_refused(), [text_chunk("Ohne Pflicht.")], attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+    assert events == [
+        TokenEvent("Ohne Pflicht."),
+        NoticeEvent("document_unread", file_id=_file_id(loop_env, NOTES), name=NOTES),
+    ]
+    assert loop_env.audit.log == ["model:1:error", "model:1:ok"]
+    assert loop_env.stored() == "Ohne Pflicht."
+
+
+def test_a_round_refused_again_without_required_is_the_model_error(loop_env: LoopEnv) -> None:
+    """The free try refused too ends the turn as any refused round does, with the model error."""
+    events = loop_env.run(_refused(), _refused(), attach=[_notes()])
+    assert _choices(loop_env) == ["required", "auto"]
+    assert events[-1] == ErrorEvent("model", "The model did not answer.")

@@ -7,7 +7,8 @@ arguments are cut as a replayed call's are. Earlier turns are then added newest
 first, whole, while they fit: each as its question, per round an assistant message with its
 calls and one tool message per call, then its answer. A replayed call's arguments stay a
 JSON object, which chat templates parse, and are cut to ``HISTORY_ARGUMENT_CHARS``; its
-result is cut to ``HISTORY_RESULT_CHARS``.
+result is cut to ``HISTORY_RESULT_CHARS``. A :class:`FitReport` counts the earlier turns and
+those replayed.
 
 With an :class:`~ghostwriter.agent.images.ImageBudget`, an image ref counts as its label's
 characters plus :func:`~ghostwriter.agent.images.estimate_image_tokens`, and a request carries
@@ -36,6 +37,14 @@ In a round that does not offer ``view_file`` (``view=False``), every note keeps 
 leaves the tool out (:data:`~ghostwriter.agent.images.WITHOUT_VIEW`).
 Without an image budget, the current turn's results are cleared oldest first and then arguments
 cut, as before; an earlier turn is replayed as its text, and the current turn must hold no image ref.
+
+At the end of an answer :func:`next_prompt_tokens` estimates what the next message's prompt starts with: the
+system prompt, the tool schemas and every turn as :func:`fit` would replay it, the answer just finished
+(:func:`finished_turn`) among them. It is sized by the same code and counts what could no longer be sent: no
+budget, no image cap.
+
+A continuation (Continue) sends its turn as :func:`continuation` gives it: the turn replayed as an earlier one is,
+the answer so far its last message, and for a provider that does not go on in that message, an instruction after it.
 """
 
 import math
@@ -68,6 +77,7 @@ from ghostwriter.agent.images import (
     told,
 )
 from ghostwriter.agent.limits import CHARS_PER_TOKEN, HISTORY_ARGUMENT_CHARS, HISTORY_RESULT_CHARS, PROMPT_TOKENS
+from ghostwriter.agent.prompt import CONTINUE
 from ghostwriter.agent.tools import CUT_MARK, compact, cut, echoed_arguments, parse_arguments
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.upload import media_kind
@@ -87,6 +97,19 @@ OFFICE_FORMATS: Final[Mapping[str, str]] = {
     ".potx": "PowerPoint",
     ".odt": "OpenDocument text",
 }
+#: What an attachment's line calls a data or text file, by the name's suffix: a document with no pages to tell. The
+#: keys are among :data:`~ghostwriter.upload.ATTACHMENT_TYPES`, never a PDF or one of the Office suffixes.
+DATA_FORMATS: Final[Mapping[str, str]] = {
+    ".csv": "CSV table",
+    ".xlsx": "Excel workbook",
+    ".json": "JSON data",
+    ".jsonl": "JSON Lines data",
+    ".ndjson": "JSON Lines data",
+    ".txt": "text",
+    ".md": "Markdown text",
+}
+#: What a document's line says once it is measured longer than one prompt holds.
+LONGER_THAN_A_PROMPT: Final = "longer than one prompt: read it in parts and say which parts you read"
 #: What a picture's line says while the turn does not see, whatever the cause: vision off, a model
 #: that takes no images, or a workbench that shows none.
 UNSEEN_PICTURE: Final = "not shown to the model"
@@ -174,22 +197,56 @@ def user_content(
     return "\n".join(lines)
 
 
-def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: bool, name: str) -> str | None:
+def attachment_facts(
+    kind: str,
+    manifest: Mapping[str, Any] | None,
+    *,
+    seen: bool,
+    name: str,
+    too_long: bool = False,
+    length: tuple[int, str] | None = None,
+) -> str | None:
     """Say what an attachment is, from what workbench reported of it.
 
     Args:
         kind: The attachment's kind: ``document``, ``image`` or ``media``.
         manifest: Its manifest as the chat keeps it, or ``None``.
         seen: Whether the turn sees images.
-        name: The attachment's name, whose suffix says an Office file's format and whether a clip is video or
-            audio.
+        name: The attachment's name, whose suffix says an Office file's format, a data or text file's
+            (:data:`DATA_FORMATS`) and whether a clip is video or audio.
+        too_long: Whether a document is longer than one prompt holds (measured by the store); a picture or a clip is
+            never, and this leaves its line as it was.
+        length: A document's measured length, its count and unit (a :data:`~ghostwriter.schemas.MeasureUnit`), or
+            ``None``; only a data or text file's line tells it, as a PDF and an Office file count their own pages.
 
     Returns:
         For a picture ``image`` and its first rendition's size, followed by :data:`UNSEEN_PICTURE`
         when not ``seen``; for a PDF its pages, for an Office file (``PowerPoint``, ``Word document`` or
         ``OpenDocument text``) its slides or pages as the manifest's ``unit`` says, and for either those
         without text (:func:`_pages_told`), whether ``seen`` or not; for a clip (``media``) its length,
-        frames and transcript (:func:`_clip_told`); else ``None``, which a manifest of kind ``none`` also gives.
+        frames and transcript (:func:`_clip_told`); for a data or text file its format and then its ``length``
+        (``CSV table, 91 lines``), whatever its manifest; else ``None``, which a PDF with a manifest of kind
+        ``none`` also gives. A ``document`` that is ``too_long`` adds :data:`LONGER_THAN_A_PROMPT` after its
+        facts, or is that phrase alone when it has none.
+    """
+    data = DATA_FORMATS.get(PurePosixPath(name).suffix.lower()) if kind == "document" else None
+    facts = _facts(kind, manifest, seen=seen, name=name) if data is None else _data_told(data, length)
+    if too_long and kind == "document":
+        return LONGER_THAN_A_PROMPT if facts is None else f"{facts}; {LONGER_THAN_A_PROMPT}"
+    return facts
+
+
+def _facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: bool, name: str) -> str | None:
+    """Say what an attachment is, before whether it is too long.
+
+    Args:
+        kind: The attachment's kind: ``document``, ``image`` or ``media``.
+        manifest: Its manifest as the chat keeps it, or ``None``.
+        seen: Whether the turn sees images.
+        name: The attachment's name.
+
+    Returns:
+        What :func:`attachment_facts` gives of a file that is not too long.
     """
     if kind == "image":
         size = rendition_size(manifest)
@@ -207,6 +264,22 @@ def attachment_facts(kind: str, manifest: Mapping[str, Any] | None, *, seen: boo
             return None
         return _pages_told(manifest, office, "slide" if manifest.get("unit") == "slide" else "page")
     return None
+
+
+def _data_told(format_name: str, length: tuple[int, str] | None) -> str:
+    """Say what a data or text file is: its format, then its measured length.
+
+    Args:
+        format_name: What the line calls the format (:data:`DATA_FORMATS`).
+        length: Its count and unit, or ``None``.
+
+    Returns:
+        ``CSV table, 91 lines`` or ``Excel workbook, 1 row``; the format alone without a length.
+    """
+    if length is None:
+        return format_name
+    total, unit = length
+    return f"{format_name}, {total} {unit}" if total == 1 else f"{format_name}, {total} {unit}s"
 
 
 def _is_length(value: object) -> TypeGuard[int | float]:
@@ -401,6 +474,27 @@ def _replayed(
     return messages
 
 
+def continuation(this: PastTurn, *, instruct: bool) -> list[dict[str, Any]]:
+    """Return the current turn of a continuation: the turn so far, its answer the last assistant message.
+
+    The turn is replayed as an earlier one is (:func:`_replayed`), its text alone: its calls' arguments and
+    results in the history form, and no image.
+
+    Args:
+        this: The turn whose answer goes on, as the store replays it.
+        instruct: Whether a user message asks the model to go on (:data:`~ghostwriter.agent.prompt.CONTINUE`),
+            for a provider that does not go on in the last assistant message itself; vllm does.
+
+    Returns:
+        The question, each round's calls and results, then the answer so far; with ``instruct``, the instruction
+        after it.
+    """
+    messages = _replayed(this)
+    if instruct:
+        messages.append({"role": "user", "content": CONTINUE})
+    return messages
+
+
 def _latest_round(messages: Sequence[Mapping[str, Any]]) -> list[int]:
     """Return where the latest round's results are: the tool messages after the last assistant message with calls.
 
@@ -502,6 +596,24 @@ class _Size:
         self.images += now[2] - images
 
 
+@dataclass
+class FitReport:
+    """How many earlier turns a round's messages replay, as :func:`fit` fills it.
+
+    Attributes:
+        past_turns: The earlier turns there were.
+        replayed_turns: Those replayed, the newest of them.
+    """
+
+    past_turns: int = 0
+    replayed_turns: int = 0
+
+    @property
+    def trimmed(self) -> bool:
+        """Whether earlier turns were left out."""
+        return self.replayed_turns < self.past_turns
+
+
 def fit(
     system: str,
     tools: list[dict[str, Any]],
@@ -511,8 +623,13 @@ def fit(
     budget: int = PROMPT_TOKENS,
     images: ImageBudget | None = None,
     view: bool = True,
+    report: FitReport | None = None,
 ) -> list[dict[str, Any]]:
     """Return the messages of a round, within the budget as far as the current turn allows.
+
+    A report, when given, is filled once the replay ends: how many earlier turns there were and how many
+    were replayed. It changes nothing of the messages. The loop gives one to the message's first round only,
+    and its try without images, whose trim is the chat's (``context_trimmed``).
 
     Args:
         system: The system prompt.
@@ -524,6 +641,7 @@ def fit(
         images: What an image costs and how many a request carries; ``None`` when the model is
             sent no images, and earlier turns are replayed as their text.
         view: Whether the round offers ``view_file``; without it no note names the tool.
+        report: Filled with the earlier turns there were and those replayed; ``None`` for none.
 
     Returns:
         The system message, the earlier turns that fit, and the current turn, in order; their
@@ -593,6 +711,7 @@ def fit(
     if size.tokens() + fixed > budget:
         logger.warning("The current turn alone is over the prompt budget: about {} tokens", size.tokens() + fixed)
     replayed: list[dict[str, Any]] = []
+    taken = 0
     for turn in reversed(past):
         modes: tuple[ReplayMode, ...] = ("none",) if images is None or not turn.images else ("images", "notes")
         for mode in modes:
@@ -607,7 +726,74 @@ def fit(
             size.image_tokens += image_tokens
             size.images += count
             replayed[:0] = messages
+            taken += 1
             break
         else:
             break
+    if report is not None:
+        report.past_turns, report.replayed_turns = len(past), taken
     return [kept[0], *replayed, *kept[1:]]
+
+
+def next_prompt_tokens(
+    system: str,
+    tools: list[dict[str, Any]],
+    past: Sequence[PastTurn],
+    *,
+    images: ImageBudget | None = None,
+) -> int:
+    """Estimate the tokens the prompt of the next message starts with.
+
+    The system message and every turn as :func:`fit` replays one, sized as :func:`fit` sizes its messages, plus the
+    tool schemas. Nothing is left out for a budget or an image cap: the estimate counts what could no longer be
+    sent, so that a chat past its budget shows as past it.
+
+    Args:
+        system: The system prompt.
+        tools: The tool schemas the next round is offered; none counts none.
+        past: The turns, oldest first, the one just finished the last of them.
+        images: What an image costs when the turn sees, which counts the pictures a question attached; ``None``
+            when it does not, and every turn counts as its text.
+
+    Returns:
+        The estimated tokens.
+    """
+    messages: list[dict[str, Any]] = [{"role": "system", "content": system}]
+    for turn in past:
+        mode: ReplayMode = "images" if images is not None and turn.images else "none"
+        messages.extend(_replayed(turn, mode=mode, images=images))
+    fixed = estimate_tokens(tools) if tools else 0
+    return _Size(messages, images).tokens() + fixed
+
+
+def finished_turn(
+    question: str, images: tuple[AttachedImage, ...], current: Sequence[Mapping[str, Any]], answer: str
+) -> PastTurn:
+    """Return the current turn as the store will replay it once its answer is stored.
+
+    Each round of the turn that called tools is one round of calls, each with the result the model read back; a
+    message that carries a tool's images is no part of it, as no tool image is replayed. A call no tool message
+    answers is left out, as a step is only stored with its result, and so is a round left with no call.
+
+    Args:
+        question: The question as the model reads it: its text and the lines naming its attachments.
+        images: The pictures its question attached that are ready to be seen.
+        current: The turn's messages as the loop holds them: the question, then each round's calls and results.
+        answer: The answer's text, as it is stored.
+
+    Returns:
+        The turn, none of its content expired.
+    """
+    results = {message["tool_call_id"]: message["content"] for message in current if message["role"] == "tool"}
+    rounds: list[tuple[PastCall, ...]] = []
+    for message in current:
+        if message["role"] != "assistant" or not message.get("tool_calls"):
+            continue
+        calls = tuple(
+            PastCall(call["id"], call["function"]["name"], call["function"]["arguments"], results[call["id"]])
+            for call in message["tool_calls"]
+            if call["id"] in results
+        )
+        if calls:
+            rounds.append(calls)
+    return PastTurn(question, tuple(rounds), answer, False, images)

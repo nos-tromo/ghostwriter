@@ -88,6 +88,7 @@ describe('the API client', () => {
             expired: false,
             kind: 'document',
             status: 'ready',
+            length: null,
           },
           201,
         ),

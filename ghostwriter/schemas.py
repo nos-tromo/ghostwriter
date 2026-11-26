@@ -10,6 +10,17 @@ StepStatus = Literal["running", "ok", "error"]
 ResultKind = Literal["image", "table", "file"]
 AttachmentKind = Literal["document", "image", "media"]
 AttachmentStatus = Literal["processing", "ready", "failed"]
+#: What an answer tells the user of itself: ``answer_cut``, ``document_partial``, ``document_unread``,
+#: ``images_dropped`` and ``tools_unavailable`` (workbench on, but no tool offered) belong to the answer,
+#: ``context_trimmed`` to the chat.
+NoticeCode = Literal[
+    "answer_cut", "document_partial", "document_unread", "images_dropped", "context_trimmed", "tools_unavailable"
+]
+#: What a document's length is counted in.
+MeasureUnit = Literal["page", "slide", "paragraph", "row", "line"]
+#: Where a document's measure is: ``pending`` while workbench measures it, then ``measured``, or ``none`` when it
+#: could not be measured (also for workbench before 0.10).
+MeasureState = Literal["pending", "measured", "none"]
 
 
 class ChatOut(BaseModel):
@@ -30,6 +41,22 @@ class ChatOut(BaseModel):
     expires_at: datetime | None
 
 
+class LengthOut(BaseModel):
+    """How long a document is, as workbench measured it.
+
+    Attributes:
+        state: ``pending`` while it is measured, ``measured``, or ``none`` when it could not be.
+        total: How many units it has, once measured.
+        unit: What ``total`` counts, once measured.
+        too_long: Whether it is longer than one prompt holds, so it is read only in parts; ``False`` unless measured.
+    """
+
+    state: MeasureState
+    total: int | None
+    unit: MeasureUnit | None
+    too_long: bool
+
+
 class AttachmentOut(BaseModel):
     """A file the user attached.
 
@@ -43,6 +70,8 @@ class AttachmentOut(BaseModel):
         status: ``processing`` while workbench prepares it, then ``ready`` or ``failed``.
         created_at: When it was handed to workbench.
         expired: Whether workbench's period for it has passed.
+        length: A document's measure; ``None`` for one never measured (a picture, a clip, a document stored before
+            measures were), and once its file has expired.
     """
 
     id: str
@@ -54,6 +83,7 @@ class AttachmentOut(BaseModel):
     status: AttachmentStatus
     created_at: datetime
     expired: bool
+    length: LengthOut | None = None
 
 
 class StepOut(BaseModel):
@@ -119,6 +149,28 @@ class ResultOut(BaseModel):
     expired: bool
 
 
+class NoticeOut(BaseModel):
+    """What an answer tells the user of itself, as the chat serves it.
+
+    The details of a notice about a file are served until the content deadline; after it, the code alone.
+
+    Attributes:
+        code: The notice (:data:`NoticeCode`).
+        file_id: workbench's id of the file it is about.
+        name: The file's name, read from its attachment.
+        read: How many units of the file were read.
+        total: How many units the file has.
+        unit: What ``read`` and ``total`` count.
+    """
+
+    code: NoticeCode
+    file_id: str | None = None
+    name: str | None = None
+    read: int | None = None
+    total: int | None = None
+    unit: MeasureUnit | None = None
+
+
 class MessageOut(BaseModel):
     """A message with what belongs to it.
 
@@ -130,6 +182,9 @@ class MessageOut(BaseModel):
         attachments: The files a user's message bound.
         steps: An answer's tool steps, in order.
         results: An answer's result cards, in order.
+        notices: An answer's notices, in order; ``None`` for a question, an answer still being written, and one
+            stored before notices were.
+        context_estimate: The estimated tokens of the prompt after this answer; ``None`` when none was stored.
     """
 
     id: str
@@ -139,6 +194,8 @@ class MessageOut(BaseModel):
     attachments: list[AttachmentOut]
     steps: list[StepOut]
     results: list[ResultOut]
+    notices: list[NoticeOut] | None = None
+    context_estimate: int | None = None
 
 
 class ChatDetail(BaseModel):

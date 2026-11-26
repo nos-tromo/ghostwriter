@@ -3,8 +3,9 @@
 A chat's rows go with it: every foreign key cascades, except an attachment's
 message, which is set to ``NULL``. Files are kept by reference only (workbench
 id, path, name, size, MIME type), never their bytes; an attachment also keeps
-its manifest, the counts and sizes workbench reported of it, derived from the
-file and emptied with it.
+its manifest, the counts and sizes workbench reported of it, and its measure,
+its length, both derived from the file and emptied with it. An answer keeps its
+notices, codes with a file's id and counts, never content or a name.
 """
 
 from datetime import datetime
@@ -48,7 +49,12 @@ class FileMark(Base):
 
 
 class Message(Base):
-    """A user's message or an assistant's answer, in its chat's order."""
+    """A user's message or an assistant's answer, in its chat's order.
+
+    An answer stores its notices, a JSON list of ``{code, …}``, when it is written; a question, an answer still
+    being written and one from before schema 3 have ``NULL``. The file ids and counts of a notice about a file go at
+    ``notices_expire_at``, then only the codes stay. ``context_estimate`` is the estimated tokens of the next prompt.
+    """
 
     __tablename__ = "messages"
     __table_args__ = (
@@ -62,6 +68,9 @@ class Message(Base):
     role: Mapped[str] = mapped_column(String(16))
     content: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
+    notices: Mapped[str | None] = mapped_column(Text)
+    context_estimate: Mapped[int | None]
+    notices_expire_at: Mapped[datetime | None] = mapped_column(UtcDateTime(), index=True)
 
 
 class ToolStep(Base):
@@ -88,13 +97,17 @@ class Attachment(Base):
 
     A picture or a PDF is ``processing`` while workbench prepares it, then ``ready``
     with its manifest in ``render``, or ``failed`` with a token in ``failure``. A
-    manifest is derived from the file, so it is emptied when the file's period passes.
+    document's length is in ``measure`` (``{total, unit, chars, capped}``) once
+    ``measure_state`` is ``measured``; it is ``pending`` before, ``none`` when it
+    cannot be measured, and ``NULL`` for one never measured. A manifest and a
+    measure are derived from the file, so they are emptied when the file's period passes.
     """
 
     __tablename__ = "attachments"
     __table_args__ = (
         CheckConstraint("kind IN ('document', 'image', 'media')", name="ck_attachments_kind"),
         CheckConstraint("status IN ('processing', 'ready', 'failed')", name="ck_attachments_status"),
+        CheckConstraint("measure_state IN ('pending', 'measured', 'none')", name="ck_attachments_measure_state"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
@@ -110,6 +123,8 @@ class Attachment(Base):
     render: Mapped[str | None] = mapped_column(Text)
     failure: Mapped[str | None] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(UtcDateTime())
+    measure: Mapped[str | None] = mapped_column(Text)
+    measure_state: Mapped[str | None] = mapped_column(String(8))
 
 
 class Result(Base):

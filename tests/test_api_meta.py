@@ -53,8 +53,18 @@ def test_config_reports_what_the_spa_needs(client: TestClient) -> None:
         "max_recording_bytes": 10485760,
         "chat_retention_days": 90,
         "file_retention_days": 7,
-        "version": "0.6.2",
+        "prompt_tokens": 34_000,
+        "reasoning_prompt_tokens": 26_000,
+        "version": "0.7.0",
     }
+
+
+def test_the_budgets_follow_the_context(tmp_path: Path) -> None:
+    """The prompt budgets the SPA divides by are the context less the answer and the margin, per switch."""
+    settings = make_settings(tmp_path, context_tokens=60_000)
+    with TestClient(create_app(settings, audit_stream=CapturedAuditStream())) as client:
+        config = client.get("/api/config", headers=as_user()).json()
+    assert (config["prompt_tokens"], config["reasoning_prompt_tokens"]) == (54_000, 46_000)
 
 
 IMAGE_SUFFIXES = sorted(IMAGE_TYPES)

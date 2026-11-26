@@ -1,7 +1,7 @@
 import { useState, type DragEvent, type ReactNode } from 'react'
 import { EmptyState, Spinner } from '@infra/ui'
 import { ApiError } from '../api/client'
-import type { AppConfig, ErrorFrame, NoticeCode } from '../api/types'
+import type { AppConfig, ErrorFrame, MessageOut } from '../api/types'
 import type { ChatStream, StreamFailure } from '../hooks/useChatStream'
 import { useChat } from '../hooks/useChats'
 import { useStickToBottom } from '../hooks/useStickToBottom'
@@ -14,18 +14,21 @@ const ERROR_KEYS: Record<ErrorFrame['code'], keyof Strings> = {
   model: 'error.model',
   audit: 'error.audit',
   internal: 'error.internal',
+  context: 'error.context',
 }
 
-/** The refusals a send or a regenerate names by their code. */
+/** The refusals a send, a regenerate or a continue names by their code. */
 const REFUSAL_KEYS: Partial<Record<string, keyof Strings>> = {
   busy: 'chat.answer_busy',
   no_answer: 'chat.no_answer',
+  not_continuable: 'chat.not_continuable',
   attachment_processing: 'chat.attachment_processing',
 }
 
 /** Why the last answer ended early, or never started: a refusal says what it
  *  is by its code (`busy`, an answer still being written, which a chat left
- *  and reopened can meet; `no_answer`; `attachment_processing`, files not yet
+ *  and reopened can meet; `no_answer`; `not_continuable`, an answer that is
+ *  not the latest or was not cut; `attachment_processing`, files not yet
  *  ready), anything else is the generic line. */
 function FailureLine({ failure }: { failure: StreamFailure }) {
   const t = useT()
@@ -42,17 +45,9 @@ function FailureLine({ failure }: { failure: StreamFailure }) {
   )
 }
 
-/** What the server said about the answer besides its text, quietly: the model
- *  answered without the pictures. Announced politely, and only for a notice this
- *  app knows. */
-function NoticeLine({ notices }: { notices: readonly NoticeCode[] }) {
-  const t = useT()
-  if (!notices.includes('images_dropped')) return null
-  return (
-    <p role="status" className="text-sm text-muted-foreground">
-      {t('chat.images_dropped')}
-    </p>
-  )
+/** Whether an answer ended at the length limit, which it says in its stored notices. */
+function isCut(message: MessageOut): boolean {
+  return message.notices?.some((notice) => notice.code === 'answer_cut') ?? false
 }
 
 /** Whether a drag carries files, not text or a link dragged out of the page. */
@@ -66,10 +61,11 @@ function carriesFiles(event: DragEvent): boolean {
  *
  * A chat with no messages invites a question, and a document only while
  * attachments are on. A regenerate's draft stands where the answer it
- * replaces was. `stream` is the chat's one stream, which `composer`, rendered
- * below the messages, sends on too; `reasoning` is the composer's switch,
- * sent with a regenerate. Files dropped anywhere on it go to `onDropFiles`;
- * without it, a drop is left to the browser.
+ * replaces was, and a continue's where the answer it goes on with was.
+ * `stream` is the chat's one stream, which `composer`, rendered below the
+ * messages, sends on too; `reasoning` is the composer's switch, sent with a
+ * regenerate. Files dropped anywhere on it go to `onDropFiles`; without it, a
+ * drop is left to the browser.
  */
 export function Conversation({
   chatId,
@@ -98,7 +94,8 @@ export function Conversation({
     // answer being written; `pendingUser` and the draft stand in their place.
     const own = stream.stored
     if (own) messages = messages.filter((m) => m.id !== own.answerId && m.id !== own.questionId)
-    // The server dropped the answer a regenerate replaces; the draft takes its place.
+    // A regenerate's old answer is dropped by the server, and a continue's is the draft's start: the draft takes
+    // its place in both, before `start` names it above.
     if (stream.pendingUser === null && messages.at(-1)?.role === 'assistant') messages = messages.slice(0, -1)
   }
   const last = messages.at(-1)
@@ -106,8 +103,6 @@ export function Conversation({
   const failure: StreamFailure | null = stream.draft?.error
     ? { kind: 'answer', code: stream.draft.error }
     : stream.failure
-  // The draft's own while the answer is written, then the stream's: kept with the answer.
-  const notices = stream.draft?.notices ?? stream.notices
   const empty = chat.isSuccess && messages.length === 0 && !stream.streaming
 
   const drops = onDropFiles && {
@@ -147,11 +142,11 @@ export function Conversation({
               message={message}
               fileDays={fileDays}
               onRegenerate={message.id === lastAnswer ? () => void stream.regenerate(reasoning) : undefined}
+              onContinue={message.id === lastAnswer && isCut(message) ? () => void stream.continueAnswer(message) : undefined}
             />
           ))}
           {stream.pendingUser !== null && <PendingUser chatId={chatId} message={stream.pendingUser} />}
           {stream.draft && <DraftView chatId={chatId} draft={stream.draft} fileDays={fileDays} />}
-          <NoticeLine notices={notices} />
           {failure && <FailureLine failure={failure} />}
         </div>
       </div>

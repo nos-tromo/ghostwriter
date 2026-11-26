@@ -72,6 +72,7 @@ function Tile({ file, picture, onRemove }: Omit<TileProps, 'chatId'> & { picture
         status={status}
         thumbnailUrl={picture}
         detail={formatSize(file.size, lang)}
+        warning={file.attachment?.length?.too_long ? t('composer.too_long') : undefined}
         statusLabel={statusLabel}
         onOpen={viewable ? () => setOpen(true) : undefined}
         onRemove={file.removing ? undefined : () => onRemove(file.key)}

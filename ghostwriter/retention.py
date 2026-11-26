@@ -34,9 +34,11 @@ Then each batch of chats:
    retention (``WORKBENCH_RETENTION_DAYS``) removes its files.
 
 Then the contents: ``delete`` / ``retention.tool_content`` names the steps, and again the
-results and the attachments, before their arguments, results, previews and manifests are
-emptied (a manifest is derived from its file, so it goes when the file's period passes; the
-attachment stays). Last, the write-ahead log is
+results, the attachments and the answers (target ``message``) whose notices' details are due,
+before their arguments, results, previews and manifests are emptied (a manifest is derived from
+its file, so it goes when the file's period passes; the attachment stays) and those notices are
+stripped to their codes (a notice about a file holds its id and counts, content made with the
+answer; the answer and the codes stay). Last, the write-ahead log is
 checkpointed, so no earlier version of what went stays in it.
 
 ``python -m ghostwriter.retention --dry-run [--chat-days N]`` (``make retention-dry-run``) prints
@@ -94,6 +96,7 @@ class SweepReport:
         manifests: Attachment manifests emptied.
         workbench_failed: Chats whose folder workbench could not delete; their rows went all the same.
         nextext_jobs: Jobs at Nextext that no clip owned, deleted.
+        notices: Answers whose notices were stripped to their codes.
     """
 
     chats: int = 0
@@ -102,6 +105,7 @@ class SweepReport:
     manifests: int = 0
     workbench_failed: int = 0
     nextext_jobs: int = 0
+    notices: int = 0
 
 
 def _iso(moment: datetime) -> str:
@@ -164,13 +168,14 @@ class Sweeper:
         await anyio.to_thread.run_sync(self._store.checkpoint)
         logger.info(
             "Retention sweep: {} Nextext jobs no clip owned deleted; {} chats deleted, {} left while busy; {} tool "
-            "steps, {} previews and {} manifests emptied; workbench failed {}.",
+            "steps, {} previews and {} manifests emptied, {} answers' notices stripped; workbench failed {}.",
             report.nextext_jobs,
             report.chats,
             busy,
             report.steps,
             report.previews,
             report.manifests,
+            report.notices,
             report.workbench_failed,
         )
         return report
@@ -318,10 +323,10 @@ class Sweeper:
             self._store.delete_chat_rows(chat_id)
 
     async def _sweep_contents(self, now: datetime, report: SweepReport) -> None:
-        """Record, then empty, the expired tool contents, previews and manifests, batch by batch.
+        """Record, then empty, the expired tool contents, previews, manifests and notices' details, batch by batch.
 
-        A batch that brings no step, result or attachment this sweep has not handled yet ends it
-        with a warning, so contents that were not emptied cannot keep it turning.
+        A batch that brings no step, result, attachment or answer this sweep has not handled yet
+        ends it with a warning, so contents that were not emptied cannot keep it turning.
 
         Args:
             now: The time of the sweep.
@@ -331,21 +336,26 @@ class Sweeper:
         handled: set[str] = set()
         while True:
             steps, results, attachments = await anyio.to_thread.run_sync(self._store.due_contents, now, SWEEP_BATCH)
-            if not steps and not results and not attachments:
+            notices = await anyio.to_thread.run_sync(self._store.due_notices, now, SWEEP_BATCH)
+            batch = (steps, results, attachments, notices)
+            if not any(batch):
                 return
-            if handled.issuperset(steps) and handled.issuperset(results) and handled.issuperset(attachments):
+            if all(handled.issuperset(ids) for ids in batch):
                 logger.warning("The retention sweep found no tool content it had not handled; it stops here.")
                 return
-            handled.update(steps, results, attachments)
-            for kind, ids in (("tool_step", steps), ("result", results), ("attachment", attachments)):
+            handled.update(*batch)
+            for kind, ids in zip(("tool_step", "result", "attachment", "message"), batch, strict=True):
                 if ids:
                     op = system_operation(self._emitter, "delete", CONTENT_DELETE)
                     target = Target(kind=kind, ids=tuple(ids), count=len(ids))
                     await anyio.to_thread.run_sync(partial(op.record, target=target, criteria=criteria))
             await anyio.to_thread.run_sync(self._store.empty_contents, steps, results, attachments)
+            if notices:
+                await anyio.to_thread.run_sync(self._store.strip_notices, notices)
             report.steps += len(steps)
             report.previews += len(results)
             report.manifests += len(attachments)
+            report.notices += len(notices)
 
 
 # --- the dry run --------------------------------------------------------------
@@ -370,6 +380,19 @@ def _recorded_period(conn: sqlite3.Connection) -> RetentionPeriodState | None:
         in_force_days,
         None if in_force_grace is None else _aware(in_force_grace),
     )
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    """Read a table's column names, as the file has them.
+
+    Args:
+        conn: The read-only connection.
+        table: The table, one of Ghostwriter's own.
+
+    Returns:
+        The names.
+    """
+    return {column[1] for column in conn.execute(f"PRAGMA table_info({table})")}
 
 
 def _counted(n: int, noun: str) -> str:
@@ -427,8 +450,10 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
     The chats are counted under ``chat_days`` as a start with it would put it in force: the
     period recorded, or another one previewed, with the notice a new or shorter period gives.
     The contents are counted by the deadlines the store holds, leaving out those of due chats:
-    the steps, the previews and the attachments' manifests, which go at the file period. A file
-    of the schema before 2 has no manifests, and counts none.
+    the steps, the previews, the attachments' manifests and measures (one count, of the
+    attachments holding either), which go at the file period, and the answers whose notices'
+    details are due. Each new column is read only where the file has it: a file of the schema
+    before 2 has no manifests, one before 3 no measures and no notices' details, and counts none.
 
     Args:
         db_path: The SQLite file, opened read-only.
@@ -456,8 +481,15 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
             " JOIN messages AS m ON m.id = r.message_id WHERE r.preview IS NOT NULL"
         ).fetchall()
         manifests: list[tuple[str, str]] = []
-        if any(column[1] == "render" for column in conn.execute("PRAGMA table_info(attachments)")):
-            manifests = conn.execute("SELECT chat_id, created_at FROM attachments WHERE render IS NOT NULL").fetchall()
+        held = _columns(conn, "attachments")
+        derived = " OR ".join(f"{column} IS NOT NULL" for column in ("render", "measure") if column in held)
+        if derived:
+            manifests = conn.execute(f"SELECT chat_id, created_at FROM attachments WHERE {derived}").fetchall()
+        notices: list[tuple[str, str, str]] = []
+        if "notices_expire_at" in _columns(conn, "messages"):
+            notices = conn.execute(
+                "SELECT chat_id, created_at, notices_expire_at FROM messages WHERE notices_expire_at IS NOT NULL"
+            ).fetchall()
     if chat_days is None:
         lines, due = ["chats due now: 0 (chat retention is off)"], set()
     else:
@@ -467,15 +499,15 @@ def dry_run(db_path: str, *, chat_days: int | None, file_days: int, notice_days:
         return [_aware(made) for chat_id, made, deadline in rows if chat_id not in due and _aware(deadline) <= now]
 
     file_period = file_days * DAY
-    made_steps, made_previews = expired(steps), expired(previews)
+    made_steps, made_previews, made_notices = expired(steps), expired(previews), expired(notices)
     made_manifests = [
         made for chat_id, stored in manifests if chat_id not in due and (made := _aware(stored)) + file_period <= now
     ]
     counts = (
         f"{_counted(len(made_steps), 'step')}, {_counted(len(made_previews), 'preview')}, "
-        f"{_counted(len(made_manifests), 'manifest')}"
+        f"{_counted(len(made_manifests), 'manifest')}, {_counted(len(made_notices), 'notice')}"
     )
-    ages = _ages("made", made_steps + made_previews + made_manifests, now)
+    ages = _ages("made", made_steps + made_previews + made_manifests + made_notices, now)
     lines.append(f"tool contents due now: {counts} ({ages}period {_counted(file_days, 'day')})")
     lines.append("This run deletes nothing.")
     return "\n".join(lines)

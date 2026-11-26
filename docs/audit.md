@@ -37,17 +37,18 @@ images, sent again without them, is two `chat.answer` events.
 | `DELETE /api/chats/{id}` | `delete` `chat.delete`, written first | `chat` [id] | `delete` `chat.workbench` |
 | `POST /api/chats/{id}/messages` | `collect` `chat.message` | `message` [user id] | `ai_call` `chat.answer` per round; `disclose` `chat.tool` per call attempt, before it is sent |
 | `POST /api/chats/{id}/regenerate` | `modify` `chat.regenerate` | `message` [replaced id] | as messages |
+| `POST /api/chats/{id}/messages/{message_id}/continue` | `modify` `chat.continue`, written before anything is stored | `message` [continued id] | `ai_call` `chat.answer` for its one round |
 | `POST /api/chats/{id}/stop` | none | — | — |
-| `POST /api/chats/{id}/attachments` | `collect` `chat.attachment` | `attachment` [id] | `disclose` `chat.attachment` (`workbench:upload`), before the upload; an `error` one if it fails; `delete` `chat.workbench` (reason `chat_gone`) for a chat deleted during the upload; for a picture, a PDF or an Office file, `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`), before the prepare is sent (for an Office file, when its background prepare starts), and an `error` one (`reason`) if it fails; for a video or audio clip, `disclose` `chat.attachment` (`nextext:transcribe`, criteria `kind`, `bytes`) before the clip goes to Nextext (none when nothing can go: Nextext off since the upload, or the clips' gate never opened), and an `error` one (`reason`) if its round trip there fails, then `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`) before its transcript and frames go to workbench, and an `error` one (`reason`) if that or the prepare fails; and `delete` `chat.nextext` (target `job` [Nextext's id], criteria `deleted`) once its job at Nextext is deleted, `error` when Nextext could not delete it (a reconcile follows 4 minutes later) |
+| `POST /api/chats/{id}/attachments` | `collect` `chat.attachment` | `attachment` [id] | `disclose` `chat.attachment` (`workbench:upload`), before the upload; an `error` one if it fails; `delete` `chat.workbench` (reason `chat_gone`) for a chat deleted during the upload; for a picture, a PDF or an Office file, `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`), before the prepare is sent (for an Office file, when its background prepare starts), and an `error` one (`reason`) if it fails; for a document with workbench 0.10.0 or later, `disclose` `chat.attachment` (`workbench:measure`, criteria `kind`) before the measure is sent (after the prepare, for a PDF or an Office file), and an `error` one (`reason`) if it fails; for a video or audio clip, `disclose` `chat.attachment` (`nextext:transcribe`, criteria `kind`, `bytes`) before the clip goes to Nextext (none when nothing can go: Nextext off since the upload, or the clips' gate never opened), and an `error` one (`reason`) if its round trip there fails, then `disclose` `chat.attachment` (`workbench:prepare`, criteria `kind`) before its transcript and frames go to workbench, and an `error` one (`reason`) if that or the prepare fails; and `delete` `chat.nextext` (target `job` [Nextext's id], criteria `deleted`) once its job at Nextext is deleted, `error` when Nextext could not delete it (a reconcile follows 4 minutes later) |
 | `DELETE /api/chats/{id}/attachments/{attachment_id}` | `delete` `chat.attachment`, an attachment not yet sent, before anything goes | `attachment` [id], criteria `status` | `delete` `chat.workbench` with the file [workbench id] after workbench's delete: `files_deleted` (0 when workbench held it no more), or an `error` one (`reason`) when workbench could not delete it, the attachment kept |
 | `GET /api/chats/{id}/attachments/{attachment_id}` | `query` `chat.attachment`, after its wait | `attachment` [id], criteria `status` | — |
 | `GET /api/chats/{id}/attachments/{attachment_id}/preview` | `disclose` `file.preview` (`preview`), criteria `page` | `file` [id] | `error` child on failure |
 | `GET /api/chats/{id}/files/{file_id}` | `disclose` `file.download` (`download`) | `file` [id] | `error` child on failure |
 | `POST /api/transcribe` | `ai_call` `speech.transcribe` (`inference:asr`) | — | — |
-| start-up, a chat delete that failed, or a take-back that failed: a `processing` attachment | `disclose` `chat.attachment` (`workbench:prepare`; for a clip `nextext:transcribe`) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare fails; for a clip, the same children as an attached clip's |
+| start-up, a chat delete that failed, or a take-back that failed: a `processing` attachment, or a `ready` document whose measure is `pending` | `disclose` `chat.attachment` (`workbench:prepare`; for a clip `nextext:transcribe`; for a `pending` measure `workbench:measure`, a second primary after the prepare's for a `processing` PDF) as the system, criteria `kind`, `requeued` | `attachment` [id] | an `error` one (`reason`) if the prepare or the measure fails; for a clip, the same children as an attached clip's |
 | start-up, 4 minutes after a create whose answer was lost or a clip's own delete that failed, and the sweep: Ghostwriter's jobs at Nextext that no clip owns | `delete` `chat.nextext` as the system, written before the deletes, criteria `listed`, `at_start` | `job` (count) | an `error` one (`job`, count) for the jobs Nextext did not delete |
 | the sweep | `delete` `retention.chat` | `chat` | `delete` `retention.chat.workbench` |
-| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests) | — |
+| the sweep | `delete` `retention.tool_content` | `tool_step` / `result` / `attachment` (manifests and measures) / `message` (an answer's notices, stripped to their codes) | — |
 
 `/api/config`, `/api/whoami`, `/api/health` and `/metrics` are not audited. A
 refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records nothing.
@@ -76,6 +77,28 @@ refusal before the action (400, 401, 404, 409, 410, 413, 415, 422, 503) records 
   then fails (a 502, or a record that cannot be written) or a sweep batch does,
   the chat stays and its `processing` attachments are handed over again, as at
   start-up (`requeued`).
+- A document is measured after its upload has answered (workbench 0.10.0 and
+  later), so its `workbench:measure` child follows the upload's events, and a
+  PDF's or an Office file's follows its `workbench:prepare` child, in the same
+  job. Measures run one at a time, apart from the prepares, so the child may come
+  well after the upload answered. A measure that fails gets an `error` child
+  (`reason`) and the document reads as before, without a length; one whose
+  hand-over cannot be written is not sent, without a child. A measure tried again
+  after a busy workbench is the same hand-over, recorded once. A chat deleted or
+  an attachment taken back meanwhile cancels it: no `error` child follows.
+- A Continue (`POST …/messages/{message_id}/continue`) is recorded as a message is:
+  its primary `modify` / `chat.continue`, naming the answer it goes on with, is written
+  before anything is stored, and its one round is one `ai_call` / `chat.answer` child
+  (`reasoning: false`, `images: 0`; it calls no tool, so no `chat.tool`). A Continue the
+  server refuses (409 `busy`, or `not_continuable` for any answer but the chat's latest
+  one cut at its length limit) records nothing and changes nothing. A record that cannot
+  be written stops it with the `audit` error frame, as for a message.
+- A notice is no event. What an answer tells of itself (`answer_cut`, `document_partial`,
+  `document_unread`, `images_dropped`, `context_trimmed`, `tools_unavailable`) is stored with the answer as
+  codes, file ids and counts, never a name or content, and the `chat.answer` criteria
+  are as they were. The sweep records, as `retention.tool_content` with the target
+  `message`, the answers whose notices it strips to their codes
+  ([retention.md](retention.md)).
 - A video or audio clip goes to Nextext after its upload has answered, on its own
   two slots, so its `nextext:transcribe` child follows the upload's events. Its
   `workbench:prepare` child is written only once Nextext's job completed, also

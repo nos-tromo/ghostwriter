@@ -12,12 +12,18 @@ On vllm, the federation's provider, every round sets the chat template's thinkin
 as docint does: a template that opens a think block in the prompt would otherwise begin the
 reply inside it unasked. Other providers get no such field, as OpenAI proper refuses unknown ones.
 
+A continuation round (Continue, on an answer cut at its length limit) goes on in the conversation's last
+assistant message, the answer so far. On vllm its body is :data:`CONTINUE_BODY`: the template continues that
+message instead of opening a new one, without thinking. Other providers get nothing for it; the loop asks
+them to go on in a user message instead.
+
 A transcription sends one recording, held in memory, to the router's ``/audio/transcriptions``
 with ``WHISPER_MODEL``; :data:`TRANSCRIBE_TIMEOUT_S` bounds each wait on it. The limits a
 recording has are here too, beside the client that sends it, as :mod:`ghostwriter.body_limit`
 caps the route's body by them.
 """
 
+import copy
 import hashlib
 import hmac
 import secrets
@@ -48,6 +54,14 @@ RECORDING_TYPES: Final = frozenset({"audio/webm", "audio/ogg", "audio/mp4", "aud
 TRANSCRIBE_TIMEOUT_S: Final = 60.0
 #: Worker threads transcriptions run on, apart from the shared pool; one beyond them waits.
 SPEECH_THREADS: Final = 4
+#: The ``extra_body`` of a continuation round on vllm: the chat template goes on in the last assistant message
+#: (``continue_final_message``) instead of opening a new one (``add_generation_prompt``; the two exclude each
+#: other), and does not think. Never changed: each request sends a copy.
+CONTINUE_BODY: Final[Mapping[str, Any]] = {
+    "continue_final_message": True,
+    "add_generation_prompt": False,
+    "chat_template_kwargs": {"enable_thinking": False},
+}
 
 # Keys the cache scopes; it never leaves this process, so a scope cannot be
 # mapped back to a user anywhere else. A restart gives every user a new scope.
@@ -101,7 +115,7 @@ class BadTranscript(openai.OpenAIError):
 
 
 class _Options(TypedDict, total=False):
-    """A request's keys sent only where they apply: the tools while any are offered, the thinking switch on vllm."""
+    """A request's keys sent only where they apply: the tools while any are offered, the template's fields on vllm."""
 
     tools: list[ChatCompletionToolUnionParam]
     tool_choice: ChatCompletionToolChoiceOptionParam
@@ -144,6 +158,8 @@ class ModelClient:
         max_tokens: int,
         timeout_s: float,
         reasoning: bool = False,
+        continuation: bool = False,
+        require_tool: bool = False,
     ) -> openai.Stream[Any]:
         """Start one streamed round.
 
@@ -156,6 +172,10 @@ class ModelClient:
             timeout_s: Seconds each wait on the router may take.
             reasoning: Whether the model may think first; on vllm it sets the template's
                 ``enable_thinking``, elsewhere nothing is sent for it.
+            continuation: Whether the round goes on in the last message, an assistant's: on vllm the body is
+                :data:`CONTINUE_BODY`, which thinks in no case; elsewhere nothing is sent for it.
+            require_tool: Whether the round must call a tool: on vllm, with tools offered, ``tool_choice`` is then
+                ``required``; elsewhere ``auto``, as Ollama takes no other.
 
         Returns:
             The stream of chunks; the last one carries the usage.
@@ -166,9 +186,13 @@ class ModelClient:
         options: _Options = {}
         if tools:
             options["tools"] = cast("list[ChatCompletionToolUnionParam]", tools)
-            options["tool_choice"] = "auto"
+            options["tool_choice"] = "required" if require_tool and self.provider == "vllm" else "auto"
         if self.provider == "vllm":
-            options["extra_body"] = {"chat_template_kwargs": {"enable_thinking": reasoning}}
+            options["extra_body"] = (
+                copy.deepcopy(dict(CONTINUE_BODY))
+                if continuation
+                else {"chat_template_kwargs": {"enable_thinking": reasoning}}
+            )
         usage: ChatCompletionStreamOptionsParam = {"include_usage": True}
         return self.client.chat.completions.create(
             model=self.model,

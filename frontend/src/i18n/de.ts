@@ -37,6 +37,7 @@ export const de: Strings = {
   'chat.copy_code': 'Code kopieren',
   'chat.answer_busy': 'In diesem Chat wird noch eine Antwort geschrieben.',
   'chat.no_answer': 'Es gibt keine Antwort, die neu erzeugt werden kann.',
+  'chat.not_continuable': 'Nur die letzte Antwort, die an der Längengrenze abgeschnitten wurde, kann fortgesetzt werden.',
   'chat.images_dropped': 'Das Modell hat die Bilder nicht angenommen und ohne sie geantwortet.',
   'chat.attachment_processing': 'Warten Sie, bis die angehängten Dateien bereit sind.',
 
@@ -67,10 +68,17 @@ export const de: Strings = {
   'composer.processing_hint': 'Das Senden wartet, bis die angehängten Dateien bereit sind.',
   'composer.transcribing_hint': 'Video und Audio dauern länger, weil sie vor dem Senden transkribiert werden.',
   'composer.unreadable': '{name} konnte nicht gelesen werden; das Modell erfährt es.',
+  'composer.too_long': 'Nur in Teilen lesbar',
   'composer.images_cap':
     'Mit einer Nachricht gehen höchstens {max} Bilder an das Modell; die übrigen werden nur genannt.',
   'composer.send': 'Senden',
   'composer.stop': 'Stopp',
+
+  // how full the chat's context is: the ring at the composer, and the note above it
+  'context.meter': 'ca. {n} % des Kontexts belegt',
+  'context.nearly_full':
+    'Dieser Chat ist fast so lang, wie das Modell auf einmal lesen kann. Für ein neues Thema beginnen Sie besser einen neuen Chat.',
+  'context.trimmed': 'Ältere Teile dieses Chats werden nicht mehr an das Modell geschickt.',
 
   // a picture at full size
   'lightbox.close': 'Schließen',
@@ -82,6 +90,26 @@ export const de: Strings = {
   'mic.unsupported': 'Dieser Browser kann kein Audio aufnehmen.',
   'mic.unavailable': 'Es konnte kein Mikrofon verwendet werden.',
   'mic.limit': 'noch {s} s',
+
+  // what an answer says about itself, under it
+  'notice.answer_cut': 'Die Antwort wurde an der Längengrenze abgeschnitten.',
+  'notice.continue': 'Weiter',
+  'notice.document_partial': 'Von ‚{name}‘ wurden {read} von {total} {units} gelesen.',
+  'notice.document_partial_generic': 'Ein Dokument wurde nur teilweise gelesen.',
+  'notice.document_unread': '‚{name}‘ wurde für diese Antwort nicht gelesen.',
+  'notice.document_unread_generic': 'Ein Anhang wurde für diese Antwort nicht gelesen.',
+  'notice.tools_unavailable': 'Die Werkzeuge waren für diese Antwort nicht erreichbar; angehängte Dateien wurden nicht gelesen.',
+  'notice.retry': 'Erneut versuchen',
+  'unit.page': 'Seiten',
+  'unit.page_one': 'Seite',
+  'unit.slide': 'Folien',
+  'unit.slide_one': 'Folie',
+  'unit.paragraph': 'Absätzen',
+  'unit.paragraph_one': 'Absatz',
+  'unit.row': 'Zeilen',
+  'unit.row_one': 'Zeile',
+  'unit.line': 'Zeilen',
+  'unit.line_one': 'Zeile',
 
   // the trail of tool steps
   'trail.steps': '{n} Schritte',
@@ -123,6 +151,7 @@ export const de: Strings = {
   'error.model': 'Das Modell hat nicht geantwortet. Bitte erneut versuchen.',
   'error.audit': 'Die Antwort wurde abgebrochen, weil sie nicht protokolliert werden konnte.',
   'error.internal': 'Etwas ist schiefgelaufen.',
+  'error.context': 'Dieser Chat ist zu lang für das Modell. Beginnen Sie einen neuen Chat oder kürzen Sie Ihre Nachricht.',
 
   // retention note
   'retention.chats': 'Chats werden {days} Tage nach ihrem Beginn gelöscht.',

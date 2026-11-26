@@ -19,7 +19,7 @@ from typing_extensions import override
 from ghostwriter.agent import limits
 from ghostwriter.agent.stream import RoundDone, TextDelta, ToolCall, stream_round
 from ghostwriter.config import Settings
-from ghostwriter.inference import ModelClient, cache_scope_for, inference_headers
+from ghostwriter.inference import CONTINUE_BODY, ModelClient, cache_scope_for, inference_headers
 from tests.conftest import make_settings
 from tests.fakes import (
     SERVED_MODEL,
@@ -75,9 +75,24 @@ def _model(settings: Settings, *rounds: Round) -> tuple[ModelClient, FakeOpenAI]
 
 
 def _round(
-    model: ModelClient, *, tools: list[dict[str, Any]] | None = None, reasoning: bool = False
+    model: ModelClient,
+    *,
+    tools: list[dict[str, Any]] | None = None,
+    reasoning: bool = False,
+    continuation: bool = False,
+    require_tool: bool = False,
 ) -> list[TextDelta | RoundDone]:
-    return list(stream_round(model, MSGS, tools=tools or [], headers=H, cancel=threading.Event(), reasoning=reasoning))
+    rounds = stream_round(
+        model,
+        MSGS,
+        tools=tools or [],
+        headers=H,
+        cancel=threading.Event(),
+        reasoning=reasoning,
+        continuation=continuation,
+        require_tool=require_tool,
+    )
+    return list(rounds)
 
 
 def _text(events: list[TextDelta | RoundDone]) -> str:
@@ -243,6 +258,21 @@ def test_a_round_with_tools_asks_for_usage_and_bounds_the_answer(settings: Setti
     ]
 
 
+@pytest.mark.parametrize(("provider", "choice"), [("vllm", "required"), ("ollama", "auto")])
+def test_a_round_that_must_call_requires_a_call_on_vllm(settings: Settings, provider: str, choice: str) -> None:
+    """A round that must call a tool asks vllm for ``required``; any other provider is asked for ``auto``."""
+    model, fake = _model(dataclasses.replace(settings, inference_provider=provider), [text_chunk("Hallo")])
+    _round(model, tools=TOOLS, require_tool=True)
+    assert fake.calls[0]["tool_choice"] == choice
+
+
+def test_a_round_without_tools_requires_nothing(settings: Settings) -> None:
+    """With no tool offered, a round that must call sends neither key, as any round without tools."""
+    model, fake = _model(settings, [text_chunk("Hallo")])
+    _round(model, tools=[], require_tool=True)
+    assert "tools" not in fake.calls[0] and "tool_choice" not in fake.calls[0]
+
+
 def test_a_stop_closes_the_stream(settings: Settings) -> None:
     """Once cancel is set no further chunk is read or shown, no half-sent call is asked for, the stream closes."""
     model, fake = _model(
@@ -297,9 +327,14 @@ def test_every_round_carries_the_cache_scope_and_request_id(settings: Settings) 
 
 
 def _over_the_wire(
-    settings: Settings, *, reasoning: bool = False, reply: Sequence[Chunk] = (text_chunk("Hal"), text_chunk("lo"))
+    settings: Settings,
+    *,
+    reasoning: bool = False,
+    reply: Sequence[Chunk] = (text_chunk("Hal"), text_chunk("lo")),
+    tools: list[dict[str, Any]] = TOOLS,
+    continuation: bool = False,
 ) -> tuple[list[TextDelta | RoundDone], httpx2.Request]:
-    """Run one round offering TOOLS through the real SDK over a mock transport."""
+    """Run one round, offering TOOLS unless told otherwise, through the real SDK over a mock transport."""
     seen: list[httpx2.Request] = []
     finish = text_chunk("")
     finish["choices"][0] |= {"delta": {}, "finish_reason": "stop"}
@@ -316,7 +351,7 @@ def _over_the_wire(
         max_retries=0,
         http_client=httpx2.Client(transport=httpx2.MockTransport(answer)),
     )
-    events = _round(ModelClient(settings, client=client), tools=TOOLS, reasoning=reasoning)
+    events = _round(ModelClient(settings, client=client), tools=tools, reasoning=reasoning, continuation=continuation)
     [request] = seen
     return events, request
 
@@ -353,6 +388,48 @@ def test_on_vllm_the_reasoning_switch_reaches_the_chat_template(
     """
     _, request = _over_the_wire(dataclasses.replace(settings, inference_provider=provider), reasoning=reasoning)
     assert json.loads(request.content) == {**BODY, "max_tokens": max_tokens, **extra}
+
+
+@pytest.mark.parametrize(("provider", "extra"), [("vllm", CONTINUE_BODY), ("ollama", {})], ids=["vllm", "ollama"])
+def test_a_continuation_continues_the_last_message_on_vllm(
+    settings: Settings, provider: str, extra: dict[str, Any]
+) -> None:
+    """On vllm a continuation goes on in the last assistant message, without thinking; elsewhere nothing is sent for it.
+
+    It offers no tool, and answers in up to the cap of a round without thinking.
+    """
+    assert CONTINUE_BODY == {
+        "continue_final_message": True,
+        "add_generation_prompt": False,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    _, request = _over_the_wire(dataclasses.replace(settings, inference_provider=provider), tools=[], continuation=True)
+    body = json.loads(request.content)
+    plain = {key: value for key, value in BODY.items() if key not in ("tools", "tool_choice")}
+    assert body == {**plain, **extra}
+    assert body["max_tokens"] == 4_000 and "tools" not in body and "tool_choice" not in body
+
+
+def test_a_continuation_keeps_the_whitespace_it_opens_with(settings: Settings) -> None:
+    """A new answer starts without leading whitespace; a continuation keeps it, as it joins the answer so far.
+
+    Its trailing whitespace is dropped as any reply's, and a reply of whitespace alone shows nothing.
+    """
+    model, _ = _model(
+        settings,
+        [text_chunk(" wei"), text_chunk("ter. ")],
+        [text_chunk(" wei"), text_chunk("ter. ")],
+        [text_chunk("\n"), text_chunk("\n- Punkt"), text_chunk(" zwei")],
+        [text_chunk(" \n "), text_chunk("  ")],
+    )
+    assert _text(_round(model)) == "weiter."
+    went_on = _round(model, continuation=True)
+    assert went_on[:-1] == [TextDelta(" wei"), TextDelta("ter.")]
+    done = went_on[-1]
+    assert isinstance(done, RoundDone) and done.text == " weiter."
+    assert _text(_round(model, continuation=True)) == "\n\n- Punkt zwei"
+    blank = _round(model, continuation=True)
+    assert _text(blank) == "" and isinstance(blank[-1], RoundDone) and blank[-1].text == ""
 
 
 def test_the_sdk_hands_over_a_separate_reasoning_field_and_it_is_dropped(settings: Settings) -> None:
@@ -408,7 +485,7 @@ def test_the_prompt_and_the_answer_fit_the_context() -> None:
     assert (limits.MAX_TOOL_ROUNDS, limits.MAX_CALLS_PER_ROUND) == (8, 4)
     assert (limits.MESSAGE_WALL_S, limits.TOOL_CUTOFF_S, limits.BUSY_RETRY_S) == (300.0, 10.0, 2.0)
     assert (limits.TOOL_RESULT_CHARS, limits.HISTORY_ARGUMENT_CHARS, limits.HISTORY_RESULT_CHARS) == (
-        12_000,
+        16_896,
         2_000,
         2_000,
     )

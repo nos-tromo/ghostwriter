@@ -1,6 +1,10 @@
 """The chat store: ownership, the chat period, contents that expire with their files, and deletion."""
 
+import contextlib
+import json
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, cast
@@ -13,8 +17,9 @@ from sqlalchemy import Engine, delete, func, select, update
 from sqlalchemy.orm import InstrumentedAttribute, Session
 
 from ghostwriter.db import init_db, make_engine
+from ghostwriter.main import create_app
 from ghostwriter.models import Attachment, Chat, FileMark, Message, Result, ToolStep
-from ghostwriter.schemas import AttachmentOut, ResultOut, StepOut, TablePreviewOut
+from ghostwriter.schemas import AttachmentOut, LengthOut, MeasureState, NoticeOut, ResultOut, StepOut, TablePreviewOut
 from ghostwriter.store import (
     STORED_MANIFEST_KEYS,
     AttachmentNotPending,
@@ -23,6 +28,7 @@ from ghostwriter.store import (
     FileRef,
     TooManyPending,
 )
+from tests.conftest import CapturedAuditStream, make_settings
 
 T0 = datetime(2026, 11, 16, tzinfo=UTC)
 DAY = timedelta(days=1)
@@ -416,6 +422,34 @@ def test_the_pending_cap_is_counted_inside_the_write(store: ChatStore) -> None:
     store.add_user_message("user-a", chat.id, "Hallo", [first.id])
     store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
     assert store.pending_count(chat.id) == 2
+
+
+def test_two_parallel_adds_one_below_the_cap_store_one(store: ChatStore, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The second add counts only after the first has stored, under SQLite's write lock: one of the two is refused."""
+    chat = store.create_chat("user-a")
+    _attach(store, chat.id)
+    both_counted = threading.Barrier(2, timeout=0.5)
+    count = ChatStore._pending
+
+    def count_then_meet(self: ChatStore, s: Session, chat_id: str, now: datetime) -> int:
+        pending = count(self, s, chat_id, now)
+        with contextlib.suppress(threading.BrokenBarrierError):
+            both_counted.wait()  # without the lock both adds count here before either stores
+        return pending
+
+    monkeypatch.setattr(ChatStore, "_pending", count_then_meet)
+
+    def add(_: int) -> str:
+        path, name = "/workspace/s/sales.xlsx", "sales.xlsx"
+        try:
+            store.add_attachment(chat.id, file_id=uuid4().hex, path=path, name=name, size=14, mime=XLSX, max_pending=2)
+        except TooManyPending:
+            return "refused"
+        return "stored"
+
+    with ThreadPoolExecutor(2) as pool:
+        outcomes = sorted(pool.map(add, range(2)))
+    assert (outcomes, store.pending_count(chat.id)) == (["refused", "stored"], 2)
 
 
 def test_expired_pending_attachments_do_not_count_against_the_cap(store: ChatStore, clock: Clock) -> None:
@@ -918,6 +952,148 @@ def test_emptying_a_manifest_leaves_steps_and_results_alone(store: ChatStore, en
         assert s.execute(select(Result.preview).where(Result.id == result.id)).scalar_one() is not None
 
 
+MEASURE = {"total": 412, "unit": "page", "chars": 90_000, "capped": False}
+
+
+def _document(
+    store: ChatStore, chat_id: str, *, status: str = "ready", measure_state: MeasureState | None = "pending"
+) -> str:
+    """Add a pending document, its measure in the state given."""
+    file_id = uuid4().hex
+    return store.add_attachment(
+        chat_id,
+        file_id=file_id,
+        path=f"/workspace/s/{file_id}.pdf",
+        name="long-report.pdf",
+        size=4096,
+        mime="application/pdf",
+        status=status,
+        measure_state=measure_state,
+    ).id
+
+
+def _measure_row(engine: Engine, attachment_id: str) -> tuple[str | None, str | None]:
+    """Read an attachment's measure state and measure as stored."""
+    with Session(engine) as s:
+        row = s.execute(
+            select(Attachment.measure_state, Attachment.measure).where(Attachment.id == attachment_id)
+        ).one()
+        return row[0], row[1]
+
+
+def test_a_measure_settles_once(store: ChatStore, engine: Engine) -> None:
+    """Only a pending measure settles: a measure is kept as its four counts, ``None`` is ``none``; nothing twice."""
+    chat = store.create_chat("user-a")
+    report, ledger = _document(store, chat.id), _document(store, chat.id)
+    assert store.settle_measure(report, {**MEASURE, "path": "/workspace/s/x.pdf", "kind": "pdf"}) is True
+    assert store.settle_measure(report, None) is False
+    assert store.settle_measure(ledger, None) is True
+    assert store.settle_measure(ledger, MEASURE) is False
+    assert store.settle_measure(_document(store, chat.id, measure_state=None), MEASURE) is False
+    assert store.settle_measure("0" * 32, MEASURE) is False
+    state, measure = _measure_row(engine, report)
+    assert state == "measured" and measure is not None and json.loads(measure) == MEASURE
+    assert _measure_row(engine, ledger) == ("none", None)
+    out = store.attachment_out("user-a", chat.id, report)
+    assert out is not None and out.length == LengthOut(state="measured", total=412, unit="page", too_long=False)
+    out = store.attachment_out("user-a", chat.id, ledger)
+    assert out is not None and out.length == LengthOut(state="none", total=None, unit=None, too_long=False)
+
+
+def test_a_document_too_long_for_the_prompt(engine: Engine, clock: Clock) -> None:
+    """Too long: more characters than the store's prompt budget in tokens, or a count workbench capped."""
+    store = ChatStore(engine, file_days=7, notice_days=30, prompt_budget=1_000, now=clock)
+    chat = store.create_chat("user-a")
+    cases = {
+        (3_000, False): False,
+        (3_001, False): True,
+        (10, True): True,
+    }
+    for (chars, capped), too_long in cases.items():
+        attachment = _document(store, chat.id)
+        store.settle_measure(attachment, {**MEASURE, "chars": chars, "capped": capped})
+        out = store.attachment_out("user-a", chat.id, attachment)
+        assert out is not None and out.length is not None and out.length.too_long is too_long
+
+
+def test_a_picture_and_a_row_before_measuring_have_no_length(store: ChatStore) -> None:
+    """``NULL`` is never measured: a picture, a clip, or a row from before schema 3; its length is ``None``."""
+    chat = store.create_chat("user-a")
+    picture = _picture(store, chat.id)
+    old = _document(store, chat.id, measure_state=None)
+    assert picture.length is None
+    out = store.attachment_out("user-a", chat.id, old)
+    assert out is not None and out.length is None
+    found = store.find_attachment("user-a", chat.id, old)
+    assert found is not None and found.measure_state is None
+
+
+def test_length_goes_with_the_file(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """Past the file's period a length is not served, and the sweep empties the measure with the manifest."""
+    chat = store.create_chat("user-a")
+    scan = _document(store, chat.id, status="processing")
+    store.settle_attachment(scan, status="ready", manifest=MANIFEST, failure=None)
+    store.settle_measure(scan, MEASURE)
+    notes = _document(store, chat.id)
+    store.settle_measure(notes, MEASURE)
+    clock.now = T0 + 7 * DAY - timedelta(microseconds=1)
+    out = store.attachment_out("user-a", chat.id, scan)
+    assert out is not None and out.length is not None and out.length.state == "measured"
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+    clock.now = T0 + 7 * DAY
+    out = store.attachment_out("user-a", chat.id, scan)
+    assert out is not None and out.expired and out.length is None
+    _, _, due = store.due_contents(clock.now, 10)
+    assert sorted(due) == sorted([scan, notes])
+    store.empty_contents([], [], due)
+    assert _raw_attachment(engine, scan)[1] is None
+    assert [_measure_row(engine, attachment)[1] for attachment in (scan, notes)] == [None, None]
+    assert store.due_contents(clock.now, 10) == ([], [], [])
+
+
+def test_pending_measures_are_the_ready_rows_still_pending(store: ChatStore) -> None:
+    """A processing row is the prepare's to requeue, a settled measure is no one's; a ready pending row is listed."""
+    chat = store.create_chat("user-a")
+    ready = _document(store, chat.id)
+    _document(store, chat.id, status="processing")
+    measured = _document(store, chat.id)
+    store.settle_measure(measured, MEASURE)
+    assert [(ref.id, ref.owner, ref.measure_state) for ref in store.pending_measures()] == [
+        (ready, "user-a", "pending")
+    ]
+
+
+def test_settle_pending_measures_at_start_without_workbench(
+    tmp_path: Path, engine: Engine, audit_stream: CapturedAuditStream
+) -> None:
+    """Without workbench nothing will measure them: every pending measure is ``none`` once the app has started."""
+    store = ChatStore(engine, file_days=7, notice_days=30)
+    chat = store.create_chat("user-a")
+    ready, processing = _document(store, chat.id), _document(store, chat.id, status="processing")
+    measured = _document(store, chat.id)
+    store.settle_measure(measured, MEASURE)
+    assert store.settle_pending_measures() == 2
+    assert store.settle_pending_measures() == 0
+    assert [_measure_row(engine, attachment)[0] for attachment in (ready, processing, measured)] == [
+        "none",
+        "none",
+        "measured",
+    ]
+    settings = make_settings(tmp_path, workbench_api_key=None, db_path=str(tmp_path / "start.sqlite3"))
+    started = make_engine(settings.db_path)
+    init_db(started)
+    try:
+        earlier = ChatStore(started, file_days=7, notice_days=30)
+        left = _document(earlier, earlier.create_chat("user-a").id)
+    finally:
+        started.dispose()
+    with TestClient(create_app(settings, audit_stream=audit_stream)) as client:
+        app_store = cast(FastAPI, client.app).state.store
+        assert cast(FastAPI, client.app).state.processor is None
+        [pending] = app_store.chat_detail("user-a", app_store.list_chats("user-a")[0].id).pending_attachments
+        assert pending.id == left and pending.length == LengthOut(state="none", total=None, unit=None, too_long=False)
+
+
 def test_an_attachment_for_a_chat_deleted_meanwhile_is_refused(store: ChatStore) -> None:
     """A chat deleted while its file was being handed over takes no attachment row."""
     chat = store.create_chat("user-a")
@@ -979,6 +1155,161 @@ def test_chats_list_by_their_latest_activity(store: ChatStore, clock: Clock) -> 
     store.add_user_message("user-a", second.id, "Hallo", [])
     assert store.get_chat("user-a", second.id).updated_at == clock.now
     assert [c.id for c in store.list_chats("user-a")] == [second.id, first.id]
+
+
+# --- an answer's notices -----------------------------------------------------
+
+#: workbench's id of the survey the notices are about.
+SURVEY = "c" * 32
+DOCX = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+PARTIAL = {"code": "document_partial", "file_id": SURVEY, "read": 9, "total": 500, "unit": "page"}
+
+
+def _asked(store: ChatStore) -> tuple[str, str]:
+    """Start a chat whose question sends the harbour survey, and open its answer.
+
+    Args:
+        store: The store.
+
+    Returns:
+        The chat's and the answer's ids.
+    """
+    chat = store.create_chat("user-a")
+    survey = store.add_attachment(
+        chat.id, file_id=SURVEY, path=f"/workspace/s/{SURVEY}.docx", name="harbour-survey.docx", size=4096, mime=DOCX
+    )
+    store.add_user_message("user-a", chat.id, "Fasse den Bericht zusammen.", [survey.id])
+    return chat.id, store.start_assistant_message(chat.id)
+
+
+def _raw_notices(engine: Engine, message_id: str) -> tuple[str | None, datetime | None]:
+    """Read an answer's notices and their deadline as stored."""
+    with Session(engine) as s:
+        row = s.execute(select(Message.notices, Message.notices_expire_at).where(Message.id == message_id)).one()
+        return row[0], row[1]
+
+
+def test_an_answer_keeps_its_notices_and_estimate(store: ChatStore, engine: Engine) -> None:
+    """The notices come back in order, a file's with its attachment's name, never stored; a question has none."""
+    chat_id, answer = _asked(store)
+    unread = {"code": "document_unread", "file_id": SURVEY}
+    notices = [{"code": "answer_cut"}, unread]
+    store.finish_assistant_message(answer, "Der Bericht", notices=notices, context_estimate=1234)
+    question, reply = store.chat_detail("user-a", chat_id).messages
+    assert reply.notices == [
+        NoticeOut(code="answer_cut"),
+        NoticeOut(code="document_unread", file_id=SURVEY, name="harbour-survey.docx"),
+    ]
+    assert reply.context_estimate == 1234
+    assert (question.notices, question.context_estimate) == (None, None)
+    stored, deadline = _raw_notices(engine, answer)
+    assert stored is not None and json.loads(stored) == notices
+    assert "harbour-survey" not in stored and deadline == T0 + 7 * DAY
+
+
+def test_a_notice_is_stored_without_a_name_whoever_the_caller_is(store: ChatStore, engine: Engine) -> None:
+    """A name a caller leaves on a notice is dropped before it is stored; the code and the file id stay."""
+    chat_id, answer = _asked(store)
+    named = {"code": "document_unread", "file_id": SURVEY, "name": "harbour-survey.docx"}
+    store.finish_assistant_message(answer, "Der Bericht", notices=[named])
+    stored, _ = _raw_notices(engine, answer)
+    assert stored is not None and json.loads(stored) == [{"code": "document_unread", "file_id": SURVEY}]
+    assert "harbour-survey" not in stored
+    assert named["name"] == "harbour-survey.docx"
+    reply = store.chat_detail("user-a", chat_id).messages[1]
+    assert reply.notices == [NoticeOut(code="document_unread", file_id=SURVEY, name="harbour-survey.docx")]
+
+
+def test_only_a_notice_about_a_file_sets_a_deadline(store: ChatStore, engine: Engine) -> None:
+    """Codes without details set no deadline; no notices are an empty list; a code not known here is left out."""
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[{"code": "images_dropped"}, {"code": "answer_cut"}])
+    assert _raw_notices(engine, answer)[1] is None
+    later = store.start_assistant_message(chat_id)
+    store.finish_assistant_message(later, "Noch einmal")
+    assert _raw_notices(engine, later) == ("[]", None)
+    assert store.chat_detail("user-a", chat_id).messages[2].notices == []
+    with Session(engine) as s, s.begin():
+        stored = json.dumps([{"code": "later_code"}, ["answer_cut"], {"code": "answer_cut"}])
+        s.execute(update(Message).where(Message.id == later).values(notices=stored))
+    assert store.chat_detail("user-a", chat_id).messages[2].notices == [NoticeOut(code="answer_cut")]
+
+
+def test_notice_details_follow_the_content_deadline(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """The survey sent on day 0 and answered on day 1: its notice's details are served until day 7, then its code alone.
+
+    Before any sweep the details are still stored; past the deadline they are only not served.
+    """
+    chat = store.create_chat("user-a")
+    survey = store.add_attachment(
+        chat.id, file_id=SURVEY, path=f"/workspace/s/{SURVEY}.docx", name="harbour-survey.docx", size=4096, mime=DOCX
+    )
+    store.add_user_message("user-a", chat.id, "Fasse den Bericht zusammen.", [survey.id])
+    clock.now = T0 + DAY
+    answer = store.start_assistant_message(chat.id)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[PARTIAL])
+    assert _raw_notices(engine, answer)[1] == T0 + 7 * DAY
+
+    def served() -> list[NoticeOut] | None:
+        return store.chat_detail("user-a", chat.id).messages[1].notices
+
+    clock.now = T0 + 7 * DAY - timedelta(seconds=1)
+    assert served() == [
+        NoticeOut(code="document_partial", file_id=SURVEY, name="harbour-survey.docx", read=9, total=500, unit="page")
+    ]
+    clock.now = T0 + 7 * DAY
+    assert [notice.model_dump() for notice in served() or []] == [
+        {"code": "document_partial", "file_id": None, "name": None, "read": None, "total": None, "unit": None}
+    ]
+    stored = _raw_notices(engine, answer)[0]
+    assert stored is not None and json.loads(stored) == [PARTIAL]
+
+
+def test_a_continued_write_keeps_the_deadline(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A later write of the answer (Continue) stores its own notices and estimate, and keeps the first one's deadline.
+
+    The later write is made under a 3-day file period, which would set another deadline.
+    """
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht", notices=[PARTIAL, {"code": "answer_cut"}])
+    assert _raw_notices(engine, answer)[1] == T0 + 7 * DAY
+    clock.now = T0 + DAY
+    later = ChatStore(engine, file_days=3, notice_days=30, now=clock)
+    later.finish_assistant_message(answer, "Der Bericht, weiter.", notices=[PARTIAL], context_estimate=2048)
+    stored, deadline = _raw_notices(engine, answer)
+    assert deadline == T0 + 7 * DAY
+    assert stored is not None and json.loads(stored) == [PARTIAL]
+    reply = store.chat_detail("user-a", chat_id).messages[1]
+    assert (reply.content, reply.context_estimate) == ("Der Bericht, weiter.", 2048)
+
+
+def test_apply_periods_moves_notice_deadlines(store: ChatStore, engine: Engine, clock: Clock) -> None:
+    """A shorter file period moves a deadline still ahead earlier; one already passed stays, as a step's does."""
+    clock.now = T0 - 10 * DAY
+    store.apply_periods(90)
+    _, passed = _asked(store)
+    store.finish_assistant_message(passed, "Alt", notices=[PARTIAL])
+    clock.now = T0
+    _, live = _asked(store)
+    store.finish_assistant_message(live, "Neu", notices=[PARTIAL])
+    _, plain = _asked(store)
+    store.finish_assistant_message(plain, "Ohne Datei", notices=[{"code": "answer_cut"}])
+    clock.now = T0 + DAY
+    ChatStore(engine, file_days=3, notice_days=30, now=clock).apply_periods(90)
+    assert _raw_notices(engine, passed)[1] == T0 - 3 * DAY
+    assert _raw_notices(engine, live)[1] == T0 + 3 * DAY
+    assert _raw_notices(engine, plain)[1] is None
+
+
+def test_an_answer_from_before_schema_3_has_no_notices(store: ChatStore, engine: Engine) -> None:
+    """An answer 0.6 stored has ``NULL`` notices and estimate: it is served with neither, as before."""
+    chat_id, answer = _asked(store)
+    store.finish_assistant_message(answer, "Der Bericht")
+    with Session(engine) as s, s.begin():
+        s.execute(update(Message).where(Message.id == answer).values(notices=None, context_estimate=None))
+    question, reply = store.chat_detail("user-a", chat_id).messages
+    assert (reply.content, reply.notices, reply.context_estimate) == ("Der Bericht", None, None)
+    assert (question.notices, question.context_estimate) == (None, None)
 
 
 def test_the_app_opens_the_store_and_applies_the_period(client: TestClient) -> None:

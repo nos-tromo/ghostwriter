@@ -20,6 +20,7 @@ function picture(fields: Partial<AttachmentOut> = {}): AttachmentOut {
     expired: false,
     kind: 'image',
     status: 'ready',
+    length: null,
     ...fields,
   }
 }

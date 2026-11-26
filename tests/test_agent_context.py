@@ -18,13 +18,20 @@ from sqlalchemy import Engine
 
 from ghostwriter.agent.context import (
     CLEARED,
+    DATA_FORMATS,
+    LONGER_THAN_A_PROMPT,
     OFFICE_FORMATS,
     UNSEEN_PICTURE,
+    FitReport,
     PastCall,
     PastTurn,
+    _replayed,
+    _Size,
     attachment_facts,
     estimate_tokens,
+    finished_turn,
     fit,
+    next_prompt_tokens,
     user_content,
 )
 from ghostwriter.agent.images import (
@@ -53,10 +60,17 @@ from ghostwriter.agent.limits import (
     REASONING_PROMPT_TOKENS,
     TOOL_RESULT_CHARS,
 )
-from ghostwriter.agent.prompt import DECK_CHECK, MEDIA, PRESENTATIONS, VISION, system_prompt
+from ghostwriter.agent.notices import SentFile
+from ghostwriter.agent.prompt import DECK_CHECK, FILES, MEDIA, PAGING, PRESENTATIONS, UNREACHABLE, VISION, system_prompt
 from ghostwriter.agent.tools import (
+    CUT_END_HINT,
+    CUT_HINT,
+    CUT_MARK,
     REFUSALS,
     Refusal,
+    compact,
+    cut,
+    cut_result,
     echoed_arguments,
     function_tools,
     parse_arguments,
@@ -67,7 +81,7 @@ from ghostwriter.agent.tools import (
 from ghostwriter.db import init_db, make_engine
 from ghostwriter.schemas import AttachmentOut
 from ghostwriter.store import ChatStore, UserTurn
-from ghostwriter.upload import OFFICE_SUFFIXES
+from ghostwriter.upload import ATTACHMENT_TYPES, OFFICE_SUFFIXES
 from ghostwriter.workbench import McpTool, OutputFile, TablePreview, ToolFailure, ToolImage, ToolResult
 from tests.fakes import TINY_JPEG, TINY_PNG, stock_manifest
 
@@ -83,6 +97,7 @@ TOOLS = function_tools(
     ]
 )
 SYSTEM = system_prompt(today=date(2026, 11, 16), folder=FOLDER, file_days=7, expired=False)
+SYSTEM_ONLY = [{"role": "system", "content": SYSTEM}]
 EXPIRED = (
     "Some files and tool results of earlier messages in this chat have been deleted, as 7 days had passed. "
     "Say so when the user asks about them, and ask them to attach the file again."
@@ -252,6 +267,325 @@ def test_the_model_reads_a_result_failure_or_refusal_in_bounded_text() -> None:
     )
 
 
+def _page_text(n: int, chars: int) -> str:
+    """Return ``chars`` characters of invented page text, umlauts and a quotation mark among them."""
+    line = f'Seite {n}: Überprüfung der "Hafenbilanz" und ihrer Posten. '
+    return (line * (chars // len(line) + 1))[:chars]
+
+
+def _paged_answer(
+    texts: list[str], *, hint: str | None = "Read on with part set to next_part.", more: bool = True
+) -> str:
+    """Return a ``read_document`` answer as workbench writes it: compact JSON, keys in its order.
+
+    Args:
+        texts: The text of each part, labelled ``page 1`` to ``page N``.
+        hint: workbench's hint, if it sent one.
+        more: Whether workbench itself stopped after the parts, with three pages more, so that ``next_part`` is
+            ``page N+1``; otherwise the parts are the end of the document, and ``next_part`` is ``None``.
+
+    Returns:
+        The answer.
+    """
+    body = {
+        "path": "long-report.pdf",
+        "kind": "pdf",
+        "parts": [
+            {"label": f"page {n}", "text": text, "units": [n, n], "cut": False} for n, text in enumerate(texts, 1)
+        ],
+        "total_parts": len(texts) + 3 if more else len(texts),
+        "pages_without_text": [3, 7],
+        "truncated": more,
+        "next_part": f"page {len(texts) + 1}" if more else None,
+        "hint": hint,
+    }
+    return compact(body)
+
+
+def _read_answer(parts: int, chars: int) -> str:
+    """Return a ``read_document`` answer of ``parts`` pages of ``chars`` characters each."""
+    return _paged_answer([_page_text(n, chars) for n in range(1, parts + 1)])
+
+
+def test_a_long_read_document_answer_keeps_its_paging_fields() -> None:
+    """A paged answer over the cap is cut by whole parts: it stays JSON and says where to read on."""
+    text = _read_answer(5, 3_900)
+    assert len(text) > TOOL_RESULT_CHARS
+    sent = json.loads(text)
+    out = tool_message(ToolResult(text, ()))
+    body = json.loads(out)
+    assert len(out) <= TOOL_RESULT_CHARS
+    kept = body["parts"]
+    assert 0 < len(kept) < 5
+    assert body["truncated"] is True
+    assert body["next_part"] == f"page {len(kept) + 1}"
+    assert (body["total_parts"], body["pages_without_text"]) == (sent["total_parts"], sent["pages_without_text"])
+    assert body["hint"].endswith(CUT_HINT) and body["hint"].startswith(sent["hint"])
+    assert kept[:-1] == sent["parts"][: len(kept) - 1]
+    assert kept == sent["parts"][: len(kept)]  # a part is not trimmed when others are kept: it is left out whole
+
+
+def test_a_part_that_does_not_fit_whole_is_left_out_not_trimmed() -> None:
+    """With other parts kept, the part that does not fit is left out whole, so that ``next_part`` names it."""
+    text = _read_answer(4, 7_000)
+    sent = json.loads(text)
+    out = cut_result(text, TOOL_RESULT_CHARS)
+    body = json.loads(out)
+    assert body["parts"] == sent["parts"][:2]
+    assert not any(part["cut"] for part in body["parts"])
+    assert body["next_part"] == "page 3"
+    assert body["truncated"] is True and body["hint"].endswith(CUT_HINT)
+    assert len(out) <= TOOL_RESULT_CHARS
+
+
+def test_a_part_cut_alone_names_workbenchs_own_next_part() -> None:
+    """A part is cut only when it is the one part there is room for; with none after it, workbench's ``next_part``."""
+    hint = "Read on with part set to next_part."
+    text = _paged_answer([_page_text(1, 20_000)], hint=hint)
+    sent = json.loads(text)
+    out = cut_result(text, TOOL_RESULT_CHARS)
+    body = json.loads(out)
+    (only,) = body["parts"]
+    assert only["label"] == "page 1" and only["units"] == [1, 1]
+    assert only["cut"] is True and only["text"].endswith(CUT_MARK)
+    assert sent["parts"][0]["text"].startswith(only["text"].removesuffix(CUT_MARK))
+    assert TOOL_RESULT_CHARS - 6 < len(out) <= TOOL_RESULT_CHARS
+    assert body["next_part"] == sent["next_part"] == "page 2"
+    assert body["total_parts"] == sent["total_parts"] and body["truncated"] is True
+    assert body["hint"] == f"{hint} {CUT_END_HINT} {CUT_HINT}"
+
+
+def test_a_first_part_too_long_alone_is_cut_and_reading_goes_on_after_it() -> None:
+    """If even the first part does not fit, it is cut, and ``next_part`` is the second part; its old advice goes."""
+    text = _paged_answer([_page_text(1, 20_000), _page_text(2, 500)], hint=WORKBENCH_PAGING[0].replace("6", "3"))
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    (only,) = body["parts"]
+    assert only["label"] == "page 1" and only["cut"] is True and only["text"].endswith(CUT_MARK)
+    assert body["next_part"] == "page 2"
+    assert body["hint"] == f"{CUT_END_HINT} {CUT_HINT}"
+
+
+@pytest.mark.parametrize("hint", [None, ""])
+def test_a_cut_answer_without_a_hint_gets_only_the_cut_hint(hint: str | None) -> None:
+    """With no hint from workbench, ``hint`` is just Ghostwriter's own sentence."""
+    text = _paged_answer([_page_text(n, 3_900) for n in range(1, 6)], hint=hint)
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    assert body["hint"] == CUT_HINT
+
+
+@pytest.mark.parametrize("limit", [2_000, 4_000, 9_999, TOOL_RESULT_CHARS])
+def test_escaped_text_still_fits(limit: int) -> None:
+    """Quotation marks, newlines and control characters grow as JSON; what is kept is fitted to the limit."""
+    hostile = '"\n\x01'
+    texts = [(hostile * 1_400)[: 3_000 + 7 * n] for n in range(4)]
+    text = _paged_answer(texts)
+    sent = json.loads(text)
+    out = cut_result(text, limit)
+    body = json.loads(out)
+    assert len(out) <= limit
+    (only,) = body["parts"]  # a part is about 10,000 characters as JSON: the limit holds one, whole or cut
+    assert body["next_part"] == "page 2"
+    if limit == TOOL_RESULT_CHARS:
+        assert only == sent["parts"][0]
+    else:
+        assert only["cut"] is True and only["text"].endswith(CUT_MARK)
+        assert sent["parts"][0]["text"].startswith(only["text"].removesuffix(CUT_MARK))
+        assert limit - len(out) < 6  # one more character, at six escaped, would not have fitted
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "x" * (TOOL_RESULT_CHARS + 500),
+        "[" * (TOOL_RESULT_CHARS + 500),
+        compact([{"label": "page 1", "text": "x" * TOOL_RESULT_CHARS}]),
+        compact("x" * TOOL_RESULT_CHARS),
+        compact({"parts": "x", "pad": "y" * TOOL_RESULT_CHARS}),
+        compact({"parts": [1, 2], "pad": "y" * TOOL_RESULT_CHARS}),
+        compact({"parts": [{"label": "page 1"}], "pad": "y" * TOOL_RESULT_CHARS}),
+        compact({"parts": [{"label": 1, "text": "x" * TOOL_RESULT_CHARS}]}),
+        compact({"parts": [{"label": "page 1", "text": None}], "pad": "y" * TOOL_RESULT_CHARS}),
+        compact({"parts": [], "pad": "y" * TOOL_RESULT_CHARS}),
+        compact({"stdout": "z" * (TOOL_RESULT_CHARS + 50), "exit_code": 0}),
+    ],
+    ids=[
+        "not json",
+        "too deeply nested",
+        "an array",
+        "a string",
+        "parts is a string",
+        "parts holds numbers",
+        "a part without text",
+        "a label that is not a string",
+        "a text that is not a string",
+        "no parts",
+        "run_python's stdout",
+    ],
+)
+def test_other_results_are_cut_as_before(text: str) -> None:
+    """Whatever is not a paged answer is cut to the limit as in 0.6, and cutting it never raises."""
+    assert len(text) > TOOL_RESULT_CHARS
+    assert cut_result(text, TOOL_RESULT_CHARS) == cut(text, TOOL_RESULT_CHARS)
+    assert tool_message(ToolResult(text, ())) == cut(text, TOOL_RESULT_CHARS)
+
+
+def test_a_paged_answer_that_cannot_be_rebuilt_is_cut_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    """If the JSON cannot be written again (nested past the interpreter's depth), the text is cut and nothing raises."""
+    text = _read_answer(5, 3_900)
+
+    def too_deep(value: Any) -> str:
+        raise RecursionError
+
+    monkeypatch.setattr("ghostwriter.agent.tools.compact", too_deep)
+    assert cut_result(text, TOOL_RESULT_CHARS) == cut(text, TOOL_RESULT_CHARS)
+
+
+def test_a_result_within_the_cap_is_unchanged() -> None:
+    """A result that fits is returned as it came, paged or not, compact or not."""
+    paged = _read_answer(2, 1_000)
+    spaced = json.dumps(json.loads(paged), indent=2)
+    assert len(paged) < TOOL_RESULT_CHARS and len(spaced) < TOOL_RESULT_CHARS
+    for text in (paged, spaced, "Umsatz 42", ""):
+        assert cut_result(text, TOOL_RESULT_CHARS) == text
+        assert tool_message(ToolResult(text, ())) == text
+    assert cut_result("x" * TOOL_RESULT_CHARS, TOOL_RESULT_CHARS) == "x" * TOOL_RESULT_CHARS
+
+
+def test_a_shell_too_long_alone_falls_back() -> None:
+    """When the fields around the parts leave no room for one, the answer is cut as any other text."""
+    text = _paged_answer([_page_text(1, 500), _page_text(2, 500)], hint="h" * 20_000)
+    assert len(text) > TOOL_RESULT_CHARS
+    assert cut_result(text, TOOL_RESULT_CHARS) == cut(text, TOOL_RESULT_CHARS)
+
+
+#: workbench's sentences that tell the model where to read on: when its own limit cut the text, and when its images did.
+WORKBENCH_PAGING = [
+    'The answer is cut at the result limit (16 KB). Call read_document again with part="page 6" to continue.',
+    'The answer is cut before page 6 to keep its images within the limit. Call read_document again with part="page 6" '
+    "to continue.",
+]
+
+
+def _three_whole_parts(text: str, hint: str) -> str:
+    """Return the answer as it is cut to the first three of its parts, the fourth left out."""
+    sent = json.loads(text)
+    return compact({**sent, "parts": sent["parts"][:3], "truncated": True, "next_part": "page 4", "hint": hint})
+
+
+@pytest.mark.parametrize("sentence", WORKBENCH_PAGING, ids=["the result limit", "the images"])
+def test_workbenchs_paging_sentence_gives_way_to_the_next_part_left(sentence: str) -> None:
+    """When parts are left out, the hint no longer sends the model to workbench's page 6; other advice stays."""
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=f"Pages 3 and 7 have no text. {sentence}")
+    expected = _three_whole_parts(text, f"Pages 3 and 7 have no text. {CUT_HINT}")
+    out = cut_result(text, len(expected) + 800)  # room for most of page 4, which is left out whole all the same
+    assert out == expected
+    assert "page 6" not in out and json.loads(out)["next_part"] == "page 4"
+
+
+def test_workbenchs_paging_sentence_stays_when_next_part_does_not_move() -> None:
+    """If the cut is in the one part and workbench's next part stands, its sentence is true, and is kept."""
+    sentence = WORKBENCH_PAGING[0].replace("page 6", "page 2")
+    text = _paged_answer([_page_text(1, 20_000)], hint=f"Pages 3 and 7 have no text. {sentence}")
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    assert body["parts"][0]["cut"] is True and body["next_part"] == "page 2"
+    assert body["hint"] == f"Pages 3 and 7 have no text. {sentence} {CUT_END_HINT} {CUT_HINT}"
+
+
+def test_a_hint_that_was_only_workbenchs_paging_sentence_is_replaced() -> None:
+    """With nothing else in the hint, the answer's hint is Ghostwriter's own sentence alone."""
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=WORKBENCH_PAGING[0])
+    out = cut_result(text, len(_three_whole_parts(text, CUT_HINT)) + 100)
+    assert json.loads(out)["hint"] == CUT_HINT
+
+
+def test_a_part_cut_alone_with_no_part_after_it_does_not_point_at_next_part() -> None:
+    """With no part to read on at, the hint says the end was cut and what to do, and ``next_part`` stays null."""
+    text = _paged_answer([_page_text(1, 20_000)], hint=None, more=False)
+    body = json.loads(cut_result(text, TOOL_RESULT_CHARS))
+    (only,) = body["parts"]
+    assert only["cut"] is True and only["text"].endswith(CUT_MARK)
+    assert body["truncated"] is True and body["next_part"] is None
+    assert body["hint"] == CUT_END_HINT
+    assert "next_part" not in body["hint"]
+
+
+def test_a_part_that_does_not_fit_whole_is_never_trimmed() -> None:
+    """At every limit between the third part and the whole fourth, the fourth is left out and ``next_part`` names it."""
+    hint = "Read on with part set to next_part."
+    text = _paged_answer([_page_text(n, 1_000) for n in range(1, 6)], hint=hint)
+    expected = _three_whole_parts(text, f"{hint} {CUT_HINT}")
+    fourth = len(json.dumps(json.loads(text)["parts"][3], ensure_ascii=False, separators=(",", ":")))
+    for limit in range(len(expected), len(expected) + fourth):
+        assert cut_result(text, limit) == expected
+
+
+def _default_size_answer() -> str:
+    """Return the largest answer workbench sends at its 16 KB default, as the door's text carries it.
+
+    workbench measures its answer without the ``None`` fields, which the text then holds: ``next_part``, ``hint``,
+    ``outputs`` and a part's ``units``. The answer measured is exactly 16,384 characters.
+
+    Returns:
+        The text, a few dozen characters longer than that.
+    """
+
+    def answer(filler: int, *, nulls: bool) -> dict[str, Any]:
+        parts = [{"label": f"page {n}", "text": _page_text(n, 3_900), "units": [n, n], "cut": False} for n in (1, 2, 3)]
+        last: dict[str, Any] = {"label": "page 4", "text": "x" * filler, "cut": False}
+        body: dict[str, Any] = {
+            "path": "long-report.pdf",
+            "kind": "pdf",
+            "parts": [*parts, {**last, "units": None} if nulls else last],
+            "total_parts": 4,
+            "pages_without_text": [3, 7],
+            "truncated": False,
+        }
+        return {**body, "next_part": None, "hint": None, "outputs": None} if nulls else body
+
+    filler = 16_384 - len(compact(answer(0, nulls=False)))
+    assert len(compact(answer(filler, nulls=False))) == 16_384
+    return compact(answer(filler, nulls=True))
+
+
+def test_an_answer_of_workbenchs_default_size_is_never_cut() -> None:
+    """At its 16 KB, with the null fields its own measure leaves out, an answer passes as it is."""
+    text = _default_size_answer()
+    assert 16_384 < len(text) <= 16_384 + 512  # over the 16 KB it measured, by the null fields
+    assert len(text) <= TOOL_RESULT_CHARS
+    assert tool_message(ToolResult(text, ())) == text == cut_result(text, TOOL_RESULT_CHARS)
+
+
+def test_an_answer_clearly_over_the_cap_leaves_the_last_part_out_whole() -> None:
+    """Over the cap (workbench's limit raised): the last part goes, and no part is trimmed."""
+    text = next(
+        candidate
+        for candidate in (_read_answer(4, chars) for chars in range(3_500, 4_500))
+        if TOOL_RESULT_CHARS + 100 < len(candidate) <= TOOL_RESULT_CHARS + 400
+    )
+    sent = json.loads(text)
+    out = tool_message(ToolResult(text, ()))
+    body = json.loads(out)
+    assert body["parts"] == sent["parts"][:3]
+    assert not any(part["cut"] for part in body["parts"])
+    assert body["next_part"] == "page 4" == sent["parts"][3]["label"]
+    assert body["hint"] == f"{sent['hint']} {CUT_HINT}"
+    assert len(out) <= TOOL_RESULT_CHARS
+
+
+def test_a_cut_answer_never_loses_every_part() -> None:
+    """At any limit a cut answer holds at least one part, or is cut as any other text: never JSON with none."""
+    text = _paged_answer([_page_text(1, 500), _page_text(2, 500)])
+    for limit in range(100, len(text)):
+        out = cut_result(text, limit)
+        try:
+            body = json.loads(out)
+        except ValueError:
+            assert out == cut(text, limit)
+        else:
+            assert len(out) <= limit and body["parts"]
+            assert len(body["parts"]) == 1 or not any(part["cut"] for part in body["parts"])  # cut only when alone
+
+
 @pytest.mark.parametrize(
     ("output", "kind"),
     [
@@ -324,6 +658,31 @@ def test_earlier_turns_are_kept_newest_first_without_a_gap() -> None:
     assert _past_users(messages) == ["neu"]
 
 
+def _long_past(turns: int) -> list[PastTurn]:
+    """Return earlier turns of about 3,000 tokens each."""
+    return [_past_turn(user=f"{n}: " + "Größe " * 1_000, answer="Übersicht " * 300) for n in range(turns)]
+
+
+def test_fit_reports_the_turns_it_replayed() -> None:
+    """A report counts the earlier turns and those replayed; fewer replayed is a trim, all of them none."""
+    past, current = _long_past(5), [_user("Fasse zusammen")]
+    report = FitReport()
+    replayed = len(_past_users(fit(SYSTEM, TOOLS, past, current, budget=10_000, report=report)))
+    assert 0 < replayed < 5
+    assert (report.past_turns, report.replayed_turns, report.trimmed) == (5, replayed, True)
+    roomy = FitReport()
+    fit(SYSTEM, TOOLS, past, current, budget=100_000, report=roomy)
+    assert (roomy.past_turns, roomy.replayed_turns, roomy.trimmed) == (5, 5, False)
+    assert not FitReport().trimmed
+
+
+def test_fit_without_a_report_is_unchanged() -> None:
+    """A report only watches: the messages are the same with it and without it."""
+    past, current = _long_past(5), [_user("Fasse zusammen")]
+    without = fit(SYSTEM, TOOLS, past, current, budget=10_000)
+    assert fit(SYSTEM, TOOLS, past, current, budget=10_000, report=FitReport()) == without
+
+
 def test_the_tool_schemas_count_against_the_budget() -> None:
     """Large tool schemas leave less room for earlier turns."""
     tools = function_tools([McpTool("run_python", "Run Python. " * 500, SCHEMA)])
@@ -345,6 +704,45 @@ def test_the_budget_holds_exactly_at_every_size() -> None:
             nearest = past[-kept - 1]
             more = [messages[0], _user(nearest.user), {"role": "assistant", "content": nearest.answer}, *messages[1:]]
             assert estimate_tokens(more) > budget
+
+
+def test_the_next_prompt_counts_every_turn_and_the_tools() -> None:
+    """The estimate is never capped: 40 big turns come to more than the budget, the tool schemas included.
+
+    It is what ``_Size`` makes of the system message and every turn as it is replayed, plus the tools; and
+    what ``fit`` sends when the budget is no limit.
+    """
+    past = _long_past(40)
+    estimate = next_prompt_tokens(SYSTEM, TOOLS, past)
+    messages = [{"role": "system", "content": SYSTEM}, *(m for turn in past for m in _replayed(turn))]
+    assert estimate > PROMPT_TOKENS
+    assert estimate == _Size(messages).tokens() + estimate_tokens(TOOLS)
+    assert estimate == estimate_tokens(fit(SYSTEM, TOOLS, past, [], budget=10**9)) + estimate_tokens(TOOLS)
+    assert next_prompt_tokens(SYSTEM, [], past) == estimate - estimate_tokens(TOOLS)
+    assert next_prompt_tokens(SYSTEM, TOOLS, []) == estimate_tokens(SYSTEM_ONLY) + estimate_tokens(TOOLS)
+
+
+def test_the_estimate_counts_images_when_the_turn_sees() -> None:
+    """A turn whose question attached a picture counts it, label and cost, when the turn sees; not otherwise."""
+    shot = _photo(1, "harbour-photo.jpg")
+    past = [_past_turn(user="Was zeigt das Bild?", answer="Einen Hafen.")]
+    seen = [PastTurn("Was zeigt das Bild?", (), "Einen Hafen.", False, (shot,))]
+    plain = next_prompt_tokens(SYSTEM, TOOLS, past)
+    assert next_prompt_tokens(SYSTEM, TOOLS, seen) == plain
+    budget = ImageBudget(fixed=280, max_images=8)
+    counted = next_prompt_tokens(SYSTEM, TOOLS, seen, images=budget)
+    assert counted >= plain + 280
+    assert next_prompt_tokens(SYSTEM, TOOLS, past, images=budget) == plain
+    pixels = next_prompt_tokens(SYSTEM, TOOLS, seen, images=ImageBudget(fixed=None, max_images=8))
+    assert pixels > plain and pixels != counted
+
+
+def test_the_estimate_is_not_held_to_the_image_cap() -> None:
+    """Nine pictures over a cap of eight are all counted: the estimate is what could no longer be sent."""
+    shots = tuple(_photo(n, f"harbour-photo-{n}.jpg") for n in range(1, 10))
+    past = [PastTurn("Was zeigen die Bilder?", (), "Häfen.", False, shots)]
+    capped = next_prompt_tokens(SYSTEM, TOOLS, past, images=ImageBudget(fixed=280, max_images=8))
+    assert capped >= next_prompt_tokens(SYSTEM, TOOLS, past) + 9 * 280
 
 
 def test_earlier_tool_results_follow_up_while_not_expired() -> None:
@@ -431,13 +829,158 @@ def test_the_store_names_attachments_in_the_users_messages(store: ChatStore, clo
     first = store.add_user_message("user-a", chat.id, "Summe der Spalte B", [attachment.id])
     store.finish_assistant_message(store.start_assistant_message(chat.id), "42")
     second = store.add_user_message("user-a", chat.id, "Und Spalte C?", [])
-    named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]"
-    assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0)
+    named = f"Summe der Spalte B\n[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes; Excel workbook)]"
+    sales = SentFile("1" * 32, f"{FOLDER}/sales.xlsx", "sales.xlsx", "document", "ready", None, None)
+    assert store.user_turn(chat.id, first.id) == UserTurn(named, (), 0, (sales,))
     assert store.user_turn(chat.id, second.id) == UserTurn("Und Spalte C?", (), 2)
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(named, (), "42", False)], False)
     clock.now = T0 + 7 * DAY
     gone = "Summe der Spalte B\n[Attached: sales.xlsx; expired]"
     assert store.past_turns(chat.id, before_position=2) == ([PastTurn(gone, (), "42", True)], True)
+
+
+def test_the_long_line_rides_the_attachment_line(engine: Engine, clock: Clock) -> None:
+    """A document's line says its measured length, and when it is longer than one prompt, to this turn and replay."""
+    store = ChatStore(engine, file_days=7, notice_days=30, prompt_budget=1_000, now=clock)
+    chat = store.create_chat("user-a")
+
+    def attach(name: str, size: int, measure: dict[str, Any] | None) -> str:
+        clock.now += timedelta(seconds=1)
+        file_id = uuid4().hex
+        attachment = store.add_attachment(
+            chat.id,
+            file_id=file_id,
+            path=f"{FOLDER}/{name}",
+            name=name,
+            size=size,
+            mime="text/plain",
+            measure_state="pending",
+        )
+        store.settle_measure(attachment.id, measure)
+        return attachment.id
+
+    long = attach("long-report.txt", 1234, {"total": 40_000, "unit": "line", "chars": 2_000_000, "capped": False})
+    short = attach("tide-notes.txt", 56, {"total": 12, "unit": "line", "chars": 300, "capped": False})
+    unmeasured = attach("quay-ledger.txt", 78, None)
+    first = store.add_user_message("user-a", chat.id, "Fasse zusammen", [long, short, unmeasured])
+    told = f"; {LONGER_THAN_A_PROMPT}"
+    expected = "\n".join(
+        [
+            "Fasse zusammen",
+            f"[Attached: long-report.txt ({FOLDER}/long-report.txt, 1234 bytes; text, 40000 lines{told})]",
+            f"[Attached: tide-notes.txt ({FOLDER}/tide-notes.txt, 56 bytes; text, 12 lines)]",
+            f"[Attached: quay-ledger.txt ({FOLDER}/quay-ledger.txt, 78 bytes; text)]",
+        ]
+    )
+    assert store.user_turn(chat.id, first.id).text == expected
+    store.finish_assistant_message(store.start_assistant_message(chat.id), "Zusammenfassung")
+    store.add_user_message("user-a", chat.id, "Und weiter?", [])
+    [turn], _ = store.past_turns(chat.id, before_position=2)
+    assert turn.user == expected
+
+
+def test_the_store_reads_the_chats_files_for_the_notices(store: ChatStore, clock: Clock) -> None:
+    """Every attachment of the chat, sent or waiting, by path; its measure's length only while measured and live."""
+    chat, other = store.create_chat("user-a"), store.create_chat("user-a")
+
+    def attach(chat_id: str, name: str, measure: dict[str, Any] | None = None) -> str:
+        clock.now += timedelta(seconds=1)
+        out = store.add_attachment(
+            chat_id,
+            file_id=name[0] * 32,
+            path=f"{FOLDER}/{name}",
+            name=name,
+            size=64,
+            mime="application/pdf",
+            measure_state="pending",
+        )
+        if measure is not None:
+            store.settle_measure(out.id, measure)
+        return out.id
+
+    measured = {"total": 500, "unit": "page", "chars": 1_200_000, "capped": False}
+    report = attach(chat.id, "long-report.pdf", measured)
+    attach(chat.id, "tide-notes.txt")
+    attach(other.id, "quay-ledger.xlsx", {"total": 40, "unit": "row", "chars": 900, "capped": False})
+    asked = store.add_user_message("user-a", chat.id, "Fass zusammen", [report])
+    pdf = SentFile("l" * 32, f"{FOLDER}/long-report.pdf", "long-report.pdf", "document", "ready", 500, "page")
+    notes = SentFile("t" * 32, f"{FOLDER}/tide-notes.txt", "tide-notes.txt", "document", "ready", None, None)
+    assert store.user_turn(chat.id, asked.id).files == (pdf,)
+    assert store.chat_files(chat.id) == {pdf.path: pdf, notes.path: notes}
+    clock.now += 7 * DAY
+    assert store.chat_files(chat.id)[pdf.path] == dataclasses.replace(pdf, total=None, unit=None)
+
+
+def test_a_finished_turn_is_what_the_store_replays(store: ChatStore) -> None:
+    """The current turn, as the loop holds it and with its answer, is the earlier turn the store replays next.
+
+    Two rounds: the first with two calls, the second with one; the question names its attachment.
+    """
+    chat = store.create_chat("user-a")
+    attachment = store.add_attachment(
+        chat.id, file_id="1" * 32, path=f"{FOLDER}/sales.xlsx", name="sales.xlsx", size=14, mime=XLSX
+    )
+    asked = store.add_user_message("user-a", chat.id, "Summe der Spalte B", [attachment.id])
+    answer = store.start_assistant_message(chat.id)
+    question = store.user_turn(chat.id, asked.id)
+    calls = [
+        (1, "call_a", "read_document", json.dumps({"path": f"{FOLDER}/sales.xlsx"}), "Monat;Summe"),
+        (1, "call_b", "run_python", json.dumps({"code": "print(42)"}), '{"stdout": "42"}'),
+        (2, "call_c", "read_document", json.dumps({"path": f"{FOLDER}/teil-2.pdf"}), "Seite 2"),
+    ]
+    current: list[dict[str, Any]] = [_user(question.text)]
+    for position, (round_no, call_id, tool, arguments, result) in enumerate(calls):
+        store.add_step(
+            answer,
+            id=str(uuid4()),
+            position=position,
+            round=round_no,
+            call_id=call_id,
+            tool=tool,
+            arguments=arguments,
+            result=result,
+            status="ok",
+        )
+    for round_no in (1, 2):
+        mine = [call for call in calls if call[0] == round_no]
+        current.append(
+            {
+                "role": "assistant",
+                "content": "Ich lese.",
+                "tool_calls": [
+                    {"id": c[1], "type": "function", "function": {"name": c[2], "arguments": c[3]}} for c in mine
+                ],
+            }
+        )
+        current.extend({"role": "tool", "tool_call_id": c[1], "content": c[4]} for c in mine)
+    store.finish_assistant_message(answer, "Summe: 42")
+    [stored, *_] = store.past_turns(chat.id, before_position=10**6)
+    assert stored[-1] == finished_turn(question.text, question.images, current, "Summe: 42")
+    assert [len(calls) for calls in stored[-1].rounds] == [2, 1] and not stored[-1].expired
+
+
+def test_a_finished_turn_without_calls_is_the_question_and_its_answer() -> None:
+    """A turn that called no tool has no rounds; its pictures stay with its question."""
+    shot = _photo(1, "harbour-photo.jpg")
+    assert finished_turn("Hallo", (shot,), [_user("Hallo")], "Guten Tag.") == PastTurn(
+        "Hallo", (), "Guten Tag.", False, (shot,)
+    )
+
+
+def test_a_finished_turn_leaves_out_what_the_store_does_not_replay() -> None:
+    """A tool image's message is never replayed, and a call no tool message answers is not a call of the turn."""
+    current = [
+        _user("Zeig die Seite"),
+        *_viewed("call_0", [PAGE]),
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_9", "type": "function", "function": {"name": "view_file", "arguments": "{}"}}],
+        },
+    ]
+    turn = finished_turn("Zeig die Seite", (), current, "Fertig.")
+    assert [[call.call_id for call in calls] for calls in turn.rounds] == [["call_0"]]
+    assert turn.rounds[0][0].result == "0" * 100
 
 
 def test_a_step_reads_back_with_its_detail_until_it_expires(store: ChatStore, clock: Clock) -> None:
@@ -474,6 +1017,51 @@ def test_the_system_prompt_names_the_folder_and_the_period() -> None:
         "user's last message, in Markdown; write tables as Markdown tables. You have no tools in this chat, and "
         "files cannot be read."
     )
+
+
+def test_the_prompt_says_to_work_on_attached_files_with_tools_only() -> None:
+    """With tools the prompt says to work on the attached files in this answer, never to ask for their content."""
+    assert FILES == (
+        "When the user's message names attached files, work on them with the tools in this answer before you reply: "
+        "read_document reads documents, text and tables; run_python computes over a file's data (statistics, totals, "
+        "filters, comparisons, charts), CSV, Excel and JSON with pandas. Compute figures with run_python, never in "
+        "your head. Never ask the user to paste a file's content, and never say you cannot open files."
+    )
+    assert f"never guess its content. {FILES} Python runs in a sandbox" in SYSTEM
+    bare = system_prompt(today=date(2026, 11, 16), folder=None, file_days=7, expired=False)
+    assert FILES not in bare
+
+
+def test_an_unreachable_workbench_has_its_own_sentence() -> None:
+    """Tools that are on but not reachable say so and ask to send again; workbench off keeps its sentence."""
+    assert UNREACHABLE == (
+        "The tools are not reachable right now, so files cannot be read in this answer. If the user asks about a "
+        "file or for work on one, say so in one sentence and ask them to send the message again in a minute; never "
+        "ask them to paste a file's content, and never guess it."
+    )
+    day = date(2026, 11, 16)
+    off = system_prompt(today=day, folder=None, file_days=7, expired=False)
+    down = system_prompt(today=day, folder=None, file_days=7, expired=False, unreachable=True)
+    assert down == off.replace("You have no tools in this chat, and files cannot be read.", UNREACHABLE)
+    assert "You have no tools" not in down and FILES not in down and PAGING not in down
+    assert system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, unreachable=True) == SYSTEM
+
+
+def test_the_prompt_says_how_to_page_with_tools_only() -> None:
+    """How to read a long document in parts follows the folder sentences, only while tools are offered."""
+    assert PAGING == (
+        "A long document comes in parts: when read_document's answer has next_part, call it again with part set to "
+        "next_part to read on, and say plainly which parts you did not read."
+    )
+    made = "Files and tool results are deleted 7 days after they were made."
+    assert SYSTEM.endswith(f"{made} {PAGING}")
+    day = date(2026, 11, 16)
+    with_sight = system_prompt(today=day, folder=FOLDER, file_days=7, expired=False, vision=True)
+    assert with_sight == f"{SYSTEM} {VISION}" and with_sight.index(PAGING) < with_sight.index(VISION)
+    gone = system_prompt(today=day, folder=FOLDER, file_days=7, expired=True)
+    assert gone == f"{SYSTEM} {EXPIRED}"
+    bare = system_prompt(today=day, folder=None, file_days=7, expired=False)
+    assert PAGING not in bare and "next_part" not in bare
 
 
 def test_the_presentation_sentence_comes_with_the_tool() -> None:
@@ -615,6 +1203,88 @@ def _clip_manifest(duration_s: float | None, total: int, *, transcript: bool = T
     }
 
 
+@pytest.mark.parametrize(
+    ("manifest", "too_long", "expected"),
+    [
+        (
+            _pdf_manifest(500, []),
+            True,
+            "PDF, 500 pages; longer than one prompt: read it in parts and say which parts you read",
+        ),
+        (
+            _pdf_manifest(500, [3]),
+            True,
+            "PDF, 500 pages; page 3 has no text; longer than one prompt: read it in parts and say which parts you read",
+        ),
+        (None, True, "longer than one prompt: read it in parts and say which parts you read"),
+        ({"kind": "none", "total": 0}, True, "longer than one prompt: read it in parts and say which parts you read"),
+        (_pdf_manifest(500, []), False, "PDF, 500 pages"),
+        (None, False, None),
+    ],
+    ids=["pages", "pages with a blank", "no manifest", "a manifest of kind none", "not too long", "nothing to say"],
+)
+def test_a_long_document_says_to_read_it_in_parts(
+    manifest: dict[str, Any] | None, too_long: bool, expected: str | None
+) -> None:
+    """A document longer than one prompt adds the phrase to its facts, or says it alone; else the line is as before."""
+    assert LONGER_THAN_A_PROMPT == "longer than one prompt: read it in parts and say which parts you read"
+    assert attachment_facts("document", manifest, seen=True, name="long-report.pdf", too_long=too_long) == expected
+
+
+@pytest.mark.parametrize(
+    ("name", "length", "expected"),
+    [
+        ("tide-table.csv", (91, "line"), "CSV table, 91 lines"),
+        ("tide-table.csv", None, "CSV table"),
+        ("berth-plan.xlsx", (1, "row"), "Excel workbook, 1 row"),
+        ("berth-plan.xlsx", (240, "row"), "Excel workbook, 240 rows"),
+        ("vessels.json", None, "JSON data"),
+        ("vessels.jsonl", (12, "line"), "JSON Lines data, 12 lines"),
+        ("vessels.ndjson", None, "JSON Lines data"),
+        ("quay-notes.txt", (30, "line"), "text, 30 lines"),
+        ("QUAY-NOTES.MD", None, "Markdown text"),
+    ],
+)
+def test_a_data_or_text_file_says_its_format_and_length(
+    name: str, length: tuple[int, str] | None, expected: str
+) -> None:
+    """A document with no pages to tell says its format by its suffix, then its measured length, if any."""
+    for manifest in (None, {"kind": "none", "total": 0}):
+        assert attachment_facts("document", manifest, seen=True, name=name, length=length) == expected
+    long = attachment_facts("document", None, seen=True, name=name, length=length, too_long=True)
+    assert long == f"{expected}; {LONGER_THAN_A_PROMPT}"
+
+
+def test_the_data_formats_are_attachment_types_without_pages() -> None:
+    """Every data format is a type Ghostwriter takes, and none is a PDF or an Office file, which tell their pages."""
+    assert set(DATA_FORMATS) <= set(ATTACHMENT_TYPES)
+    assert not set(DATA_FORMATS) & {".pdf", *OFFICE_SUFFIXES}
+
+
+def test_a_document_with_pages_keeps_its_line_whatever_its_length() -> None:
+    """A PDF or an Office file counts its own pages; its measured length adds nothing, and an unknown suffix none."""
+    assert attachment_facts(
+        "document", _pdf_manifest(12, []), seen=True, name="quay-scan.pdf", length=(12, "page")
+    ) == ("PDF, 12 pages")
+    assert attachment_facts("document", None, seen=True, name="quay-scan.pdf", length=(12, "page")) is None
+    assert attachment_facts("document", None, seen=True, name="harbour.bin", length=(3, "line")) is None
+
+
+def test_a_picture_and_a_clip_are_never_too_long() -> None:
+    """Only a document is read in parts: ``too_long`` leaves a picture's line and a clip's as they were."""
+    times = "\N{MULTIPLICATION SIGN}"
+    picture = _image_manifest(2048, 1536)
+    assert (
+        attachment_facts("image", picture, seen=True, name="harbour-photo.jpg", too_long=True)
+        == f"image 2048{times}1536"
+    )
+    clip = _clip_manifest(134.2, 8)
+    assert attachment_facts("media", clip, seen=True, name="harbour-tour.mp4", too_long=True) == (
+        "video 02:14, 8 frames; transcript"
+    )
+    assert attachment_facts("media", None, seen=True, name="harbour-tour.mp4", too_long=True) is None
+
+
 def test_the_attachment_line_carries_facts() -> None:
     """The line names an image's size, a PDF's pages and those without text; a failed or expired file says so."""
     times = "\N{MULTIPLICATION SIGN}"
@@ -677,7 +1347,7 @@ def test_the_attachment_line_carries_facts() -> None:
         f"[Attached: quay-scan.pdf ({FOLDER}/quay-scan.pdf, 900000 bytes; PDF, 12 pages; pages 3, 7 have no text)]",
         f"[Attached: quay-letter.pdf ({FOLDER}/quay-letter.pdf, 70000 bytes; PDF, 5 pages; page 3 has no text)]",
         f"[Attached: letter.pdf ({FOLDER}/letter.pdf, 2000 bytes; PDF, 1 page)]",
-        f"[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes)]",
+        f"[Attached: sales.xlsx ({FOLDER}/sales.xlsx, 14 bytes; Excel workbook)]",
         "[Attached: blurred-photo.jpg; could not be read]",
         "[Attached: old-scan.pdf; expired]",
     ]
@@ -1064,7 +1734,7 @@ def test_an_office_attachment_without_facts_says_nothing() -> None:
     assert attachment_facts("document", none, seen=True, name="quay-report.docx") is None
     assert attachment_facts("document", None, seen=True, name="harbour-deck.pptx") is None
     assert attachment_facts("document", _office_manifest("slide", 0, []), seen=True, name="harbour-deck.pptx") is None
-    assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.xlsx") is None
+    assert attachment_facts("document", {"kind": "xls", "total": 3}, seen=True, name="harbour-figures.odp") is None
 
 
 def test_a_clips_line_says_what_it_holds() -> None:
@@ -1286,6 +1956,13 @@ def test_the_store_lists_ready_images_of_a_turn(store: ChatStore, clock: Clock) 
         ),
         (photo,),
         0,
+        (
+            SentFile("o" * 32, f"{FOLDER}/old-photo.jpg", "old-photo.jpg", "image", "ready", None, None),
+            SentFile("h" * 32, f"{FOLDER}/harbour-photo.jpg", "harbour-photo.jpg", "image", "ready", None, None),
+            SentFile("q" * 32, f"{FOLDER}/quay-photo.jpg", "quay-photo.jpg", "image", "processing", None, None),
+            SentFile("b" * 32, f"{FOLDER}/blurred-photo.jpg", "blurred-photo.jpg", "image", "failed", None, None),
+            SentFile("s" * 32, f"{FOLDER}/scan.pdf", "scan.pdf", "document", "ready", None, None),
+        ),
     )
     unseen = store.user_turn(chat.id, first.id)
     assert unseen.images == (photo,) and f"image 64{times}48; not shown to the model" in unseen.text

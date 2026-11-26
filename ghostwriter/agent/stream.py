@@ -12,6 +12,10 @@ reasoning), a separate reasoning field (the endpoint keeps reasoning apart, so t
 the answer), or the end of the reply (the held content was the answer), as docint's
 ``stream_round`` does. It may answer in up to ``REASONING_ANSWER_TOKENS``.
 
+A continuation round (Continue) goes on in the answer so far, the conversation's last message: it
+asks the model for that (:data:`~ghostwriter.inference.CONTINUE_BODY` on vllm), and the whitespace its
+reply opens with, which an answer's start drops, is kept, as it joins the reply to the answer so far.
+
 :class:`ToolCall` and :class:`ToolCallAccumulator`, with the helpers they use, are copied
 unchanged from docint (``docint/agents/turn/stream.py``); here they read the SDK's chunks
 directly.
@@ -70,7 +74,7 @@ class RoundDone:
 
     Attributes:
         text (str): Every :class:`TextDelta` of the round, joined: reasoning left out, and
-            leading and trailing whitespace too.
+            leading and trailing whitespace too; a continuation keeps its leading whitespace.
         calls (list[ToolCall]): The tool calls, in the order the model began them; empty when
             the text is the answer, and for a stopped round.
         finish_reason (str | None): The endpoint's finish reason, or ``None`` if it sent none.
@@ -298,6 +302,55 @@ def _count(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+class _Lead:
+    """The whitespace a continuation opens with, which joins it to the answer so far.
+
+    The reader drops a reply's leading whitespace, as an answer starts without it. A continuation goes on where
+    the answer stopped, so a space or a line break it opens with is the seam: it is held while the reply's content
+    is whitespace alone, and put before the reply's first visible text. For any other round it passes everything on.
+    """
+
+    def __init__(self, *, kept: bool) -> None:
+        """Start before any content.
+
+        Args:
+            kept (bool): Whether the reply's leading whitespace is kept: only a continuation's is.
+        """
+        self._held = ""
+        self._open = kept
+        self._shown = not kept
+
+    def take(self, content: str) -> str:
+        """Hold the content's leading whitespace while the reply's content so far is whitespace alone.
+
+        Args:
+            content (str): The next piece of the reply's content.
+
+        Returns:
+            str: The piece for the reader, without what was held.
+        """
+        if not self._open:
+            return content
+        rest = content.lstrip()
+        self._held += content[: len(content) - len(rest)]
+        self._open = not rest
+        return rest
+
+    def give(self, text: str) -> str:
+        """Put what was held before the reply's first visible text.
+
+        Args:
+            text (str): Visible text the reader passed on.
+
+        Returns:
+            str: The text, the held whitespace before it if it is the first.
+        """
+        if self._shown or not text:
+            return text
+        self._shown = True
+        return self._held + text
+
+
 def stream_round(
     model: ModelClient,
     messages: list[dict[str, Any]],
@@ -306,6 +359,8 @@ def stream_round(
     headers: Mapping[str, str],
     cancel: threading.Event,
     reasoning: bool = False,
+    continuation: bool = False,
+    require_tool: bool = False,
 ) -> Iterator[TextDelta | RoundDone]:
     """Stream one model round, bounded in tokens, each wait on the router by ``MODEL_TIMEOUT_S``.
 
@@ -318,6 +373,10 @@ def stream_round(
         cancel (threading.Event): Set to stop the round.
         reasoning (bool): Whether the model may think first: the round asks for it and answers
             in up to ``REASONING_ANSWER_TOKENS``, else ``MAX_ANSWER_TOKENS``.
+        continuation (bool): Whether the round goes on in the last message, the answer so far: it asks
+            for that, and keeps the whitespace its reply opens with.
+        require_tool (bool): Whether the round must call one of ``tools``
+            (:meth:`~ghostwriter.inference.ModelClient.stream` says on which provider that is asked for).
 
     Yields:
         TextDelta | RoundDone: The visible text as it arrives, then exactly one :class:`RoundDone`.
@@ -332,9 +391,12 @@ def stream_round(
         max_tokens=REASONING_ANSWER_TOKENS if reasoning else MAX_ANSWER_TOKENS,
         timeout_s=MODEL_TIMEOUT_S,
         reasoning=reasoning,
+        continuation=continuation,
+        require_tool=require_tool,
     )
     accumulator = ToolCallAccumulator()
     reader = ReasoningStripper(reasoning_open=reasoning)
+    lead = _Lead(kept=continuation)
     shown: list[str] = []
     finish_reason: str | None = None
     model_id: str | None = None
@@ -357,7 +419,8 @@ def stream_round(
             text = ""
             if _text(_field(delta, "reasoning_content")) or _text(_field(delta, "reasoning")):
                 text = reader.cancel_open_reasoning()
-            text += reader.feed(_scalar(_text(_field(delta, "content"))))
+            content = lead.take(_scalar(_text(_field(delta, "content"))))
+            text = lead.give(text + reader.feed(content))
             if text:
                 shown.append(text)
                 yield TextDelta(text)
@@ -365,7 +428,7 @@ def stream_round(
         stream.close()
     calls: list[ToolCall] = []
     if not stopped:
-        tail = reader.flush()
+        tail = lead.give(reader.flush())
         if tail:
             shown.append(tail)
             yield TextDelta(tail)

@@ -4,7 +4,8 @@
 |---|---|---|
 | A chat: its messages, steps, attachments and results | `GHOSTWRITER_CHAT_RETENTION_DAYS` (90) after it started | the daily sweep deletes it |
 | Tool contents (a step's arguments and result) and table previews | `WORKBENCH_RETENTION_DAYS` (7), or less: never past a file they may come from | read as expired at once; the daily sweep empties them |
-| An attachment's manifest (its page count, the pages without text, the sizes of its renders; a clip's length, frame count and whether it has a transcript) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties it; the attachment itself stays with its chat |
+| An attachment's manifest (its page count, the pages without text, the sizes of its renders; a clip's length, frame count and whether it has a transcript) and a document's measure (its count and unit, the characters of a full read, whether the count was capped) | `WORKBENCH_RETENTION_DAYS` (7) after the attachment was made | the daily sweep empties them; the attachment itself stays with its chat, and its measure's state with it |
+| An answer's notices about a file (`document_partial`, `document_unread`: the file's id, how much of it was read, of how much, in which unit) | `WORKBENCH_RETENTION_DAYS` (7) after the answer was made, or less: never past a file it may come from | read as the bare code at once; the daily sweep strips them to their codes. The answer, the codes and its estimate of the next prompt stay with the chat |
 | The files, and the renders workbench made of them (a clip's transcript and frames are derived files of the clip) | 7 days, in workbench | workbench's own retention; here their cards read "expired" and a download or a preview answers 410 |
 | A clip's copy at Nextext, and what Nextext made of it | one job: until its transcript and frames are in workbench, it failed, or `NEXTEXT_TIMEOUT` (900 s) is spent; a job still running then keeps the upload at Nextext until its pipeline ends | Ghostwriter deletes the job at once; one whose delete failed goes 4 minutes later, one a crash left at the next start, or with the daily sweep |
 
@@ -39,13 +40,33 @@ has not expired yet, without a notice; nothing expired comes back.
 ## Manifests and renders
 
 An attachment's manifest is derived from its file, so it goes with the file's
-period: the sweep records it, then empties it, and the attachment stays. The
+period: the sweep records it, then empties it, and the attachment stays. So does
+a document's measure, its length (workbench 0.10.0): it is not served once the
+file's period has passed (the SPA is served no length), and the sweep empties it
+with the manifest. Its state (`measured`, `none`) stays; a measure still `pending`
+at start is measured again, or settled `none` while workbench is off. The
 renders themselves (the pages and pictures the model sees) are workbench's
 derived files and are deleted with their source there. Ghostwriter keeps none:
 the processing and preview routes hold nothing (the preview streams a render
 through), and a picture's bytes live in memory for the one message that sends it.
 After the period an earlier picture is read as expired: the follow-up's line says
 so and nothing is fetched.
+
+## An answer's notices
+
+An answer is stored with its notices ([data-flow.md](data-flow.md#what-the-user-is-told)). Of a notice about a
+file, its file id and its numbers (how much was read, of how much, in which unit) are content made with the answer,
+derived from the file's text, so they expire like a step's arguments and result: `WORKBENCH_RETENTION_DAYS` after the
+answer was made, or with the earliest file that may still be in the chat's folder then, if that goes first. The
+deadline is set by the first write of the answer that holds such a notice and stays through a Continue of the same
+answer. A changed file period moves it at the next start, as it moves a step's, without a notice.
+
+Past it the answer is served the bare code, which says "A document was read only in part" or "An attachment was not
+read for this answer", with neither the file's name nor a number, and the sweep strips the stored notice to its code.
+The name is never stored: it is read from the chat's attachment row while the details are served. The answer, the
+codes (`answer_cut`, `images_dropped`, `context_trimmed` and `tools_unavailable` hold no file or number, and so no
+deadline) and the estimate of the next prompt, an integer, stay with the chat until its own period ends. A notice is
+a code, an id and counts, never content.
 
 ## The delete order
 
@@ -117,6 +138,8 @@ name, even with another token, it would delete this one's jobs when it starts.
 ## The dry run
 
 `make retention-dry-run` asks the running backend what a sweep would delete
-now, in counts, ages and dates only: the chats, and the tool steps, previews
-and manifests whose period has passed; `CHAT_DAYS=n` previews another chat
-period, with the notice it would get. It records and changes nothing.
+now, in counts, ages and dates only: the chats, and the tool steps, previews,
+manifests (an attachment's manifest or measure, counted once) and answers'
+notices (those whose file details are due) whose period has passed; `CHAT_DAYS=n` previews
+another chat period, with the notice it would get. It records and changes nothing.
+The file it reads may be of an older schema: a column it lacks counts nothing.

@@ -20,6 +20,8 @@ const CONFIG: AppConfig = {
   max_recording_bytes: 10 * 1024 * 1024,
   chat_retention_days: 90,
   file_retention_days: 7,
+  prompt_tokens: 34_000,
+  reasoning_prompt_tokens: 26_000,
   version: '0.1.0',
 }
 

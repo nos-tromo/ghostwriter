@@ -17,7 +17,7 @@ from sqlalchemy.types import TypeDecorator
 from typing_extensions import override
 
 #: The schema this release writes.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _to_2(conn: Connection) -> None:
@@ -40,8 +40,28 @@ def _to_2(conn: Connection) -> None:
         conn.exec_driver_sql(statement)
 
 
+def _to_3(conn: Connection) -> None:
+    """Give answers their notices and the estimate of the next prompt, and attachments a measure and its state.
+
+    Every row written before has none of them: ``NULL``.
+
+    Args:
+        conn: The connection of the migration's transaction.
+    """
+    for statement in (
+        "ALTER TABLE messages ADD COLUMN notices TEXT",
+        "ALTER TABLE messages ADD COLUMN context_estimate INTEGER",
+        "ALTER TABLE messages ADD COLUMN notices_expire_at DATETIME",
+        "CREATE INDEX ix_messages_notices_expire_at ON messages (notices_expire_at)",
+        "ALTER TABLE attachments ADD COLUMN measure TEXT",
+        "ALTER TABLE attachments ADD COLUMN measure_state VARCHAR(8)"
+        " CHECK (measure_state IN ('pending', 'measured', 'none'))",
+    ):
+        conn.exec_driver_sql(statement)
+
+
 #: Version ``n`` to ``n + 1``, each run in a transaction of its own.
-MIGRATIONS: dict[int, Callable[[Connection], None]] = {1: _to_2}
+MIGRATIONS: dict[int, Callable[[Connection], None]] = {1: _to_2, 2: _to_3}
 
 _PRAGMAS: Final = ("busy_timeout=5000", "foreign_keys=ON", "secure_delete=ON", "journal_mode=WAL")
 

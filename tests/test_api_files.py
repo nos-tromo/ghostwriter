@@ -3,6 +3,7 @@
 Every name, id and value here is invented.
 """
 
+import json
 import logging
 import time
 from collections.abc import Callable, Iterator
@@ -25,6 +26,7 @@ from ghostwriter.config import Settings
 from ghostwriter.db import init_db, make_engine, utcnow
 from ghostwriter.main import create_app
 from ghostwriter.processing import AttachmentProcessor, PrepareJob
+from ghostwriter.schemas import MeasureState
 from ghostwriter.store import ChatStore
 from ghostwriter.workbench import chat_folder, session_pseudonym
 from tests.conftest import (
@@ -224,6 +226,7 @@ def test_an_attachment_streams_to_workbench_and_is_kept_by_reference(
         "status": "ready",
         "created_at": None,
         "expired": False,
+        "length": {"state": "none", "total": None, "unit": None, "too_long": False},
     }
     upload = door.last("/files/upload")
     assert upload.url.params["directory"] == chat_folder(KEY, cid)
@@ -445,7 +448,7 @@ def test_an_orphan_delete_whose_record_fails_never_raises(
     r = _attach(client, cid)
     audit_stream.writes_left = None
     assert (r.status_code, r.json()) == (404, {"detail": "Chat not found."})
-    assert [request.url.path for request, _ in door.requests] == sent
+    assert [request.url.path for request, _ in door.requests if request.url.path != "/mcp"] == sent
     assert "AuditWriteError" in loguru_caplog.text and cid not in loguru_caplog.text
 
 
@@ -978,7 +981,10 @@ def test_an_office_file_is_not_prepared_with_vision_off(client: TestClient, door
 
 
 async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Path) -> None:
-    """A ready deck whose background job runs is answered at once, whatever wait was asked; a processing row waits."""
+    """A ready deck whose background job runs is answered at once, whatever wait was asked, and so is a measured one.
+
+    A processing row waits for its prepare only, and a ready one whose measure is pending for its job.
+    """
     settings = make_settings(tmp_path, vision=True)
     engine = make_engine(settings.db_path)
     init_db(engine)
@@ -986,7 +992,7 @@ async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Pat
         store = ChatStore(engine, file_days=settings.file_days, notice_days=settings.notice_days)
         cid = store.create_chat("user-a").id
 
-        def add(name: str, status: str) -> str:
+        def add(name: str, status: str, measure_state: MeasureState | None = None) -> str:
             return store.add_attachment(
                 cid,
                 file_id="7" * 32,
@@ -996,17 +1002,23 @@ async def test_a_status_request_for_a_ready_attachment_never_waits(tmp_path: Pat
                 mime="application/octet-stream",
                 kind="document",
                 status=status,
+                measure_state=measure_state,
             ).id
 
         deck, scan = add("harbour-deck.pptx", "ready"), add("quay-scan.pdf", "processing")
+        notes, ledger = add("tide-notes.txt", "ready", "pending"), add("quay-ledger.csv", "ready", "none")
         processor = create_autospec(AttachmentProcessor, instance=True)
         processor.running.return_value = True
-        found = await _read_after_wait(store, processor, "user-a", cid, deck, wait=20)
-        assert found is not None and found.status == "ready"
+        for ready in (deck, ledger):
+            found = await _read_after_wait(store, processor, "user-a", cid, ready, wait=20)
+            assert found is not None and found.status == "ready"
         processor.wait.assert_not_called()
         found = await _read_after_wait(store, processor, "user-a", cid, scan, wait=20)
         assert found is not None and found.status == "processing"
-        processor.wait.assert_awaited_once_with(scan, 20)
+        processor.wait.assert_awaited_once_with(scan, 20, prepare_only=True)
+        found = await _read_after_wait(store, processor, "user-a", cid, notes, wait=20)
+        assert found is not None and found.length is not None and found.length.state == "pending"
+        processor.wait.assert_awaited_with(notes, 20, prepare_only=False)
     finally:
         engine.dispose()
 
@@ -1115,6 +1127,121 @@ def test_the_long_poll_returns_when_ready_or_after_its_wait(
     r = _status(seeing, cid, stuck.id, wait=1)
     assert (r.status_code, r.json()["status"]) == (200, "processing")
     assert 1 <= time.monotonic() - started < 5
+
+
+# --- documents: measured in the background from workbench 0.10 -----------------
+
+NOTES = "tide-notes.txt"
+#: Two lines, 31 characters.
+NOTES_TEXT = b"high tide 06:12\nlow tide 12:30\n"
+PENDING = {"state": "pending", "total": None, "unit": None, "too_long": False}
+
+
+def _app_over(tmp_path: Path, audit_stream: CapturedAuditStream, door: FakeDoor, clock: Clock) -> TestClient:
+    """Return a client of the app with workbench behind ``door``, vision off; enter it with ``with``."""
+    app = create_app(
+        make_settings(tmp_path), audit_stream=audit_stream, workbench_transport=httpx.MockTransport(door), now=clock
+    )
+    return TestClient(app)
+
+
+@pytest.fixture
+def measuring_door() -> FakeDoor:
+    """Return workbench 0.10.0's doors, which measure a document."""
+    return FakeDoor(server_version="0.10.0")
+
+
+@pytest.fixture
+def measuring(
+    tmp_path: Path, audit_stream: CapturedAuditStream, measuring_door: FakeDoor, clock: Clock
+) -> Iterator[TestClient]:
+    """Serve the app over workbench 0.10.0, vision off."""
+    with _app_over(tmp_path, audit_stream, measuring_door, clock) as test_client:
+        yield test_client
+
+
+def test_a_document_is_ready_at_once_and_measured(
+    measuring: TestClient, measuring_door: FakeDoor, audit_stream: CapturedAuditStream
+) -> None:
+    """The upload answers ready with its measure pending; the long poll answers it measured, not too long."""
+    cid = _new(measuring)
+    before = len(events(audit_stream))
+    r = _attach(measuring, cid, NOTES, NOTES_TEXT)
+    assert r.status_code == 201
+    notes = r.json()
+    assert (notes["status"], notes["length"]) == ("ready", PENDING)
+    r = _status(measuring, cid, notes["id"], wait=20)
+    assert r.status_code == 200
+    assert r.json()["length"] == {"state": "measured", "total": 2, "unit": "line", "too_long": False}
+    [measure] = [r for r, _ in measuring_door.requests if r.url.path == "/files/measure"]
+    assert json.loads(measure.content) == {"path": f"{chat_folder(KEY, cid)}/{NOTES}"}
+    [collect] = [e for e in _since(audit_stream, before) if e["action"] == "collect"]
+    [handed] = [e for e in _since(audit_stream, before) if e.get("recipient") == "workbench:measure"]
+    assert (handed["action"], handed["parent_event_id"], handed["criteria"]) == (
+        "disclose",
+        collect["event_id"],
+        {"kind": "document"},
+    )
+    assert NOTES not in audit_stream.getvalue()
+
+
+@pytest.mark.parametrize(
+    ("chars", "capped", "too_long"),
+    [(3 * 34_000 + 3, False, True), (10, True, True), (3 * 34_000, False, False)],
+    ids=["over_the_budget", "capped", "at_the_budget"],
+)
+def test_a_long_document_is_too_long(
+    measuring: TestClient, measuring_door: FakeDoor, chars: int, capped: bool, too_long: bool
+) -> None:
+    """Too long: more characters than the prompt budget's tokens hold (34,000 at 40k), or a count that was capped."""
+    cid = _new(measuring)
+    path = f"{chat_folder(KEY, cid)}/long-report.pdf"
+    measuring_door.measures[path] = {
+        "path": path,
+        "kind": "pdf",
+        "unit": "page",
+        "total": 412,
+        "chars": chars,
+        "capped": capped,
+    }
+    report = _attach(measuring, cid, "long-report.pdf", b"%PDF-1.7").json()
+    assert (report["status"], report["length"]) == ("ready", PENDING)
+    r = _status(measuring, cid, report["id"], wait=20)
+    assert r.json()["length"] == {"state": "measured", "total": 412, "unit": "page", "too_long": too_long}
+
+
+def test_no_measure_before_workbench_0_10(tmp_path: Path, audit_stream: CapturedAuditStream, clock: Clock) -> None:
+    """Before workbench 0.10 nothing is measured: a document's length is ``none`` at once, and no measure is sent."""
+    door = FakeDoor(server_version="0.9.0")
+    with _app_over(tmp_path, audit_stream, door, clock) as client:
+        cid = _new(client)
+        notes = _attach(client, cid, NOTES, NOTES_TEXT).json()
+        assert notes["length"] == {"state": "none", "total": None, "unit": None, "too_long": False}
+        assert not _state(client).processor.running(notes["id"])
+        assert _status(client, cid, notes["id"], wait=20).json()["length"]["state"] == "none"
+    assert [r for r, _ in door.requests if r.url.path == "/files/measure"] == []
+
+
+def test_a_picture_has_no_length(seeing: TestClient, door: FakeDoor) -> None:
+    """A picture is never measured: its length is null, before and after its prepare."""
+    cid = _new(seeing)
+    photo = _attach(seeing, cid, PHOTO, TINY_JPEG).json()
+    assert photo["length"] is None
+    assert _settled(seeing, cid, photo["id"]) == "ready"
+    assert _status(seeing, cid, photo["id"]).json()["length"] is None
+
+
+def test_the_long_poll_waits_on_a_pending_measure(measuring: TestClient, measuring_door: FakeDoor) -> None:
+    """A ready document whose measure is pending is followed: a long poll answers once it is measured."""
+    measuring_door.delays["/files/measure"] = 0.5
+    cid = _new(measuring)
+    notes = _attach(measuring, cid, NOTES, NOTES_TEXT).json()
+    started = time.monotonic()
+    r = _status(measuring, cid, notes["id"], wait=0)
+    assert (r.json()["status"], r.json()["length"]) == ("ready", PENDING)
+    r = _status(measuring, cid, notes["id"], wait=20)
+    assert (r.json()["status"], r.json()["length"]["state"]) == ("ready", "measured")
+    assert time.monotonic() - started < 5
 
 
 def test_a_preview_streams_the_rendition_with_the_hardening(

@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+#: The nginx location of the chat's streams: a send, a regenerate and a continue.
+STREAM_LOCATION = "~ ^/api/chats/[^/]+/(messages|regenerate|messages/[^/]+/continue)$"
 
 
 def _service(text: str, name: str) -> str:
@@ -27,6 +29,20 @@ def _service(text: str, name: str) -> str:
             end = i
             break
     return "".join(lines[start:end])
+
+
+def _location_pattern(conf: str, spec: str) -> str:
+    """Return the regular expression of a ``location ~`` block, which the block must have.
+
+    Args:
+        conf: The nginx configuration's text.
+        spec: What follows ``location`` on the opening line, ``~ <regex>``.
+
+    Returns:
+        str: The regular expression.
+    """
+    assert f"location {spec} {{" in conf
+    return spec.removeprefix("~ ").strip()
 
 
 def _location(conf: str, spec: str) -> str:
@@ -124,12 +140,27 @@ def test_make_knows_the_networks_and_the_volume() -> None:
     assert "docker volume rm ghostwriter-data" in mk
 
 
+def test_nginx_streams_the_send_the_regenerate_and_the_continue() -> None:
+    """One location holds the three routes that answer as Server-Sent Events, and no route that does not."""
+    conf = (ROOT / "frontend" / "nginx" / "default.conf").read_text(encoding="utf-8")
+    pattern = re.compile(_location_pattern(conf, STREAM_LOCATION))
+    streams = ("/api/chats/c1/messages", "/api/chats/c1/regenerate", "/api/chats/c1/messages/m1/continue")
+    assert all(pattern.match(path) for path in streams)
+    others = (
+        "/api/chats/c1",
+        "/api/chats/c1/messages/m1",
+        "/api/chats/c1/messages/m1/continue/x",
+        "/api/chats/c1/stop",
+    )
+    assert not any(pattern.match(path) for path in others)
+
+
 def test_nginx_serves_under_ghostwriter_streams_and_allows_the_microphone() -> None:
     """Nginx strips /ghostwriter, streams the chat, sizes uploads and allows the microphone."""
     conf = (ROOT / "frontend" / "nginx" / "default.conf").read_text(encoding="utf-8")
     assert "rewrite ^/ghostwriter(/.+)$ $1;" in conf and "return 302 /ghostwriter/;" in conf
     assert "proxy_max_temp_file_size 0;" in conf and "access_log /var/log/nginx/access.log scrubbed;" in conf
-    stream = _location(conf, "~ ^/api/chats/[^/]+/(messages|regenerate)$")
+    stream = _location(conf, STREAM_LOCATION)
     assert all(
         d in stream
         for d in ("proxy_buffering off;", "proxy_request_buffering off;", "proxy_read_timeout 1h;", "gzip off;")
@@ -146,7 +177,7 @@ def test_nginx_serves_under_ghostwriter_streams_and_allows_the_microphone() -> N
     assert "proxy_buffering off;" in _location(conf, "~ ^/api/chats/[^/]+/files/")
     assert "client_max_body_size 1m;" in _location(conf, "/api/")
     for spec in (
-        "~ ^/api/chats/[^/]+/(messages|regenerate)$",
+        STREAM_LOCATION,
         "~ ^/api/chats/[^/]+/attachments$",
         "= /api/transcribe",
         "~ ^/api/chats/[^/]+/files/",
